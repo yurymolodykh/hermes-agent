@@ -572,7 +572,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, Mapping
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -5441,6 +5441,11 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    async def on_processing_suspended(
+        self, event: MessageEvent, suspension: Mapping[str, Any]
+    ) -> None:
+        """Private opt-in hook for the adapter that owns a durable suspension."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
 
@@ -6366,6 +6371,9 @@ class BasePlatformAdapter(ABC):
             response = await self._message_handler(event)
             is_suspended_response = isinstance(response, SuspendedReply)
             if is_suspended_response:
+                await self._run_processing_hook(
+                    "on_processing_suspended", event, response.suspension
+                )
                 # Only the bounded public shape reaches lifecycle-hook
                 # consumers: never the private routing envelope (session_key,
                 # tool_call_id) the integration adapter uses for resume.

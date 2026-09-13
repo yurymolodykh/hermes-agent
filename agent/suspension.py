@@ -11,7 +11,137 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+
+_MAX_RESUME_RESULT_BYTES = 256 * 1024
+
+
+class InvalidResume(ValueError):
+    """A trusted resume value is malformed or unsupported."""
+
+
+class ResumeConflict(RuntimeError):
+    """The durable transcript no longer matches the validated resume."""
+
+
+@dataclass(frozen=True)
+class ValidatedToolResume:
+    """Capability already authenticated and schema-validated by an adapter."""
+
+    session_id: str
+    kind: str
+    tool_name: str
+    tool_call_id: str
+    result: str | Mapping[str, Any]
+    token_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "session_id", "kind", "tool_name", "tool_call_id", "token_fingerprint"
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise InvalidResume(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        if self.kind != "question_set" or self.tool_name != "clarify":
+            raise InvalidResume("unsupported suspended tool resume kind")
+        if isinstance(self.result, str):
+            result = self.result
+        elif isinstance(self.result, Mapping):
+            try:
+                result = json.dumps(
+                    dict(self.result), ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise InvalidResume("resume result must be JSON-serializable") from exc
+        else:
+            raise InvalidResume("resume result must be a string or mapping")
+        if not result:
+            raise InvalidResume("resume result must not be empty")
+        if len(result.encode("utf-8")) > _MAX_RESUME_RESULT_BYTES:
+            raise InvalidResume("resume result is too large")
+        object.__setattr__(self, "result", result)
+
+
+def reconcile_validated_tool_resume(
+    history: Sequence[Mapping[str, Any]], resume: ValidatedToolResume
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind a validated resume to a fresh durable tool-call tail."""
+    if not isinstance(resume, ValidatedToolResume):
+        raise InvalidResume("resume must be a ValidatedToolResume")
+    rows = [dict(row) for row in history]
+    assistant_index = -1
+    for index in range(len(rows) - 1, -1, -1):
+        if rows[index].get("role") == "assistant" and rows[index].get("tool_calls"):
+            assistant_index = index
+            break
+    if assistant_index < 0:
+        raise ResumeConflict("no suspended assistant tool-call tail")
+    suffix = rows[assistant_index + 1 :]
+    if any(row.get("role") != "tool" for row in suffix):
+        raise ResumeConflict("a newer turn exists after the suspended tool call")
+
+    calls = rows[assistant_index].get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        raise ResumeConflict("malformed assistant tool-call tail")
+    call_ids: list[str] = []
+    call_names: dict[str, str] = {}
+    for call in calls:
+        if not isinstance(call, Mapping):
+            raise ResumeConflict("malformed assistant tool call")
+        call_id = call.get("id")
+        function = call.get("function")
+        name = function.get("name") if isinstance(function, Mapping) else None
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            raise ResumeConflict("malformed assistant tool call")
+        if call_id in call_names:
+            raise ResumeConflict("duplicate assistant tool call id")
+        call_ids.append(call_id)
+        call_names[call_id] = name
+    if resume.tool_call_id not in call_names:
+        raise ResumeConflict("resume tool call is not present in the durable tail")
+    if call_names[resume.tool_call_id] != resume.tool_name:
+        raise ResumeConflict("resume tool name does not match the durable tail")
+
+    result_by_id: dict[str, str] = {}
+    for expected_id, row in zip(call_ids, suffix):
+        actual_id = row.get("tool_call_id")
+        if actual_id != expected_id or actual_id in result_by_id:
+            raise ResumeConflict("tool results are not an ordered prefix of the call block")
+        content = row.get("content")
+        if not isinstance(content, str):
+            raise ResumeConflict("durable tool result content is malformed")
+        result_by_id[actual_id] = content
+    if len(suffix) > len(call_ids):
+        raise ResumeConflict("too many durable tool results")
+
+    target_index = call_ids.index(resume.tool_call_id)
+    if target_index < len(suffix):
+        if result_by_id[resume.tool_call_id] != resume.result:
+            raise ResumeConflict("tool call already has a different result")
+        if len(suffix) != len(call_ids):
+            raise ResumeConflict("partially persisted resume batch")
+        return rows, []
+    if target_index != len(suffix):
+        raise ResumeConflict("resume target is not the next unclosed tool call")
+
+    appended = [{
+        "role": "tool", "tool_call_id": resume.tool_call_id,
+        "tool_name": resume.tool_name, "content": resume.result,
+    }]
+    cancellation = json.dumps(
+        {"cancelled": True, "reason": "not_executed_after_tool_suspension"},
+        sort_keys=True, separators=(",", ":"),
+    )
+    for call_id in call_ids[target_index + 1 :]:
+        appended.append({
+            "role": "tool", "tool_call_id": call_id,
+            "tool_name": call_names[call_id], "content": cancellation,
+            "effect_disposition": "not_executed",
+        })
+    return rows + appended, appended
 
 
 @dataclass(frozen=True)
@@ -100,4 +230,8 @@ def public_suspension_projection(suspension: Any) -> dict[str, Any]:
     return result
 
 
-__all__ = ["ToolSuspension", "public_suspension_projection", "SUSPENSION_PRIVATE_PAYLOAD_KEYS"]
+__all__ = [
+    "ToolSuspension", "ValidatedToolResume", "InvalidResume", "ResumeConflict",
+    "reconcile_validated_tool_resume", "public_suspension_projection",
+    "SUSPENSION_PRIVATE_PAYLOAD_KEYS",
+]

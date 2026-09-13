@@ -452,3 +452,36 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_resume_mode_adds_no_user_turn_or_user_side_effects():
+    agent, memory_manager = _agent_with_memory_manager()
+    history = [
+        {"role": "user", "content": "need input"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "validated"},
+    ]
+
+    with patch("hermes_cli.lifecycle.invoke_hook") as hook, patch(
+        "agent.turn_context.recover_rotated_compression_session"
+    ) as recover, patch(
+        "agent.turn_context._maybe_title_session_at_turn_start"
+    ) as title:
+        ctx = _build(
+            agent,
+            user_message=None,
+            conversation_history=history,
+            resume_mode=True,
+        )
+
+    assert ctx.messages == history
+    assert ctx.current_turn_user_idx == -1
+    assert ctx.original_user_message == ""
+    assert agent._user_turn_count == 1  # hydrated prior turn; resume did not increment
+    assert agent._is_user_initiated_turn is False
+    assert agent._persist_calls == 0
+    hook.assert_not_called()
+    recover.assert_not_called()
+    title.assert_not_called()
+    memory_manager.on_turn_start.assert_not_called()
+    memory_manager.prefetch_all.assert_not_called()

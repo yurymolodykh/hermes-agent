@@ -34,7 +34,12 @@ class _DB:
 
     def get_messages_as_conversation(self, session_id, **kwargs):
         self.events.append(("reload", session_id, kwargs))
-        return [{"role": "user", "content": "durable latest"}]
+        return list(getattr(self, "history", [{"role": "user", "content": "durable latest"}]))
+
+    def append_messages_batch(self, session_id, messages, **kwargs):
+        self.events.append(("append", session_id, list(messages), kwargs))
+        self.history.extend(dict(message) for message in messages)
+        return len(messages)
 
     def refresh_session_turn_lease(self, session_id, holder, **kwargs):
         return True
@@ -635,3 +640,56 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+def test_validated_tool_resume_reloads_and_persists_before_model(monkeypatch):
+    from agent.suspension import ValidatedToolResume
+
+    db = _DB()
+    db.history = [
+        {"role": "user", "content": "need input", "_row_id": 1},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "clarify-1",
+                "type": "function",
+                "function": {"name": "clarify", "arguments": "{}"},
+            }],
+            "_row_id": 2,
+        },
+    ]
+    agent = _agent_with_db(db, session_id="resume-session")
+    observed = {}
+
+    def fake_run(_agent, message, _system, history, *_args, **kwargs):
+        observed.update(message=message, history=history, resume=kwargs.get("_tool_resume"))
+        assert db.events[-1][0] == "reload"
+        assert history[-1]["role"] == "tool"
+        return {"final_response": "continued", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    resume = ValidatedToolResume(
+        session_id="resume-session",
+        kind="question_set",
+        tool_name="clarify",
+        tool_call_id="clarify-1",
+        result={"answers": [{"question_id": "q1", "answer": "yes"}]},
+        token_fingerprint="sha256:test",
+    )
+    result = AIAgent.resume_suspended_tool(agent, resume)
+
+    assert result["final_response"] == "continued"
+    assert observed["message"] is None
+    assert observed["resume"] is resume
+    assert [event[0] for event in db.events] == [
+        "acquire", "reload", "append", "reload", "release"
+    ]
+    append_event = db.events[2]
+    assert append_event[2] == [{
+        "role": "tool",
+        "tool_call_id": "clarify-1",
+        "tool_name": "clarify",
+        "content": '{"answers":[{"answer":"yes","question_id":"q1"}]}',
+    }]
+    assert "token_fingerprint" not in repr(append_event)

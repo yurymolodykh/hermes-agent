@@ -8492,6 +8492,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        _tool_resume=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8585,9 +8586,19 @@ class AIAgent:
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
             _durable_session_exists = False
+            _durable_session_row = None
+            if _tool_resume is not None:
+                from agent.suspension import InvalidResume, ValidatedToolResume
+                if not isinstance(_tool_resume, ValidatedToolResume):
+                    raise InvalidResume("resume must be a ValidatedToolResume")
+                if _tool_resume.session_id != session_id:
+                    raise InvalidResume("resume session does not match the opened agent session")
+                if _turn_db is None or getattr(self, "_persist_disabled", False):
+                    raise InvalidResume("resume requires a durable session database")
             if _turn_db is not None and session_id:
                 try:
-                    _durable_session_exists = _turn_db.get_session(session_id) is not None
+                    _durable_session_row = _turn_db.get_session(session_id)
+                    _durable_session_exists = _durable_session_row is not None
                 except Exception:
                     # A locked / non-WAL read is not proof the row is absent.
                     # Treating probe failure as "fresh session" skipped the
@@ -8602,6 +8613,16 @@ class AIAgent:
                         exc_info=True,
                     )
                     _durable_session_exists = True
+            if _tool_resume is not None and not _durable_session_exists:
+                from agent.suspension import ResumeConflict
+                raise ResumeConflict("resume session does not exist")
+            if (
+                _tool_resume is not None
+                and isinstance(_durable_session_row, dict)
+                and _durable_session_row.get("ended_at") is not None
+            ):
+                from agent.suspension import ResumeConflict
+                raise ResumeConflict("resume session is no longer the active segment")
             if (
                 _turn_db is not None
                 and session_id
@@ -8731,7 +8752,35 @@ class AIAgent:
                 # Skip when acquisition was immediate — no other process held
                 # the lease, so the in-memory history is current and reloading
                 # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                if _tool_resume is not None:
+                    # Resume is a compare-and-append operation. Always ignore
+                    # caller snapshots and re-read after lease admission.
+                    from agent.suspension import (
+                        InvalidResume, reconcile_validated_tool_resume,
+                    )
+                    if self.session_id != _tool_resume.session_id:
+                        raise InvalidResume("resume session changed before admission")
+                    conversation_history = _turn_db.get_messages_as_conversation(
+                        self.session_id,
+                        repair_alternation=False,
+                        include_row_ids=True,
+                    )
+                    conversation_history, _resume_rows = reconcile_validated_tool_resume(
+                        conversation_history, _tool_resume
+                    )
+                    if _resume_rows:
+                        _turn_db.append_messages_batch(
+                            self.session_id,
+                            _resume_rows,
+                            turn_lease_holder=durable_turn_lease,
+                            turn_lease_ttl_seconds=_lease_ttl,
+                        )
+                        conversation_history = _turn_db.get_messages_as_conversation(
+                            self.session_id,
+                            repair_alternation=False,
+                            include_row_ids=True,
+                        )
+                elif _lease_waited:
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id
@@ -8866,6 +8915,7 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        _tool_resume=_tool_resume,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but
@@ -8959,6 +9009,20 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+
+    def resume_suspended_tool(
+        self,
+        resume,
+        *,
+        stream_callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """Continue a validated durable tool boundary without a user turn."""
+        return self.run_conversation(
+            None,
+            task_id=f"resume:{uuid.uuid4()}",
+            stream_callback=stream_callback,
+            _tool_resume=resume,
+        )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

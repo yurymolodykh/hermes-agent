@@ -4304,6 +4304,9 @@ def _suspended_reply_for_agent_result(agent_result: dict) -> Optional[SuspendedR
     suspension = _validate_suspension_dict(agent_result.get("suspension"))
     if suspension is None:
         return None
+    core_session_id = agent_result.get("session_id")
+    if isinstance(core_session_id, str) and core_session_id.strip():
+        suspension = dict(suspension, core_session_id=core_session_id)
     return SuspendedReply(suspension)
 
 
@@ -6648,7 +6651,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if ctx.tool_resume is not None:
+                result = agent.resume_suspended_tool(ctx.tool_resume)
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -20622,6 +20628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                tool_resume=getattr(event, "_hermes_validated_tool_resume", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -28339,6 +28346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        tool_resume: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28359,6 +28367,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                tool_resume=tool_resume,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28372,6 +28381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                tool_resume=tool_resume,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28515,6 +28525,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        tool_resume: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28824,6 +28835,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            tool_resume=tool_resume,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

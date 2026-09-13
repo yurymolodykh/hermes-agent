@@ -28,6 +28,7 @@ class _Adapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
         self.outcomes = []
         self.sent = []
+        self.private_suspensions = []
 
     async def connect(self, *, is_reconnect=False):
         return True
@@ -44,6 +45,9 @@ class _Adapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome):
         self.outcomes.append((outcome, getattr(event, "_hermes_suspension", None)))
+
+    async def on_processing_suspended(self, event, suspension):
+        self.private_suspensions.append(dict(suspension))
 
 
 # Local import keeps the adapter declaration compact and mirrors plugin stubs.
@@ -220,7 +224,11 @@ def test_agent_result_projects_through_base_adapter_without_delivery():
         "tool_name": "clarify",
         "tool_call_id": "call-1",
     }
-    agent_result = {"suspended": True, "suspension": suspension}
+    agent_result = {
+        "suspended": True,
+        "suspension": suspension,
+        "session_id": "20260913_123456_deadbeef",
+    }
     projected = _suspended_reply_for_agent_result(agent_result)
     adapter._message_handler = AsyncMock(return_value=projected)
     adapter._active_sessions["test-session"] = __import__("asyncio").Event()
@@ -233,6 +241,8 @@ def test_agent_result_projects_through_base_adapter_without_delivery():
     assert adapter.outcomes == [
         (ProcessingOutcome.SUSPENDED, public_suspension_projection(suspension))
     ]
+    expected_private = dict(suspension, core_session_id="20260913_123456_deadbeef")
+    assert adapter.private_suspensions == [expected_private]
 
 
 # ---------------------------------------------------------------------------
