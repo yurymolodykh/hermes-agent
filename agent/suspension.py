@@ -144,6 +144,63 @@ def reconcile_validated_tool_resume(
     return rows + appended, appended
 
 
+def completed_validated_tool_resume(
+    history: Sequence[Mapping[str, Any]], resume: ValidatedToolResume
+) -> str | None:
+    """Return an already-persisted final answer for an exact completed resume tail."""
+    if not isinstance(resume, ValidatedToolResume):
+        raise InvalidResume("resume must be a ValidatedToolResume")
+    rows = [dict(row) for row in history]
+    assistant_index = -1
+    calls: list[Mapping[str, Any]] = []
+    for index in range(len(rows) - 1, -1, -1):
+        candidate = rows[index]
+        candidate_calls = candidate.get("tool_calls")
+        if candidate.get("role") != "assistant" or not isinstance(candidate_calls, list):
+            continue
+        for call in candidate_calls:
+            function = call.get("function") if isinstance(call, Mapping) else None
+            if (
+                isinstance(call, Mapping)
+                and call.get("id") == resume.tool_call_id
+                and isinstance(function, Mapping)
+                and function.get("name") == resume.tool_name
+            ):
+                assistant_index = index
+                calls = candidate_calls
+                break
+        if assistant_index >= 0:
+            break
+    if assistant_index < 0:
+        return None
+    suffix = rows[assistant_index + 1 :]
+    if len(suffix) != len(calls) + 1:
+        return None
+    for call, result_row in zip(calls, suffix[:-1]):
+        if not isinstance(call, Mapping):
+            return None
+        function = call.get("function")
+        expected_name = function.get("name") if isinstance(function, Mapping) else None
+        if (
+            result_row.get("role") != "tool"
+            or result_row.get("tool_call_id") != call.get("id")
+            or result_row.get("tool_name") != expected_name
+        ):
+            return None
+        if call.get("id") == resume.tool_call_id and result_row.get("content") != resume.result:
+            return None
+    final_row = suffix[-1]
+    final_content = final_row.get("content")
+    if (
+        final_row.get("role") != "assistant"
+        or final_row.get("tool_calls")
+        or not isinstance(final_content, str)
+        or not final_content
+    ):
+        return None
+    return final_content
+
+
 @dataclass(frozen=True)
 class ToolSuspension:
     """JSON-safe metadata describing an intentional tool-boundary suspension.

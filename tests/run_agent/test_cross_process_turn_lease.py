@@ -693,3 +693,43 @@ def test_validated_tool_resume_reloads_and_persists_before_model(monkeypatch):
         "content": '{"answers":[{"answer":"yes","question_id":"q1"}]}',
     }]
     assert "token_fingerprint" not in repr(append_event)
+
+
+def test_validated_tool_resume_returns_persisted_final_without_provider(monkeypatch):
+    from agent.suspension import ValidatedToolResume
+
+    resume = ValidatedToolResume(
+        session_id="resume-session",
+        kind="question_set",
+        tool_name="clarify",
+        tool_call_id="clarify-1",
+        result={"responses": [{"id": "q1", "user_response": "yes"}]},
+        token_fingerprint="sha256:retry",
+    )
+    db = _DB()
+    db.history = [
+        {"role": "user", "content": "need input", "_row_id": 1},
+        {
+            "role": "assistant", "content": None, "_row_id": 2,
+            "tool_calls": [{
+                "id": "clarify-1", "type": "function",
+                "function": {"name": "clarify", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool", "tool_call_id": "clarify-1",
+            "tool_name": "clarify", "content": resume.result, "_row_id": 3,
+        },
+        {"role": "assistant", "content": "continued", "_row_id": 4},
+    ]
+    agent = _agent_with_db(db, session_id="resume-session")
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_args, **_kwargs: pytest.fail("provider must not be called"),
+    )
+
+    result = AIAgent.resume_suspended_tool(agent, resume)
+
+    assert result["final_response"] == "continued"
+    assert result["completed"] is True
+    assert [event[0] for event in db.events] == ["acquire", "reload", "release"]

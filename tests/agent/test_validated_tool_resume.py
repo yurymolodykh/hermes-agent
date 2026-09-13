@@ -4,6 +4,7 @@ from agent.suspension import (
     InvalidResume,
     ResumeConflict,
     ValidatedToolResume,
+    completed_validated_tool_resume,
     reconcile_validated_tool_resume,
 )
 
@@ -86,3 +87,23 @@ def test_reconcile_same_result_is_idempotent():
     assert appended
     assert retry_rows == []
     assert second == first
+
+
+def test_completed_resume_returns_only_exact_terminal_assistant_tail():
+    resume = _resume()
+    completed = _tail() + [
+        {
+            "role": "tool",
+            "tool_call_id": "clarify-1",
+            "tool_name": "clarify",
+            "content": resume.result,
+        },
+        {"role": "assistant", "content": "continued"},
+    ]
+    assert completed_validated_tool_resume(completed, resume) == "continued"
+    assert completed_validated_tool_resume(
+        completed + [{"role": "user", "content": "new turn"}], resume
+    ) is None
+    changed = [dict(row) for row in completed]
+    changed[-2] = dict(changed[-2], content="different")
+    assert completed_validated_tool_resume(changed, resume) is None

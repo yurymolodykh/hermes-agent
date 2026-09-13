@@ -8756,7 +8756,8 @@ class AIAgent:
                     # Resume is a compare-and-append operation. Always ignore
                     # caller snapshots and re-read after lease admission.
                     from agent.suspension import (
-                        InvalidResume, reconcile_validated_tool_resume,
+                        InvalidResume, completed_validated_tool_resume,
+                        reconcile_validated_tool_resume,
                     )
                     if self.session_id != _tool_resume.session_id:
                         raise InvalidResume("resume session changed before admission")
@@ -8765,6 +8766,17 @@ class AIAgent:
                         repair_alternation=False,
                         include_row_ids=True,
                     )
+                    _cached_final = completed_validated_tool_resume(
+                        conversation_history, _tool_resume
+                    )
+                    if _cached_final is not None:
+                        return {
+                            "final_response": _cached_final,
+                            "messages": conversation_history,
+                            "failed": False,
+                            "completed": True,
+                            "session_id": self.session_id,
+                        }
                     conversation_history, _resume_rows = reconcile_validated_tool_resume(
                         conversation_history, _tool_resume
                     )
