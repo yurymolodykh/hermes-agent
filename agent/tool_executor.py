@@ -32,6 +32,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.suspension import ToolSuspension, public_suspension_projection
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -2625,6 +2626,32 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        if isinstance(function_result, ToolSuspension):
+            suspension = function_result.to_result(
+                tool_name=function_name,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+            agent._tool_suspension = suspension
+            agent._current_tool = None
+            agent._touch_activity(
+                f"tool suspended: {function_name} ({tool_duration:.1f}s)"
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=public_suspension_projection(suspension),
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=int(tool_duration * 1000),
+                status="suspended",
+                middleware_trace=list(middleware_trace),
+            )
+            # Deliberately leave the durable assistant tool-call tail open.
+            # Resume/replay cleanup owns that boundary; fabricating a role=tool
+            # row here would falsely claim the deferred interaction completed.
+            return
+
         _execution_timed_out = isinstance(
             function_result, (_ToolTimeoutResult, _ToolCancelledResult)
         )
@@ -2871,6 +2898,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
+            return
+        if getattr(agent, "_tool_suspension", None) is not None:
             return
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────

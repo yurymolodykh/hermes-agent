@@ -25,6 +25,8 @@ from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 
+from agent.suspension import public_suspension_projection
+
 logger = logging.getLogger(__name__)
 
 
@@ -2294,6 +2296,7 @@ class ProcessingOutcome(Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     CANCELLED = "cancelled"
+    SUSPENDED = "suspended"
 
 
 @dataclass
@@ -2631,6 +2634,23 @@ def is_chat_level_not_found(exc: Optional[BaseException] = None, error_text: str
     if any(s in blob for s in _SUBCHAT_NOT_FOUND_SUBSTRINGS):
         return False
     return any(s in blob for s in _CHAT_LEVEL_NOT_FOUND_SUBSTRINGS)
+
+
+@dataclass(frozen=True)
+class SuspendedReply:
+    """Non-text handler result for an intentional tool-boundary suspension.
+
+    The payload is attached to the inbound event as ``_hermes_suspension`` for
+    lifecycle-hook consumers.  No chat reply is sent and the turn is reported
+    as :attr:`ProcessingOutcome.SUSPENDED` rather than success or failure.
+    """
+
+    suspension: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.suspension, dict):
+            raise TypeError("suspension must be a dict")
+        object.__setattr__(self, "suspension", dict(self.suspension))
 
 
 class EphemeralReply(str):
@@ -4265,6 +4285,11 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    # Explicit capability gate. Adapters that can durably own a rendered
+    # interaction may set this to literal ``True``; every existing adapter
+    # keeps the historical in-process wait behavior by default.
+    supports_deferred_clarify: bool = False
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -5426,7 +5451,7 @@ class BasePlatformAdapter(ABC):
         ``(chat_id, message_id[, emoji])``. Otherwise this is a no-op, as it
         always was. Remove-then-add rather than a bare replace: deterministic
         whether the platform replaces a sender's previous reaction or stacks
-        them. CANCELLED outcomes leave the message unreacted.
+        them. CANCELLED and SUSPENDED outcomes leave the message unreacted.
         """
         if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
             return
@@ -5448,7 +5473,7 @@ class BasePlatformAdapter(ABC):
         elif outcome == ProcessingOutcome.FAILURE:
             if self._FAIL_EMOJI:
                 await add(chat_id, message_id, self._FAIL_EMOJI)
-        # CANCELLED: leave the message unreacted.
+        # CANCELLED/SUSPENDED: leave the message unreacted.
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
@@ -6339,6 +6364,15 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            is_suspended_response = isinstance(response, SuspendedReply)
+            if is_suspended_response:
+                # Only the bounded public shape reaches lifecycle-hook
+                # consumers: never the private routing envelope (session_key,
+                # tool_call_id) the integration adapter uses for resume.
+                event._hermes_suspension = public_suspension_projection(
+                    response.suspension
+                )
+                response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6816,7 +6850,13 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                (
+                    ProcessingOutcome.SUSPENDED
+                    if is_suspended_response
+                    else ProcessingOutcome.SUCCESS
+                    if processing_ok
+                    else ProcessingOutcome.FAILURE
+                ),
             )
 
             # The active drain owns debounce state. If a queue-mode timer has

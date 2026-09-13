@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.suspension import SUSPENSION_PRIVATE_PAYLOAD_KEYS
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -726,6 +728,21 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    _tool_suspension = getattr(agent, "_tool_suspension", None)
+    if _tool_suspension is not None:
+        result["suspended"] = True
+        # The gateway projects/detects the suspension from this schema-valid
+        # dict (kind/payload/tool_name/tool_call_id), so keep that shape, but
+        # strip the private routing secret (session_key) out of the payload so
+        # it never reaches the public result or logs.
+        suspension = dict(_tool_suspension)
+        payload = suspension.get("payload")
+        if isinstance(payload, Mapping) and SUSPENSION_PRIVATE_PAYLOAD_KEYS:
+            payload = dict(payload)
+            for _private_key in SUSPENSION_PRIVATE_PAYLOAD_KEYS:
+                payload.pop(_private_key, None)
+            suspension["payload"] = payload
+        result["suspension"] = suspension
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

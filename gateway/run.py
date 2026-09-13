@@ -42,6 +42,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
+from collections.abc import Mapping as _Mapping
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -980,6 +981,117 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
     if response is None or response == "":
         # Timeout or session-boundary cancellation
+        return f"[user did not respond within {int(timeout / 60)}m]"
+    return response
+
+
+def _canonical_deferred_clarify_questions(
+    question: str,
+    choices,
+    multi_select: bool,
+    questions=None,
+) -> list[dict]:
+    """Return stable, JSON-safe question rows for a deferred interaction."""
+    source = questions if isinstance(questions, list) and questions else [
+        {
+            "qid": "q0",
+            "question": question,
+            "choices_offered": list(choices) if choices else None,
+            "multi_select": bool(multi_select),
+        }
+    ]
+    rows = []
+    for index, item in enumerate(source):
+        if not isinstance(item, dict):
+            raise ValueError("deferred clarify questions must be mappings")
+        qid = str(item.get("id") or item.get("qid") or f"q{index}")
+        text = item.get("question")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("deferred clarify question text is required")
+        offered = item.get("choices_offered", item.get("choices"))
+        if offered is not None and (
+            not isinstance(offered, list)
+            or not offered
+            or any(not isinstance(choice, str) or not choice for choice in offered)
+        ):
+            raise ValueError("deferred clarify choices must be non-empty strings")
+        is_multi = bool(item.get("multi_select")) and bool(offered)
+        rows.append(
+            {
+                "id": qid,
+                "type": (
+                    "multi_select" if is_multi
+                    else "single_select" if offered
+                    else "text"
+                ),
+                "question": text,
+                "choices": list(offered) if offered else None,
+                "multi_select": is_multi,
+            }
+        )
+    return rows
+
+
+def _deferred_clarify_suspension(
+    adapter,
+    *,
+    question: str,
+    choices,
+    multi_select: bool,
+    questions,
+    clarify_id: str,
+    session_key: str,
+):
+    """Build a suspension value only for an explicitly opted-in adapter."""
+    if getattr(adapter, "supports_deferred_clarify", False) is not True:
+        return None
+    from agent.suspension import ToolSuspension
+
+    return ToolSuspension(
+        kind="question_set",
+        payload={
+            "question_set_id": clarify_id,
+            "revision": 1,
+            "session_key": session_key,
+            "questions": _canonical_deferred_clarify_questions(
+                question, choices, multi_select, questions
+            ),
+        },
+    )
+
+
+def _clarify_send_then_wait_or_suspend(
+    fut,
+    *,
+    clarify_id: str,
+    session_key: str,
+    clarify_mod,
+    suspension,
+):
+    """Defer after definitive send success; preserve historical waits otherwise."""
+    if suspension is None:
+        return _clarify_send_then_wait(
+            fut,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            clarify_mod=clarify_mod,
+        )
+    outcome = _approval_send_outcome(fut, timeout=15)
+    if outcome == "failed":
+        logger.warning("Clarify send failed definitively; clearing registration")
+        clarify_mod.clear_session(session_key)
+        return "[clarify prompt could not be delivered]"
+    if outcome == "sent":
+        # No in-process waiter may survive ownership transfer to the adapter.
+        clarify_mod.clear_session(session_key)
+        return suspension
+    logger.warning(
+        "Clarify prompt send timed out — deferred ownership not transferred; "
+        "waiting in-process for a possibly-delivered prompt"
+    )
+    timeout = clarify_mod.get_clarify_timeout()
+    response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+    if response is None or response == "":
         return f"[user did not respond within {int(timeout / 60)}m]"
     return response
 
@@ -2679,6 +2791,7 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    SuspendedReply,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
@@ -4031,6 +4144,12 @@ def _normalize_empty_agent_response(
     if response:
         return response
 
+    # Intentional tool-boundary suspension is not an empty-response failure.
+    # The integrating adapter has already persisted/projected its interaction
+    # payload and must receive no synthetic warning text.
+    if _suspended_reply_for_agent_result(agent_result) is not None:
+        return ""
+
     if agent_result.get("failed"):
         # None-safe: the gateway result dict is built with
         # ``'error': holder.get('error')`` and can carry an EXPLICIT None,
@@ -4118,6 +4237,74 @@ def _normalize_empty_agent_response(
         )
 
     return response
+
+
+# Maximum serialized size of a suspension payload, in bytes.  Keeps a
+# malformed/hostile agent result from turning into an unbounded payload that
+# would otherwise be carried into the gateway suspension projection.
+_MAX_SUSPENSION_PAYLOAD_BYTES = 256 * 1024
+# Exact allowed top-level keys of a validated suspension dict.  Anything else
+# means the shape came from somewhere other than ToolSuspension.to_result()
+# and must not be projected as a suspension.
+_SUSPENSION_ALLOWED_KEYS = frozenset({"kind", "payload", "tool_name", "tool_call_id"})
+
+
+def _validate_suspension_dict(suspension: Any) -> Optional[Dict[str, Any]]:
+    """Return a copied, schema-valid suspension dict or ``None``.
+
+    Fail-open by design: this projection sits on the agent-result boundary,
+    which may receive untrusted/malformed dicts.  Anything short of an
+    unambiguous, schema-valid suspension (the exact shape built by
+    ``ToolSuspension.to_result``) is rejected with ``None`` so the caller
+    falls through to the normal empty-response/error path instead of wrongly
+    suppressing it.
+    """
+    if not isinstance(suspension, _Mapping):
+        return None
+    suspension = dict(suspension)
+    if set(suspension.keys()) != _SUSPENSION_ALLOWED_KEYS:
+        return None
+    kind = suspension.get("kind")
+    if not isinstance(kind, str) or not kind.strip():
+        return None
+    payload = suspension.get("payload")
+    if not isinstance(payload, _Mapping):
+        return None
+    tool_name = suspension.get("tool_name")
+    tool_call_id = suspension.get("tool_call_id")
+    if not isinstance(tool_name, str) or not isinstance(tool_call_id, str):
+        return None
+    try:
+        serialized = json.dumps(dict(payload), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    if len(serialized.encode("utf-8")) > _MAX_SUSPENSION_PAYLOAD_BYTES:
+        return None
+    return suspension
+
+
+def _suspended_reply_for_agent_result(agent_result: dict) -> Optional[SuspendedReply]:
+    """Project a validated agent suspension into the generic platform seam.
+
+    Fail-open: only an unambiguous suspension (``suspended is True``, a
+    schema-valid ``suspension`` dict, and no conflicting failure/answer flags)
+    yields a :class:`~gateway.platforms.base.SuspendedReply`.  Every malformed
+    shape returns ``None`` so the turn falls through to the ordinary
+    empty-response/error handling rather than suppressing it.
+    """
+    if not isinstance(agent_result, dict):
+        return None
+    if agent_result.get("suspended") is not True:
+        return None
+    # A suspension cannot coexist with completed/errored/answered turns.
+    if agent_result.get("failed") or agent_result.get("interrupted"):
+        return None
+    if agent_result.get("final_response"):
+        return None
+    suspension = _validate_suspension_dict(agent_result.get("suspension"))
+    if suspension is None:
+        return None
+    return SuspendedReply(suspension)
 
 
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
@@ -5959,7 +6146,12 @@ class TurnRunner:
         # explaining that no response arrived (so the agent can adapt
         # rather than hang forever).
         # ------------------------------------------------------------------
-        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+        def _clarify_callback_impl(
+            question: str,
+            choices,
+            multi_select: bool = False,
+            questions=None,
+        ):
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
@@ -5967,6 +6159,15 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
+            suspension = _deferred_clarify_suspension(
+                ctx._status_adapter,
+                question=question,
+                choices=choices,
+                multi_select=multi_select,
+                questions=questions,
+                clarify_id=clarify_id,
+                session_key=ctx.session_key or "",
+            )
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
@@ -6003,6 +6204,15 @@ class TurnRunner:
                     exc_info=True,
                 )
 
+            if suspension is not None:
+                # Explicit, namespaced hand-off data. Existing adapters never
+                # see this key because their capability gate is false.
+                _clarify_metadata = dict(ctx._status_thread_metadata or {})
+                _clarify_metadata["hermes_deferred_clarify"] = dict(
+                    suspension.payload
+                )
+            else:
+                _clarify_metadata = ctx._status_thread_metadata
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
@@ -6010,24 +6220,45 @@ class TurnRunner:
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_clarify_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
                 log_message="Clarify send failed to schedule",
             )
-            # Boundary rule (see _approval_send_outcome): a send timeout is
-            # AMBIGUOUS — the card may have posted with a late ack. Only a
-            # definitive failure tears down the registration; ambiguous
-            # falls through to the bounded wait so a late reply resolves.
-            return _clarify_send_then_wait(
+            # Transfer ownership only after a definitive successful send.
+            # Ambiguous sends retain the old bounded in-process wait.
+            return _clarify_send_then_wait_or_suspend(
                 fut,
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 clarify_mod=_clarify_mod,
+                suspension=suspension,
             )
 
-        agent.clarify_callback = _clarify_callback_sync
+        # Preserve the old callback signature for every existing adapter: it
+        # makes clarify_tool retain its historical per-question batch fallback.
+        # Only explicit deferred adapters advertise ``questions`` and receive
+        # one atomic normalized batch.
+        def _clarify_callback_sync(question: str, choices, multi_select: bool = False):
+            return _clarify_callback_impl(question, choices, multi_select)
+
+        def _deferred_clarify_callback_sync(
+            question: str,
+            choices,
+            multi_select: bool = False,
+            questions=None,
+        ):
+            return _clarify_callback_impl(
+                question, choices, multi_select, questions=questions
+            )
+
+        agent.clarify_callback = (
+            _deferred_clarify_callback_sync
+            if getattr(ctx._status_adapter, "supports_deferred_clarify", False)
+            is True
+            else _clarify_callback_sync
+        )
 
         # Show assistant thinking between tool calls — independent of
         # tool_progress mode. Mattermost needs an explicit per-platform
@@ -6625,6 +6856,8 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "suspended": result.get("suspended", False),
+                "suspension": result.get("suspension"),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -20941,6 +21174,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._refresh_agent_cache_message_count(
                 session_key, session_entry.session_id
             )
+
+            suspended_reply = _suspended_reply_for_agent_result(agent_result)
+            if suspended_reply is not None:
+                return suspended_reply
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is

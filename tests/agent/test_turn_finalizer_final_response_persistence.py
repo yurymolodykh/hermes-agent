@@ -81,6 +81,58 @@ class FakeAgent:
         pass
 
 
+def test_suspension_preserves_durable_open_tool_call_without_forged_result(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._tool_suspension = {
+        "kind": "question_set",
+        "payload": {"question_set_id": "qs-1", "session_key": "sekret-routing"},
+        "tool_name": "clarify",
+        "tool_call_id": "call-1",
+    }
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-1", "function": {"name": "clarify", "arguments": "{}"}}
+            ],
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="tool_suspended",
+    )
+
+    assert result["completed"] is False
+    assert result["suspended"] is True
+    # The public result keeps the schema-valid shape the gateway uses to detect
+    # the suspension (tool_name/tool_call_id present) but strips the private
+    # routing secret (session_key) so it never reaches the public result/logs.
+    assert result["suspension"] == {
+        "kind": "question_set",
+        "payload": {"question_set_id": "qs-1"},
+        "tool_name": "clarify",
+        "tool_call_id": "call-1",
+    }
+    assert agent.persisted_messages == messages
+    assert messages[-1]["role"] == "assistant"
+    assert all(message.get("role") != "tool" for message in messages)
+
+
 
 
 

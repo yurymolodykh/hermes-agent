@@ -17,6 +17,8 @@ a thin dispatcher that delegates to a platform-provided callback.
 import json
 from typing import Dict, List, Optional, Callable
 
+from agent.suspension import ToolSuspension
+
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
@@ -276,7 +278,9 @@ def _batch_result(normalized: List[dict], answers: dict, timed_out: bool) -> str
     return json.dumps(result, ensure_ascii=False)
 
 
-def _run_batch(normalized: List[dict], callback, question: str) -> str:
+def _run_batch(
+    normalized: List[dict], callback, question: str
+) -> str | ToolSuspension:
     """Dispatch a validated batch to the platform callback.
 
     Batch-capable callbacks (a ``questions`` kwarg, detected by signature)
@@ -293,6 +297,8 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
     """
     if _callback_accepts_questions(callback):
         raw = callback(question, None, questions=normalized)
+        if isinstance(raw, ToolSuspension):
+            return raw
 
         answers: dict = {}
         timed_out = False
@@ -319,6 +325,8 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
         raw = _invoke_callback(
             callback, entry["question"], entry["choices"], entry["multi_select"],
         )
+        if isinstance(raw, ToolSuspension):
+            return raw
         if raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE):
             timed_out = True
             break
@@ -332,7 +340,7 @@ def clarify_tool(
     multi_select: bool = False,
     questions: Optional[List[dict]] = None,
     callback: Optional[Callable] = None,
-) -> str:
+) -> str | ToolSuspension:
     """
     Ask the user a question, optionally with multiple-choice options.
 
@@ -412,6 +420,9 @@ def clarify_tool(
         raw_response = _invoke_callback(callback, question, choices, multi_select)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
+
+    if isinstance(raw_response, ToolSuspension):
+        return raw_response
 
     if multi_select and choices is not None:
         user_response = [strip_recommended(r) for r in _parse_multi_select_response(raw_response)]

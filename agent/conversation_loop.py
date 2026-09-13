@@ -1880,6 +1880,9 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    # Tool suspension is a per-turn opt-in control value. Cached gateway agents
+    # must never leak a previous suspended turn into the next user message.
+    agent._tool_suspension = None
     # Cause of the most recent persistence failure this turn ('locked',
     # 'disk', or 'unknown' — see hermes_state.classify_persistence_error).
     # Reset alongside the failure flag so a lock-contention diagnosis from a
@@ -7331,6 +7334,11 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_tool_suspension", None) is not None:
+                    _turn_exit_reason = "tool_suspended"
+                    final_response = None
+                    break
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
