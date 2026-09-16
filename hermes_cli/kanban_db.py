@@ -387,6 +387,19 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 RECLAIM_DEFER_GRACE_SECONDS = 120
 
 
+# Bounded-reclaim safety net: a worker that (a) keeps surviving SIGTERM/SIGKILL
+# in `_terminate_reclaimed_worker` and (b) has NEVER produced a heartbeat is not
+# verifiably doing work — it is almost certainly a stuck/zombie/unkillable
+# process whose PID falsely reports alive. Deferring it forever (the pre-fix
+# behavior for a no-heartbeat dead worker, kanban t_e1b78631) leaves the task
+# stuck in ``running``. After this many consecutive defers for the same run
+# with no heartbeat, `_defer_reclaim_for_live_worker` signals the caller to
+# reclaim the task as a crash instead of holding its claim (bounded near-crash).
+# A worker that DOES heartbeat is never subject to this cap — a live worker is
+# always deferred, never force-reclaimed into a duplicate.
+MAX_RECLAIM_DEFER_CYCLES = 4
+
+
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Return the effective claim TTL, honoring the kanban env override.
 
@@ -5045,8 +5058,16 @@ def release_stale_claims(
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
+            if _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
+                reason="ttl_expired_worker_alive",
+            ):
+                continue
+            # Bounded-reclaim cap hit: no-heartbeat worker survived MAX defers.
+            # Not verifiably alive → reclaim as a crash instead of hanging in
+            # ``running`` (false-alive safety net, t_e1b78631).
+            _reclaim_deferred_worker_as_crash(
+                conn, row["id"], row["claim_lock"], termination,
                 reason="ttl_expired_worker_alive",
             )
             continue
@@ -8247,6 +8268,92 @@ def _pid_alive(pid: Optional[int]) -> bool:
         except (OSError, subprocess.SubprocessError, TimeoutError):
             # If the secondary probe fails, keep the kill(0) answer.
             pass
+    # Definitive liveness probe (works on every platform, including Windows
+    # where the process OBJECT can outlive the process and fool the existence
+    # check above). psutil.pid_exists()/OpenProcess succeed against a process
+    # that has exited but whose object/handle is still held (e.g. the Popen
+    # handle the dispatcher intentionally abandons for detached spawns), so a
+    # dead-but-lingering worker would otherwise stay "alive" forever and keep
+    # its task in ``running`` — reclaim never fires and the card hangs
+    # (kanban t_e1b78631 ttl_expired_worker_alive). ``Process.is_running()``
+    # reports the true execution state: False once the process has actually
+    # exited, even when the object still exists. Only downgrade to "dead" on a
+    # CONFIDENT answer (NoSuchProcess / is_running==False / zombie); any error
+    # leaves the existence-check answer intact so a genuinely live worker is
+    # never falsely reclaimed (which would cause a duplicate spawn).
+    try:
+        import psutil  # type: ignore
+        proc = psutil.Process(int(pid))
+        try:
+            status = proc.status()
+        except psutil.NoSuchProcess:
+            return False
+        if status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            return False
+        try:
+            if not proc.is_running():
+                return False
+        except psutil.NoSuchProcess:
+            return False
+        except Exception:
+            pass
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        # psutil unavailable or probe errored — keep the answer above.
+        pass
+    return True
+
+
+def _reclaim_deferred_worker_as_crash(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    termination: dict,
+    *,
+    reason: str,
+) -> bool:
+    """Reclaim a task whose worker repeatedly survived termination without a
+    heartbeat, instead of deferring it forever.
+
+    Bounded-reclaim safety net (t_e1b78631 / t_1364e31f / t_db662ef7): a worker
+    PID that ``_pid_alive`` keeps reporting alive but which has never produced a
+    heartbeat and has now survived ``MAX_RECLAIM_DEFER_CYCLES`` termination
+    attempts is not verifiably doing work. It is almost certainly a dead/
+    zombie/unkillable process. Rather than leave the task stuck in ``running``
+    (the pre-fix false-alive hang), restore it to its source phase and close the
+    run with ``outcome='crashed'`` so the dispatcher can re-queue or surface it
+    honestly.
+
+    Return True if the reclaim committed; False if the claim changed under us
+    (a re-claimed task) — in which case we must NOT touch it.
+    """
+    with write_txn(conn):
+        retry_status = _retry_status_for_run(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+            "AND claim_expires IS NOT NULL",
+            (retry_status, task_id, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="crashed", status="crashed",
+            error=f"{reason}: worker survived {MAX_RECLAIM_DEFER_CYCLES} reclaim "
+                  "attempts without a heartbeat (not verifiably alive)",
+            metadata=termination,
+        )
+        payload = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "bounded_defer_cap": MAX_RECLAIM_DEFER_CYCLES,
+            "retry_status": retry_status,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "crashed", payload, run_id=run_id)
     return True
 
 
@@ -8336,7 +8443,7 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
-) -> None:
+) -> bool:
     """Hold a claim whose worker survived termination instead of releasing it.
 
     Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
@@ -8344,7 +8451,37 @@ def _defer_reclaim_for_live_worker(
     event so the hold is visible in ``hermes kanban tail``. The next dispatch
     tick retries the kill; this is self-correcting because not spawning a
     duplicate is what lets the throttled worker finally die.
+
+    Returns ``True`` when the claim was deferred normally. Returns ``False``
+    when the bounded-reclaim cap was hit: the same run's worker has now survived
+    ``MAX_RECLAIM_DEFER_CYCLES`` consecutive termination attempts WITHOUT ever
+    producing a heartbeat. Such a worker is not verifiably alive — treating it
+    as a false-alive and deferring forever would leave the task stuck in
+    ``running`` (kanban t_e1b78631). The caller should then reclaim the task as
+    a crash. A worker that has heartbeated is never capped here.
     """
+    # Count prior deferrals for THIS run/worker. A worker that never heartbeats
+    # and has been deferred repeatedly is a bounded-near-crash, not live work.
+    try:
+        prior = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'reclaim_deferred'",
+            (task_id,),
+        ).fetchone()
+        prior_deferrals = int(prior["n"]) if prior else 0
+    except Exception:
+        prior_deferrals = 0
+    have_heartbeat = False
+    try:
+        hb_row = conn.execute(
+            "SELECT last_heartbeat_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        have_heartbeat = bool(hb_row and hb_row["last_heartbeat_at"] is not None)
+    except Exception:
+        pass
+    if prior_deferrals >= MAX_RECLAIM_DEFER_CYCLES and not have_heartbeat:
+        return False
+
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
         cur = conn.execute(
@@ -8353,7 +8490,7 @@ def _defer_reclaim_for_live_worker(
             (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
-            return
+            return False
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
@@ -8367,6 +8504,7 @@ def _defer_reclaim_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+    return True
 
 
 def heartbeat_worker(
@@ -8616,8 +8754,15 @@ def detect_stale_running(
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
+            if _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
+                reason="heartbeat_stale_worker_alive",
+            ):
+                continue
+            # Bounded-reclaim cap hit: no-heartbeat worker survived MAX defers.
+            # Reclaim as a crash rather than hang in ``running``.
+            _reclaim_deferred_worker_as_crash(
+                conn, tid, lock, termination,
                 reason="heartbeat_stale_worker_alive",
             )
             continue
@@ -9805,6 +9950,78 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _provider_route_blocker(
+    provider: Optional[str],
+    model: Optional[str],
+) -> Optional[str]:
+    """Return a block reason when a pinned provider/model cannot run on this host.
+
+    A worker is spawned with ``--provider <provider_override> -m <model_override>``.
+    When that route does not resolve to a configured provider endpoint with
+    usable auth, the subprocess dies instantly at startup — ``"No API key found
+    for provider 'custom'"`` then immediate ``Goodbye!`` — without a heartbeat,
+    and the dispatcher misreads the instant crash as a genuine failure
+    (kanban t_e1b78631 / t_1364e31f / t_db662ef7). Detecting the doomed route
+    HERE, before spawn, turns that silent crash-loop into a deterministic,
+    visible block.
+
+    Mirrors the worker CLI's own fatal-startup conditions
+    (``cli_agent_setup_mixin``): fails only when provider resolution raises, or
+    yields an empty endpoint, or a non-local endpoint with no API key. Local /
+    ad-hoc custom endpoints that ignore auth are allowed through, exactly as the
+    CLI allows them. Returns ``None`` when the route is usable or there is no
+    pinned route (profile default) to validate.
+    """
+    if not provider or not model:
+        return None
+    provider_norm = str(provider).strip().lower()
+    # Bare ``custom`` / ``local/custom`` is the shared *billing class* of every
+    # named providers:/custom_providers: entry — it is NOT a routable identity.
+    # Unless a provider entry is literally named ``custom``, the worker falls
+    # through to the openrouter default with no endpoint/key and dies silently.
+    if provider_norm in ("custom", "local/custom"):
+        try:
+            from hermes_cli.runtime_provider import has_named_custom_provider
+            if not has_named_custom_provider(provider_norm):
+                return (
+                    f"provider_override={provider!r} does not name a configured "
+                    "provider entry: bare 'custom' has no endpoint/key of its own. "
+                    "Pin the named provider (e.g. 'custom:letovo' / 'letovo') or "
+                    "clear the override so the assignee profile's route is used."
+                )
+        except Exception:
+            pass
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+    except Exception as exc:
+        return (
+            f"provider_override={provider!r} is not resolvable on this host: {exc}"
+        )
+    base_url = str(runtime.get("base_url") or "").strip()
+    if not base_url:
+        return f"provider_override={provider!r} resolved to an empty endpoint"
+    api_key = runtime.get("api_key")
+    key_usable = callable(api_key) or (isinstance(api_key, str) and bool(api_key))
+    if not key_usable:
+        # The CLI only bails on an empty key when there is no local endpoint
+        # that would ignore auth. Mirror that so we don't block legit local
+        # servers, but DO block the openrouter fallback the worker would die on.
+        try:
+            from hermes_cli.runtime_provider import base_url_host_matches
+            if base_url_host_matches(base_url, "openrouter.ai"):
+                return (
+                    f"provider_override={provider!r} resolved with no API key and "
+                    "a non-local endpoint (openrouter fallback); the worker would "
+                    "exit 'No API key found' immediately."
+                )
+        except Exception:
+            return (
+                f"provider_override={provider!r} resolved with no usable API key"
+            )
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10034,7 +10251,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, model_override, provider_override FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10043,7 +10260,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, model_override, provider_override FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10227,6 +10444,28 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        if not dry_run:
+            # Defense-in-depth provider pre-flight: a card pinned to a route
+            # that cannot resolve to a configured endpoint/key on this host
+            # would spawn a worker that dies instantly ("No API key found for
+            # provider 'custom'" → "Goodbye!", no heartbeat) and be misread as
+            # a genuine crash. Block it with a visible reason instead of
+            # spawning (t_e1b78631 / t_1364e31f / t_db662ef7). Note this runs
+            # AFTER resolve_task_root_route above, so lineage-valid routes still
+            # reach here; a bare/unresolvable provider is caught deterministically.
+            row_model = (row["model_override"] or "").strip()
+            row_provider = (row["provider_override"] or "").strip()
+            _provider_block = _provider_route_blocker(
+                row_provider or None, row_model or None,
+            )
+            if _provider_block:
+                block_task(
+                    conn, row["id"],
+                    reason=f"provider pre-flight blocked before spawn: {_provider_block}",
+                    kind="capability",
+                )
+                result.auto_blocked.append(row["id"])
+                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10354,6 +10593,22 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
+        if not dry_run:
+            # Same provider pre-flight as the ready lane (see above): never
+            # spawn a review worker pinned to an unresolvable provider route.
+            row_model = (row["model_override"] or "").strip()
+            row_provider = (row["provider_override"] or "").strip()
+            _provider_block = _provider_route_blocker(
+                row_provider or None, row_model or None,
+            )
+            if _provider_block:
+                block_task(
+                    conn, row["id"],
+                    reason=f"provider pre-flight blocked before review spawn: {_provider_block}",
+                    kind="capability",
+                )
+                result.auto_blocked.append(row["id"])
+                continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10531,6 +10786,26 @@ def _is_windows_batch_shim(path: str) -> bool:
     return path.lower().endswith((".cmd", ".bat"))
 
 
+def _is_windows_console_script_shim(path: str) -> bool:
+    """Return true for a Windows console-script launcher (``hermes.exe``).
+
+    setuptools/distlib console-script launchers fork the real interpreter
+    into a child process but keep the recorded Popen PID as the short-lived
+    launcher, so a worker spawned this way is repeatedly mis-reported
+    "not alive" by the dispatcher's liveness check. The interpreter-bound
+    module form (single stable PID) is the safe spawn path on Windows.
+    """
+    if not _IS_WINDOWS:
+        return False
+    base = os.path.basename(path).lower()
+    if not base.endswith(".exe"):
+        return False
+    # Match the hermes console-script launcher specifically (e.g.
+    # <venv>/Scripts/hermes.exe), not python.exe or arbitrary exes.
+    stem = base[:-4]
+    return stem in ("hermes", "hermes-agent")
+
+
 def _path_search_names(command: str) -> list[str]:
     """Return executable names to try for an unqualified command."""
     if not _IS_WINDOWS or os.path.splitext(command)[1]:
@@ -10611,8 +10886,16 @@ def _resolve_hermes_argv() -> list[str]:
         return _module_hermes_argv()
 
     hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
+    if hermes_bin and not (_IS_WINDOWS and _is_windows_console_script_shim(hermes_bin)):
         return _hermes_path_argv(hermes_bin)
+    # On Windows, a setuptools/distlib console-script launcher (hermes.exe)
+    # forks the real interpreter into a child process; the Popen PID we
+    # record is the transient launcher, so _pid_alive() mis-reports a live
+    # worker as "not alive" ~1 min into every spawn. Prefer the
+    # interpreter-bound module form (single stable PID) for detached worker
+    # spawns — this is precisely what `_module_hermes_argv` exists for.
+    if _IS_WINDOWS:
+        return _module_hermes_argv()
     return _module_hermes_argv()
 
 
