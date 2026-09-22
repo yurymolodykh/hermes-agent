@@ -175,6 +175,65 @@ class TestCreateSkill:
         assert "Invalid category '../escape'" in result["error"]
         assert not (tmp_path / "escape").exists()
 
+    def test_create_similar_skill_is_advisory_not_a_blocker(self, tmp_path):
+        existing = VALID_SKILL_CONTENT.replace(
+            "name: test-skill", "name: deploy-kubernetes"
+        ).replace(
+            "A test skill for unit testing.",
+            "Use when deploying Kubernetes clusters safely."
+        )
+        new = VALID_SKILL_CONTENT.replace(
+            "name: test-skill", "name: deploy-kubernetes-canary"
+        ).replace(
+            "A test skill for unit testing.",
+            "Use when deploying Kubernetes clusters with canary releases."
+        )
+        with _skill_dir(tmp_path):
+            assert _create_skill("deploy-kubernetes", existing)["success"] is True
+            result = _create_skill("deploy-kubernetes-canary", new)
+
+        assert result["success"] is True, result
+        assert result["advisory_candidates"] == [{
+            "name": "deploy-kubernetes",
+            "description": "Use when deploying Kubernetes clusters safely.",
+            "state": "active",
+            "shared_terms": "clusters, deploying, kubernetes, use, when",
+        }]
+        assert "not blocked" in result["recommendation"]
+
+    def test_create_disabled_or_archived_match_is_still_advisory(self, tmp_path):
+        existing = VALID_SKILL_CONTENT.replace(
+            "name: test-skill", "name: deploy-kubernetes"
+        ).replace(
+            "A test skill for unit testing.",
+            "Use when deploying Kubernetes clusters safely."
+        )
+        new = VALID_SKILL_CONTENT.replace(
+            "name: test-skill", "name: deploy-kubernetes-canary"
+        ).replace(
+            "A test skill for unit testing.",
+            "Use when deploying Kubernetes clusters with canary releases."
+        )
+        with _skill_dir(tmp_path), \
+             patch("hermes_cli.config.load_config", return_value={"skills": {"disabled": ["deploy-kubernetes"]}}), \
+             patch("tools.skill_usage.load_usage", return_value={"deploy-kubernetes": {"state": "archived"}}):
+            assert _create_skill("deploy-kubernetes", existing)["success"] is True
+            result = _create_skill("deploy-kubernetes-canary", new)
+
+        assert result["success"] is True, result
+        assert result["advisory_candidates"][0]["state"] == "disabled"
+
+        archived_existing = existing.replace("deploy-kubernetes", "archive-kubernetes")
+        archived_new = new.replace("deploy-kubernetes-canary", "archive-kubernetes-canary")
+        with _skill_dir(tmp_path / "archived"), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch("tools.skill_usage.load_usage", return_value={"archive-kubernetes": {"state": "archived"}}):
+            assert _create_skill("archive-kubernetes", archived_existing)["success"] is True
+            archived_result = _create_skill("archive-kubernetes-canary", archived_new)
+
+        assert archived_result["success"] is True, archived_result
+        assert archived_result["advisory_candidates"][0]["state"] == "archived"
+
 
     def test_edit_long_desc_still_allowed_with_preview(self, tmp_path):
         """Edit/patch paths stay permissive so existing over-limit skills
@@ -801,7 +860,10 @@ class TestDeleteSkillRmtreeGuard:
         skills = tmp_path / "skills"
         skills.mkdir()
         evil = skills / "evil-skill"
-        evil.symlink_to(victim, target_is_directory=True)
+        try:
+            evil.symlink_to(victim, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
         try:
             with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
                  patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \

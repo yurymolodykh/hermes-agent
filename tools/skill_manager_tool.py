@@ -662,6 +662,66 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _skill_creation_advisories(name: str, content: str) -> List[Dict[str, str]]:
+    """Return non-blocking, deterministic near-duplicate hints for creation."""
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    frontmatter, _ = _parse_frontmatter(content)
+    description = str(frontmatter.get("description") or "")
+    query_terms = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", f"{name} {description}".lower()))
+    if not query_terms:
+        return []
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_disabled_skills
+        disabled = get_disabled_skills(load_config())
+    except Exception:
+        disabled = set()
+    try:
+        from tools import skill_usage
+        usage = skill_usage.load_usage()
+    except Exception:
+        usage = {}
+
+    advisories: List[Dict[str, str]] = []
+    seen = set()
+    for root in get_all_skills_dirs():
+        try:
+            candidates = root.rglob("SKILL.md")
+        except OSError:
+            continue
+        for skill_md in candidates:
+            if is_excluded_skill_path(skill_md) or skill_md.parent.name == name:
+                continue
+            try:
+                candidate_content = skill_md.read_text(encoding="utf-8")
+                candidate_fm, _ = _parse_frontmatter(candidate_content)
+            except OSError:
+                continue
+            candidate_name = str(candidate_fm.get("name") or skill_md.parent.name)
+            if candidate_name in seen:
+                continue
+            candidate_description = str(candidate_fm.get("description") or "")
+            candidate_terms = set(re.findall(
+                r"[a-z0-9][a-z0-9_-]{2,}",
+                f"{candidate_name} {candidate_description}".lower(),
+            ))
+            shared = query_terms & candidate_terms
+            if len(shared) < 2:
+                continue
+            seen.add(candidate_name)
+            state = str((usage.get(candidate_name) or {}).get("state") or "active")
+            if candidate_name in disabled:
+                state = "disabled"
+            advisories.append({
+                "name": candidate_name,
+                "description": candidate_description,
+                "state": state,
+                "shared_terms": ", ".join(sorted(shared)),
+            })
+    return sorted(advisories, key=lambda item: (item["state"] != "active", item["name"]))[:5]
+
+
 def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
     """Submit an org-skill edit upstream when `sync.org_auto_propose` is on.
 
@@ -971,6 +1031,14 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+    candidates = _skill_creation_advisories(name, content)
+    if candidates:
+        result["advisory_candidates"] = candidates
+        candidate_names = ", ".join(candidate["name"] for candidate in candidates)
+        result["recommendation"] = (
+            f"Similar skills found: {candidate_names}. Creation was not blocked; "
+            "review them and consider extending one if the procedures overlap."
+        )
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
     return result
