@@ -9,6 +9,10 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+import subprocess
+import sys
+
+import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
@@ -98,6 +102,48 @@ def _unseen_terminal_events(tid, platform, chat_id):
         return events
     finally:
         conn.close()
+
+
+@pytest.mark.windows_only
+def test_provider_outage_wakes_origin_with_full_operator_question(tmp_path, monkeypatch):
+    """Real 74 exit -> durable block -> api_server wake in the same origin."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "outage.db"))
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="specific route", assignee="worker",
+                             model_override="gemma4:26b", provider_override="local",
+                             session_id="worker-session")
+        kb.add_notify_sub(conn, task_id=tid, platform="api_server",
+                          chat_id="owner-session", delivery_mode="notify+wake")
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:test")
+        proc = subprocess.Popen([sys.executable, "-c", "import sys;sys.exit(74)"],
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        kb._windows_worker_processes[proc.pid] = proc
+        assert proc.wait(timeout=10) == 74
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (proc.pid, tid))
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb.reap_worker_zombies()
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.get_task(conn, tid).status == "blocked"
+
+    posts = []
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append((text, session_id))
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(posts) == 1
+    text, session_id = posts[0]
+    assert session_id == "owner-session"
+    assert "local/gemma4:26b" in text
+    assert "letovo/deepseek-v4-flash" in text
+    assert "доступность и качество альтернативы не подтверждены" in text
+    assert "Без вашего явного ответа переключения не будет" in text
+    assert _unseen_terminal_events(tid, "api_server", "owner-session") == []
 
 
 def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, monkeypatch):

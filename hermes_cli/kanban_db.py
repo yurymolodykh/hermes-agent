@@ -441,6 +441,10 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# A worker exhausted its own retries against a temporary provider/transport
+# outage. Unlike an ordinary crash this needs an explicit routing decision;
+# spawning the same pinned model again cannot solve a persistent outage.
+KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE = 74
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -8116,6 +8120,10 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+# On Windows waitpid/WIFEXITED do not exist. Keep the actual Popen handle until
+# poll() yields its returncode; _pid_alive alone can tell us only that it died,
+# not whether it exited 0, 74, 75, or crashed.
+_windows_worker_processes: "dict[int, Any]" = {}
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8165,10 +8173,30 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    if _IS_WINDOWS:
+        proc = _windows_worker_processes.get(int(pid))
+        if proc is not None:
+            code = proc.poll()
+            if code is None:
+                return ("unknown", None)
+            _windows_worker_processes.pop(int(pid), None)
+            _record_worker_exit(int(pid), int(code))
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
+    raw, reaped_at = entry
+    if time.time() - reaped_at > _RECENT_WORKER_EXIT_TTL_SECONDS:
+        _recent_worker_exits.pop(int(pid), None)
+        return ("unknown", None)
+    if _IS_WINDOWS:
+        code = raw
+        if code == 0:
+            return ("clean_exit", code)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        if code == KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE:
+            return ("provider_unavailable", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -8176,6 +8204,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE:
+                return ("provider_unavailable", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8188,10 +8218,17 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows polls tracked Popen handles.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if _IS_WINDOWS:
+        for pid, proc in list(_windows_worker_processes.items()):
+            code = proc.poll()
+            if code is not None:
+                _windows_worker_processes.pop(pid, None)
+                _record_worker_exit(pid, int(code))
+                reaped.append(pid)
+    else:
         try:
             while True:
                 try:
@@ -9037,7 +9074,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "model_override, provider_override "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9060,6 +9098,40 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if kind == "provider_unavailable":
+                # The CLI exhausted its in-process provider/transport retries.
+                # Never route to another model or bounce this pinned worker in
+                # a dispatcher retry loop. A blocked event is consumed by the
+                # existing notifier (including the api_server session wake).
+                route = "/".join(filter(None, (
+                    row["provider_override"], row["model_override"]
+                ))) or "the assigned profile's configured provider/model"
+                question = (
+                    f"Провайдер/модель {route}: после повторов API всё ещё недоступен "
+                    "(ошибка соединения, таймаут или сбой сервера). Задача остановлена "
+                    "без смены маршрута. Вы выбираете: повторить тот же маршрут позже "
+                    "или разрешить только для этой задачи letovo/deepseek-v4-flash? "
+                    "Во втором случае изменятся провайдер и модель; доступность и "
+                    "качество альтернативы не подтверждены. Без вашего явного ответа "
+                    "переключения не будет."
+                )
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "last_failure_error=? WHERE id=? AND status='running' "
+                    "AND worker_pid=? AND claim_lock IS ?",
+                    (question[:500], row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount == 1:
+                    payload = {"pid": pid, "exit_code": code,
+                               "reason": question, "kind": "needs_input",
+                               "provider_route": route}
+                    run_id = _end_run(
+                        conn, row["id"], outcome="blocked", status="blocked",
+                        error=question, summary=question, metadata=payload,
+                    )
+                    _append_event(conn, row["id"], "blocked", payload, run_id=run_id)
+                continue
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -9772,7 +9844,7 @@ def review_dispatch_enabled() -> bool:
 #      see other tenants of the box, so under real observed pressure the
 #      dispatcher stops adding workers regardless of configured caps.
 #
-# Both fail open: on non-Linux hosts or any read error the sample is empty,
+# Both fail open: when platform sampling is unavailable or any read fails,
 # the derived default is None (no cap — unchanged behaviour), and the
 # pressure level is "unknown" (no spawn restriction).
 # ---------------------------------------------------------------------------
@@ -11201,6 +11273,9 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if _IS_WINDOWS and hasattr(proc, "poll"):
+        _recent_worker_exits.pop(proc.pid, None)  # PID reuse must not inherit an old exit.
+        _windows_worker_processes[proc.pid] = proc
     return proc.pid
 
 

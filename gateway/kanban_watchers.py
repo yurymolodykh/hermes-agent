@@ -580,7 +580,14 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                if ev.payload.get("provider_route"):
+                                    # A provider outage requires an actual
+                                    # operator choice. Never truncate the
+                                    # question before the alternative is shown.
+                                    reason = f": {str(ev.payload['reason'])[:500]}"
+                                    wake_handoff = str(ev.payload["reason"])[:500]
+                                else:
+                                    reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""

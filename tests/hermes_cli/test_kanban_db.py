@@ -258,8 +258,8 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
 
 
 def _exited_status(code: int) -> int:
-    """Raw wait-status for a WIFEXITED child with the given exit code."""
-    return code << 8
+    """Platform-specific reap-registry value for an exited child."""
+    return code if os.name == "nt" else code << 8
 
 
 
