@@ -13,6 +13,13 @@ def test_archived_api_cron_persists_pending_without_claiming_delivery(tmp_path, 
     }
     job = {"id": "3f0173195624", "name": "morning-backup-status-check", "deliver": "origin", "origin": origin}
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    registry = tmp_path / "webui.db"
+    with sqlite3.connect(registry) as db:
+        db.execute("CREATE TABLE chat (id TEXT PRIMARY KEY, user_id TEXT NOT NULL)")
+        db.execute("INSERT INTO chat VALUES (?, ?)",
+                   ("98d69f26-8263-4e1c-84a5-6d9fcdbf593d", "server-authorized-owner"))
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", str(registry))
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "01-orchestrator")
     monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda job: [{
         "platform": "api_server", "chat_id": origin["chat_id"], "thread_id": None,
     }])
@@ -39,6 +46,7 @@ def test_archived_cron_legacy_origin_requires_operator_registry_to_rebind(tmp_pa
                    ("98d69f26-8263-4e1c-84a5-6d9fcdbf593d", "owner-A"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", str(registry))
+    monkeypatch.setenv("HERMES_OPENWEBUI_LEGACY_CRON_ALLOWLIST", "3f0173195624:owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d")
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "01-orchestrator")
     error = scheduler._deliver_result(job, "СТАТУС БЭКАПОВ HERMES", source_id="2026-09-24_08-30-58")
     assert error and "pending client ACK" in error
@@ -54,6 +62,22 @@ def test_api_cron_missing_owner_does_not_use_home_or_send(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     error = scheduler._deliver_result(job, "backup output", source_id="run-1")
     assert error and "origin" in error.lower()
+    assert not (tmp_path / "delivery-outbox.sqlite").exists()
+
+
+def test_legacy_cron_existing_foreign_chat_without_operator_allowlist_fails_closed(tmp_path, monkeypatch):
+    registry = tmp_path / "webui.db"
+    with sqlite3.connect(registry) as db:
+        db.execute("CREATE TABLE chat (id TEXT PRIMARY KEY, user_id TEXT NOT NULL)")
+        db.execute("INSERT INTO chat VALUES (?, ?)",
+                   ("98d69f26-8263-4e1c-84a5-6d9fcdbf593d", "other-owner"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", str(registry))
+    monkeypatch.delenv("HERMES_OPENWEBUI_LEGACY_CRON_ALLOWLIST", raising=False)
+    job = {"id": "3f0173195624", "deliver": "origin", "origin": {
+        "platform": "api_server", "chat_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d"}}
+    error = scheduler._deliver_result(job, "secret", source_id="run-1")
+    assert error and "binding" in error
     assert not (tmp_path / "delivery-outbox.sqlite").exists()
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Mapping
 
@@ -32,19 +33,33 @@ def _destination(origin: Mapping[str, object]) -> str:
     return json.dumps(binding, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
-def _open(path: str | Path) -> sqlite3.Connection:
+@contextmanager
+def _open(path: str | Path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=10)
-    db.execute("PRAGMA busy_timeout=10000")
-    db.execute("PRAGMA synchronous=FULL")
-    db.execute("""CREATE TABLE IF NOT EXISTS origin_delivery (
-        id TEXT PRIMARY KEY, source_id TEXT NOT NULL, destination TEXT NOT NULL,
-        content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-        receipt TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        ack_at TEXT, UNIQUE(source_id, destination)
-    )""")
-    return db
+    try:
+        with db:
+            db.execute("PRAGMA busy_timeout=10000")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("""CREATE TABLE IF NOT EXISTS origin_delivery (
+                id TEXT PRIMARY KEY, source_id TEXT NOT NULL, destination TEXT NOT NULL,
+                content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                receipt TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ack_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                UNIQUE(source_id, destination)
+            )""")
+            # Older candidate DBs already exist: retain pending entries during upgrade.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(origin_delivery)")}
+            for name, ddl in (("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                              ("next_attempt_at", "INTEGER NOT NULL DEFAULT 0"),
+                              ("last_error", "TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE origin_delivery ADD COLUMN {name} {ddl}")
+            yield db
+    finally:
+        db.close()
 
 
 def enqueue(path: str | Path, source_id: str, origin: Mapping[str, object], content: str) -> str:
@@ -95,6 +110,38 @@ def ack(path: str | Path, event_id: str, origin: Mapping[str, object], receipt: 
             WHERE id = ? AND destination = ? AND status = 'pending'""",
             (receipt, event_id, destination)).rowcount
     return bool(changed)
+
+
+def due(path: str | Path, *, now: int, limit: int = 100) -> list[dict]:
+    """List persisted retryable entries, including their exact binding."""
+    with _open(path) as db:
+        rows = db.execute("""SELECT id, destination, attempts FROM origin_delivery
+                             WHERE status = 'pending' AND next_attempt_at <= ?
+                             ORDER BY created_at, id LIMIT ?""", (now, min(max(limit, 1), 100))).fetchall()
+    return [{"id": row[0], "origin": json.loads(row[1]), "attempts": row[2]} for row in rows]
+
+
+def fail_attempt(path: str | Path, event_id: str, *, now: int, max_attempts: int,
+                 base_delay: int, error: str) -> None:
+    """Bound retries and keep exhausted items inspectable rather than deleting."""
+    with _open(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT attempts FROM origin_delivery WHERE id=? AND status='pending'",
+                         (event_id,)).fetchone()
+        if row is None:
+            return
+        count = row[0] + 1
+        db.execute("""UPDATE origin_delivery SET attempts=?, status=?, next_attempt_at=?, last_error=?
+                      WHERE id=? AND status='pending'""",
+                   (count, "failed" if count >= max_attempts else "pending",
+                    now + min(base_delay * (2 ** min(count - 1, 10)), 3600), error[:300], event_id))
+
+
+def counts(path: str | Path) -> dict[str, int]:
+    """Operator-facing delivery status; execution success is a separate field."""
+    with _open(path) as db:
+        rows = db.execute("SELECT status, count(*) FROM origin_delivery GROUP BY status").fetchall()
+    return dict(rows)
 
 
 def status(path: str | Path, event_id: str) -> str | None:

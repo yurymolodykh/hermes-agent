@@ -2866,7 +2866,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
     if api_targets:
         if len(api_targets) != len(targets):
             return "api_server origin delivery failed: mixed push/API targets require per-target receipts"
-        from gateway.origin_outbox import enqueue
+        from gateway.origin_outbox import enqueue, status as delivery_status
         from hermes_constants import get_hermes_home
 
         origin = _resolve_origin(job)
@@ -2880,12 +2880,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
         # request headers or route through a home chat. If configured, it also
         # verifies already-bound origins against the real chat owner.
         registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH", "")
-        if registry:
-            from hermes_cli.profiles import get_active_profile_name
-            from gateway.openwebui_origin import resolve_origin
-            origin = resolve_origin(registry, get_active_profile_name(), origin)
-            if origin is None:
-                return "api_server origin delivery failed: no server-owned Open WebUI chat binding"
+        if not registry:
+            return "api_server origin delivery failed: missing server-owned binding registry"
+        # Pre-binding cron records with no owner are ambiguous: knowing a
+        # valid chat id is not proof that this job was created by that user.
+        # Only an explicit operator-approved job:chat pair may be recovered.
+        if not origin.get("user_id") and not origin.get("owner_id"):
+            allowed = {part.strip() for part in os.environ.get(
+                "HERMES_OPENWEBUI_LEGACY_CRON_ALLOWLIST", "").split(",") if part.strip()}
+            if f"{job['id']}:{origin.get('chat_id')}" not in allowed:
+                return "api_server origin delivery failed: unbound legacy job/chat binding"
+        from hermes_cli.profiles import get_active_profile_name
+        from gateway.openwebui_origin import resolve_origin
+        origin = resolve_origin(registry, get_active_profile_name(), origin)
+        if origin is None:
+            return "api_server origin delivery failed: no server-owned Open WebUI chat binding"
         try:
             event = enqueue(
                 get_hermes_home() / "delivery-outbox.sqlite",
@@ -2893,6 +2902,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
             )
         except (ValueError, OSError) as exc:
             return f"api_server origin delivery failed: {exc}"
+        _delivery_state = delivery_status(get_hermes_home() / "delivery-outbox.sqlite", event)
+        if _delivery_state == "acknowledged":
+            return None
+        if _delivery_state == "failed":
+            return f"api_server origin delivery failed: exhausted retries (outbox={event})"
         # No fallback into another chat; mixed-platform fanout still needs a
         # distinct per-target receipt contract before we can return success.
         return f"api_server delivery pending client ACK (outbox={event})"

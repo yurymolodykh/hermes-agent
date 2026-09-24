@@ -35,6 +35,19 @@ def test_enqueue_duplicate_and_exact_owner_ack_survive_reopen(tmp_path):
     assert outbox.pending(path, ORIGIN) == []
 
 
+def test_legacy_outbox_schema_migrates_without_losing_pending(tmp_path):
+    path = tmp_path / "delivery.sqlite"
+    with sqlite3.connect(path) as db:
+        db.execute("""CREATE TABLE origin_delivery (
+          id TEXT PRIMARY KEY, source_id TEXT NOT NULL, destination TEXT NOT NULL,
+          content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          receipt TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          ack_at TEXT, UNIQUE(source_id, destination))""")
+    event = outbox.enqueue(path, "run-1", ORIGIN, "output")
+    assert outbox.due(path, now=0)[0]["id"] == event
+    assert outbox.counts(path) == {"pending": 1}
+
+
 def test_missing_origin_and_pwa_owner_fail_closed(tmp_path):
     for origin in ({}, {**ORIGIN, "chat_id": ""}, {**ORIGIN, "owner_id": ""},
                    {**ORIGIN, "platform": "pwa", "owner_id": ""}):

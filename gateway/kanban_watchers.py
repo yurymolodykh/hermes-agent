@@ -290,6 +290,19 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                # Opt-in privileged local registry: drain cron and Kanban
+                # outbox even if the board has no subscriptions this tick.
+                # A missing registry never turns an HTTP self-post into ACK.
+                _owui_registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                if (_owui_registry
+                        and os.environ.get("HERMES_OPENWEBUI_DELIVERY_WRITE_ENABLED") == "1"):
+                    from hermes_constants import get_hermes_home
+                    from gateway.origin_delivery_worker import drain_openwebui
+                    await asyncio.to_thread(
+                        drain_openwebui,
+                        get_hermes_home() / "delivery-outbox.sqlite",
+                        _owui_registry,
+                    )
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
                 if _gc_due:
@@ -539,8 +552,10 @@ class GatewayKanbanWatchersMixin:
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
                     mode = sub.get("delivery_mode") or "notify"
-                    wake_agent = mode in ("notify+wake", "wake")
-                    send_passive = mode != "wake"
+                    # API self-post is NOT a user-visible receipt. Its exact
+                    # terminal event goes through the persisted chat outbox.
+                    wake_agent = mode in ("notify+wake", "wake") and platform_str != "api_server"
+                    send_passive = mode != "wake" or platform_str == "api_server"
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -655,6 +670,33 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if platform_str == "api_server":
+                            # A claimed cursor is only provisional. Stage one
+                            # exact event and wait for server-owned chat readback
+                            # before letting the cursor move. Repeated ticks
+                            # never create another message/agent turn.
+                            from hermes_constants import get_hermes_home
+                            from gateway.kanban_origin_delivery import stage_terminal
+                            _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                            _state = "unbound"
+                            if _registry and (not sub_profile or sub_profile == notifier_profile):
+                                _state, _delivery_id = await asyncio.to_thread(
+                                    stage_terminal,
+                                    get_hermes_home() / "delivery-outbox.sqlite",
+                                    _registry, sub, sub_profile or notifier_profile,
+                                    board_slug or "default", ev.id, msg,
+                                )
+                            if _state != "acknowledged":
+                                logger.warning(
+                                    "kanban notifier: exact api_server event %s/%s delivery %s; cursor retained",
+                                    sub["task_id"], ev.id, _state,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind, sub, d["cursor"],
+                                    d.get("old_cursor", 0), board_slug,
+                                )
+                                break
+                            continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
