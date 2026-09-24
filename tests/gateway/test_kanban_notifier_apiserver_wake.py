@@ -188,6 +188,29 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 
 
+def test_apiserver_failed_wake_retains_subscription_after_retry_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "failed-wake.db"))
+    kb.init_db()
+    tid = _create_completed_subscription("api_server", "origin-session")
+    import gateway.wake as wake_mod
+    calls = []
+
+    async def failed_post(adapter, *, text, session_id):
+        calls.append(session_id)
+        raise ConnectionError("self-post unavailable")
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", failed_post)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    for _ in range(13):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(calls) == 13
+    with kb.connect() as conn:
+        sub = conn.execute("SELECT last_event_id FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone()
+        assert sub is not None
+        assert _unseen_terminal_events(tid, "api_server", "origin-session")
+
+
 def test_apiserver_subscriptions_have_independent_wake_destinations(
     tmp_path, monkeypatch,
 ):

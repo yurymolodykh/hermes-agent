@@ -874,24 +874,22 @@ class GatewayKanbanWatchersMixin:
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
                                 if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
+                                    logger.error(
+                                        "kanban notifier: delivery pending for %s on %s after %d wake failures; "
+                                        "subscription and cursor retained for retry/operator inspection",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
-                                    # is NOT lost.
-                                    await _to_thread_process_service(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
+                                # Never drop the sole delivery path for a
+                                # blocked model-choice question. The event is
+                                # durable in task_events; rewind the claim on
+                                # every failure, including after the threshold.
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
                                 continue
 
                         async def _push_wake() -> None:

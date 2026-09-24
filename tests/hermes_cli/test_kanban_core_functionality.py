@@ -414,6 +414,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         run1 = kb.latest_run(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(_kb, "_IS_WINDOWS", False)  # generic crash path
         assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)

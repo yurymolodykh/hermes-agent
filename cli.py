@@ -20865,8 +20865,10 @@ def _kanban_failure_exit_code(result, is_kanban_worker: bool) -> int:
         )
         if reason in ("rate_limit", "billing"):
             return KANBAN_RATE_LIMIT_EXIT_CODE
+        # `unknown` can also be an internal decoder/worker exception. Its
+        # retryable flag alone is not evidence of a provider outage.
         if result.get("failure_retryable") is True and reason in (
-            "timeout", "server_error", "overloaded", "unknown",
+            "timeout", "server_error", "overloaded",
         ):
             return KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE
     except ImportError:
@@ -21431,6 +21433,13 @@ def main(
                         _exit_code = _kanban_failure_exit_code(
                             result, bool(os.environ.get("HERMES_KANBAN_TASK"))
                         )
+                        if _exit_code in (74, 75):
+                            from hermes_cli.kanban_db import write_worker_exit_marker
+                            write_worker_exit_marker(
+                                _exit_code,
+                                provider=getattr(cli.agent, "provider", None),
+                                model=getattr(cli.agent, "model", None),
+                            )
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
