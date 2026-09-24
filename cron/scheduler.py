@@ -2914,19 +2914,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
             return None  # local-only jobs don't deliver — not a failure
-        # deliver=origin with no resolvable origin and no configured home
-        # channels: treat as local rather than reporting an error.  CLI-created
-        # jobs never capture a {platform, chat_id} origin, so failing here would
-        # make every CLI `deliver=origin` (or auto-detect) job emit a spurious
-        # "no delivery target resolved" error on every run (#43014).  The output
-        # is still persisted in last_output for `cron list`/resume.
+        # An origin-specific job cannot count as delivered when that origin is
+        # absent. Its execution output remains persisted, while the separate
+        # last_delivery_error keeps the missing destination observable. CLI
+        # jobs with no ingress should use deliver=local explicitly.
         if deliver_value == "origin":
-            logger.info(
-                "Job '%s': deliver=origin but no origin or home channels — "
-                "skipping delivery (output saved in last_output)",
-                job.get("name", job.get("id", "?")),
-            )
-            return None
+            msg = "origin delivery failed: no bound origin destination"
+            logger.warning("Job '%s': %s", job.get("name", job.get("id", "?")), msg)
+            return msg
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg

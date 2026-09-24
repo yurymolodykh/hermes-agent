@@ -84,6 +84,8 @@ def test_legacy_cron_existing_foreign_chat_without_operator_allowlist_fails_clos
 def test_origin_without_binding_never_resolves_home(monkeypatch):
     monkeypatch.setattr(scheduler, "_iter_home_target_platforms", lambda: ["telegram"])
     monkeypatch.setattr(scheduler, "_get_home_target_chat_id", lambda platform: "home-chat")
-    assert scheduler._resolve_single_delivery_target(
-        {"id": "3f0173195624", "deliver": "origin"}, "origin"
-    ) is None
+    job = {"id": "3f0173195624", "deliver": "origin"}
+    assert scheduler._resolve_single_delivery_target(job, "origin") is None
+    # A successfully executed job without its destination is NOT delivered.
+    error = scheduler._deliver_result(job, "backup output", source_id="run-1")
+    assert error and "origin" in error.lower()

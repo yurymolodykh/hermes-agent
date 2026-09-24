@@ -33,7 +33,14 @@ leaves the machine.
 * Telegram push remains on its existing adapter path. The API server is NOT
   permitted to wake itself with a fake event. A claimed Kanban cursor is
   rewound until the exact persisted receipt exists; root, child and review
-  events use their event ID plus board as deduplication key. PWA has no native
+  events use their event ID plus board as deduplication key. A cron job with
+  `deliver=origin` but no bound origin retains the execution output and records
+  `last_delivery_error` (never silently counts as local delivery); CLI-only
+  jobs must select `deliver=local` intentionally. A successful execution with
+  an unacknowledged delivery has `last_status=delivery_pending` (or
+  `delivery_failed` on a hard error), not `ok`; execution success remains
+  separate. Later outbox ACK does not retroactively rewrite the prior cron
+  run status: consult the outbox receipt for that event. PWA has no native
   platform/renderer contract in this repository and is NOT covered by this
   candidate; a separate authenticated PWA ingress/receipt implementation is
   needed before claiming cross-client parity.
