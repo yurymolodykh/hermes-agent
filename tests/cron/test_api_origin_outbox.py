@@ -1,0 +1,44 @@
+"""Regression for the archived api_server cron loss: no adapter.send or fake ACK."""
+from cron import scheduler
+from gateway import origin_outbox
+
+
+def test_archived_api_cron_persists_pending_without_claiming_delivery(tmp_path, monkeypatch):
+    origin = {
+        "platform": "api_server", "profile": "01-orchestrator",
+        "chat_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
+        "session_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
+        "owner_id": "server-authorized-owner", "thread_id": None,
+    }
+    job = {"id": "3f0173195624", "name": "morning-backup-status-check", "deliver": "origin", "origin": origin}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda job: [{
+        "platform": "api_server", "chat_id": origin["chat_id"], "thread_id": None,
+    }])
+    sends = []
+    import tools.send_message_tool as sender
+    monkeypatch.setattr(sender, "_send_to_platform", lambda *args, **kw: sends.append(kw))
+    content = "СТАТУС БЭКАПОВ HERMES (проверка утром)"
+    error = scheduler._deliver_result(job, content, source_id="cron:3f0173195624:2026-09-24_08-30-58")
+    assert error and "pending client ACK" in error
+    assert sends == []
+    rows = origin_outbox.pending(tmp_path / "delivery-outbox.sqlite", origin)
+    assert len(rows) == 1
+    assert content in rows[0]["content"]
+
+
+def test_api_cron_missing_owner_does_not_use_home_or_send(tmp_path, monkeypatch):
+    origin = {"platform": "api_server", "chat_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d"}
+    job = {"id": "3f0173195624", "deliver": "origin", "origin": origin}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    error = scheduler._deliver_result(job, "backup output", source_id="run-1")
+    assert error and "origin" in error.lower()
+    assert not (tmp_path / "delivery-outbox.sqlite").exists()
+
+
+def test_origin_without_binding_never_resolves_home(monkeypatch):
+    monkeypatch.setattr(scheduler, "_iter_home_target_platforms", lambda: ["telegram"])
+    monkeypatch.setattr(scheduler, "_get_home_target_chat_id", lambda platform: "home-chat")
+    assert scheduler._resolve_single_delivery_target(
+        {"id": "3f0173195624", "deliver": "origin"}, "origin"
+    ) is None

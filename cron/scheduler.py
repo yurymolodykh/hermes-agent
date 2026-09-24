@@ -2328,21 +2328,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": _origin_delivery_thread(origin),
             }
-        # Origin missing (e.g. job created via API/script) — try each
-        # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in _iter_home_target_platforms():
-            chat_id = _get_home_target_chat_id(platform_name)
-            if chat_id:
-                logger.info(
-                    "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
-                    job.get("name", job.get("id", "?")),
-                    platform_name,
-                )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": _get_home_target_thread_id(platform_name),
-                }
+        # Origin is an exact address, not permission to fan out to a home
+        # channel. A missing ingress binding must remain undelivered and
+        # visible as not_configured, rather than leaking output elsewhere.
         return None
 
     if ":" in deliver_value:
@@ -2856,7 +2844,8 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None,
+                    source_id: Optional[str] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2868,6 +2857,34 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    source_id = source_id or job.get("_delivery_execution_id")
+    # HTTP request/response is NOT an asynchronous send primitive. Persist the
+    # exact destination before considering a transport and never turn a local
+    # transcript mirror or a self-post into a user-visible ACK. Client receipt
+    # is a separate transition; until then last_delivery_error stays visible.
+    api_targets = [t for t in targets if t["platform"] == "api_server"]
+    if api_targets:
+        if len(api_targets) != len(targets):
+            return "api_server origin delivery failed: mixed push/API targets require per-target receipts"
+        from gateway.origin_outbox import enqueue
+        from hermes_constants import get_hermes_home
+
+        origin = _resolve_origin(job)
+        if not origin or not source_id or any(
+            not _target_matches_origin(origin, t["platform"], t["chat_id"], t.get("thread_id"))
+            for t in api_targets
+        ):
+            return "api_server origin delivery failed: missing or mismatched origin/source event"
+        try:
+            event = enqueue(
+                get_hermes_home() / "delivery-outbox.sqlite",
+                f"cron:{job['id']}:{source_id}", origin, content,
+            )
+        except (ValueError, OSError) as exc:
+            return f"api_server origin delivery failed: {exc}"
+        # No fallback into another chat; mixed-platform fanout still needs a
+        # distinct per-target receipt contract before we can return success.
+        return f"api_server delivery pending client ACK (outbox={event})"
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -6930,7 +6947,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            {**job, "_delivery_execution_id": execution_id},
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7069,7 +7086,7 @@ def _run_one_job_body(
             try:
                 delivery_attempted = True
                 delivery_error = _deliver_result(
-                    job,
+                    {**job, "_delivery_execution_id": execution_id},
                     # Composed exactly like the normal failure delivery above.
                     # mark_job_run below records THIS run in failure_streak
                     # whichever layer failed, so a job that fails before the
