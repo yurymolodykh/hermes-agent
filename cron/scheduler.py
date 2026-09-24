@@ -2328,21 +2328,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": _origin_delivery_thread(origin),
             }
-        # Origin missing (e.g. job created via API/script) — try each
-        # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in _iter_home_target_platforms():
-            chat_id = _get_home_target_chat_id(platform_name)
-            if chat_id:
-                logger.info(
-                    "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
-                    job.get("name", job.get("id", "?")),
-                    platform_name,
-                )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": _get_home_target_thread_id(platform_name),
-                }
+        # Origin is an exact address, not permission to fan out to a home
+        # channel. A missing ingress binding must remain undelivered and
+        # visible as not_configured, rather than leaking output elsewhere.
         return None
 
     if ":" in deliver_value:
@@ -2856,7 +2844,8 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None,
+                    source_id: Optional[str] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2868,23 +2857,71 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    source_id = source_id or job.get("_delivery_execution_id")
+    # HTTP request/response is NOT an asynchronous send primitive. Persist the
+    # exact destination before considering a transport and never turn a local
+    # transcript mirror or a self-post into a user-visible ACK. Client receipt
+    # is a separate transition; until then last_delivery_error stays visible.
+    api_targets = [t for t in targets if t["platform"] == "api_server"]
+    if api_targets:
+        if len(api_targets) != len(targets):
+            return "api_server origin delivery failed: mixed push/API targets require per-target receipts"
+        from gateway.origin_outbox import enqueue, status as delivery_status
+        from hermes_constants import get_hermes_home
+
+        origin = _resolve_origin(job)
+        if not origin or not source_id or any(
+            not _target_matches_origin(origin, t["platform"], t["chat_id"], t.get("thread_id"))
+            for t in api_targets
+        ):
+            return "api_server origin delivery failed: missing or mismatched origin/source event"
+        # Legacy OWUI jobs predate server-owned user/session binding. Only an
+        # operator-configured local chat registry may rebind them; never trust
+        # request headers or route through a home chat. If configured, it also
+        # verifies already-bound origins against the real chat owner.
+        registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH", "")
+        if not registry:
+            return "api_server origin delivery failed: missing server-owned binding registry"
+        # Pre-binding cron records with no owner are ambiguous: knowing a
+        # valid chat id is not proof that this job was created by that user.
+        # Only an explicit operator-approved job:chat pair may be recovered.
+        if not origin.get("user_id") and not origin.get("owner_id"):
+            allowed = {part.strip() for part in os.environ.get(
+                "HERMES_OPENWEBUI_LEGACY_CRON_ALLOWLIST", "").split(",") if part.strip()}
+            if f"{job['id']}:{origin.get('chat_id')}" not in allowed:
+                return "api_server origin delivery failed: unbound legacy job/chat binding"
+        from hermes_cli.profiles import get_active_profile_name
+        from gateway.openwebui_origin import resolve_origin
+        origin = resolve_origin(registry, get_active_profile_name(), origin)
+        if origin is None:
+            return "api_server origin delivery failed: no server-owned Open WebUI chat binding"
+        try:
+            event = enqueue(
+                get_hermes_home() / "delivery-outbox.sqlite",
+                f"cron:{job['id']}:{source_id}", origin, content,
+            )
+        except (ValueError, OSError) as exc:
+            return f"api_server origin delivery failed: {exc}"
+        _delivery_state = delivery_status(get_hermes_home() / "delivery-outbox.sqlite", event)
+        if _delivery_state == "acknowledged":
+            return None
+        if _delivery_state == "failed":
+            return f"api_server origin delivery failed: exhausted retries (outbox={event})"
+        # No fallback into another chat; mixed-platform fanout still needs a
+        # distinct per-target receipt contract before we can return success.
+        return f"api_server delivery pending client ACK (outbox={event})"
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
             return None  # local-only jobs don't deliver — not a failure
-        # deliver=origin with no resolvable origin and no configured home
-        # channels: treat as local rather than reporting an error.  CLI-created
-        # jobs never capture a {platform, chat_id} origin, so failing here would
-        # make every CLI `deliver=origin` (or auto-detect) job emit a spurious
-        # "no delivery target resolved" error on every run (#43014).  The output
-        # is still persisted in last_output for `cron list`/resume.
+        # An origin-specific job cannot count as delivered when that origin is
+        # absent. Its execution output remains persisted, while the separate
+        # last_delivery_error keeps the missing destination observable. CLI
+        # jobs with no ingress should use deliver=local explicitly.
         if deliver_value == "origin":
-            logger.info(
-                "Job '%s': deliver=origin but no origin or home channels — "
-                "skipping delivery (output saved in last_output)",
-                job.get("name", job.get("id", "?")),
-            )
-            return None
+            msg = "origin delivery failed: no bound origin destination"
+            logger.warning("Job '%s': %s", job.get("name", job.get("id", "?")), msg)
+            return msg
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
@@ -6930,7 +6967,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            {**job, "_delivery_execution_id": execution_id},
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7069,7 +7106,7 @@ def _run_one_job_body(
             try:
                 delivery_attempted = True
                 delivery_error = _deliver_result(
-                    job,
+                    {**job, "_delivery_execution_id": execution_id},
                     # Composed exactly like the normal failure delivery above.
                     # mark_job_run below records THIS run in failure_streak
                     # whichever layer failed, so a job that fails before the

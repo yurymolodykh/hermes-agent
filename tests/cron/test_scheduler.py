@@ -2075,25 +2075,24 @@ class TestDeliverResultLiveAdapterUnconfirmed:
 
 
 class TestDeliverOriginUnresolvableIsLocal:
-    """Regression for #43014.
+    """An explicit origin request without a binding must not report delivery.
 
-    A cron job created in a CLI session has no {platform, chat_id} origin.
-    With ``deliver=origin`` (or auto-detect / deliver=None) and no configured
-    platform home channel, delivery is unresolvable — but that is the EXPECTED
-    state for CLI jobs, not an error.  _deliver_result must return None (treat
-    as local; output stays in last_output), not the "no delivery target
-    resolved" error string that previously fired on every run.
+    A CLI job with no ingress may choose deliver=local. If it explicitly
+    selects deliver=origin, execution output remains saved, but delivery must
+    retain a separate error rather than producing a false success receipt.
     """
 
     def _deliver(self, job, monkeypatch):
         import cron.scheduler as sched
-        # No home channel for any platform → origin is unresolvable.
         monkeypatch.setattr(sched, "_get_home_target_chat_id", lambda *_: "")
         return _deliver_result(job, "CLI bulletin")
 
-    def test_origin_with_no_home_channels_returns_none(self, monkeypatch):
+    def test_origin_with_no_home_channels_reports_failure(self, monkeypatch):
         job = {"id": "cli-job", "deliver": "origin", "origin": "cli-session-provenance"}
-        assert self._deliver(job, monkeypatch) is None
+        assert "no bound origin" in self._deliver(job, monkeypatch)
+
+    def test_explicit_local_still_succeeds(self, monkeypatch):
+        assert self._deliver({"id": "cli-job", "deliver": "local"}, monkeypatch) is None
 
 
 class TestSendMediaTimeoutCancelsFuture:

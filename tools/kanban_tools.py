@@ -1534,6 +1534,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         from gateway.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if platform.lower() == "api_server":
+            # A request-scoped API session id (and even its user_id context)
+            # does not authenticate ownership of an Open WebUI chat. Do not
+            # register an undeliverable or client-claimable subscription; the
+            # opt-in exact-origin worker can only use independently bound rows.
+            return False
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
