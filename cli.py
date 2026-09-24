@@ -5359,7 +5359,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Fallback provider chain — tried in order when primary fails after retries.
         # Merge new ``fallback_providers`` entries with any legacy
         # ``fallback_model`` entries so old configs still participate.
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        # A kanban worker is bound to its card's route. The profile-wide
+        # fallback chain is not consent to move this task to another model;
+        # report an outage to the board and ask the operator instead.
+        self._fallback_model = (
+            [] if os.environ.get("HERMES_KANBAN_TASK")
+            else get_fallback_chain(CLI_CONFIG)
+        )
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -20840,6 +20846,36 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _kanban_failure_exit_code(result, is_kanban_worker: bool) -> int:
+    """Preserve structured provider failure at the subprocess boundary.
+
+    A retryable provider outage has already exhausted the agent's own retry
+    budget; the dispatcher must ask for routing input, not silently respawn it
+    or count the transport outage as a task failure. Other CLI runs retain 0/1.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if not is_kanban_worker:
+        return 1
+    reason = result.get("failure_reason")
+    try:
+        from hermes_cli.kanban_db import (
+            KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE,
+            KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+        if reason in ("rate_limit", "billing"):
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+        # `unknown` can also be an internal decoder/worker exception. Its
+        # retryable flag alone is not evidence of a provider outage.
+        if result.get("failure_retryable") is True and reason in (
+            "timeout", "server_error", "overloaded",
+        ):
+            return KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE
+    except ImportError:
+        pass
+    return 1
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -21394,19 +21430,16 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                        _exit_code = _kanban_failure_exit_code(
+                            result, bool(os.environ.get("HERMES_KANBAN_TASK"))
+                        )
+                        if _exit_code in (74, 75):
+                            from hermes_cli.kanban_db import write_worker_exit_marker
+                            write_worker_exit_marker(
+                                _exit_code,
+                                provider=getattr(cli.agent, "provider", None),
+                                model=getattr(cli.agent, "model", None),
+                            )
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails

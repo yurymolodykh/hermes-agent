@@ -441,6 +441,10 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# A worker exhausted its own retries against a temporary provider/transport
+# outage. Unlike an ordinary crash this needs an explicit routing decision;
+# spawning the same pinned model again cannot solve a persistent outage.
+KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE = 74
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -8116,6 +8120,48 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+# On Windows waitpid/WIFEXITED do not exist. Keep the actual Popen handle until
+# poll() yields its returncode; _pid_alive alone can tell us only that it died,
+# not whether it exited 0, 74, 75, or crashed.
+_windows_worker_processes: "dict[int, Any]" = {}
+
+def _worker_exit_marker_path(task_id: str, run_id: int, *, board: Optional[str] = None) -> Path:
+    """Per-run evidence survives dispatcher restarts (unlike Popen handles)."""
+    return worker_logs_dir(board=board) / f"{task_id}.{run_id}.exit.json"
+
+def write_worker_exit_marker(code: int, *, provider: Optional[str] = None,
+                             model: Optional[str] = None) -> None:
+    """Worker-side atomic terminal error receipt; no credentials or response text."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "")
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    if not task_id or not run_id or code not in (
+        KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE, KANBAN_RATE_LIMIT_EXIT_CODE,
+    ):
+        return
+    try:
+        path = _worker_exit_marker_path(task_id, int(run_id))
+        payload = {"task_id": task_id, "run_id": int(run_id),
+                   "pid": os.getpid(), "exit_code": code,
+                   "provider": provider, "model": model}
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, ValueError) as exc:
+        _log.warning("kanban worker could not persist exit marker: %s", exc)
+
+def _read_worker_exit_marker(task_id: str, run_id: int, *, board: Optional[str] = None) -> Optional[dict]:
+    try:
+        data = json.loads(_worker_exit_marker_path(task_id, run_id, board=board).read_text(encoding="utf-8"))
+        # The launcher Popen pid can differ from the real Python worker pid
+        # (Windows shims); the unique DB run id + task id are the binding.
+        if (data.get("task_id") == task_id and data.get("run_id") == run_id
+                and isinstance(data.get("pid"), int) and data["pid"] > 0
+                and data.get("exit_code") in
+                (KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE, KANBAN_RATE_LIMIT_EXIT_CODE)):
+            return data
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8165,10 +8211,30 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    if _IS_WINDOWS:
+        proc = _windows_worker_processes.get(int(pid))
+        if proc is not None:
+            code = proc.poll()
+            if code is None:
+                return ("unknown", None)
+            _windows_worker_processes.pop(int(pid), None)
+            _record_worker_exit(int(pid), int(code))
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
+    raw, reaped_at = entry
+    if time.time() - reaped_at > _RECENT_WORKER_EXIT_TTL_SECONDS:
+        _recent_worker_exits.pop(int(pid), None)
+        return ("unknown", None)
+    if _IS_WINDOWS:
+        code = raw
+        if code == 0:
+            return ("clean_exit", code)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        if code == KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE:
+            return ("provider_unavailable", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -8176,6 +8242,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE:
+                return ("provider_unavailable", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8188,10 +8256,17 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows polls tracked Popen handles.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if _IS_WINDOWS:
+        for pid, proc in list(_windows_worker_processes.items()):
+            code = proc.poll()
+            if code is not None:
+                _windows_worker_processes.pop(pid, None)
+                _record_worker_exit(pid, int(code))
+                reaped.append(pid)
+    else:
         try:
             while True:
                 try:
@@ -9037,7 +9112,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id, "
+            "model_override, provider_override "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9060,6 +9136,102 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if _IS_WINDOWS and kind == "unknown" and row["current_run_id"]:
+                # An in-memory Popen handle is lost on dispatcher restart.
+                # Trust only a receipt bound to this exact task/run; never
+                # infer provider outage (or auto-retry) from a missing handle.
+                marker = _read_worker_exit_marker(row["id"], int(row["current_run_id"]))
+                code = marker["exit_code"] if marker else None
+                if code == KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE:
+                    kind = "provider_unavailable"
+                elif code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                    kind = "rate_limited"
+                else:
+                    question = (f"Windows worker {pid} exited after dispatcher restart; "
+                                "exit status cannot be verified. Inspect the worker log and "
+                                "choose whether to retry the same route; no automatic respawn.")
+                    cur = conn.execute(
+                        "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                        "last_failure_error=? WHERE id=? AND status='running' "
+                        "AND worker_pid=? AND claim_lock IS ?",
+                        (question, row["id"], pid, row["claim_lock"]),
+                    )
+                    if cur.rowcount:
+                        run_id = _end_run(conn, row["id"], outcome="blocked",
+                                          status="blocked", error=question, summary=question)
+                        _append_event(conn, row["id"], "blocked",
+                                      {"reason": question, "kind": "needs_input"}, run_id=run_id)
+                    continue
+            if kind == "provider_unavailable":
+                # The CLI exhausted its in-process provider/transport retries.
+                # Never route to another model or bounce this pinned worker in
+                # a dispatcher retry loop. A blocked event is consumed by the
+                # existing notifier (including the api_server session wake).
+                marker = _read_worker_exit_marker(
+                    row["id"], int(row["current_run_id"])
+                ) if row["current_run_id"] else None
+                # Worker-reported resolved route is bound to this attempt and
+                # survives both config changes and dispatcher restarts.
+                provider = (marker or {}).get("provider") or row["provider_override"]
+                model = (marker or {}).get("model") or row["model_override"]
+                if not provider or not model:
+                    # Legacy/missing receipt: use the profile's configured
+                    # defaults rather than presenting a generic placeholder.
+                    try:
+                        from hermes_cli.profiles import resolve_profile_env
+                        import yaml
+                        profile_home = Path(resolve_profile_env(row["assignee"]))
+                        cfg = yaml.safe_load((profile_home / "config.yaml").read_text(encoding="utf-8")) or {}
+                        model_cfg = cfg.get("model") or {}
+                        if isinstance(model_cfg, dict):
+                            raw = model_cfg.get("default") or model_cfg.get("model") or ""
+                            from hermes_cli.config import split_model_config_default
+                            default_model, nested_provider = split_model_config_default(raw)
+                            model = model or default_model
+                            provider = provider or nested_provider or model_cfg.get("provider")
+                    except Exception as exc:
+                        _log.warning("cannot resolve legacy worker route for %s: %s", row["id"], exc)
+                route = "/".join((str(provider or "не установлен"), str(model or "не установлена")))
+                question = (
+                    f"Провайдер/модель {route}: после повторов API всё ещё недоступен "
+                    "(ошибка соединения, таймаут или сбой сервера). Задача остановлена "
+                    "без смены маршрута. Вы выбираете: повторить тот же маршрут позже "
+                    "или разрешить только для этой задачи letovo/deepseek-v4-flash? "
+                    "Во втором случае изменятся провайдер и модель; доступность и "
+                    "качество альтернативы не подтверждены. Без вашего явного ответа "
+                    "переключения не будет."
+                )
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "last_failure_error=? WHERE id=? AND status='running' "
+                    "AND worker_pid=? AND claim_lock IS ?",
+                    (question[:500], row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount == 1:
+                    payload = {"pid": pid, "exit_code": code,
+                               "reason": question, "kind": "needs_input",
+                               "provider_route": route}
+                    run_id = _end_run(
+                        conn, row["id"], outcome="blocked", status="blocked",
+                        error=question, summary=question, metadata=payload,
+                    )
+                    _append_event(conn, row["id"], "blocked", payload, run_id=run_id)
+                    subs = conn.execute(
+                        "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=?",
+                        (row["id"],),
+                    ).fetchone()[0]
+                    if not subs:
+                        # No notification path exists; make the escalation
+                        # durable and discoverable rather than implying that
+                        # the question was delivered to a human.
+                        _append_event(conn, row["id"], "delivery_pending",
+                                      {"reason": "no notification subscription",
+                                       "source_event": "blocked"}, run_id=run_id)
+                        _log.error("kanban provider outage for %s: no notification subscription; "
+                                     "question pending on blocked card", row["id"])
+                continue
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -9772,7 +9944,7 @@ def review_dispatch_enabled() -> bool:
 #      see other tenants of the box, so under real observed pressure the
 #      dispatcher stops adding workers regardless of configured caps.
 #
-# Both fail open: on non-Linux hosts or any read error the sample is empty,
+# Both fail open: when platform sampling is unavailable or any read fails,
 # the derived default is None (no cap — unchanged behaviour), and the
 # pressure level is "unknown" (no spawn restriction).
 # ---------------------------------------------------------------------------
@@ -11156,17 +11328,10 @@ def _default_spawn(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # The quiet path preserves structured provider failures as rc=74/75 and
+    # writes a per-run exit receipt. The regular chat path discards the result
+    # and exits 0 even on a failed API call. Goal-loop workers also need -Q.
+    cmd.extend(["chat", "-q", prompt, "-Q"])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11201,6 +11366,9 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if _IS_WINDOWS and hasattr(proc, "poll"):
+        _recent_worker_exits.pop(proc.pid, None)  # PID reuse must not inherit an old exit.
+        _windows_worker_processes[proc.pid] = proc
     return proc.pid
 
 

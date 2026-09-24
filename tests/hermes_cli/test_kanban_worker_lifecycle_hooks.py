@@ -104,6 +104,9 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        # Exercise legacy generic crash accounting, not Windows' new
+        # restart-safe unknown-exit hold (covered by outage tests).
+        monkeypatch.setattr(kb, "_IS_WINDOWS", False)
         assert kb.detect_crashed_workers(conn) == [tid]
     finally:
         conn.close()
@@ -169,6 +172,7 @@ def test_raising_callbacks_never_break_worker_lifecycle(
             assert any(row[0] == tid for row in result.spawned)
 
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+            monkeypatch.setattr(kb, "_IS_WINDOWS", False)
             assert kb.detect_crashed_workers(conn) == [tid]
 
             kb.claim_task(conn, tid)

@@ -14,13 +14,13 @@ Two delivery strategies, selected by the target adapter's
   ``X-Hermes-Session-Id`` key real gateway/HQ turns run under
   (``_bind_api_server_session``), so the wake lands in a parallel, invisible
   session. Instead we self-POST ``/v1/chat/completions`` on the in-pod API
-  server with the raw session id in the ``X-Hermes-Session-Id`` header — the
-  exact entry point real turns use — so the wake turn resumes the REAL
-  session, with full history, and its result is visible the next time the
-  client polls/reopens the conversation.
+  server with the raw session id in the ``X-Hermes-Session-Id`` header. This
+  runs an agent turn in the same server-side session, but its HTTP response
+  goes to the notifier — NOT to the owner's OpenWebUI chat. Callers must not
+  treat this as an acknowledgement of user-visible delivery.
 
-Failures RAISE (after bounded retries on transient errors) so callers can
-rewind cursors / retry instead of silently losing the event.
+Failures RAISE (after bounded retries on transient errors). HTTP 200 with an
+incomplete agent body also raises, so callers retain their delivery cursor.
 """
 
 from __future__ import annotations
@@ -160,9 +160,39 @@ async def _self_post_chat_completion(
                             f"wake self-post failed for session {session_id}: "
                             f"HTTP {resp.status}: {body}"
                         )
-                    await resp.read()
+                    # HTTP 200 is not proof of a successful agent turn. The API
+                    # server returns 200 with hermes.failed=true and
+                    # finish_reason=error when a run produced partial text.
+                    # Reject malformed responses too; otherwise a proxy error
+                    # page could silently consume the notification cursor.
+                    try:
+                        body = await resp.json()
+                    except (ValueError, aiohttp.ContentTypeError) as exc:
+                        raise RuntimeError(
+                            f"wake self-post returned invalid JSON for session {session_id}"
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise RuntimeError(
+                            f"wake self-post returned invalid completion for session {session_id}"
+                        )
+                    hermes = body.get("hermes") or {}
+                    choices = body.get("choices") or []
+                    if (not isinstance(hermes, dict) or not isinstance(choices, list)
+                            or not choices or not isinstance(choices[0], dict)):
+                        raise RuntimeError(
+                            f"wake self-post returned invalid completion for session {session_id}"
+                        )
+                    if (hermes.get("failed") is True
+                            or hermes.get("completed") is False
+                            or hermes.get("partial") is True
+                            or choices[0].get("finish_reason") != "stop"
+                            or body.get("object") != "chat.completion"):
+                        raise RuntimeError(
+                            f"wake self-post agent turn incomplete for session {session_id}"
+                        )
                     logger.info(
-                        "wake self-post delivered for session %s (attempt %d)",
+                        "wake self-post agent turn completed for session %s (attempt %d); "
+                        "client display not confirmed",
                         session_id,
                         attempt + 1,
                     )

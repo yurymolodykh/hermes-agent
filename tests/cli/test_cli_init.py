@@ -107,6 +107,15 @@ class TestVerboseAndToolProgress:
 
 
 class TestFallbackChainInit:
+    def test_kanban_worker_does_not_inherit_profile_fallback(self):
+        cli = _make_cli(
+            env_overrides={"HERMES_KANBAN_TASK": "t_pinned"},
+            config_overrides={"fallback_providers": [
+                {"provider": "other", "model": "different-model"},
+            ]},
+        )
+        assert cli._fallback_model == []
+
     def test_merges_new_and_legacy_fallback_config(self):
         cli = _make_cli(config_overrides={
             "fallback_providers": [
