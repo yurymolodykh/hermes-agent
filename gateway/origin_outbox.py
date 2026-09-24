@@ -73,6 +73,16 @@ def pending(path: str | Path, origin: Mapping[str, object]) -> list[dict[str, st
     return [dict(zip(("id", "source_id", "content"), row)) for row in rows]
 
 
+def get_pending(path: str | Path, event_id: str, origin: Mapping[str, object]) -> dict[str, str] | None:
+    """Read a single pending item for this exact authorized destination."""
+    destination = _destination(origin)
+    with _open(path) as db:
+        row = db.execute("""SELECT id, source_id, content FROM origin_delivery
+                            WHERE id = ? AND destination = ? AND status = 'pending'""",
+                         (event_id, destination)).fetchone()
+    return dict(zip(("id", "source_id", "content"), row)) if row else None
+
+
 def ack(path: str | Path, event_id: str, origin: Mapping[str, object], receipt: str) -> bool:
     """Commit client receipt against the exact authorized destination."""
     destination = _destination(origin)
