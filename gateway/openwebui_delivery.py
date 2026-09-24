@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Mapping
 
-from gateway.openwebui_origin import _CHAT_ID, acknowledge_visible, resolve_origin
+from gateway.openwebui_origin import _CHAT_ID, active_chain, acknowledge_visible, resolve_origin
 from gateway.origin_outbox import get_pending
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ def persist_pending(outbox_path: str | Path, db_path: str | Path,
                 return False
             messages = history.get("messages")
             current = history.get("currentId")
-            if not isinstance(messages, dict) or not isinstance(current, str) or current not in messages:
+            if active_chain(messages, current) is None:
                 return False
             if event_id not in messages:
                 message = {"id": event_id, "parentId": current, "role": "assistant",

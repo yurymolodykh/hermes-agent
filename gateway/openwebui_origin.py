@@ -17,6 +17,29 @@ from typing import Mapping
 _CHAT_ID = re.compile(r"owui-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\Z")
 
 
+def active_chain(messages: dict, current: str) -> list[str] | None:
+    """Validate the complete active parent chain, refusing broken/cyclic histories."""
+    if not isinstance(messages, dict) or not isinstance(current, str):
+        return None
+    chain: list[str] = []
+    visited: set[str] = set()
+    while current not in visited:
+        message = messages.get(current)
+        if not isinstance(message, dict) or message.get("id") != current:
+            return None
+        visited.add(current)
+        chain.append(current)
+        if "parentId" not in message:
+            return None
+        parent = message["parentId"]
+        if parent is None:
+            return chain
+        if not isinstance(parent, str) or parent not in messages:
+            return None
+        current = parent
+    return None
+
+
 def resolve_origin(db_path: str | Path, profile: str, source: Mapping[str, object]) -> dict | None:
     """Resolve exact OWUI chat ownership; fail closed for missing DB/owner."""
     if not isinstance(source, Mapping) or source.get("platform") != "api_server":
@@ -88,19 +111,15 @@ def acknowledge_visible(outbox_path: str | Path, db_path: str | Path,
         if not isinstance(messages, dict):
             return False
         current = history.get("currentId")
-        visited = set()
-        while isinstance(current, str) and current in messages and current not in visited:
-            visited.add(current)
-            message = messages[current]
-            if not isinstance(message, dict):
-                return False
-            if current == event_id:
-                if (message.get("id") != event_id or message.get("role") != "assistant"
-                        or message.get("done") is not True
-                        or message.get("content") != pending["content"]):
-                    return False
-                return ack(outbox_path, event_id, resolved, f"openwebui:{event_id}")
-            current = message.get("parentId")
+        chain = active_chain(messages, current)
+        if chain is None or event_id not in chain:
+            return False
+        message = messages[event_id]
+        if (message.get("id") != event_id or message.get("role") != "assistant"
+                or message.get("done") is not True
+                or message.get("content") != pending["content"]):
+            return False
+        return ack(outbox_path, event_id, resolved, f"openwebui:{event_id}")
     except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
         return False
     return False

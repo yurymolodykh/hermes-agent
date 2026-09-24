@@ -39,6 +39,22 @@ def test_exact_owner_persistence_readback_ack_duplicate_and_restart(fixture):
     assert not persist_pending(outbox, db_path, origin, event)  # restart/replay: no second message
     assert read_chat(db_path) == chat
 
+def test_persistence_on_active_branch_preserves_sibling_branch(fixture):
+    db_path, outbox, origin, event = fixture
+    chat = read_chat(db_path)
+    sibling = {"id": "sibling", "parentId": "user-1", "role": "assistant",
+               "content": "other branch", "done": True}
+    chat["history"]["messages"]["sibling"] = sibling
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert persist_pending(outbox, db_path, origin, event)
+    updated = read_chat(db_path)
+    assert updated["history"]["messages"]["sibling"] == sibling
+    assert updated["history"]["messages"][event]["parentId"] == "user-1"
+    assert updated["history"]["currentId"] == event
+    assert status(outbox, event) == "acknowledged"
+
+
 def test_wrong_owner_and_chat_never_write(fixture):
     db_path, outbox, origin, event = fixture
     before = read_chat(db_path)
@@ -57,6 +73,23 @@ def test_crash_after_write_before_ack_is_recovered_without_duplicate(fixture, mo
     monkeypatch.undo()
     assert persist_pending(outbox, db_path, origin, event)
     assert read_chat(db_path) == written
+
+@pytest.mark.parametrize("invalid_parent", [
+    {"id": "DIFFERENT", "parentId": None, "role": "user"},
+    {"id": "user-1", "role": "user"},
+    {"id": "user-1", "parentId": "missing", "role": "user"},
+    {"id": "user-1", "parentId": "user-1", "role": "user"},
+])
+def test_malformed_active_parent_is_never_written_or_acknowledged(fixture, invalid_parent):
+    db_path, outbox, origin, event = fixture
+    with sqlite3.connect(db_path) as db:
+        chat = read_chat(db_path)
+        chat["history"]["messages"]["user-1"] = invalid_parent
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert not persist_pending(outbox, db_path, origin, event)
+    assert read_chat(db_path) == chat
+    assert status(outbox, event) == "pending"
+
 
 def test_corrupt_or_divergent_history_fails_closed(fixture):
     db_path, outbox, origin, event = fixture

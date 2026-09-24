@@ -30,10 +30,12 @@ leaves the machine.
   Future automatic binding needs an authenticated ingress principal mapped to
   the WebUI registry owner and a separate review of that trust boundary.
 * The privileged local writer uses `BEGIN IMMEDIATE` on the WebUI registry,
-  verifies exact owner and active history branch, appends a deterministic
-  assistant message, commits, reads back the exact persisted message and only
-  then ACKs the outbox. Concurrent retries are idempotent. No public write
-  endpoint and no credentials are introduced. Pending and exhausted records
+  verifies exact owner and the complete active history parent chain (including
+  matching IDs, existing ancestors and no cycles), appends a deterministic
+  assistant message without disturbing sibling branches, commits, reads back
+  the exact persisted active chain and only then ACKs the outbox. Concurrent
+  retries are idempotent. No public write endpoint and no credentials are
+  introduced. Pending and exhausted records
   remain in the outbox; retries back off exponentially and stop after a
   bounded number of attempts. `gateway.origin_outbox.counts(path)` reports
   `pending`, `acknowledged`, `failed`; `last_delivery_error` remains distinct
