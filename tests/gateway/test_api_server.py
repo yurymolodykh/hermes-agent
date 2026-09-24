@@ -2372,6 +2372,58 @@ class TestSessionIdHeader:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_wake_real_api_session_response_is_not_client_push(auth_adapter):
+    """A real HTTP API session accepts a wake on the same ID, but its reply
+    belongs to the notifier's request, not the owner's completed UI request."""
+    from gateway.wake import deliver_wake
+
+    calls = []
+    async def run_agent(**kwargs):
+        calls.append(kwargs)
+        return ({"final_response": f"reply-{len(calls)}", "messages": [],
+                 "session_id": kwargs["session_id"]},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    auth_adapter._run_agent = run_agent
+    server = TestServer(_create_app(auth_adapter))
+    async with TestClient(server) as client:
+        auth_adapter._host = "127.0.0.1"
+        auth_adapter._port = server.port
+        owner = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-secret", "X-Hermes-Session-Id": "origin-session"},
+            json={"model": "hermes-agent", "messages": [{"role": "user", "content": "start"}]},
+        )
+        owner_body = await owner.json()
+        assert owner_body["choices"][0]["message"]["content"] == "reply-1"
+        await deliver_wake(auth_adapter, session_id="origin-session", text="blocked question")
+        assert len(calls) == 2
+        assert calls[0]["session_id"] == calls[1]["session_id"] == "origin-session"
+        assert calls[1]["user_message"] == "blocked question"
+        # No asynchronous response is attached to the already-completed
+        # owner request; a success from self-post cannot acknowledge UI display.
+        assert "blocked question" not in str(owner_body)
+
+
+@pytest.mark.asyncio
+async def test_wake_real_api_soft_failure_raises(auth_adapter):
+    from gateway.wake import deliver_wake
+
+    async def failed_agent(**kwargs):
+        return ({"final_response": "partial", "failed": True, "completed": False,
+                 "error": "provider down", "session_id": kwargs["session_id"]},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    auth_adapter._run_agent = failed_agent
+    server = TestServer(_create_app(auth_adapter))
+    async with TestClient(server):
+        auth_adapter._host = "127.0.0.1"
+        auth_adapter._port = server.port
+        with pytest.raises(RuntimeError, match="agent turn incomplete"):
+            await deliver_wake(auth_adapter, session_id="origin-session", text="blocked question")
+
+
 class TestSessionKeyHeader:
     """The session key is a stable per-channel identifier that scopes
     long-term memory (e.g. Honcho) independently of the transcript-scoped

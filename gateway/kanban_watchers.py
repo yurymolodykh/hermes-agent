@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -530,6 +531,41 @@ class GatewayKanbanWatchersMixin:
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
+                    # An API self-post is a separate HTTP request: even a
+                    # successful agent response is returned to the notifier,
+                    # not to the owner's OpenWebUI browser. Keep provider-choice
+                    # questions pending until a real client delivery/ack path
+                    # exists; never spend another agent turn for the same
+                    # undeliverable event on every notifier tick.
+                    _choice_events = [
+                        ev for ev in d["events"]
+                        if ev.kind == "blocked" and ev.payload
+                        and ev.payload.get("provider_route")
+                    ]
+                    _api_choice = platform_str == "api_server" and bool(_choice_events)
+                    if _api_choice:
+                        from hermes_cli import kanban_db as _kb
+                        def _pending_choice() -> bool:
+                            with _kb.connect(board=board_slug) as conn:
+                                for row in conn.execute(
+                                    "SELECT payload FROM task_events WHERE task_id=? "
+                                    "AND kind='delivery_pending'",
+                                    (sub["task_id"],),
+                                ):
+                                    try:
+                                        info = json.loads(row["payload"] or "{}")
+                                    except (ValueError, TypeError):
+                                        continue
+                                    if (info.get("source_event_id") in [ev.id for ev in _choice_events]
+                                            and info.get("destination") == sub["chat_id"]):
+                                        return True
+                            return False
+                        if await asyncio.to_thread(_pending_choice):
+                            await _to_thread_process_service(
+                                self._kanban_rewind, sub, d["cursor"],
+                                d.get("old_cursor", 0), board_slug,
+                            )
+                            continue
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
                     # ``else`` clause) needs it even when every event in the
@@ -859,6 +895,40 @@ class GatewayKanbanWatchersMixin:
                                     text=_synth,
                                     session_id=_session_key,
                                 )
+                                if _api_choice:
+                                    # The completion went to this notifier's
+                                    # HTTP client, NOT to the OpenWebUI owner.
+                                    # No browser delivery receipt exists on
+                                    # this non-push transport. Rewind first
+                                    # (fail-safe on interruption), then leave
+                                    # one durable escalation per destination.
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind, sub, d["cursor"],
+                                        d.get("old_cursor", 0), board_slug,
+                                    )
+                                    def _record_pending_choice() -> None:
+                                        conn = _kb.connect(board=board_slug)
+                                        try:
+                                            with _kb.write_txn(conn):
+                                                for event in _choice_events:
+                                                    _kb._append_event(
+                                                        conn, sub["task_id"], "delivery_pending",
+                                                        {"reason": "api_server is non-push; self-post "
+                                                         "does not confirm display in the owner's "
+                                                         "OpenWebUI chat. Operator must inspect the "
+                                                         "blocked task and answer explicitly.",
+                                                         "source_event_id": event.id,
+                                                         "destination": sub["chat_id"]},
+                                                    )
+                                        finally:
+                                            conn.close()
+                                    await asyncio.to_thread(_record_pending_choice)
+                                    logger.error(
+                                        "kanban notifier: question for %s remains delivery_pending "
+                                        "on api_server/%s; self-post is not client delivery",
+                                        sub["task_id"], sub["chat_id"],
+                                    )
+                                    continue
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,

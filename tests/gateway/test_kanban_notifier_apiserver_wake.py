@@ -9,6 +9,7 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+import json
 import subprocess
 import sys
 
@@ -143,7 +144,22 @@ def test_provider_outage_wakes_origin_with_full_operator_question(tmp_path, monk
     assert "letovo/deepseek-v4-flash" in text
     assert "доступность и качество альтернативы не подтверждены" in text
     assert "Без вашего явного ответа переключения не будет" in text
-    assert _unseen_terminal_events(tid, "api_server", "owner-session") == []
+    assert _unseen_terminal_events(tid, "api_server", "owner-session"), (
+        "a separate self-post response is not visible in the owner's browser"
+    )
+    with kb.connect() as conn:
+        pending = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='delivery_pending'",
+            (tid,),
+        ).fetchall()
+        assert len(pending) == 1
+        marker = json.loads(pending[0]["payload"])
+        assert "non-push" in marker["reason"]
+        assert marker["destination"] == "owner-session"
+        assert isinstance(marker["source_event_id"], int)
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(posts) == 1, "pending question must not spawn repeated invisible agent turns"
 
 
 def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, monkeypatch):
