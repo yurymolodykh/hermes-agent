@@ -20,7 +20,15 @@ leaves the machine.
   reviewed the particular archived origin, not that the chat id is a secret.
   A Kanban subscription must already carry the matching server-owned
   `user_id` and the correct `notifier_profile`; absent/mismatched ownership
-  retains its cursor and never creates a delivery.
+  retains its cursor and never creates a delivery. The generic API-server
+  ingress binds a request-scoped session id but does **not** authenticate an
+  Open WebUI owner into `HERMES_SESSION_USER_ID`. Kanban task creation therefore
+  reports `subscribed=false` for API-server sessions (including an injected
+  user-id claim), rather than persisting an unbound subscription. An
+  operator-provisioned, independently verified server-owned subscription can
+  still be processed by the opt-in worker; this is not an automatic WebUI route.
+  Future automatic binding needs an authenticated ingress principal mapped to
+  the WebUI registry owner and a separate review of that trust boundary.
 * The privileged local writer uses `BEGIN IMMEDIATE` on the WebUI registry,
   verifies exact owner and active history branch, appends a deterministic
   assistant message, commits, reads back the exact persisted message and only
