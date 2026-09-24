@@ -23,6 +23,8 @@ def resolve_origin(db_path: str | Path, profile: str, source: Mapping[str, objec
         return None
     if not isinstance(profile, str) or not profile.strip():
         return None
+    if source.get("profile") is not None and source.get("profile") != profile:
+        return None
     chat_id = source.get("chat_id")
     match = _CHAT_ID.fullmatch(chat_id) if isinstance(chat_id, str) else None
     if not match or source.get("thread_id") is not None:

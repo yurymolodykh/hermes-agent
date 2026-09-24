@@ -2875,6 +2875,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
             for t in api_targets
         ):
             return "api_server origin delivery failed: missing or mismatched origin/source event"
+        # Legacy OWUI jobs predate server-owned user/session binding. Only an
+        # operator-configured local chat registry may rebind them; never trust
+        # request headers or route through a home chat. If configured, it also
+        # verifies already-bound origins against the real chat owner.
+        registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH", "")
+        if registry:
+            from hermes_cli.profiles import get_active_profile_name
+            from gateway.openwebui_origin import resolve_origin
+            origin = resolve_origin(registry, get_active_profile_name(), origin)
+            if origin is None:
+                return "api_server origin delivery failed: no server-owned Open WebUI chat binding"
         try:
             event = enqueue(
                 get_hermes_home() / "delivery-outbox.sqlite",
