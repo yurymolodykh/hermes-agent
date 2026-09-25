@@ -12729,8 +12729,416 @@ def rewind_notify_cursor(
 
 
 # ---------------------------------------------------------------------------
-# Retention + garbage collection
+# Branch summary (короткий итог ветки)
 # ---------------------------------------------------------------------------
+# When EVERY task of a Kanban branch is closed (a subscribed root placed from a
+# channel + all its descendants via task_links), the gateway notifier delivers
+# ONE short message to the root's originating channel: «✅ Задача выполнена» /
+# «❌ Задача не выполнена (нужен фикс): <id:title>». Delivery is additive —
+# the existing per-event terminal notifications stay untouched (unless
+# ``kanban.branch_summary_replace: true``).
+#
+# Once-only state is a ``branch_summary`` event row on the ROOT task in
+# ``task_events`` (payload holds the итог + per-channel delivery acks). No new
+# table, no schema migration. ``kind='branch_summary'`` is intentionally NOT
+# part of the notifier's TERMINAL_KINDS (it would cause delivery
+# duplication/looping) and never moves a subscription cursor.
+BRANCH_SUMMARY_KIND = "branch_summary"
+# Terminal success = status ∈ {done, archived}.
+BRANCH_TERMINAL_SUCCESS = frozenset({"done", "archived"})
+# Terminal failure = the task "gave up" — the retry circuit breaker tripped and
+# a ``gave_up`` event was emitted (the task's status then flips to ``blocked``,
+# see kanban_db._record_task_failure), OR the task is ``blocked`` in a way that
+# needs a human FIX (block_kind needs_input / capability / legacy NULL).
+# ``blocked`` with an auto-resolving kind (dependency / transient) is NOT
+# terminal: the dispatcher or dependency-gating will move it on its own, so the
+# branch must stay silent.
+BRANCH_TERMINAL_FAILURE_KIND = "gave_up"
+# block_kind values whose ``blocked`` status is a terminal branch failure.
+_BRANCH_FAIL_BLOCK_KINDS = frozenset({"needs_input", "capability"})
+# block_kind values whose ``blocked`` status is self-resolving (branch open).
+_BRANCH_OPEN_BLOCK_KINDS = frozenset({"dependency", "transient"})
+# Node outcome tri-state:
+#   "ok"   -> done / archived
+#   "fail" -> gave_up event, or blocked with a needs-a-fix block_kind
+#   "open" -> todo/ready/running/review/triage/scheduled, or blocked with an
+#             auto-resolving block_kind, or a dangling task_links edge
+SA_BRANCH_NODE_OK = "ok"
+SA_BRANCH_NODE_FAIL = "fail"
+SA_BRANCH_NODE_OPEN = "open"
+
+
+def classify_branch_node_status(
+    status: Optional[str], block_kind: Optional[str],
+) -> str:
+    """Classify ONE node for the whole-branch summary.
+
+    ``"ok"``  — done / archived.
+    ``"fail"`` — the retry guard tripped (breaker: the task gave up and a
+        ``gave_up`` event exists — the status then reads ``blocked``) or the
+        task is explicitly blocked waiting on a human FIX (block_kind
+        needs_input / capability, or a legacy un-typed ``None`` block).
+    ``"open"`` — anything else (todo/ready/running/review/triage/scheduled, a
+        ``blocked`` task whose block_kind is auto-resolving (dependency /
+        transient — a human fix or a dependency completion will resolve it)).
+    """
+    status = str(status or "").strip()
+    if status in BRANCH_TERMINAL_SUCCESS:
+        return SA_BRANCH_NODE_OK
+    if status == "gave_up":
+        # Spec lists ``status ∈ {gave_up}`` as terminal failure. In practice
+        # a breaker-tripped task flips to ``blocked`` (branch_state detects it
+        # via the ``gave_up`` event) — this guard is belt-and-braces for any
+        # path that stores the literal status.
+        return SA_BRANCH_NODE_FAIL
+    if status == "blocked":
+        kind = str(block_kind or "").strip()
+        if kind in _BRANCH_OPEN_BLOCK_KINDS:
+            return SA_BRANCH_NODE_OPEN
+        return SA_BRANCH_NODE_FAIL
+    # todo / ready / running / review / triage / scheduled / gave_up-as-status /
+    # crashed / timed_out / unknown — someone (dispatcher, parent-gating, human)
+    # is still expected to move the node. Branch stays open.
+    return SA_BRANCH_NODE_OPEN
+
+
+def get_descendant_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Return all descendants of ``task_id`` via ``task_links`` (transitive closure).
+
+    Excludes the task itself. A node with several parents is returned for EACH
+    ancestor branch — branch-итог is still sent once per root (the notifier
+    keys once-only state on the root, not on shared descendants).
+    """
+    seen: set[str] = set()
+    stack = [task_id]
+    while stack:
+        node = stack.pop()
+        rows = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (node,)
+        ).fetchall()
+        for row in rows:
+            child = row["child_id"]
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    seen.discard(task_id)
+    return seen
+
+
+def get_ancestor_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Return all ancestors of ``task_id`` via ``task_links`` (transitive closure).
+
+    Excludes the task itself. Cycle-safe (task_links can never contain a
+    cycle — ``link_tasks`` rejects them — but the guard keeps the walk
+    defensive against corrupt data).
+    """
+    seen: set[str] = set()
+    stack = [task_id]
+    while stack:
+        node = stack.pop()
+        rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (node,)
+        ).fetchall()
+        for row in rows:
+            parent = row["parent_id"]
+            if parent not in seen:
+                seen.add(parent)
+                stack.append(parent)
+    seen.discard(task_id)
+    return seen
+
+
+def subscribed_branch_roots(conn: sqlite3.Connection) -> list[str]:
+    """Return subscribed tasks that are roots of a Kanban branch.
+
+    A branch root is a task that (a) has at least one ``kanban_notify_subs``
+    row AND (b) has NO parent with a subscription. When a subscription owner
+    itself has a subscribed parent, it belongs to the higher branch — we walk
+    up until we find the subscribed task with no subscribed parent (that task
+    owns the branch итог for the whole subtree). This mirrors the orchestrator
+    rule: "выбрать ту, у которой НЕТ родителя с подпиской (иначе искать выше)".
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT task_id FROM kanban_notify_subs ORDER BY task_id"
+    ).fetchall()
+    subscribed = {row["task_id"] for row in rows}
+    if not subscribed:
+        return []
+    roots: list[str] = []
+    for task_id in subscribed:
+        ancestors = get_ancestor_ids(conn, task_id)
+        if not (ancestors & subscribed):
+            roots.append(task_id)
+    return sorted(roots)
+
+
+def _task_ids_with_gave_up_event(
+    conn: sqlite3.Connection, task_ids: Iterable[str],
+) -> set[str]:
+    """Return the subset of ``task_ids`` that ever emitted a ``gave_up`` event."""
+    ids = sorted(set(str(i) for i in task_ids if i))
+    if not ids:
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT DISTINCT task_id FROM task_events "
+        f"WHERE task_id IN ({placeholders}) AND kind = ?",
+        (*ids, BRANCH_TERMINAL_FAILURE_KIND),
+    ).fetchall()
+    return {row["task_id"] for row in rows}
+
+
+def branch_state(
+    conn: sqlite3.Connection, root_id: str,
+) -> Optional[dict]:
+    """Classify a branch rooted at ``root_id``: ``success`` / ``failure`` / open.
+
+    Branch = root + transitive descendants. Fixed default semantics (agreed by
+    the orchestrator — the summary is sent only when the WHOLE branch is
+    terminal):
+
+    * success when EVERY node is terminal-success (status ∈ {done, archived});
+    * failure when ≥1 node is terminal-failure and NO node is open:
+      a ``gave_up`` event exists for the node (breaker tripped) regardless of
+      its ``block_kind``, OR the node is ``blocked`` with a needs-a-fix
+      ``block_kind`` (needs_input / capability) or a legacy un-typed (NULL)
+      block;
+    * open (returns ``None``, nothing to send) while any node is non-terminal:
+      todo, ready, running, review, triage, scheduled, a ``blocked`` node
+      whose block_kind is auto-resolving (dependency / transient), crashed,
+      timed_out, or a dangling task_links edge to a missing task.
+
+    Returns ``None`` for an open branch, else::
+
+        {"outcome": "success"|"failure",
+         "failed": [(task_id, title), ...],
+         "fingerprint": <deterministic close-state fingerprint>}
+
+    The fingerprint identifies the exact close-state (status AND block_kind per
+    node). The once-only marker is compared against it so repeat ticks /
+    restarts never duplicate a delivered итог. A reopen → re-close clears the
+    marker while the branch is open, so a fresh итог is sent again.
+    """
+    node_ids = {root_id} | get_descendant_ids(conn, root_id)
+    ordered = sorted(node_ids)
+    placeholders = ", ".join("?" * len(ordered))
+    rows = conn.execute(
+        "SELECT id, title, status, block_kind FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ordered,
+    ).fetchall()
+    row_by_id = {row["id"]: row for row in rows}
+    # A child edge that points at a missing task must keep the branch open
+    # (never count a phantom node as closed).
+    if len(row_by_id) != len(ordered):
+        return None
+    gave_up_ids = _task_ids_with_gave_up_event(conn, ordered)
+    failed: list[tuple[str, str]] = []
+    for nid in ordered:
+        row = row_by_id[nid]
+        status = str(row["status"] or "").strip()
+        block_kind = str(row["block_kind"] or "").strip() or None
+        if status in BRANCH_TERMINAL_SUCCESS:
+            continue
+        # Breaker trip is terminal even if block_kind still carries an
+        # auto-resolving value (blocked(transient) -> retry -> gave_up).
+        if nid in gave_up_ids:
+            failed.append((nid, row["title"] or ""))
+            continue
+        cls = classify_branch_node_status(status, block_kind)
+        if cls == SA_BRANCH_NODE_FAIL:
+            failed.append((nid, row["title"] or ""))
+        elif cls == SA_BRANCH_NODE_OPEN:
+            return None
+    fingerprint = json.dumps(
+        [
+            (
+                nid,
+                str(row_by_id[nid]["status"] or "").strip(),
+                str(row_by_id[nid]["block_kind"] or "").strip() or None,
+            )
+            for nid in ordered
+        ],
+        ensure_ascii=False,
+    )
+    if failed:
+        return {"outcome": "failure", "failed": failed, "fingerprint": fingerprint}
+    return {"outcome": "success", "failed": [], "fingerprint": fingerprint}
+
+
+def has_branch_summary(conn: sqlite3.Connection, root_id: str) -> Optional[dict]:
+    """Return the most recent ``branch_summary`` payload for ``root_id``, else None.
+
+    Payload fields (written by the notifier): ``fingerprint`` (branch close
+    state), ``outcome``, ``failed``, ``message``, ``sent`` (sub keys already
+    delivered) and ``done`` (bool — every routed channel got the итог). The
+    returned dict also carries ``_event_id`` for the underlying task_events row.
+    """
+    row = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (root_id, BRANCH_SUMMARY_KIND),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("_event_id", int(row["id"]))
+    return payload
+
+
+def mark_branch_summary(
+    conn: sqlite3.Connection, root_id: str, payload: dict,
+) -> int:
+    """Append a ``branch_summary`` event to ``root_id``; return the new event id.
+
+    The marker must be created on a WRITABLE connection (opens its own
+    ``write_txn``); it deliberately does not touch any subscription cursor.
+    The notifier only marks roots whose branch is terminal AND unmarked — the
+    marker IS the once-only claim.
+    """
+    with write_txn(conn):
+        _append_event(conn, root_id, BRANCH_SUMMARY_KIND, payload)
+        event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    return event_id
+
+
+def clear_branch_summary(conn: sqlite3.Connection, root_id: str) -> int:
+    """Delete every ``branch_summary`` marker event of ``root_id``.
+
+    Returns the number of rows removed. Called when the branch becomes open
+    again after a delivered итог (a node was reactivated), so the next full
+    close re-sends the summary — and by the notifier to discard a stale claim
+    (fingerprint changed without the branch passing through open).
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
+            (root_id, BRANCH_SUMMARY_KIND),
+        )
+    return int(cur.rowcount or 0)
+
+
+def branch_summary_message(
+    outcome: str, failed: Iterable[tuple[str, str]],
+) -> str:
+    """Compile the SHORT channel message for a terminal branch.
+
+    Success: ``✅ Задача выполнена``. Failure: ``❌ Задача не выполнена
+    (нужен фикс): <id:title>[, <id2:title2>…]`` — capped at 3 failing nodes
+    with an ``(+N ещё)`` tail so the message stays one line.
+    """
+    if outcome != "failure":
+        return "✅ Задача выполнена"
+    parts = [f"{task_id}:{title[:80]}" for task_id, title in failed]
+    shown = parts[:3]
+    tail = f" (+{len(parts) - 3} ещё)" if len(parts) > 3 else ""
+    return "❌ Задача не выполнена (нужен фикс): " + ", ".join(shown) + tail
+
+
+def branch_summary_channel_key(
+    platform: str, chat_id: str, thread_id: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """Stable per-channel key for the marker's ``delivered``/``sent`` list."""
+    return (
+        str(platform or "").lower(),
+        str(chat_id or ""),
+        str(thread_id or ""),
+    )
+
+
+def branch_summary_delivered_set(payload: Optional[dict]) -> set:
+    """Return the set of already-delivered channel keys in a marker payload."""
+    if not isinstance(payload, dict):
+        return set()
+    delivered = payload.get("delivered") or payload.get("sent") or []
+    out: set = set()
+    for item in delivered:
+        try:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                out.add(
+                    branch_summary_channel_key(item[0], item[1], item[2] if len(item) > 2 else None)
+                )
+            elif isinstance(item, dict):
+                out.add(
+                    branch_summary_channel_key(
+                        item.get("platform"), item.get("chat_id"), item.get("thread_id"),
+                    )
+                )
+        except Exception:
+            continue
+    return out
+
+
+def branch_summary_pending_subs(
+    payload: Optional[dict], subs: Iterable[Mapping[str, Any]],
+) -> list[dict]:
+    """Return the subs of a root whose channel has not yet received the итог.
+
+    Handles both payload shapes: a list-of-tuples ``delivered``/``sent`` or
+    legacy list-of-dicts (``platform``/``chat_id``/``thread_id``).
+    """
+    delivered = branch_summary_delivered_set(payload)
+    pending: list[dict] = []
+    for sub in subs:
+        key = branch_summary_channel_key(
+            sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"),
+        )
+        if key not in delivered:
+            pending.append(sub)
+    return pending
+
+
+def ack_branch_summary_channel(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[int]:
+    """Record one channel as delivered inside the root's marker payload.
+
+    The marker payload's ``delivered`` list is a per-channel once-only ack:
+    a repeated tick (or a retry after a partial delivery) never re-sends the
+    итог to an already-acked channel. Idempotent — a second ack for the same
+    channel is a no-op. Returns the updated marker event id, or ``None`` when
+    no marker exists (nothing to ack).
+    """
+    key = list(branch_summary_channel_key(platform, chat_id, thread_id))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (root_id, BRANCH_SUMMARY_KIND),
+        ).fetchone()
+        if row is None or not row["payload"]:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        delivered = [
+            list(item) if isinstance(item, (list, tuple)) else
+            [item.get("platform"), item.get("chat_id"), item.get("thread_id")]
+            for item in (payload.get("delivered") or payload.get("sent") or [])
+        ]
+        if key not in delivered:
+            delivered.append(key)
+        payload["delivered"] = delivered
+        payload.pop("sent", None)
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+        )
+        return int(row["id"])
+
 
 def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
@@ -12738,13 +13146,21 @@ def gc_events(
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    history.
+
+    ``branch_summary`` markers are excluded: they are the once-only state of a
+    delivered branch итог. Pruning them would make the notifier treat a still-
+    closed branch as undelivered and re-send the итог on a later tick. They are
+    tiny (one short row per branch close) and belong to terminal roots, so the
+    retention cost is negligible.
+    """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind != ? "
+            "AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
-            (cutoff,),
+            (cutoff, BRANCH_SUMMARY_KIND),
         )
     return int(cur.rowcount or 0)
 

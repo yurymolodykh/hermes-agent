@@ -74,6 +74,24 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def _kanban_branch_summary_replace() -> bool:
+    """Return whether ``kanban.branch_summary_replace`` is enabled.
+
+    When enabled, the notifier suppresses the INDIVIDUAL per-task terminal
+    pings for every task that is a strict descendant of a subscribed branch
+    root (the branch итог delivered by ``_kanban_branch_summary_watcher`` is
+    the single channel message). Default ``False``: the branch итог is ADDED
+    on top of the existing per-event notifications, which stay untouched.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_cfg
+        _cfg = _load_cfg() or {}
+        _kanban_cfg = _cfg.get("kanban") or {}
+        return bool(_kanban_cfg.get("branch_summary_replace", False))
+    except Exception:
+        return False
+
+
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
@@ -449,6 +467,8 @@ class GatewayKanbanWatchersMixin:
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+                            replace_summary = _kanban_branch_summary_replace()
+                            subscribed_ids = {str(sub.get("task_id")) for sub in subs}
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
@@ -478,9 +498,24 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # branch_summary_replace mode: tasks that
+                                    # are a strict descendant of a subscribed
+                                    # branch root have their individual pings
+                                    # suppressed — the whole-branch итог
+                                    # (delivered by
+                                    # _kanban_branch_summary_watcher) is the
+                                    # single channel message. compute once per
+                                    # subscription.
+                                    silent = False
+                                    if replace_summary:
+                                        silent = any(
+                                            pid in subscribed_ids
+                                            for pid in _kb.parent_ids(conn, sub["task_id"])
+                                        )
                                     logger.debug(
-                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
+                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
+                                        " (silent: branch_summary_replace)" if silent else "",
                                     )
                                     deliveries.append({
                                         "sub": sub,
@@ -489,6 +524,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "silent": silent,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -557,6 +593,12 @@ class GatewayKanbanWatchersMixin:
                     # terminal event goes through the persisted chat outbox.
                     wake_agent = mode in ("notify+wake", "wake") and platform_str != "api_server"
                     send_passive = mode != "wake" or platform_str == "api_server"
+                    if d.get("silent"):
+                        # branch_summary_replace: nothing to send or wake for
+                        # this subscription — the branch итог is the single
+                        # channel message. Cursor still advances below.
+                        wake_agent = False
+                        send_passive = False
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -564,6 +606,11 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        if d.get("silent") and kind in TERMINAL_KINDS:
+                            # Suppressed in branch_summary_replace mode. The
+                            # event is claimed so the cursor advances below and
+                            # it can never replay/wedge the sub.
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -1109,6 +1156,432 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    async def _kanban_branch_summary_watcher(self, interval: float = 45.0) -> None:
+        """Deliver ONE short branching result (итог) when a whole branch closes.
+
+        For every subscribed branch root (a task with a ``kanban_notify_subs``
+        row whose ancestors have no subscription) the tick expands the
+        transitive ``task_links`` subtree and, when the WHOLE branch is
+        terminal, sends a single short message to the root's originating
+        channel(s): ``✅ Задача выполнена`` / ``❌ Задача не выполнена (нужен
+        фикс): <id:title>``.
+
+        Once-only state is a ``branch_summary`` event row on the ROOT task
+        (``task_events``) whose payload holds the итог + a per-channel
+        ``delivered`` ack list — entirely outside the subscription cursor
+        machinery, so this stage never moves or conflicts with per-sub
+        cursors (see kanban_db.branch_state / mark_branch_summary /
+        ack_branch_summary_channel).
+
+        A node reopening after the итог (done→running and so on) makes the
+        branch non-terminal again → the marker is cleared and the next full
+        close re-sends a fresh итог.
+
+        Default semantics: the итог is ADDITIVE — the existing per-task
+        terminal pings keep flowing. With ``kanban.branch_summary_replace:
+        true`` the notifier suppresses the individual descendant pings and the
+        итог is the single channel message.
+
+        Cadence is a separate ~45s supervised tick (deliberately NOT inside
+        the 5s notifier loop: the per-subscription cursor machinery stays
+        untouched, and the subtree scan must not add latency to event
+        delivery).
+        """
+        from gateway.config import Platform as _Platform
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban branch summary: kanban_db not importable; disabled")
+            return
+
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            notifier_profile = self._active_profile_name()
+            self._kanban_notifier_profile = notifier_profile
+
+        # Per-(root, channel) delivery-failure counter. A permanently broken
+        # chat must not spin forever inside a 45s tick; after MAX consecutive
+        # failures the channel is acked anyway and dropped (an ERROR is
+        # logged). Resets on a successful delivery.
+        MAX_FAILURES = 12
+        fail_counts: dict[tuple, int] = getattr(
+            self, "_kanban_branch_summary_fail_counts", {}
+        )
+        self._kanban_branch_summary_fail_counts = fail_counts
+
+        # Let the gateway finish wiring adapters + the notifier take its first
+        # pass before branch scanning starts.
+        await asyncio.sleep(10)
+
+        while self._running:
+            try:
+                def _collect():
+                    plans: list[dict] = []
+                    reactivated: list[tuple[str, str, int]] = []
+                    include_unowned = self._owns_kanban_dispatcher_lock()
+                    notifier_profiles = {notifier_profile}
+                    notifier_profiles.update(
+                        str(profile).strip()
+                        for profile in getattr(self, "_profile_adapters", {})
+                        if str(profile).strip()
+                    )
+                    active_platforms = {
+                        getattr(platform, "value", str(platform)).lower()
+                        for platform in self.adapters.keys()
+                    }
+                    for _profile_adapter_map in getattr(self, "_profile_adapters", {}).values():
+                        active_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in _profile_adapter_map.keys()
+                        )
+                    if not active_platforms:
+                        return plans, reactivated
+                    try:
+                        boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    seen_db_paths: set[str] = set()
+                    for board_meta in boards:
+                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        db_path = board_meta.get("db_path")
+                        try:
+                            resolved_db_path = (
+                                str(Path(db_path).expanduser().resolve())
+                                if db_path else str(_kb.kanban_db_path(slug).resolve())
+                            )
+                        except Exception:
+                            resolved_db_path = f"slug:{slug}"
+                        if resolved_db_path in seen_db_paths:
+                            continue
+                        seen_db_paths.add(resolved_db_path)
+                        try:
+                            if _kb.count_notify_subs(
+                                board=slug,
+                                notifier_profiles=notifier_profiles,
+                                include_unowned=include_unowned,
+                            ) == 0:
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            conn = _kb.connect(board=slug)
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban branch summary: cannot open board %s: %s",
+                                slug, exc,
+                            )
+                            continue
+                        try:
+                            subs = _kb.list_notify_subs(
+                                conn,
+                                notifier_profiles=notifier_profiles,
+                                include_unowned=include_unowned,
+                            )
+                            if not subs:
+                                continue
+                            # Only branch ROOTS may own a branch итог: the
+                            # topmost subscribed task of a subtree (see
+                            # kanban_db.subscribed_branch_roots).
+                            roots = _kb.subscribed_branch_roots(conn)
+                            subs_by_task: dict[str, list[dict]] = {}
+                            for sub in subs:
+                                subs_by_task.setdefault(
+                                    str(sub.get("task_id")), []
+                                ).append(sub)
+                            for root_id in roots:
+                                # A channel subscribed to ANY task of the
+                                # branch must receive the итог — in
+                                # ``kanban.branch_summary_replace`` mode its
+                                # individual per-node pings are suppressed, so
+                                # the whole-branch message is its only
+                                # notification. Collect every sub whose task
+                                # lies in the root's subtree, deduped by
+                                # (platform, chat_id, thread_id) so a channel
+                                # subscribed to both a node and its ancestor
+                                # still receives exactly ONE message.
+                                node_ids = {root_id} | _kb.get_descendant_ids(
+                                    conn, root_id
+                                )
+                                root_subs: list[dict] = []
+                                seen_channels: set[tuple] = set()
+                                for tid in node_ids:
+                                    for sub in subs_by_task.get(tid, []):
+                                        chan_key = _kb.branch_summary_channel_key(
+                                            sub.get("platform"),
+                                            sub.get("chat_id"),
+                                            sub.get("thread_id"),
+                                        )
+                                        if chan_key in seen_channels:
+                                            continue
+                                        seen_channels.add(chan_key)
+                                        root_subs.append(sub)
+                                if not root_subs:
+                                    continue
+                                # Only roots with ≥1 locally-deliverable sub
+                                # are scanned; another gateway owns the rest.
+                                if not any(
+                                    (str(sub.get("platform") or "").lower() in active_platforms)
+                                    for sub in root_subs
+                                ):
+                                    continue
+                                try:
+                                    plan = self._plan_branch_summary(
+                                        conn, root_id, root_subs, slug,
+                                    )
+                                    if plan is None:
+                                        continue
+                                    if plan.get("reactivated"):
+                                        reactivated.append(
+                                            (root_id, slug, plan.get("cleared", 0))
+                                        )
+                                        continue
+                                    plans.append(plan)
+                                except Exception as exc:
+                                    logger.warning(
+                                        "kanban branch summary: plan for root %s on board %s failed: %s",
+                                        root_id, slug, exc,
+                                    )
+                                    continue
+                        finally:
+                            conn.close()
+                    return plans, reactivated
+
+                plans, reactivated = await asyncio.to_thread(_collect)
+                for root_id, slug, cleared in reactivated:
+                    logger.info(
+                        "kanban branch summary: branch %s on board %s re-opened "
+                        "(cleared %d summary marker(s)); a fresh итог will be "
+                        "sent on the next full close",
+                        root_id, slug, cleared,
+                    )
+                for plan in plans:
+                    root_id = plan["root_id"]
+                    board_slug = plan["board"]
+                    for sub in plan["pending"]:
+                        sub_key = (
+                            root_id, (sub.get("platform") or "").lower(),
+                            sub.get("chat_id"), sub.get("thread_id") or "",
+                        )
+                        try:
+                            ok = await self._deliver_branch_summary(
+                                plan, sub, notifier_profile,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban branch summary: delivery failed for %s on "
+                                "%s/%s: %s",
+                                root_id, sub.get("platform"), sub.get("chat_id"), exc,
+                            )
+                            ok = False
+                        if ok:
+                            fail_counts.pop(sub_key, None)
+                        else:
+                            n = fail_counts.get(sub_key, 0) + 1
+                            fail_counts[sub_key] = n
+                            if n >= MAX_FAILURES:
+                                # Permanent failure: drop the channel by
+                                # acking it so the marker completes and the
+                                # tick stops hammering it. The individual
+                                # (non-summary) notifier is unaffected.
+                                await _to_thread_process_service(
+                                    self._ack_branch_summary,
+                                    board_slug, root_id,
+                                    (sub.get("platform") or "").lower(),
+                                    sub.get("chat_id"),
+                                    sub.get("thread_id") or "",
+                                )
+                                logger.error(
+                                    "kanban branch summary: dropping channel "
+                                    "%s/%s for root %s after %d consecutive "
+                                    "delivery failures (итог not delivered there)",
+                                    sub.get("platform"), sub.get("chat_id"),
+                                    root_id, n,
+                                )
+                                fail_counts.pop(sub_key, None)
+            except Exception as exc:
+                logger.warning("kanban branch summary tick failed: %s", exc)
+            # Sleep with cancellation checks.
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    def _plan_branch_summary(
+        self,
+        conn, root_id: str, root_subs: list[dict], board_slug: str,
+    ) -> Optional[dict]:
+        """Decide + claim the branch итог for ONE root (runs in a thread).
+
+        Returns ``None`` when the root has nothing to do this tick; a dict
+        describing a fresh/resumed delivery otherwise. Marker mutations are
+        atomic per-root (``mark_branch_summary`` opens its own write txn), so
+        concurrent gateways cannot double-deliver a fresh итог.
+        """
+        from hermes_cli import kanban_db as _kb
+        st = _kb.branch_state(conn, root_id)
+        if st is None:
+            # Branch is open. If a marker from a previous close lingers, clear
+            # it so the next full close re-sends the итог.
+            if _kb.has_branch_summary(conn, root_id) is not None:
+                cleared = _kb.clear_branch_summary(conn, root_id)
+                return {"reactivated": True, "cleared": cleared, "root_id": root_id}
+            return None
+        outcome = st["outcome"]
+        msg = _kb.branch_summary_message(outcome, st["failed"])
+        marker = _kb.has_branch_summary(conn, root_id)
+        if marker is not None and marker.get("fingerprint") == st["fingerprint"]:
+            # Already claimed for this exact close-state: only channels not
+            # yet acked (partial delivery, or a newly added subscription) need
+            # the итог this tick.
+            pending = _kb.branch_summary_pending_subs(marker, root_subs)
+            if not pending:
+                return None
+            return {
+                "root_id": root_id,
+                "board": board_slug,
+                "subs": root_subs,
+                "pending": pending,
+                "outcome": outcome,
+                "msg": msg,
+                "marker_id": marker.get("_event_id"),
+                "fingerprint": st["fingerprint"],
+            }
+        if marker is not None:
+            # Close-state changed without passing through open (e.g. a blocked
+            # node was archived directly). Discard the stale claim and re-mark.
+            _kb.clear_branch_summary(conn, root_id)
+        payload = {
+            "fingerprint": st["fingerprint"],
+            "outcome": outcome,
+            "failed": [{"id": tid, "title": title} for tid, title in st["failed"]],
+            "message": msg,
+            "delivered": [],
+            "root": root_id,
+            "board": board_slug,
+        }
+        marker_id = _kb.mark_branch_summary(conn, root_id, payload)
+        return {
+            "root_id": root_id,
+            "board": board_slug,
+            "subs": root_subs,
+            "pending": list(root_subs),
+            "outcome": outcome,
+            "msg": msg,
+            "marker_id": marker_id,
+            "fingerprint": st["fingerprint"],
+        }
+
+    async def _deliver_branch_summary(
+        self, plan: dict, sub: dict, notifier_profile: str,
+    ) -> bool:
+        """Send one branch итог to one subscription channel.
+
+        Returns True when delivered (or the channel is intentionally dropped),
+        False when the channel should stay pending for a later tick. On
+        success the channel is acked inside the marker payload so repeated
+        ticks never re-send it.
+        """
+        from hermes_cli import kanban_db as _kb
+        from gateway.config import Platform as _Platform
+        board = plan["board"]
+        root_id = plan["root_id"]
+        msg = plan["msg"]
+        platform_str = (sub.get("platform") or "").lower()
+        sub_profile = sub.get("notifier_profile") or ""
+        try:
+            plat = _Platform(platform_str)
+        except ValueError:
+            # Unknown platform — nothing can ever deliver; ack to stop retries.
+            await _to_thread_process_service(
+                self._ack_branch_summary, board, root_id,
+                platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
+            )
+            return True
+        adapter = self._authorization_adapter(plat, sub_profile or None)
+        if adapter is None:
+            # Channel adapter not connected this tick — keep the channel
+            # pending; the message arrives when the adapter is back.
+            logger.debug(
+                "kanban branch summary: adapter %s disconnected for %s; deferred",
+                platform_str, root_id,
+            )
+            return False
+        delivery_metadata = sub.get("delivery_metadata")
+        metadata: dict[str, Any] = (
+            dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        )
+        if sub.get("thread_id") and not metadata.get("thread_id"):
+            metadata["thread_id"] = sub["thread_id"]
+        if platform_str == "api_server":
+            from hermes_constants import get_hermes_home
+            from gateway.kanban_origin_delivery import stage_terminal
+            _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+            _state = "unbound"
+            marker_id = plan.get("marker_id") or 0
+            if (
+                _registry
+                and (not sub_profile or sub_profile == notifier_profile)
+                and int(marker_id or 0) > 0
+            ):
+                _state, _delivery_id = await asyncio.to_thread(
+                    stage_terminal,
+                    get_hermes_home() / "delivery-outbox.sqlite",
+                    _registry, sub, sub_profile or notifier_profile,
+                    board or "default", int(marker_id), msg,
+                )
+            if _state != "acknowledged":
+                logger.warning(
+                    "kanban branch summary: api_server delivery for %s state=%s; "
+                    "channel kept pending",
+                    root_id, _state,
+                )
+                return False
+            await _to_thread_process_service(
+                self._ack_branch_summary, board, root_id,
+                platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
+            )
+            return True
+        try:
+            _send_res = await adapter.send(
+                sub["chat_id"], msg, metadata=metadata,
+            )
+            if getattr(_send_res, "success", True) is False:
+                raise RuntimeError(
+                    f"adapter send() reported failure: "
+                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                )
+        except Exception as exc:
+            logger.warning(
+                "kanban branch summary: send failed for %s on %s/%s: %s",
+                root_id, platform_str, sub.get("chat_id"), exc,
+            )
+            return False
+        await _to_thread_process_service(
+            self._ack_branch_summary, board, root_id,
+            platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
+        )
+        return True
+
+    def _ack_branch_summary(
+        self,
+        board: Optional[str],
+        root_id: str,
+        platform: str,
+        chat_id: str,
+        thread_id: str,
+    ) -> None:
+        """Sync helper: mark one channel as delivered in the marker payload."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.ack_branch_summary_channel(
+                conn, root_id,
+                platform=platform, chat_id=chat_id,
+                thread_id=thread_id or None,
             )
         finally:
             conn.close()

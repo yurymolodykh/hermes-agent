@@ -13693,6 +13693,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
+        # Start the kanban branch-summary watcher — delivers ONE short итог
+        # to the root task's channel when the whole branch (root + descendants)
+        # is closed. Separate cadence (45s) so the subtree scan never adds
+        # latency to the 5s per-event notifier.
+        self._spawn_supervised(
+            self._kanban_branch_summary_watcher, "kanban_branch_summary_watcher"
+        )
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
