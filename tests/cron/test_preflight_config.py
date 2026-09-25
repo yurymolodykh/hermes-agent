@@ -192,6 +192,31 @@ class TestMissingProviderKeyBlocks:
 
 
 class TestHealthyJobUnaffected:
+    def test_pinned_pair_is_not_replaced_by_fallback_chain(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: z-ai/glm-5.2\n",
+            encoding="utf-8",
+        )
+        calls = []
+
+        def resolve(**kwargs):
+            calls.append(kwargs.get("requested"))
+            from hermes_cli.auth import AuthError
+            raise AuthError("locked provider unavailable")
+
+        job = _job(provider="nous", model="Hermes-4.3-36B")
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, output, final_response, error, agent_constructed = \
+                _run_job_patched(job, tmp_path, resolve=resolve)
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None
+        assert calls == ["nous"]
+
     def test_healthy_job_runs_normally(self, tmp_path):
         job = _job()
         with cron_jobs.use_cron_store(tmp_path):

@@ -5589,7 +5589,15 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        # A server-provided retry_after (e.g. Telegram FloodWait) is itself
+        # authoritative evidence the failure is transient: honor it through the
+        # retry loop instead of dropping straight to the plain-text fallback.
+        # (LOCAL FIX: retry_after alone no longer bypasses retries.)
+        is_network = (
+            result.retryable
+            or result.retry_after is not None
+            or self._is_retryable_error(error_str)
+        )
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.

@@ -1751,10 +1751,25 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
+    # Resolve effective credentials. A locked parent route is inherited
+    # atomically and cannot be replaced by delegation config/task overrides.
+    parent_route_lock = getattr(parent_agent, "_immutable_route", None)
+    if parent_route_lock:
+        effective_model = str(parent_route_lock.get("model") or "").strip()
+        effective_provider = str(parent_route_lock.get("provider") or "").strip().lower()
+        if not effective_model or not effective_provider:
+            raise RuntimeError("MODEL_LOCK: parent route is incomplete; child not started")
+        effective_base_url = parent_agent.base_url
+        override_provider = None
+        override_base_url = None
+        override_api_key = None
+        override_api_mode = None
+        override_acp_command = None
+        override_acp_args = None
+    else:
+        effective_model = model or parent_agent.model
+        effective_provider = override_provider or getattr(parent_agent, "provider", None)
+        effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
     effective_api_key = override_api_key or parent_api_key
@@ -1855,7 +1870,7 @@ def _build_child_agent(
     # liveness for explicit pins: the pinned child fails loudly instead.
     parent_fallback = (
         None
-        if override_provider
+        if override_provider or parent_route_lock
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
 
@@ -1975,6 +1990,13 @@ def _build_child_agent(
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
             )
+            if parent_route_lock:
+                child._immutable_route = {
+                    "provider": effective_provider,
+                    "model": effective_model,
+                }
+                child._fallback_chain = []
+                child._fallback_model = None
         except BaseException:
             # Construction failed: the dedicated handle has no owner and no
             # child close() will ever run — release it here so the sqlite fds

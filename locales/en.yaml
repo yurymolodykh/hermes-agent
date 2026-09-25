@@ -185,7 +185,7 @@ gateway:
       status_joiner:       ", "
       message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
       handoff:             "Result: {summary}"
-      guidance:            "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
+      guidance:            "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist. Reply in the originating session with a concise execution summary, every deliverable artifact path, and exactly what is still needed from the user to continue (say 'nothing' when no input is needed). Do not merely acknowledge the notification."
 
   personality:
     none_configured:       "No personalities configured in `{path}/config.yaml`"

@@ -34,11 +34,11 @@ from hermes_cli.dashboard_auth import list_session_providers
 # are doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in — Hermes Agent</title>
+<title>Вход — Hermes Up Great</title>
 <style>
   /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
   @font-face {{
@@ -298,20 +298,30 @@ _LOGIN_HTML_TEMPLATE = """\
     background: var(--midground);
     color: var(--background-base);
   }}
+  /* Up Great dashboard identity — official palette and accessible contrast. */
+  :root {{ --background-base: #F4F8F9; --background: #F4F8F9; --midground: #20CBD4; --foreground: #FFFFFF; --hairline: rgba(0,123,135,.32); --hairline-strong: rgba(0,123,135,.58); }}
+  html, body {{ background-color: #F4F8F9; color: #253746; font-family: Arial, Helvetica, sans-serif; }}
+  body {{ background-image: radial-gradient(ellipse at top, rgba(32,203,212,.16) 0%, transparent 55%), repeating-conic-gradient(rgba(0,123,135,.035) 0% 25%, transparent 0% 50%); }}
+  .brand {{ line-height: 0; }} .brand .dot {{ display: none; }} .brand svg {{ width: 138px; height: auto; }}
+  .card {{ background: #253746; border-color: rgba(32,203,212,.7); box-shadow: 0 24px 60px -20px rgba(37,55,70,.45); }}
+  h1 {{ color: #FFFFFF; font-family: Arial, Helvetica, sans-serif; letter-spacing: .02em; text-transform: none; }}
+  .subtitle {{ color: #C2C6C9; }} .form-title {{ color: #FFFFFF; }} .field-label {{ color: #C2C6C9; }}
+  .field-input {{ background: #FFFFFF; color: #253746; font-family: Arial, Helvetica, sans-serif; }}
+  .provider-btn {{ color: #253746; font-family: Arial, Helvetica, sans-serif; }} footer {{ color: #60727B; }}
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="brand" aria-label="Технологические конкурсы Up Great"><svg width="92" height="34" viewBox="0 0 92 34" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Up Great"><g clip-path="url(#upgreat-clip)"><path fill-rule="evenodd" clip-rule="evenodd" d="M0 9.22841V0H3.5213V9.11315C3.5213 10.7987 4.1998 12.7275 6.71945 12.7275C9.23795 12.7275 9.89287 10.7987 9.89287 9.11315V0H13.4389V9.20593C13.4389 12.3904 11.6828 15.6267 6.71945 15.6267C1.75547 15.6267 0 12.2458 0 9.22841ZM15.429 15.3501V0H24.5508C27.8622 0 29.6671 2.25553 29.6671 4.94844C29.6671 7.61773 27.8398 9.89573 24.5508 9.89573H19.3372V15.3501H15.429ZM26.0222 4.94844C26.0222 3.65932 25.0631 2.87675 23.7837 2.87675H19.3372V7.01898H23.7837C25.0631 7.01898 26.0222 6.21336 26.0222 4.94844Z" fill="white"/><path fill-rule="evenodd" clip-rule="evenodd" d="M77.231 16.9712V20.2709H82.4882V32.7944H86.7185V20.2709H91.9522V16.9712H77.231ZM66.4843 17.2778L60.5905 32.6279H65.0571L65.7241 30.819L72.8311 30.8132L73.4843 32.6279H77.8492L75.7544 27.1487H71.6564L71.657 27.1504H66.9063L69.2822 20.5452L71.2913 26.1327H75.3531L71.9795 17.2778H66.4843ZM45.1449 17.2778V32.6279H58.4538V29.1933H49.0532V26.5062H57.9616V23.0399H49.0532V20.2473H58.6148V17.2778H45.1449ZM28.4066 17.2778V32.6285H32.3155V27.8437H35.4147L38.4064 32.6285H42.7948L39.3696 27.4536C41.0135 27.0611 42.873 25.1323 42.873 22.417C42.873 19.5638 40.7628 17.2783 37.5876 17.2783H28.406L28.4066 17.2778ZM32.3155 20.1545H37.1081C38.4099 20.1545 39.392 20.9371 39.392 22.2256C39.392 23.5142 38.4099 24.2967 ... [truncated]
   <div class="card">
-    <h1>Sign in</h1>
-    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
+    <h1>Вход в Hermes</h1>
+    <p class="subtitle">Войдите, чтобы продолжить работу в системе Hermes для технологических конкурсов Up Great.</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
   <footer>
-    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
+    <span class="sep"></span>Защищённый доступ<span class="sep"></span>
   </footer>
 </main>
 {password_script}
@@ -412,6 +422,12 @@ auth gate (not recommended on untrusted networks).</p>
 _PASSWORD_FORM_SCRIPT = """\
 <script>
 (function () {
+  // Derive the proxy prefix from the rendered login URL. Direct deploys use
+  // /login (basePath=""); prefixed deploys use /dashboard/login.
+  var loginPath = window.location.pathname || '/login';
+  var basePath = loginPath.endsWith('/login')
+    ? loginPath.slice(0, -'/login'.length)
+    : '';
   function handle(form) {
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -425,7 +441,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch(basePath + '/auth/password-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -433,7 +449,12 @@ _PASSWORD_FORM_SCRIPT = """\
       }).then(function (resp) {
         if (resp.ok) {
           return resp.json().then(function (data) {
-            window.location.assign((data && data.next) || '/');
+            var destination = (data && data.next) || '/';
+            if (basePath && destination.charAt(0) === '/' &&
+                destination !== basePath && !destination.startsWith(basePath + '/')) {
+              destination = basePath + destination;
+            }
+            window.location.assign(destination);
           });
         }
         var msg = resp.status === 429
@@ -532,3 +553,4 @@ def _render_password_form(provider, next_path: str) -> str:
         f'        <button class="provider-btn" type="submit">Sign in</button>\n'
         f'      </form>'
     )
+

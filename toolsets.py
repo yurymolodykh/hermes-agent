@@ -85,7 +85,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_request_changes",
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
-    "kanban_unblock",
+    "kanban_unblock", "kanban_resolve_triage",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
@@ -327,7 +327,7 @@ TOOLSETS = {
             "kanban_request_review", "kanban_request_changes",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
-            "kanban_unblock",
+            "kanban_unblock", "kanban_resolve_triage",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
         "includes": [],
@@ -763,7 +763,9 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
 # cache entry is valid for as long as the generation is unchanged; external
 # callers never pass ``visited``, so the memo engages exactly at the public
 # entry and the internal cycle-detection recursion stays untouched.
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
+# A registry generation is process-wide, but its tool entries are profile-scoped.
+# Include the active scope or one profile can reuse another's resolved tool list.
+_resolve_toolset_memo: Dict[Tuple[str, bool, int, int, str], List[str]] = {}
 
 
 def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bool = True) -> List[str]:
@@ -793,10 +795,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
             registry_id = id(registry)
             generation = getattr(registry, "_generation", 0)
+            scope = registry.current_scope_key()
         except Exception:
             registry_id = 0
             generation = 0
-        memo_key = (name, include_registry, registry_id, generation)
+            scope = ""
+        memo_key = (name, include_registry, registry_id, generation, scope)
         cached = _resolve_toolset_memo.get(memo_key)
         if cached is not None:
             return list(cached)
@@ -867,14 +871,16 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
             registry_id = id(registry)
             generation = getattr(registry, "_generation", 0)
+            scope = registry.current_scope_key()
         except Exception:
             registry_id = 0
             generation = 0
+            scope = ""
         # Entries from previous registry generations are never hit again;
         # keep the memo bounded across long sessions with many MCP refreshes.
         if len(_resolve_toolset_memo) >= 256:
             _resolve_toolset_memo.clear()
-        _resolve_toolset_memo[(name, include_registry, registry_id, generation)] = list(result)
+        _resolve_toolset_memo[(name, include_registry, registry_id, generation, scope)] = list(result)
     return result
 
 

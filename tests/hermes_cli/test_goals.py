@@ -97,6 +97,124 @@ class TestJudgeGoal:
         assert reason == "achieved"
 
 
+class TestChatGoalJudgeSourceRoute:
+    """Chat /goal must judge with the source session route, never defaults."""
+
+    def test_telegram_api_session_routes_judge_to_persisted_source(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        # This is the row written by GatewayRunner._sync_session_model_from_agent
+        # after a Telegram/API turn. The profile default may be letovo/deepseek;
+        # it is intentionally absent from the only allowed provenance source.
+        class _Db:
+            def get_session(self, session_id):
+                assert session_id == "telegram-api-session"
+                return {
+                    "model": "gpt-5.6-terra",
+                    "model_config": json.dumps({
+                        "gateway_runtime": {"provider": "openai-codex"},
+                    }),
+                }
+
+        monkeypatch.setattr(goals, "_get_session_db", lambda: _Db())
+        monkeypatch.setattr(goals, "load_goal", lambda _sid: None)
+        monkeypatch.setattr(goals, "save_goal", lambda _sid, _state: None)
+        captured = {}
+
+        def _call_llm(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "continue"}'))]
+            )
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_call_llm):
+            mgr = GoalManager(
+                session_id="telegram-api-session",
+                require_source_route=True,
+            )
+            mgr.set("complete the API request")
+            decision = mgr.evaluate_after_turn("work remains")
+
+        assert decision["status"] == "active"
+        assert captured["provider"] == "openai-codex"
+        assert captured["model"] == "gpt-5.6-terra"
+        assert captured["allow_fallback"] is False
+        assert "task" not in captured
+        # The post-turn hook runs after the primary turn has reset its runtime
+        # ContextVar. Carry source provenance in a fresh immutable runtime so
+        # runtime-model-lock can prove the judge's route.
+        assert captured["main_runtime"] == {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-terra",
+            "route_locked": True,
+        }
+
+    def test_persisted_source_runtime_is_accepted_by_model_lock(self, monkeypatch):
+        """The source route remains provable after the main turn unbinds it."""
+        from agent import auxiliary_client as aux
+        from agent import immutable_route_plugin as route_lock
+        from hermes_cli import goals
+
+        captured = {}
+
+        def _call_llm(**kwargs):
+            captured.update(kwargs)
+            # _resolve_task_provider_model enforces MODEL_LOCK from this
+            # ContextVar rather than the explicit call kwargs. The judge must
+            # bind its persisted source route while dispatching the request.
+            assert aux._RUNTIME_MAIN_CONTEXT.get() == {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+                "route_locked": True,
+            }
+            route = route_lock.current_route(kwargs.get("main_runtime"))
+            assert route["route_locked"] is True
+            assert (route["provider"], route["model"]) == (
+                "openai-codex", "gpt-5.6-terra",
+            )
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(
+                    content='{"done": false, "reason": "continue"}'
+                ))]
+            )
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_call_llm):
+            verdict, _reason, _parse_failed, _wait, transport_failed = goals.judge_goal(
+                "finish safely",
+                "the work remains",
+                provider="openai-codex",
+                model="gpt-5.6-terra",
+                strict_source_route=True,
+            )
+
+        assert verdict == "continue"
+        assert transport_failed is False
+        assert captured["allow_fallback"] is False
+
+    def test_missing_chat_session_provenance_pauses_without_auxiliary_fallback(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        class _Db:
+            def get_session(self, _session_id):
+                return {"model": "gpt-5.6-terra", "model_config": "{}"}
+
+        monkeypatch.setattr(goals, "_get_session_db", lambda: _Db())
+        monkeypatch.setattr(goals, "load_goal", lambda _sid: None)
+        monkeypatch.setattr(goals, "save_goal", lambda _sid, _state: None)
+        with patch("agent.auxiliary_client.call_llm") as call_llm:
+            mgr = GoalManager(session_id="missing-provider", require_source_route=True)
+            mgr.set("complete safely")
+            decision = mgr.evaluate_after_turn("work remains")
+
+        assert decision["status"] == "paused"
+        assert decision["verdict"] == "route_error"
+        assert "missing recorded provider" in decision["message"]
+        assert "refusing auxiliary/default routing" in decision["message"]
+        call_llm.assert_not_called()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────
@@ -701,6 +819,9 @@ class TestJudgeWithContract:
             goals.judge_goal(
                 "ship it", "I think it's done",
                 contract=GoalContract(verification="pytest -q passes"),
+                provider="openai-codex",
+                model="gpt-5.6-terra",
+                strict_source_route=True,
             )
         user_msg = next(
             (m["content"] for m in (captured.get("messages") or []) if m["role"] == "user"), ""
@@ -708,6 +829,10 @@ class TestJudgeWithContract:
         assert "completion contract" in user_msg.lower()
         assert "pytest -q passes" in user_msg
         assert "concrete evidence" in user_msg
+        assert captured["provider"] == "openai-codex"
+        assert captured["model"] == "gpt-5.6-terra"
+        assert captured["allow_fallback"] is False
+        assert "task" not in captured
 
 
 class TestDraftContract:

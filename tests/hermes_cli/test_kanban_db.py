@@ -18,6 +18,9 @@ import hermes_state
 from hermes_cli import kanban_db as kb
 
 
+pytestmark = pytest.mark.usefixtures("isolated_kanban_assignee_registry")
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -566,7 +569,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {str(target).replace(chr(92), '/')}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1614,3 +1617,147 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher never re-spawns terminal (completed/archived) tasks (#t_db662ef7)
+#
+# Root cause: claim_task / claim_review_task only gated on ``status`` and
+# ``claim_lock``. A broken retry path that corrupts a terminal task's status
+# back to ``ready`` made the dispatcher re-spawn an already-completed/archived
+# task forever (incident: t_2b49cfcd, archived + completed_at set, re-spawned
+# 29x). The guard below adds ``completed_at IS NULL`` to the claim CAS so a
+# task that has reached a terminal state can never transition back to running.
+# ---------------------------------------------------------------------------
+
+def test_claim_task_rejects_terminal_done_task(kanban_home):
+    """A ``done`` task (completed_at set) whose status is corrupted back to
+    ``ready`` must not be re-claimed — the fix for the re-spawn loop."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship", assignee="a")
+        assert kb.complete_task(conn, t, result="ok")
+        task = kb.get_task(conn, t)
+        assert task.status == "done"
+        assert task.completed_at is not None
+
+        # Simulate the broken retry path flipping the terminal task back to ready.
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?",
+            (t,),
+        )
+        conn.commit()
+
+        # Claiming a terminal task must be refused even though status=='ready'.
+        assert kb.claim_task(conn, t) is None
+        # Status stays non-running; no claim, no new run, no spawn.
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        run = kb.latest_run(conn, t)
+        assert run is not None and run.outcome == "completed"  # no new run
+
+
+def test_claim_task_rejects_archived_with_completed_at(kanban_home):
+    """An ``archived`` task that kept its completed_at (archived after done)
+    and whose status is corrupted to ``ready`` must not be re-claimed."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="archive", assignee="a")
+        assert kb.complete_task(conn, t, result="ok")
+        assert kb.archive_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task.status == "archived"
+        assert task.completed_at is not None
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?",
+            (t,),
+        )
+        conn.commit()
+
+        assert kb.claim_task(conn, t) is None
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        run = kb.latest_run(conn, t)
+        assert run is not None and run.outcome == "completed"  # no new run
+
+
+def test_claim_task_still_claims_genuine_ready_task(kanban_home):
+    """No false positives: a live (never-terminated) ready task is still
+    claimable, so real ready/running work is unaffected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="live", assignee="a")
+        # Sanity: completed_at is NULL for a never-done task.
+        assert kb.get_task(conn, t).completed_at is None
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        # A genuine preserved run id was allocated.
+        assert kb.latest_run(conn, t) is not None
+
+
+def test_dispatch_once_does_not_respawn_terminal_task(kanban_home, monkeypatch):
+    """End-to-end: ``dispatch_once`` must not spawn a terminal task even when
+    its status was corrupted to ``ready``, while still spawning a genuine
+    ready task in the same tick."""
+    import hermes_cli.kanban_db as _kb
+
+    spawned = []
+    _fake_pid = 424242
+
+    def fake_spawn(*args, **kwargs):
+        spawned.append(args)
+        # A real spawn returns the worker pid (int); mirror that exactly so the
+        # dispatch loop's `_set_worker_pid(..., int(pid))` succeeds.
+        return _fake_pid
+
+    monkeypatch.setattr(_kb, "_default_spawn", fake_spawn)
+    # Ensure the assignee passes the spawnable profile check so the loop reaches
+    # the spawn path (the real resolution is covered elsewhere).
+    import hermes_cli.profiles as _profiles
+    monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+    # Bypass the separate `recent_success` respawn guard so this test isolates
+    # exactly the `completed_at IS NULL` claim guard under test (a freshly
+    # completed task would otherwise be deferred by that unrelated cooldown).
+    monkeypatch.setattr(_kb, "check_respawn_guard", lambda conn, tid: None)
+    # Bypass the unrelated MODEL_LOCK route-resolution gate (live profile +
+    # model route wiring is covered elsewhere) so this test reaches the claim
+    # step that carries the fix.
+    monkeypatch.setattr(
+        _kb, "resolve_task_root_route",
+        lambda conn, tid, persist=False, allow_unpinned=False: ((tid,), "prof", "prof-model"),
+    )
+
+    with kb.connect() as conn:
+        # Terminal task whose status was corrupted to ready.
+        term = kb.create_task(conn, title="term", assignee="prof")
+        assert kb.complete_task(conn, term, result="ok")
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL WHERE id=?", (term,),
+        )
+        # Genuine ready task that must still spawn.
+        live = kb.create_task(conn, title="live", assignee="prof")
+        conn.commit()
+
+        _kb.dispatch_once(conn)
+
+    # Only the live task was spawned; the terminal task was skipped entirely.
+    spawned_titles = []
+    with kb.connect() as conn:
+        for _claimed, _workspace in spawned:
+            spawned_titles.append(kb.get_task(conn, _claimed.id).title)
+    assert "live" in spawned_titles
+    assert "term" not in spawned_titles
+    assert len(spawned_titles) == 1
+    # The terminal task was not advanced to running; no new run was created.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, term).status == "ready"
+        run = kb.latest_run(conn, term)
+        assert run is not None and run.outcome == "completed"  # terminal run only

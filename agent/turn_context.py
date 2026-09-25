@@ -562,6 +562,9 @@ def build_turn_context(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    # The external memory bridge may only cite the real user input of THIS
+    # turn. A resumed tool call has no freshly authenticated user input.
+    agent._memory_source_turn = None
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.
@@ -1357,6 +1360,14 @@ def build_turn_context(
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            from agent.background_review import bind_memory_source_turn
+            # Gateway internal notifications and CLI auto-continue entries
+            # have user-shaped transcript rows, but no real user source.
+            bind_memory_source_turn(
+                agent,
+                None if persist_user_display_kind else original_user_message,
+                agent._user_turn_count,
+            )
         except Exception:
             pass
 

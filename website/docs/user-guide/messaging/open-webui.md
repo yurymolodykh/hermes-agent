@@ -131,8 +131,11 @@ If you prefer to configure the connection through the UI instead of environment 
 6. Enter:
    - **URL**: `http://host.docker.internal:8642/v1`
    - **API Key**: the exact same value as `API_SERVER_KEY` in Hermes
+   - **Custom Header**: `X-Hermes-Session-Id` = `owui-{{CHAT_ID}}`
 7. Click the **checkmark** to verify the connection
 8. **Save**
+
+The `owui-{{CHAT_ID}}` header gives each Open WebUI conversation a stable Hermes session and enables compact native status updates. While a tool is running, the status names the current activity; during a quiet model/tool wait Hermes refreshes it every 30 seconds with elapsed time, so the browser shows that the request is still alive. These updates are status metadata, not assistant text, and therefore do not accumulate in the final answer.
 
 Your agent model should now appear in the model dropdown (named after your profile, or **hermes-agent** for the default profile).
 
@@ -175,7 +178,7 @@ When you send a message in Open WebUI:
 1. Open WebUI sends a `POST /v1/chat/completions` request with your message and conversation history
 2. Hermes Agent creates a server-side `AIAgent` instance using the API server's profile, model/provider config, memory, skills, and configured API-server toolsets
 3. The agent processes your request — it may call tools (terminal, file operations, web search, etc.) on the API-server host
-4. As tools execute, **inline progress messages stream to the UI** so you can see what the agent is doing (e.g. `` `💻 ls -la` ``, `` `🔍 Python 3.12 release` ``)
+4. As tools execute, **compact native status updates** show the current activity (for example, “Ищу в интернете: Python 3.12 release”); a 30-second heartbeat with elapsed time covers quiet waits
 5. The agent's final text response streams back to Open WebUI
 6. Open WebUI displays the response in its chat interface
 
@@ -184,7 +187,7 @@ Your agent has access to the same tools and capabilities as that API-server Herm
 If you need tools to run against your **local** workspace today, run Hermes locally and point it at a pure LLM provider or pure OpenAI-compatible model proxy (for example vLLM, LiteLLM, Ollama, llama.cpp, OpenAI, OpenRouter, etc.). A future split-runtime mode for "remote brain, local hands" is being tracked in [#18715](https://github.com/NousResearch/hermes-agent/issues/18715); it is not the behavior of the current API server.
 
 :::tip Tool Progress
-With streaming enabled (the default), you'll see brief inline indicators as tools run — the tool emoji and its key argument. These appear in the response stream before the agent's final answer, giving you visibility into what's happening behind the scenes.
+With streaming enabled (the default) and the `owui-{{CHAT_ID}}` session header configured, Open WebUI shows one-line native statuses while tools run. If no content or tool event arrives for 30 seconds, Hermes emits a heartbeat status with elapsed time. Status metadata is kept out of `delta.content`, so it cannot pollute the model-visible conversation or the final answer.
 :::
 
 ## Configuration Reference
@@ -204,6 +207,41 @@ With streaming enabled (the default), you'll see brief inline indicators as tool
 |----------|-------------|
 | `OPENAI_API_BASE_URL` | Hermes Agent's API URL (include `/v1`) |
 | `OPENAI_API_KEY` | Must be non-empty. Match your `API_SERVER_KEY`. |
+
+## Durable long tasks
+
+A normal streaming chat turn is tied to its HTTP connection. To launch work
+that must continue after Open WebUI disconnects, put this exact line first:
+
+```text
+ДЛИННАЯ ЗАДАЧА
+```
+
+Hermes saves the complete message byte-for-byte as `TASK_PROMPT.md` in a
+persistent workspace, creates a goal-mode Kanban task on the `durable-tasks`
+board, returns a `t_...` task id immediately, and executes it in a separate
+worker. The worker is explicitly told to read the complete file, avoiding the
+Kanban inline-body preview limit; the prompt below the marker is not rewritten.
+
+The following commands are handled directly by the API server and therefore
+do not depend on an LLM interpreting them:
+
+```text
+/task list
+/task status <task-id>
+/task pause <task-id>
+/task change <task-id> <new instruction>
+/task resume <task-id>
+/task stop <task-id>
+```
+
+`change` first stops the active worker, durably records the new instruction,
+and leaves the task paused. Run `resume` after checking the status. A resumed
+worker starts a new attempt in the same persistent workspace and receives the
+original task, prior attempt context, and comments. It does not restore an
+interrupted model call byte-for-byte; the task itself must checkpoint external
+or non-idempotent effects and use `recovery_required` when completion is
+ambiguous.
 
 ## Troubleshooting
 

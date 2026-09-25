@@ -15,6 +15,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+pytestmark = pytest.mark.usefixtures(
+    "isolated_kanban_assignee_registry", "isolated_kanban_route_resolver"
+)
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -52,7 +57,7 @@ def worker_env(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "bound-worker-session")
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -63,9 +68,13 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert kb.bind_worker_session(conn, tid, run.id, "test-worker", "bound-worker-session")
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     return tid
 
 
@@ -127,9 +136,85 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert run.metadata["files"] == 2
+        assert run.metadata["worker_session_id"] == "bound-worker-session"
     finally:
         conn.close()
+
+
+def test_complete_rejects_worker_without_authenticated_run_session(monkeypatch, worker_env):
+    """An unbound worker session cannot mutate even its own active task."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unbound-worker-session")
+
+    out = json.loads(kt._handle_complete({"summary": "must not land"}))
+    assert "error" in out
+    assert "authenticated Kanban run/session binding" in out["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+        assert kb.latest_run(conn, worker_env).outcome is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("_handle_block", {"reason": "must not write"}),
+        ("_handle_request_review", {"summary": "must not write"}),
+        ("_handle_request_changes", {"reason": "must not write"}),
+        ("_handle_heartbeat", {"note": "must not write"}),
+        ("_handle_comment", {"body": "must not write"}),
+        ("_handle_attach", {"filename": "blocked.txt", "content_base64": "eA=="}),
+        ("_handle_attach_url", {"url": "http://127.0.0.1/never-fetch"}),
+        ("_handle_create", {"title": "must not write", "assignee": "peer"}),
+        ("_handle_link", {"parent_id": "t_parent", "child_id": "t_child"}),
+        ("_handle_heartbeat", {"note": "forged board", "board": "forged-named-board"}),
+    ],
+)
+def test_mutation_handlers_reject_unbound_worker_before_any_write(
+    monkeypatch, worker_env, handler_name, args,
+):
+    """Every worker-reachable write path needs the active run/session binding.
+
+    ``kanban_comment`` deliberately permits a bound worker to hand off to a
+    different task, so the check must authenticate the *current worker task*,
+    not merely the write target. ``kanban_attach_url`` must reject before it
+    attempts a model-supplied network fetch.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unbound-worker-session")
+    args = dict(args)
+    if handler_name == "_handle_comment":
+        conn = kb.connect()
+        try:
+            other_task = kb.create_task(conn, title="handoff target", assignee="peer")
+        finally:
+            conn.close()
+        args["task_id"] = other_task
+
+    def write_state():
+        conn = kb.connect()
+        try:
+            # SQLite's deterministic dump captures every persisted table,
+            # including schema-specific event/attachment tables.
+            return tuple(conn.iterdump())
+        finally:
+            conn.close()
+
+    before = write_state()
+    out = json.loads(getattr(kt, handler_name)(args))
+    assert "binding" in out["error"]
+    assert write_state() == before
 
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
@@ -181,18 +266,26 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True,
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run and kb.bind_worker_session(conn, goal_task_id, run.id, "test-worker", "goal-session")
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "goal-session")
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+    def mock_judge_goal(goal, last_response, **kwargs):
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
+        assert kwargs["provider"] == "openai-codex"
+        assert kwargs["model"] == "gpt-5.6-terra"
+        assert kwargs["strict_source_route"] is True
         return "continue", "missing verification evidence", False, None, False
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
@@ -213,6 +306,49 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         assert task.status == "running"  # Should still be running, not done
     finally:
         conn2.close()
+
+
+def test_complete_goal_mode_without_source_route_blocks_task(monkeypatch, tmp_path):
+    """Missing task provenance must block instead of choosing an ambient judge."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="unrouted-goal", assignee="test-worker", goal_mode=True
+        )
+        kb.claim_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert run and kb.bind_worker_session(conn, task_id, run.id, "test-worker", "goal-session")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "goal-session")
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: pytest.fail("judge must not run without source route"),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        run = kb.latest_run(conn, task_id)
+        assert "refusing ambient auxiliary" in (run.summary or "")
+    finally:
+        conn.close()
 
 
 def test_block_happy_path(worker_env):
@@ -250,9 +386,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             body="Must achieve X.", goal_mode=True,
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run and kb.bind_worker_session(conn, goal_task_id, run.id, "test-worker", "goal-session")
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_SESSION_ID", "goal-session")
     return goal_task_id
 
 
@@ -530,7 +670,8 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata["child_task"] == child_out["task_id"]
+        assert run.metadata["worker_session_id"] == "bound-worker-session"
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
@@ -842,7 +983,13 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     """A gateway session (platform + chat_id set) gets auto-subscribed
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
+    from gateway.session_context import reset_session_vars
     from tools import kanban_tools as kt
+
+    # Earlier gateway tests can leave ContextVars explicitly empty. This unit
+    # test exercises the legacy environment fallback, which applies only to an
+    # unbound context.
+    reset_session_vars()
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
@@ -871,6 +1018,45 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["delivery_mode"] == "notify+wake"
 
 
+def test_create_subscribes_with_delivery_owner_profile(monkeypatch, worker_env):
+    """A session whose creator is routed to a runtime profile (01-orchestrator)
+    but delivered by the ACTIVE gateway's adapter must stamp that ACTIVE
+    profile, not the routed one. Regression for the multiplexed single-gateway
+    deployment: sessions routed to 01-orchestrator used to stamp
+    notifier_profile=01-orchestrator, but 01-orchestrator owns no adapter, so
+    the notifier failed closed and status never returned to the chat.
+
+    gateway/run.py::_set_session_env now propagates the delivery-OWNER profile
+    (the profile whose adapter physically received the message) as
+    HERMES_SESSION_PROFILE. The kanban notifier poles on notifier_profile, so
+    the subscription must carry that owner so the owning gateway claims and
+    delivers it.
+    """
+    from gateway.session_context import reset_session_vars
+    from tools import kanban_tools as kt
+
+    # Exercise the legacy environment bridge in an unbound context; a bound
+    # empty ContextVar correctly masks process-global environment variables.
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "home-125805788")
+    # What the (fixed) gateway exports: the delivery owner for a routed session.
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+
+    out = kt._handle_create({
+        "title": "delivery-owner auto-sub",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    new_tid = d["task_id"]
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(new_tid))
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "default"
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
@@ -882,7 +1068,6 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-abc")
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
     out = kt._handle_create({
         "title": "auto-sub tui",
@@ -908,7 +1093,6 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
     out = kt._handle_create({
         "title": "no sub cli",
@@ -921,20 +1105,19 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
+def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery
     channel. This is the knob that addresses the upstream design
     concern from PR #19718 (reverted in #19721) — users who want
     explicit kanban_notify-subscribe calls per task get that."""
-    # worker_env already created <tmp>/.hermes; use a fresh sibling
-    # home to avoid mkdir() colliding with the worker's directory.
-    home = tmp_path / "gate-home" / ".hermes"
-    home.mkdir(parents=True)
+    # Reuse the worker fixture's isolated home so the active task/run/session
+    # binding remains valid while the configuration gate is exercised.
+    from pathlib import Path
+    home = Path(os.environ["HERMES_HOME"])
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
-    monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 

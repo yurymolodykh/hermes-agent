@@ -8,31 +8,22 @@ from hermes_cli.codex_models import (
 )
 
 
-CHATGPT_REJECTED_CODEX_PRO_SLUGS = {
-    "gpt-5.6-sol-pro",
-    "gpt-5.6-terra-pro",
-    "gpt-5.6-luna-pro",
-}
+APPROVED_CODEX_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
 
 
-def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch):
-    """OAuth fallback retains real models but never synthesizes rejected ones."""
-    retained_models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
-    template_models = {model for model, _fallbacks in _FORWARD_COMPAT_TEMPLATE_MODELS}
-
-    assert retained_models.issubset(DEFAULT_CODEX_MODELS)
-    assert retained_models.issubset(template_models)
-    assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(DEFAULT_CODEX_MODELS)
-    assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(template_models)
-
+def test_approved_gpt6_catalog_is_exact_and_ordered(monkeypatch):
+    """Every picker receives only the approved GPT-6 lineup in user order."""
+    assert DEFAULT_CODEX_MODELS == APPROVED_CODEX_MODELS
     monkeypatch.setattr(
         "hermes_cli.codex_models._fetch_models_from_api",
-        lambda access_token: ["gpt-5.5"],
+        lambda access_token: ["gpt-5.6-sol", "gpt-5.5"],
     )
-    model_ids = get_codex_model_ids(access_token="codex-access-token")
+    assert get_codex_model_ids(access_token="codex-access-token") == APPROVED_CODEX_MODELS
 
-    assert retained_models.issubset(model_ids)
-    assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
+
+def test_forward_compat_templates_cover_the_approved_gpt6_catalog():
+    template_models = [model for model, _fallbacks in _FORWARD_COMPAT_TEMPLATE_MODELS]
+    assert template_models == APPROVED_CODEX_MODELS
 
 
 

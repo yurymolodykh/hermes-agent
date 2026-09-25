@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import shlex
 import sys
@@ -41,6 +42,32 @@ _STATUS_ICONS = {
     "done":     "✓",
     "archived": "—",
 }
+
+_DEFAULT_LIST_DONE_RETENTION_HOURS = 12.0
+
+
+def _default_list_done_cutoff() -> int:
+    """Return the configured cutoff for hiding completed cards in default lists.
+
+    The setting is presentation-only; it never deletes task history. Invalid
+    values fall back to the documented default so a malformed local config
+    cannot make list output unusable.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        hours = float(
+            kanban_cfg.get(
+                "list_done_retention_hours", _DEFAULT_LIST_DONE_RETENTION_HOURS
+            )
+        )
+        if not math.isfinite(hours) or hours < 0:
+            raise ValueError("list_done_retention_hours must be a finite nonnegative number")
+    except Exception:
+        hours = _DEFAULT_LIST_DONE_RETENTION_HOURS
+    return int(time.time() - hours * 60 * 60)
 
 
 def _fmt_ts(ts: Optional[int]) -> str:
@@ -78,6 +105,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "root_model_override": t.root_model_override,
+        "root_provider_override": t.root_provider_override,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -435,6 +464,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              "(set on tasks created from inside an ACP loop)")
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
+    p_list.add_argument(
+        "--historical",
+        action="store_true",
+        help="Include completed done tasks older than the configured retention window",
+    )
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
         "--sort",
@@ -1642,6 +1676,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    # Keep the operational view focused without pruning board history. Explicit
+    # done and historical queries are retrieval modes and bypass this filter.
+    hide_done_completed_before = None
+    if not args.historical and args.status != "done":
+        hide_done_completed_before = _default_list_done_cutoff()
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
@@ -1653,6 +1692,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             session_id=args.session,
             include_archived=args.archived,
+            hide_done_completed_before=hide_done_completed_before,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
@@ -2215,14 +2255,13 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     """Apply the goal judge to every terminal worker handoff, including review."""
     if task is None or not task.goal_mode:
         return None
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return None
-    if client is None or not model:
-        return None
+    source_model = (task.model_override or "").strip()
+    source_provider = (task.provider_override or "").strip()
+    if not source_model or not source_provider:
+        return (
+            "Kanban goal_mode requires recorded source task model_override and "
+            "provider_override; refusing ambient auxiliary goal_judge route"
+        )
 
     from hermes_cli.goals import judge_goal
 
@@ -2232,6 +2271,9 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            provider=source_provider,
+            model=source_model,
+            strict_source_route=True,
         )
     except Exception as judge_exc:
         import logging as _logging
@@ -2242,6 +2284,13 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             exc_info=True,
         )
     return reason if verdict != "done" else None
+
+
+def _goal_mode_missing_source_route(task: Optional[kb.Task]) -> bool:
+    """Whether a goal-mode card cannot be judged without violating its lock."""
+    return bool(task and task.goal_mode) and not (
+        (task.model_override or "").strip() and (task.provider_override or "").strip()
+    )
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -2284,6 +2333,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 (summary or args.result or "").strip(),
             )
             if rejection is not None:
+                if _goal_mode_missing_source_route(task):
+                    kb.block_task(
+                        conn,
+                        tid,
+                        reason=rejection,
+                        expected_run_id=_worker_run_id_for(tid),
+                    )
                 print(
                     f"kanban: goal completion of {tid} rejected by judge: {rejection}. "
                     f"Provide evidence matching the task's acceptance criteria.",

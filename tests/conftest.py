@@ -1743,3 +1743,33 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture
+def isolated_kanban_assignee_registry(monkeypatch):
+    """Opt-in synthetic spawn registry for hermetic Kanban unit tests.
+
+    Production code keeps its filesystem-backed ``profile_exists`` preflight.
+    Tests that exercise isolated boards may request this dependency injection
+    explicitly; pytest restores the real resolver at teardown.
+    """
+    from hermes_cli import profiles
+
+    synthetic_profiles = frozenset({
+        "01-orchestrator", "a", "alice", "b", "bob", "builder", "elias", "factory",
+        "ops", "parent-worker", "peer", "prof", "qa", "reviewer", "test-worker", "w", "worker",
+        "worker-a", "worker-d", "x",
+    })
+
+    def _synthetic_profile_exists(name):
+        return profiles.normalize_profile_name(name) in synthetic_profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", _synthetic_profile_exists)
+
+
+@pytest.fixture
+def isolated_kanban_route_resolver(monkeypatch):
+    """Opt-in route resolver for unit tests unrelated to host credentials."""
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "_provider_route_blocker", lambda _provider, _model: None)

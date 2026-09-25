@@ -256,6 +256,7 @@ def _record_codex_app_server_compaction(
     *,
     approx_tokens: int | None = None,
     force: bool = False,
+    task_id: str | None = None,
 ) -> bool:
     """Record a Codex-native context compaction boundary in Hermes state.
 
@@ -266,6 +267,11 @@ def _record_codex_app_server_compaction(
     if not force and not getattr(turn, "compacted", False):
         return False
 
+    from agent.context_read_dedup import invalidate_context_read_dedup
+
+    invalidate_context_read_dedup(
+        task_id if task_id is not None else getattr(agent, "_current_task_id", None)
+    )
     thread_id = getattr(turn, "thread_id", None) or ""
     turn_id = getattr(turn, "turn_id", None) or ""
     logger.info(
@@ -876,7 +882,7 @@ def run_codex_app_server_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
-    _record_codex_app_server_compaction(agent, turn)
+    _record_codex_app_server_compaction(agent, turn, task_id=effective_task_id)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
 

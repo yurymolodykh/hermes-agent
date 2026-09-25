@@ -20,6 +20,11 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
+pytestmark = pytest.mark.usefixtures(
+    "isolated_kanban_assignee_registry", "isolated_kanban_route_resolver"
+)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -75,11 +80,9 @@ def test_set_and_clear_model_override(conn):
     assert t.model_override == "gpt-5.6-sol"
     assert t.provider_override == "openai"
 
-    # Clearing the model clears the provider too.
-    assert kb.set_model_override(conn, tid, None)
-    t = kb.get_task(conn, tid)
-    assert t.model_override is None
-    assert t.provider_override is None
+    # The first complete pair establishes the immutable root route.
+    with pytest.raises(RuntimeError, match="MODEL_LOCK immutable root route"):
+        kb.set_model_override(conn, tid, None)
 
 
 def test_provider_without_model_rejected(conn):
@@ -90,6 +93,22 @@ def test_provider_without_model_rejected(conn):
         kb.create_task(
             conn, title="t2", assignee="worker", provider_override="openrouter",
         )
+
+
+def test_route_override_is_immutable_after_first_run(conn):
+    tid = kb.create_task(
+        conn, title="t", assignee="worker",
+        model_override="locked-model", provider_override="openrouter",
+    )
+    conn.execute(
+        "UPDATE tasks SET started_at = ? WHERE id = ?",
+        ("2026-09-15T00:00:00Z", tid),
+    )
+    conn.commit()
+    with pytest.raises(RuntimeError, match="already claimed or run"):
+        kb.set_model_override(conn, tid, "different-model", provider="nous")
+    task = kb.get_task(conn, tid)
+    assert (task.provider_override, task.model_override) == ("openrouter", "locked-model")
 
 
 def test_create_task_with_model_and_provider(conn):
@@ -236,11 +255,12 @@ def test_reasoning_effort_survives_clearing_the_model(conn):
         model_override="glm-5", provider_override="openrouter",
         reasoning_effort="ultra",
     )
-    assert kb.set_model_override(conn, tid, None)
-    t = kb.get_task(conn, tid)
-    assert t.model_override is None
-    assert t.provider_override is None
-    assert t.reasoning_effort == "ultra"
+    with pytest.raises(RuntimeError, match="MODEL_LOCK immutable root route"):
+        kb.set_model_override(conn, tid, None)
+    task = kb.get_task(conn, tid)
+    assert task.model_override == "glm-5"
+    assert task.provider_override == "openrouter"
+    assert task.reasoning_effort == "ultra"
 
 
 def test_reasoning_effort_without_a_model_override(conn):

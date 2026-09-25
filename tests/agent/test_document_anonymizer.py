@@ -24,6 +24,18 @@ def test_document_text_replaces_people_money_and_identifiers_deterministically()
     assert result.count("SUM1") == 2
 
 
+def test_school_and_surname_with_initials_are_anonymized():
+    from agent.document_anonymizer import anonymize_document_text
+
+    result = anonymize_document_text("ГБОУ Школа № 2086, директор Орловой Е. В.; _____Молодых Юрий Олегович")
+
+    assert "2086" not in result
+    assert "Орловой" not in result
+    assert "Молодых" not in result
+    assert "organization1" in result
+    assert "person1" in result and "person2" in result
+
+
 def test_plain_message_is_never_anonymized_by_document_block_filter():
     from agent.document_anonymizer import anonymize_document_blocks
 
@@ -73,6 +85,71 @@ def test_openwebui_source_tags_are_anonymized_without_touching_user_query(monkey
     assert "Петров Петр Петрович" not in result
     assert "25 000" not in result
     assert '<source anonymized="true">' in result
+
+
+def test_openwebui_resource_id_uses_local_upload_not_rag_excerpt(tmp_path, monkeypatch):
+    from agent.document_anonymizer import anonymize_openwebui_source_blocks
+
+    monkeypatch.setenv("HERMES_DOCUMENT_ANONYMIZATION", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    resource_id = "69e9e8c1-b67e-4cac-b1c1-b1edc364bb87"
+    uploads = tmp_path / "hermes-home" / "openwebui" / "uploads"
+    uploads.mkdir(parents=True)
+    (uploads / f"{resource_id}_application.txt").write_text(
+        "Локальный документ: Сидоров Сидор Сидорович, +7 999 123-45-67", encoding="utf-8"
+    )
+    text = (
+        "анонимизируй документ\n"
+        f'<source id="1" resource-id="{resource_id}" name="application.txt">'
+        "Усечённый RAG-фрагмент</source>"
+    )
+
+    result = anonymize_openwebui_source_blocks(text)
+
+    assert "Усечённый RAG-фрагмент" not in result
+    assert "Сидоров Сидор Сидорович" not in result
+    assert "+7 999 123-45-67" not in result
+    assert "Локальный документ:" in result
+    assert "person1" in result and "person2" in result
+    assert "resource-id" not in result
+
+
+def test_openwebui_attached_file_descriptor_uses_local_upload(tmp_path, monkeypatch):
+    from agent.document_anonymizer import anonymize_openwebui_attachment_tags
+
+    monkeypatch.setenv("HERMES_DOCUMENT_ANONYMIZATION", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    resource_id = "71d4bc23-77ab-447a-bee8-d1426c0767ad"
+    uploads = tmp_path / "hermes-home" / "openwebui" / "uploads"
+    uploads.mkdir(parents=True)
+    (uploads / f"{resource_id}_application.txt").write_text(
+        "Полный документ: Петров Петр Петрович", encoding="utf-8"
+    )
+    text = (
+        "<attached_files>\n"
+        f'<file id="{resource_id}" url="{resource_id}" name="application.txt"/>\n'
+        "</attached_files>\nпроанализируй документ"
+    )
+
+    result = anonymize_openwebui_attachment_tags(text)
+
+    assert "Полный документ:" in result
+    assert "Петров Петр Петрович" not in result
+    assert "person1" in result
+    assert f'id="{resource_id}"' not in result
+
+
+def test_openwebui_source_cannot_select_path_outside_uploads(tmp_path, monkeypatch):
+    from agent.document_anonymizer import anonymize_openwebui_source_blocks
+
+    monkeypatch.setenv("HERMES_DOCUMENT_ANONYMIZATION", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    text = '<source resource-id="../../secret">Петров Петр Петрович</source>'
+
+    result = anonymize_openwebui_source_blocks(text)
+
+    assert "Петров Петр Петрович" not in result
+    assert "secret" not in result
 
 
 def test_text_file_reference_is_anonymized_but_python_source_is_not(tmp_path, monkeypatch):

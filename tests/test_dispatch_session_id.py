@@ -60,6 +60,21 @@ class TestSessionIdForwarding:
         assert "session_id" in captured
         assert captured["session_id"] is None
 
+    def test_provider_is_forwarded_to_plugin_handler(self):
+        """registry.dispatch receives the active per-turn provider."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="sess-provider",
+                provider="openai-codex",
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("provider") == "openai-codex"
+
     def test_task_id_still_forwarded(self):
         """Existing task_id forwarding is not broken by this change."""
         captured = {}

@@ -29,6 +29,9 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import profiles
 
 
+pytestmark = pytest.mark.usefixtures("isolated_kanban_assignee_registry")
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -66,10 +69,14 @@ def test_bare_custom_provider_pinned_task_is_blocked_before_spawn(
 
     with kb.connect() as conn:
         kb.create_board(slug="default", name="T")
-        tid = kb.create_task(
-            conn, title="doomed custom", assignee="default",
-            model_override="deepseek-v4-flash", provider_override="custom",
-        )
+        # Legacy rows can predate create-time route validation; dispatch must
+        # still block them rather than spawning an unusable worker.
+        with monkeypatch.context() as create_patch:
+            create_patch.setattr(kb, "_provider_route_blocker", lambda _p, _m: None)
+            tid = kb.create_task(
+                conn, title="doomed custom", assignee="default",
+                model_override="deepseek-v4-flash", provider_override="custom",
+            )
         res = kb.dispatch_once(conn, spawn_fn=spy_spawn, dry_run=False)
 
     assert tid in res.auto_blocked
@@ -104,10 +111,12 @@ def test_unresolvable_named_provider_pinned_task_is_blocked(
 
     with kb.connect() as conn:
         kb.create_board(slug="default", name="T")
-        tid = kb.create_task(
-            conn, title="missing prov", assignee="default",
-            model_override="some-model", provider_override="definitely-missing-prov",
-        )
+        with monkeypatch.context() as create_patch:
+            create_patch.setattr(kb, "_provider_route_blocker", lambda _p, _m: None)
+            tid = kb.create_task(
+                conn, title="missing prov", assignee="default",
+                model_override="some-model", provider_override="definitely-missing-prov",
+            )
         res = kb.dispatch_once(conn, spawn_fn=spy_spawn, dry_run=False)
 
     assert tid in res.auto_blocked
@@ -150,10 +159,12 @@ def test_provider_blocker_not_invoked_in_dry_run(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_provider_route_blocker", spy)
     with kb.connect() as conn:
         kb.create_board(slug="default", name="T")
-        kb.create_task(
-            conn, title="dry", assignee="default",
-            model_override="m", provider_override="custom",
-        )
+        with monkeypatch.context() as create_patch:
+            create_patch.setattr(kb, "_provider_route_blocker", lambda _p, _m: None)
+            kb.create_task(
+                conn, title="dry", assignee="default",
+                model_override="m", provider_override="custom",
+            )
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 5, dry_run=True,
                          max_in_progress=10)
     assert calls == []

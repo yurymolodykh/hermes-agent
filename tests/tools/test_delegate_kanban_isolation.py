@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.usefixtures("isolated_kanban_assignee_registry")
+
 # The subprocess-boundary tests below spawn ``sys.executable -c`` with a tmp
 # cwd. Without an explicit PYTHONPATH the child resolves ``hermes_cli`` /
 # ``agent`` through whatever install is on sys.path (in a worktree that is the

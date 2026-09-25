@@ -131,6 +131,7 @@ class TestTurnRunner:
             session_id="test-session",
             session_key="test-session-key",
             user_config={},
+            has_attachments=True,
             AIAgent=_ExhaustedAgent,
             resolve_display_setting=lambda *_args: False,
             _run_still_current=lambda: True,
@@ -141,6 +142,8 @@ class TestTurnRunner:
 
         result = TurnRunner(gateway_runner, ctx).run_sync()
 
+        gateway_runner._resolve_turn_agent_config.assert_called_once()
+        assert gateway_runner._resolve_turn_agent_config.call_args.kwargs["has_attachments"] is True
         assert result["final_response"] == (
             "Context length exceeded. Cannot compress further."
         )

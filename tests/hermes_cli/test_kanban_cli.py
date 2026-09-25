@@ -20,6 +20,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # The CLI tests exercise board behavior against an isolated filesystem,
+    # not the host profile registry.  Profile validation is covered separately.
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
     kb.init_db()
     return home
 
@@ -55,6 +58,72 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         and row.get("session_id") == "acp-x"
         for row in payload
     )
+
+
+def test_kanban_list_hides_done_tasks_at_or_past_configured_retention(
+    kanban_home, monkeypatch
+):
+    """Default list uses the configured inclusive done-retention boundary."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    now = 1_700_000_000
+    assert DEFAULT_CONFIG["kanban"]["list_done_retention_hours"] == 12.0
+    with kb.connect() as conn:
+        stale_done = kb.create_task(conn, title="stale done")
+        exact_done = kb.create_task(conn, title="12 hour done")
+        recent_done = kb.create_task(conn, title="recent done")
+        null_done = kb.create_task(conn, title="undated done")
+        ready = kb.create_task(conn, title="ready")
+        blocked = kb.create_task(conn, title="blocked")
+        kb.complete_task(conn, stale_done, result="old")
+        kb.complete_task(conn, exact_done, result="boundary")
+        kb.complete_task(conn, recent_done, result="new")
+        kb.complete_task(conn, null_done, result="legacy")
+        kb.block_task(conn, blocked, reason="needs input")
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (now - 12 * 60 * 60 - 1, stale_done),
+        )
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (now - 12 * 60 * 60, exact_done),
+        )
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (now - (11 * 60 + 59) * 60, recent_done),
+        )
+        conn.execute("UPDATE tasks SET completed_at = NULL WHERE id = ?", (null_done,))
+        conn.commit()
+
+    monkeypatch.setattr(kc.time, "time", lambda: now)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    default_titles = {row["title"] for row in json.loads(kc.run_slash("list --json"))}
+    done_titles = {
+        row["title"] for row in json.loads(kc.run_slash("list --status done --json"))
+    }
+    historical_titles = {
+        row["title"] for row in json.loads(kc.run_slash("list --historical --json"))
+    }
+
+    assert "stale done" not in default_titles
+    assert {"recent done", "undated done", "ready", "blocked"} <= default_titles
+    assert "12 hour done" not in default_titles
+    assert {"stale done", "12 hour done", "recent done", "undated done"} == done_titles
+    assert {"stale done", "12 hour done", "recent done", "undated done", "ready", "blocked"} <= historical_titles
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"list_done_retention_hours": 0.5}},
+    )
+    override_titles = {
+        row["title"] for row in json.loads(kc.run_slash("list --json"))
+    }
+    assert "recent done" not in override_titles
+    assert "undated done" in override_titles
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, stale_done).status == "done"
+        assert kb.get_task(conn, stale_done).completed_at == now - 12 * 60 * 60 - 1
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

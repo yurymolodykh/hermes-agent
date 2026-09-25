@@ -37,6 +37,11 @@ import logging
 import re
 import shutil
 import contextvars as _ctxvars
+import hashlib
+import os
+import tarfile
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -122,15 +127,17 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
-def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+def _security_scan_skill(skill_dir: Path, *, strict: bool = False) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
     No-op when skills.guard_agent_created is disabled (the default).
+    Managed shared updates use strict=True so a missing/failing scanner
+    cannot turn an enabled guard into a successful publication.
     """
-    if not _GUARD_AVAILABLE:
-        return None
     if not _guard_agent_created_enabled():
         return None
+    if not _GUARD_AVAILABLE:
+        return "Security scan unavailable" if strict else None
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
@@ -146,9 +153,31 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        if strict:
+            return "Security scan failed; refusing managed shared update"
     return None
 
 import yaml
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader which rejects duplicate mapping keys instead of silently
+    accepting last-writer-wins frontmatter."""
+
+
+def _unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.YAMLError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping
+)
 
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
@@ -590,7 +619,7 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     yaml_content = content[3:end_match.start() + 3]
 
     try:
-        parsed = yaml.safe_load(yaml_content)
+        parsed = yaml.load(yaml_content, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as e:
         return f"YAML frontmatter parse error: {e}"
 
@@ -660,66 +689,6 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
     return None
-
-
-def _skill_creation_advisories(name: str, content: str) -> List[Dict[str, str]]:
-    """Return non-blocking, deterministic near-duplicate hints for creation."""
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-
-    frontmatter, _ = _parse_frontmatter(content)
-    description = str(frontmatter.get("description") or "")
-    query_terms = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", f"{name} {description}".lower()))
-    if not query_terms:
-        return []
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.skills_config import get_disabled_skills
-        disabled = get_disabled_skills(load_config())
-    except Exception:
-        disabled = set()
-    try:
-        from tools import skill_usage
-        usage = skill_usage.load_usage()
-    except Exception:
-        usage = {}
-
-    advisories: List[Dict[str, str]] = []
-    seen = set()
-    for root in get_all_skills_dirs():
-        try:
-            candidates = root.rglob("SKILL.md")
-        except OSError:
-            continue
-        for skill_md in candidates:
-            if is_excluded_skill_path(skill_md) or skill_md.parent.name == name:
-                continue
-            try:
-                candidate_content = skill_md.read_text(encoding="utf-8")
-                candidate_fm, _ = _parse_frontmatter(candidate_content)
-            except OSError:
-                continue
-            candidate_name = str(candidate_fm.get("name") or skill_md.parent.name)
-            if candidate_name in seen:
-                continue
-            candidate_description = str(candidate_fm.get("description") or "")
-            candidate_terms = set(re.findall(
-                r"[a-z0-9][a-z0-9_-]{2,}",
-                f"{candidate_name} {candidate_description}".lower(),
-            ))
-            shared = query_terms & candidate_terms
-            if len(shared) < 2:
-                continue
-            seen.add(candidate_name)
-            state = str((usage.get(candidate_name) or {}).get("state") or "active")
-            if candidate_name in disabled:
-                state = "disabled"
-            advisories.append({
-                "name": candidate_name,
-                "description": candidate_description,
-                "state": state,
-                "shared_terms": ", ".join(sorted(shared)),
-            })
-    return sorted(advisories, key=lambda item: (item["state"] != "active", item["name"]))[:5]
 
 
 def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
@@ -1031,14 +1000,6 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
-    candidates = _skill_creation_advisories(name, content)
-    if candidates:
-        result["advisory_candidates"] = candidates
-        candidate_names = ", ".join(candidate["name"] for candidate in candidates)
-        result["recommendation"] = (
-            f"Similar skills found: {candidate_names}. Creation was not blocked; "
-            "review them and consider extending one if the procedures overlap."
-        )
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
     return result
@@ -1254,8 +1215,24 @@ def _patch_skill(
     return result
 
 
+def _external_destructive_write_guard(name: str, skill_dir: Path, action: str) -> Optional[Dict[str, Any]]:
+    """Do not turn an external loader root into a recursive/unlink write API.
+
+    This is an exact-path ownership check, shared by skill_manage's preflight
+    and the low-level helpers. Only update_shared has the narrow CAS/backup
+    authorization for a configured shared SKILL.md; it never deletes files.
+    """
+    try:
+        skill_dir.resolve().relative_to(_skills_dir().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return {"success": False, "error":
+                f"Refusing {action} for read-only external/shared skill '{name}'; "
+                "destructive skill_manage actions are confined to the profile-local skills root."}
+    return None
+
+
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
-    """Delete a skill.
+    """Delete a profile-local skill.
 
     ``absorbed_into`` declares intent:
       - ``None`` / missing  → caller didn't declare (legacy / non-curator path);
@@ -1269,6 +1246,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    readonly_guard = _external_destructive_write_guard(name, existing["path"], "delete")
+    if readonly_guard:
+        return readonly_guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
     if org_guard:
         return org_guard
@@ -1443,6 +1423,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    readonly_guard = _external_destructive_write_guard(name, skill_dir, "remove_file")
+    if readonly_guard:
+        return readonly_guard
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
     if guard:
         return guard
@@ -1485,9 +1468,385 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     }
 
 
+# -----------------------------------------------------------------------------
+# Shared-skill promotion
+# -----------------------------------------------------------------------------
+
+_PROMOTION_ALLOWED_DIRS = {"references", "templates", "scripts", "assets"}
+_PROMOTION_EXCLUDED_NAMES = {"__pycache__", "smoke-output"}
+_PROMOTION_EXCLUDED_PREFIXES = ("r3-", "task-", "run-")
+
+
+def _promotion_excluded(relative: Path) -> bool:
+    """Return whether a source path is generated/runtime residue, not package data."""
+    return any(
+        part in _PROMOTION_EXCLUDED_NAMES or part.startswith(_PROMOTION_EXCLUDED_PREFIXES)
+        for part in relative.parts
+    )
+
+
+def _promotion_safe_relative(path: Path, root: Path) -> Optional[Path]:
+    """Return a non-escaping relative path, rejecting links and junctions."""
+    if _is_path_redirect(path):
+        return None
+    try:
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+        relative = resolved.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+    return relative
+
+
+def _promotion_files(source_dir: Path, local_root: Path) -> Tuple[Optional[List[Tuple[Path, Path]]], Optional[str]]:
+    """Collect the redistributable package without following source redirects."""
+    source_relative = _promotion_safe_relative(source_dir, local_root)
+    if source_relative is None:
+        return None, "profile-local source is a symlink/junction or escapes its skills root"
+    files: List[Tuple[Path, Path]] = []
+    try:
+        for path in source_dir.rglob("*"):
+            relative = path.relative_to(source_dir)
+            if _promotion_excluded(relative):
+                continue
+            if _is_path_redirect(path):
+                return None, f"source contains a symlink/junction: {relative}"
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                return None, f"source contains unsupported non-file entry: {relative}"
+            if relative.name == "SKILL.md" and len(relative.parts) == 1:
+                files.append((path, relative))
+            elif relative.parts and relative.parts[0] in _PROMOTION_ALLOWED_DIRS:
+                files.append((path, relative))
+    except OSError as exc:
+        return None, f"could not inspect profile-local source: {exc}"
+    if not any(relative == Path("SKILL.md") for _, relative in files):
+        return None, "profile-local source has no redistributable SKILL.md"
+    return sorted(files, key=lambda item: item[1].as_posix()), None
+
+
+def _promotion_manifest(files: List[Tuple[Path, Path]]) -> Dict[str, Any]:
+    entries = []
+    for source, relative in files:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        entries.append({"path": relative.as_posix(), "sha256": digest, "bytes": source.stat().st_size})
+    canonical = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"algorithm": "sha256", "files": entries, "package_sha256": hashlib.sha256(canonical).hexdigest()}
+
+
+def _promotion_target_is_owned(marker: Path, owner_token: str) -> bool:
+    """Prove a published target still belongs to this invocation before cleanup."""
+    if _is_path_redirect(marker):
+        return False
+    try:
+        return marker.is_file() and marker.read_text(encoding="utf-8") == owner_token
+    except OSError:
+        return False
+
+
+def _configured_shared_promotion_root() -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve exactly the configured external create_dir, never a caller path."""
+    try:
+        from hermes_cli.config import load_config
+        from agent.skill_utils import get_all_skills_dirs
+        configured = cfg_get(load_config(), "skills", "create_dir")
+    except Exception as exc:
+        return None, f"could not load skills.create_dir: {exc}"
+    if not isinstance(configured, str) or not configured.strip():
+        return None, "skills.create_dir must be configured to a shared/external skills root before promotion"
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        return None, "skills.create_dir must be an absolute shared/external skills root"
+    if _is_path_redirect(candidate):
+        return None, "skills.create_dir must not be a symlink/junction"
+    try:
+        target_root = candidate.resolve(strict=True)
+        local_root = _skills_dir().resolve()
+        external_roots = {Path(root).resolve() for root in get_all_skills_dirs() if Path(root).exists()}
+    except OSError as exc:
+        return None, f"could not resolve skills.create_dir safely: {exc}"
+    if target_root == local_root or target_root not in external_roots:
+        return None, "skills.create_dir must resolve to one configured shared/external skills root, not the profile-local root"
+    return target_root, None
+
+
+def _promote_skill(name: str) -> Dict[str, Any]:
+    """Publish one exact profile-local skill to the configured shared root safely."""
+    err = _validate_name(name)
+    if err:
+        return {"success": False, "error": err}
+    local_root = _skills_dir()
+    if _is_path_redirect(local_root):
+        return {"success": False, "error": "profile-local skills root is a symlink/junction"}
+    try:
+        local_root = local_root.resolve(strict=True)
+    except OSError as exc:
+        return {"success": False, "error": f"could not resolve profile-local skills root: {exc}"}
+
+    # Do not use _find_skill: it may select the shared/external collision.
+    sources = []
+    try:
+        for md in local_root.rglob("SKILL.md"):
+            if md.parent.name != name or _promotion_safe_relative(md.parent, local_root) is None:
+                continue
+            fm = _strict_frontmatter(md.read_text(encoding="utf-8"))
+            if fm.get("name") == name:
+                sources.append(md.parent)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return {"success": False, "error": f"could not discover exact profile-local source '{name}': {exc}"}
+    if len(sources) != 1:
+        state = "not found" if not sources else "ambiguous"
+        return {"success": False, "error": f"exact profile-local source '{name}' is {state}; promotion requires exactly one source"}
+    source_dir = sources[0]
+    files, error = _promotion_files(source_dir, local_root)
+    if error:
+        return {"success": False, "error": error}
+    assert files is not None
+    target_root, error = _configured_shared_promotion_root()
+    if error:
+        return {"success": False, "error": error}
+    assert target_root is not None
+    source_relative = source_dir.relative_to(local_root)
+    target_dir = target_root / source_relative
+    if _promotion_safe_relative(target_dir.parent, target_root) is None:
+        return {"success": False, "error": "resolved destination parent escapes configured shared root"}
+    if target_dir.exists() or target_dir.is_symlink() or _is_path_redirect(target_dir):
+        return {"success": False, "error": f"refusing to overwrite existing shared target: {target_dir}"}
+    # Same-name anywhere in the target root is a collision even across categories.
+    try:
+        for md in target_root.rglob("SKILL.md"):
+            if md.parent.name == name:
+                return {"success": False, "error": f"refusing same-name shared collision: {md.parent}"}
+    except OSError as exc:
+        return {"success": False, "error": f"could not inspect shared target root: {exc}"}
+
+    manifest = _promotion_manifest(files)
+    backup_root = get_hermes_home() / "skill-promotion-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_id = f"{name}-{uuid.uuid4().hex}"
+    rollback_archive = backup_root / f"{backup_id}.tar.gz"
+    rollback_manifest = backup_root / f"{backup_id}.manifest.json"
+    try:
+        with tarfile.open(rollback_archive, "w:gz") as archive:
+            for source, relative in files:
+                archive.add(source, arcname=relative.as_posix(), recursive=False)
+        atomic_write_text(rollback_manifest, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", create_mode=0o600)
+    except (OSError, tarfile.TarError) as exc:
+        return {"success": False, "error": f"could not create rollback archive and manifest: {exc}"}
+
+    # Keep temporary output within the configured shared root too: promotion
+    # must not create arbitrary sibling directories while it prepares an atomic
+    # replacement.
+    stage_parent = target_root
+    stage_dir = None
+    published_target = False
+    owner_marker_name = f".{name}.promotion-owner"
+    owner_token = uuid.uuid4().hex
+    owner_marker = target_dir / owner_marker_name
+    try:
+        stage_dir = Path(tempfile.mkdtemp(prefix=f".{name}.promote-", dir=stage_parent))
+        staged_target = stage_dir / source_relative
+        for source, relative in files:
+            destination = staged_target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination, follow_symlinks=False)
+        # The marker moves atomically with the staged package.  It is excluded
+        # from the public manifest and lets failure cleanup distinguish this
+        # invocation's output from a target another writer replaced mid-flight.
+        staged_marker = staged_target / owner_marker_name
+        staged_marker.write_text(owner_token, encoding="utf-8")
+        staged_files, stage_error = _promotion_files(staged_target, stage_dir)
+        if stage_error or staged_files is None or _promotion_manifest(staged_files) != manifest:
+            raise OSError(stage_error or "staging manifest does not match source manifest")
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        if target_dir.exists() or _is_path_redirect(target_dir):
+            raise FileExistsError(f"shared target appeared during staging: {target_dir}")
+        os.replace(staged_target, target_dir)
+        published_target = True
+        staged_target = None
+        published_files, published_error = _promotion_files(target_dir, target_root)
+        if published_error or published_files is None or _promotion_manifest(published_files) != manifest:
+            raise OSError(published_error or "post-readback manifest mismatch")
+        if not _promotion_target_is_owned(owner_marker, owner_token):
+            raise OSError("post-readback ownership marker mismatch")
+        owner_marker.unlink()
+    except (OSError, shutil.Error) as exc:
+        if published_target and target_dir.exists() and _promotion_target_is_owned(owner_marker, owner_token):
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return {"success": False, "error": f"promotion failed; source preserved and owned target rolled back when safe: {exc}",
+                "rollback": {"archive": str(rollback_archive), "manifest": str(rollback_manifest)}}
+    finally:
+        if stage_dir is not None:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+    return {
+        "success": True,
+        "message": f"Skill '{name}' promoted to configured shared skills root.",
+        "promotion": {
+            "source": str(source_dir), "target": str(target_dir), "manifest": manifest,
+            "rollback": {"archive": str(rollback_archive), "manifest": str(rollback_manifest)},
+            "post_readback": "manifest_sha256_match",
+        },
+    }
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
+
+# Enforced lifecycle preflight -------------------------------------------------
+# This is deliberately core-resident and computes from loader roots/configuration;
+# it never consumes an LLM-supplied manifest or user-editable receipt.
+_LIFECYCLE_MUTATIONS = {"create", "edit", "patch", "write_file", "delete", "remove_file"}
+_LIFECYCLE_WORDS = re.compile(r"[\w-]{3,}", re.UNICODE)
+
+
+def _strict_frontmatter(content: str) -> Dict[str, Any]:
+    """Parse SKILL.md frontmatter without duplicate-key ambiguity."""
+    content = content.lstrip("\ufeff")
+    if not content.startswith("---"):
+        raise ValueError("missing YAML frontmatter")
+    end = re.search(r"\n---\s*\n", content[3:])
+    if not end:
+        raise ValueError("unclosed YAML frontmatter")
+    parsed = yaml.load(content[3:end.start() + 3], Loader=_UniqueKeySafeLoader)
+    if not isinstance(parsed, dict):
+        raise ValueError("frontmatter is not a mapping")
+    return parsed
+
+
+def _lifecycle_text(name: str, description: str, body: str) -> set[str]:
+    # Structured sections are intentionally part of the deterministic signal,
+    # rather than an LLM's free-form assertion that two skills differ.
+    headings = re.findall(r"^##?\s+(.+)$", body, re.MULTILINE)
+    return set(x.lower() for x in _LIFECYCLE_WORDS.findall(" ".join([name, description, *headings, body])))
+
+
+def _lifecycle_content_fingerprint(content: str) -> str:
+    """Detect exact procedural copies under different names, not topic overlap."""
+    fm = _strict_frontmatter(content)
+    end = re.search(r"\n---\s*\n", content.lstrip("\ufeff")[3:])
+    assert end is not None  # _strict_frontmatter validated the closing delimiter
+    body = content.lstrip("\ufeff")[end.end() + 3:].strip()
+    identity = json.dumps([str(fm.get("description", "")).strip(), body], ensure_ascii=False)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _core_skill_inventory() -> List[Dict[str, Any]]:
+    """Inventory every applicable loader root, including disabled and archive.
+
+    External/project roots are discovery sources, not write authority.  A
+    malformed or escaping SKILL.md is recorded as invalid so the preflight
+    blocks rather than silently hiding it.
+    """
+    from agent.skill_utils import get_all_skills_dirs, get_disabled_skill_names
+    roots = []
+    for root in get_all_skills_dirs():
+        try:
+            resolved = Path(root).resolve()
+        except OSError:
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    local = _skills_dir().resolve()
+    disabled = set(get_disabled_skill_names())
+    records = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        source = "local" if root == local else "external"
+        for md in root.rglob("SKILL.md"):
+            try:
+                resolved = md.resolve()
+                if resolved != root and root not in resolved.parents:
+                    records.append({"path": str(md), "state": "invalid", "reason": "symlink escape"})
+                    continue
+                text = resolved.read_text(encoding="utf-8")
+                fm = _strict_frontmatter(text)
+                skill_name = str(fm.get("name") or resolved.parent.name)
+                archived = ".archive" in resolved.relative_to(root).parts
+                readonly = source != "local"
+                try:
+                    from tools import skill_usage
+                    readonly = readonly or skill_usage.is_bundled(skill_name) or skill_usage.is_hub_installed(skill_name)
+                except Exception:
+                    pass
+                records.append({"name": skill_name, "description": str(fm.get("description", "")),
+                                "path": str(resolved), "source": source, "disabled": skill_name in disabled,
+                                "archived": archived, "readonly": readonly,
+                                "provenance": fm.get("provenance") or fm.get("homepage") or fm.get("author"),
+                                "content_fingerprint": _lifecycle_content_fingerprint(text),
+                                "terms": sorted(_lifecycle_text(skill_name, str(fm.get("description", "")), text))})
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                records.append({"path": str(md), "state": "invalid", "reason": str(exc)})
+    return sorted(records, key=lambda r: (r.get("name", ""), r["path"]))
+
+
+def _core_lifecycle_preflight(action: str, name: str, content: Optional[str], file_path: Optional[str]) -> Dict[str, Any]:
+    """Return a deterministic decision used in the same mutation call.
+
+    The result is evidence, not an authorization supplied by the caller.
+    Unsupported state transitions are returned as fail-closed recommendations.
+    """
+    if action not in _LIFECYCLE_MUTATIONS:
+        return {"allowed": True, "decision": action, "candidates": []}
+    if action in {"delete", "remove_file"}:
+        # Destructive user-directed operations have an exact target; unrelated
+        # malformed skills must not block a legitimate profile-local cleanup.
+        # The low-level helpers repeat this guard before filesystem mutation.
+        existing = _find_skill(name)
+        if existing:
+            guard = _external_destructive_write_guard(name, existing["path"], action)
+            if guard:
+                return {"allowed": False, "decision": "blocked", "source_state": "read_only",
+                        "reason": guard["error"], "candidates": []}
+        return {"allowed": True, "decision": action, "candidates": []}
+    try:
+        proposed = _strict_frontmatter(content) if action in {"create", "edit"} and content else {}
+    except (ValueError, yaml.YAMLError) as exc:
+        return {"allowed": False, "reason": f"invalid proposed frontmatter: {exc}", "decision": "blocked", "candidates": []}
+    description = str(proposed.get("description", ""))
+    terms = _lifecycle_text(name, description, content or "")
+    inventory = _core_skill_inventory()
+    invalid = [r for r in inventory if r.get("state") == "invalid"]
+    if invalid:
+        return {"allowed": False, "reason": "inventory contains invalid/escaping skill metadata", "decision": "blocked", "candidates": invalid, "source_state": "invalid"}
+    candidates = []
+    for r in inventory:
+        score = 1.0 if r["name"] == name else len(terms & set(r["terms"])) / max(1, len(terms))
+        if r["name"] == name or score >= 0.30:
+            candidates.append(dict(r, similarity=round(score, 4)))
+    exact = [r for r in candidates if r["name"] == name]
+    # Topic words (especially those in a long procedure body) are discovery
+    # hints, not evidence that a distinct skill is the same procedure. Only an
+    # exact name or an identical description+body can veto a create.
+    duplicate = []
+    if action == "create" and content and not exact:
+        fingerprint = _lifecycle_content_fingerprint(content)
+        duplicate = [r for r in inventory if r["content_fingerprint"] == fingerprint]
+    pool = exact or duplicate
+    # A profile-local skill shadows the same-name external copy in the loader;
+    # lexical path order must not make an unrelated shared root the target.
+    pool.sort(key=lambda r: (r["source"] != "local", r["name"], r["path"]))
+    local_count = sum(r["source"] == "local" for r in pool)
+    if len(pool) > 1 and (len({r["name"] for r in pool}) > 1 or local_count > 1 or local_count == 0):
+        return {"allowed": False, "decision": "blocked", "reason": "ambiguous matching skills; choose a target explicitly", "candidates": pool, "source_state": "ambiguous"}
+    selected = pool[0] if pool else None
+    evidence = {"decision": action, "candidates": candidates, "selected": selected,
+                "evidence_locator": "core:skill_manager_tool:_core_lifecycle_preflight", "source_state": "none"}
+    if not selected:
+        return dict(evidence, allowed=True, reason="no exact name or identical procedure; similar topics are advisory")
+    if selected["disabled"]:
+        return dict(evidence, allowed=False, decision="enable", source_state="disabled", reason="matching skill is disabled", recommended_action="enable", recommended_target=selected["path"])
+    if selected["archived"]:
+        return dict(evidence, allowed=False, decision="restore", source_state="archived", reason="matching skill is archived", recommended_action="restore", recommended_target=selected["path"])
+    if selected["readonly"]:
+        return dict(evidence, allowed=False, decision="fork", source_state="read_only", reason="matching skill is read-only", recommended_action="fork", recommended_target=selected["path"])
+    if action == "create":
+        return dict(evidence, allowed=False, decision="patch", source_state="editable", reason="matching editable skill exists", recommended_action="patch", recommended_target=selected["path"])
+    return dict(evidence, allowed=True, source_state="editable", reason="selected editable skill", recommended_target=selected["path"])
+
 
 # ContextVar bypass: set while replaying an already-approved staged skill write
 # so skill_manage() does not re-gate (and re-stage) it.
@@ -1502,7 +1861,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file", "promote", "update_shared"}:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1553,6 +1912,9 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             new_string=payload.get("new_string"),
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
+            shared_path=payload.get("shared_path"),
+            expected_sha256=payload.get("expected_sha256"),
+            rollback_id=payload.get("rollback_id"),
         )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1621,12 +1983,56 @@ def skill_manage(
     absorbed_into: str = None,
     task_id: str = None,
     session_id: str = None,
+    shared_path: str = None,
+    expected_sha256: str = None,
+    rollback_id: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
     Returns JSON string with results.
     """
+    if action == "preflight":
+        # Read-only explicit inspection surface. Mutations below independently
+        # recompute this same evidence in their own call, so this result cannot
+        # be forged/replayed as authority.
+        lifecycle = _core_lifecycle_preflight("create" if content else "patch", name, content, file_path)
+        return json.dumps({"success": True, "preflight": lifecycle}, ensure_ascii=False)
+
+    if action == "update_shared":
+        # A distinct, narrow maintenance lane: normal edit/patch remains
+        # read-only for external skills. Only configured shared create_dir can
+        # be targeted; arbitrary profiles' create_dir points at their own
+        # local root and is rejected by this resolver.
+        from tools.skill_provenance import is_background_review
+        if get_hermes_home().name != "10-skill-librarian":
+            return tool_error("update_shared is restricted to the skill-librarian profile", success=False)
+        if is_background_review():
+            return tool_error("background review cannot update shared skills", success=False)
+        root, error = _configured_shared_promotion_root()
+        if error:
+            return tool_error(error, success=False)
+        gate_result = _apply_skill_write_gate(
+            action, name, content=content, shared_path=shared_path,
+            expected_sha256=expected_sha256, rollback_id=rollback_id,
+        )
+        if gate_result is not None:
+            return gate_result
+        from tools.managed_shared_skill_update import managed_shared_update
+        result = managed_shared_update(root, name, shared_path, expected_sha256,
+                                      content=content, rollback_id=rollback_id)
+        if result.get("success"):
+            try:
+                from agent.prompt_builder import clear_skills_system_prompt_cache
+                clear_skills_system_prompt_cache(clear_snapshot=True)
+            except Exception:
+                pass
+        return json.dumps(result, ensure_ascii=False)
+
+    lifecycle = _core_lifecycle_preflight(action, name, content, file_path)
+    if not lifecycle.get("allowed"):
+        return json.dumps({"success": False, "error": lifecycle.get("reason"), "preflight": lifecycle}, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -1691,10 +2097,16 @@ def skill_manage(
             return tool_error("file_path is required for 'remove_file'.", success=False)
         result = _remove_file(name, file_path)
 
+    elif action == "promote":
+        result = _promote_skill(name)
+
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: preflight, create, patch, edit, delete, write_file, remove_file, promote"}
 
     if result.get("success"):
+        # Persisted result is bound to evidence computed by this core call, not
+        # to a mutable profile receipt.
+        result["preflight"] = lifecycle
         # Audit ledger append (best-effort; never blocks the mutation).
         try:
             from tools import skill_ledger as _ledger
@@ -1781,10 +2193,14 @@ SKILL_MANAGE_SCHEMA = {
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
+        "Actions: preflight (inspect enforced lifecycle decision), create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
-        "delete, write_file, remove_file.\n\n"
+        "delete, write_file, remove_file, promote, update_shared. Update_shared "
+        "replaces one existing configured shared SKILL.md with CAS and durable "
+        "backup/journal; rollback needs resulting hash and transaction id. "
+        "Promote publishes exactly one "
+        "profile-local skill to configured external skills.create_dir with a rollback archive; it never accepts a destination path.\n\n"
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
         "pruning it with no forwarding target. This lets the curator tell "
@@ -1816,7 +2232,7 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["preflight", "create", "patch", "edit", "delete", "write_file", "remove_file", "promote", "update_shared"],
                 "description": "The action to perform."
             },
             "name": {
@@ -1888,6 +2304,18 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "shared_path": {
+                "type": "string",
+                "description": "For update_shared: existing category/name/SKILL.md under configured external skills.create_dir."
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "For update_shared: lowercase SHA-256 of current shared SKILL.md; required also for rollback."
+            },
+            "rollback_id": {
+                "type": "string",
+                "description": "For update_shared rollback only: returned transaction id; omit content."
+            },
         },
         "required": ["action", "name"],
     },
@@ -1912,6 +2340,9 @@ registry.register(
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
+        shared_path=args.get("shared_path"),
+        expected_sha256=args.get("expected_sha256"),
+        rollback_id=args.get("rollback_id"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",

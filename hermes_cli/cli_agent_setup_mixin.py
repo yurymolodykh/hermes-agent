@@ -542,6 +542,13 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            # A model selected through the CLI /model flow is an explicit user
+            # instruction.  Keep the same no-silent-fallback policy as the
+            # gateway; config defaults remain eligible for automatic fallback.
+            self.agent._model_explicitly_selected = bool(
+                getattr(self, "_model_explicitly_selected", False)
+            )
+            self.agent._explicit_model_unavailable = False
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

@@ -199,6 +199,10 @@ class TestCheckWebApiKey:
         assert web_tools.check_web_api_key() is True
 
     def test_no_credentials_fails(self, monkeypatch):
+        # The optional ddgs package may be installed in the test environment;
+        # hide it at the import boundary so this test exercises the actual
+        # no-provider branch rather than the emergency search-only fallback.
+        monkeypatch.setitem(__import__("sys").modules, "ddgs", None)
         from tools import web_tools
         from agent import web_search_registry
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})

@@ -267,7 +267,6 @@ def _get_backend() -> str:
         ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
-        ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
         if available:
@@ -289,8 +288,8 @@ def _get_backend() -> str:
             logger.debug("web provider %r.is_available() raised: %s", provider.name, exc)
 
     # Keyless free-tier walk — zero credentials anywhere. Providers with a
-    # public anonymous endpoint (Parallel, Exa — see
-    # plugins/web/keyless_mcp.py) can still serve, unless the user disabled
+    # public anonymous endpoints (Exa, Parallel, Tavily, Firecrawl, and
+    # Keenable — see plugins/web/keyless_mcp.py) can still serve, unless the user disabled
     # the tier via ``web.keyless_fallback: false``. Strictly last so it
     # never pre-empts any keyed/importable backend above. Discovery must
     # run first — this path is reachable from contexts that haven't loaded
@@ -313,6 +312,12 @@ def _get_backend() -> str:
                     )
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
         logger.debug("keyless fallback walk failed: %s", exc)
+
+    # DDGS remains available as a search-only emergency fallback, but it must
+    # not pre-empt the five-provider keyless ring merely because the package is
+    # installed. An explicit web.backend/search_backend: ddgs still wins above.
+    if _ddgs_package_importable():
+        return "ddgs"
 
     return "firecrawl"  # default (backward compat)
 

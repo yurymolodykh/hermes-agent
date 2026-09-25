@@ -1,18 +1,16 @@
 """Keyless web search/extract via public MCP endpoints.
 
-Exa and Parallel both operate public, anonymous MCP endpoints with a free
-tier (the same endpoints the opencode CLI ships as its default search
-path):
+Five providers operate public, anonymous endpoints with a free tier:
 
-- Exa:      https://mcp.exa.ai/mcp           (tools: web_search_exa, web_fetch_exa)
-- Parallel: https://search.parallel.ai/mcp   (tools: web_search, web_fetch)
+- Exa, Parallel, Tavily, Firecrawl, and Keenable. Each provider-specific
+  adapter is kept below in this module.
 
 This module implements a minimal JSON-RPC ``tools/call`` client for those
-two endpoints so a fresh Hermes install with **zero web credentials** still
+these endpoints so a fresh Hermes install with **zero web credentials** still
 gets working ``web_search`` / ``web_extract`` tools. The keyless tier is
-resolved strictly LAST — after every keyed backend, the managed tool
-gateway, ddgs, and custom plugin providers — so it never pre-empts a
-deliberate setup (see ``tools.web_tools._get_backend`` and the registry's
+resolved after credentialed and managed backends, but before the DDGS
+emergency fallback, so an installed search-only package cannot pre-empt the
+five-provider ring (see ``tools.web_tools._get_backend`` and the registry's
 ``_KEYLESS_PREFERENCE`` walk).
 
 Privacy: requests carry no user identifiers. Parallel's free tier asks for

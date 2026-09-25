@@ -14,6 +14,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+- POST /api/feedback/openwebui     — persist an authenticated Open WebUI rating for skill review
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -48,6 +49,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import mimetypes
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
@@ -239,6 +241,50 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+OPENWEBUI_STATUS_DESCRIPTION_MAX_CHARS = 120
+
+
+_OPENWEBUI_TOOL_STATUS = {
+    "web_search": ("Ищу в интернете", "Поиск завершён"),
+    "web_extract": ("Читаю веб-источник", "Источник прочитан"),
+    "browser_navigate": ("Открываю страницу", "Страница открыта"),
+    "browser_click": ("Работаю со страницей", "Действие на странице завершено"),
+    "read_file": ("Читаю файл", "Файл прочитан"),
+    "search_files": ("Ищу в файлах", "Поиск в файлах завершён"),
+    "write_file": ("Записываю файл", "Файл записан"),
+    "patch": ("Изменяю файл", "Файл изменён"),
+    "terminal": ("Выполняю команду", "Команда выполнена"),
+    "execute_code": ("Выполняю код", "Код выполнен"),
+    "delegate_task": ("Запустил отдельную проверку", "Отдельная проверка завершена"),
+    "vision_analyze": ("Анализирую изображение", "Изображение проверено"),
+}
+
+
+def _openwebui_status_event(progress: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate one Hermes tool event to Open WebUI's native status shape."""
+    tool = str(progress.get("tool") or "").strip()
+    running = progress.get("status") == "running"
+    active, completed = _OPENWEBUI_TOOL_STATUS.get(
+        tool, ("Выполняю действие", "Действие завершено")
+    )
+    description = active if running else completed
+    label = str(progress.get("label") or "").strip()
+    if running and label and label != tool:
+        description = f"{description}: {label}"
+    if len(description) > OPENWEBUI_STATUS_DESCRIPTION_MAX_CHARS:
+        description = description[: OPENWEBUI_STATUS_DESCRIPTION_MAX_CHARS - 1].rstrip() + "…"
+    return {
+        "event": {
+            "type": "status",
+            "data": {
+                "action": "hermes_work",
+                "description": description,
+                "done": not running,
+            },
+        }
+    }
+
+
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1167,6 +1213,97 @@ _MEDIA_MIME = {
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
 
 
+def _extract_openwebui_image_deltas(text: str) -> list[dict[str, Any]]:
+    """Return Open WebUI ``images`` delta items for safe local PNG MEDIA tags.
+
+    Open WebUI's OpenAI-compatible streaming parser turns an ``images`` delta
+    carrying a ``data:image/png`` URL into a chat-owned downloadable file.
+    The normal markdown response path cannot do that: it only renders text.
+    PNG is deliberately the sole supported format here because Open WebUI
+    persists only that data-URL form in its confirmed parser path.  As with
+    :func:`_resolve_media_to_data_urls`, paths must pass the shared delivery
+    validator and image payloads are bounded before their bytes are read.
+    """
+    if not text or "MEDIA:" not in text:
+        return []
+
+    items: list[dict[str, Any]] = []
+
+    def _repl(m: "re.Match[str]") -> str:
+        safe_path = validate_media_delivery_path(m.group("path"))
+        if not safe_path:
+            return m.group(0)
+        path = Path(safe_path)
+        if path.suffix.lower() != ".png":
+            return m.group(0)
+        try:
+            if path.stat().st_size > _MEDIA_DATA_URL_MAX_BYTES:
+                return m.group(0)
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            return m.group(0)
+        items.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{encoded}"},
+        })
+        return m.group(0)
+
+    try:
+        MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+    except Exception:
+        return []
+    return items
+
+
+def _extract_openwebui_file_deltas(text: str) -> list[dict[str, Any]]:
+    """Encode generated files for OpenWebUI's authenticated attachment store.
+
+    A result file is delivered when the agent explicitly emits ``MEDIA:`` or
+    reports an existing bare absolute path. The latter mirrors every native
+    gateway adapter and means a plain-path final answer from an API-server run
+    still arrives in Open WebUI as a downloadable attachment. Every candidate
+    is passed through the shared media-delivery safety policy before bytes are
+    read; paths in code examples are excluded by ``extract_local_files``.
+    """
+    if not text:
+        return []
+
+    candidates: list[str] = []
+    if "MEDIA:" in text:
+        for match in MEDIA_TAG_CLEANUP_RE.finditer(text):
+            candidates.append(match.group("path"))
+    try:
+        bare_paths, _ = BasePlatformAdapter.extract_local_files(text)
+        candidates.extend(bare_paths)
+    except Exception:
+        # A delivery convenience must never make a completed agent response
+        # fail. Explicit MEDIA tags are still handled below.
+        pass
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        safe_path = validate_media_delivery_path(candidate)
+        if not safe_path or safe_path in seen:
+            continue
+        seen.add(safe_path)
+        path = Path(safe_path)
+        try:
+            if path.stat().st_size > 30 * 1024 * 1024:
+                continue
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            continue
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        items.append({
+            "type": "file",
+            "name": path.name,
+            "content_type": content_type,
+            "data": f"data:{content_type};base64,{encoded}",
+        })
+    return items
+
+
 def _resolve_media_to_data_urls(text: str) -> str:
     """Replace ``MEDIA:<path>`` image tags with inline base64 data URLs.
 
@@ -1513,12 +1650,29 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        # Durable tasks have two independently significant profiles: the
+        # runtime assignee selected for this request and the profile that owns
+        # this HTTP transport.  Capture the latter before per-request routing
+        # enters a named profile scope.  Completion notifications must be
+        # claimed by the transport owner; subscribing them to the runtime
+        # profile makes a multiplexed default listener skip its own wake.
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            self._transport_owner_profile = get_active_profile_name() or "default"
+        except Exception:
+            self._transport_owner_profile = "default"
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # default_profile: when a request carries no explicit /p/<profile>/
+        # prefix (and no per-request profile middleware set it), route the
+        # request to this profile instead of "default". Lets Open WebUI /
+        # Yandex-Disk PWA (which call the plain /v1/... endpoints) land on the
+        # orchestrator automatically, with no client-side base-url edit.
+        self._default_profile: str = (extra.get("default_profile") or "").strip()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1906,7 +2060,7 @@ class APIServerAdapter(BasePlatformAdapter):
     def _expected_api_key(self) -> str:
         """Return the API key authorized for the URL-selected profile."""
         profile = _api_request_profile.get()
-        if not profile or profile == "default":
+        if not profile or profile == "default" or profile == self._default_profile:
             return self._api_key
 
         try:
@@ -1936,7 +2090,7 @@ class APIServerAdapter(BasePlatformAdapter):
         the no-key branch only exists for tests or unsupported manual wiring.
         """
         profile = _api_request_profile.get()
-        is_named_profile = bool(profile and profile != "default")
+        is_named_profile = bool(profile and profile != "default" and profile != self._default_profile)
         expected_key = self._expected_api_key()
         if not expected_key:
             # Preserve the historical no-key test/manual-wiring behavior only
@@ -2189,10 +2343,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": "Unknown or unconfigured profile"},
                     status=404,
                 )
-            token = _api_request_profile.set(profile)
+            token = _api_request_profile.set(profile or (self._default_profile or None))
             try:
-                with self._profile_scope(profile):
-                    resolved_profile = profile or "default"
+                with self._profile_scope(profile or (self._default_profile or None)):
+                    resolved_profile = profile or (self._default_profile or "default")
                     principal_token = _api_request_browser_control_principal.set(
                         self._derive_browser_control_principal(resolved_profile)
                     )
@@ -2245,6 +2399,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            # Ratings arrive from an Open WebUI backend/plugin using API-key auth.
+            # They are local review evidence, never live prompt/context mutation.
+            ("POST", "/api/feedback/openwebui", self._handle_openwebui_feedback),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
@@ -2503,6 +2660,19 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         stored = session.get("model") if isinstance(session, dict) else None
         if not stored or stored == self._model_name:
+            return None
+        # Configured aliases are atomic routes.  A legacy raw model-only row is
+        # intentionally ignored: combining it with today's ambient provider is
+        # the model/provider splice this invariant forbids.
+        if self._resolve_route(stored):
+            return stored
+        cfg = self._parse_session_model_config(session.get("model_config"))
+        lock = cfg.get("browser_model_lock") if isinstance(cfg, dict) else None
+        if not isinstance(lock, dict):
+            return None
+        provider = self._clean_runtime_id(lock.get("provider"), max_len=80)
+        model = self._clean_runtime_id(lock.get("model"))
+        if not provider or model != stored:
             return None
         return stored
 
@@ -3242,8 +3412,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if _api_request_profile.get()
             else self._model_name
         )
-        models = [
-            {
+        # A configured route table is an explicit client-facing allowlist.
+        # Do not also advertise the virtual gateway-default model: clients show
+        # every /v1/models item in their picker and could otherwise select an
+        # unpinned fallback rather than one of the deliberate routes.
+        models = []
+        if not self._model_routes:
+            models.append({
                 "id": model_name,
                 "object": "model",
                 "created": now,
@@ -3251,8 +3426,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "permission": [],
                 "root": model_name,
                 "parent": None,
-            }
-        ]
+            })
         # Expose configured model route aliases so clients can discover them.
         # Only the alias and resolved model name are exposed — never provider
         # credentials.
@@ -4200,6 +4374,49 @@ class APIServerAdapter(BasePlatformAdapter):
             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         return body, None
 
+    async def _handle_openwebui_feedback(self, request: "web.Request") -> "web.Response":
+        """POST /api/feedback/openwebui — accept one idempotent UI rating.
+
+        This endpoint deliberately does not enqueue a live agent turn or alter
+        memories/skills.  Open WebUI comments are untrusted user data; a later
+        review job evaluates repeated, attributable evidence before any skill
+        change is made.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, body_err = await self._read_json_body(request)
+        if body_err:
+            return body_err
+        try:
+            from agent.openwebui_feedback import (
+                FeedbackValidationError,
+                feedback_store_for_profile,
+                normalize_feedback,
+            )
+            from hermes_constants import get_hermes_home
+
+            record = normalize_feedback(body)
+            store = feedback_store_for_profile(get_hermes_home())
+            inserted = await asyncio.to_thread(store.record, record)
+        except FeedbackValidationError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_openwebui_feedback"),
+                status=400,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] failed to store Open WebUI feedback")
+            return web.json_response(
+                _openai_error(_redact_api_error_text(exc), code="openwebui_feedback_storage_failed"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "hermes.openwebui_feedback",
+            "event_id": record["event_id"],
+            "accepted": inserted,
+            "duplicate": not inserted,
+        }, status=201 if inserted else 200)
+
     async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = await self._ensure_session_db_async()
         if db is None:
@@ -4995,6 +5212,96 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+
+    def _durable_chat_response(
+        self,
+        *,
+        request: "web.Request",
+        text: str,
+        completion_id: str,
+        model: str,
+        created: int,
+        stream: bool,
+        session_id: str,
+        task_id: Optional[str] = None,
+        state: Optional[str] = None,
+        ok: bool = True,
+    ) -> "web.Response":
+        """Return an immediate OpenAI-compatible response for durable controls.
+
+        The actual long-running work belongs to the SQLite-backed Kanban worker,
+        not to this HTTP request.  Therefore a client disconnect after this
+        response cannot cancel the worker.
+        """
+        headers = {"X-Hermes-Session-Id": session_id}
+        if task_id:
+            headers["X-Hermes-Task-Id"] = task_id
+        headers["X-Hermes-Completed"] = "true" if ok else "false"
+        hermes_meta = {
+            "completed": True,
+            "durable_task": True,
+            "task_id": task_id,
+            "state": state,
+            "ok": ok,
+        }
+        if not stream:
+            return web.json_response(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "hermes": hermes_meta,
+                },
+                headers=headers,
+            )
+
+        role_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        content_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+        }
+        finish_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "hermes": hermes_meta,
+        }
+        sse_headers = {
+            **headers,
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        body = b"".join((
+            _sse_frame(role_chunk),
+            _sse_frame(content_chunk),
+            _sse_frame(finish_chunk),
+            b"data: [DONE]\n\n",
+        ))
+        return web.Response(body=body, headers=sse_headers)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5022,7 +5329,10 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
-        from agent.document_anonymizer import anonymize_openwebui_source_blocks
+        from agent.document_anonymizer import (
+            anonymize_openwebui_attachment_tags,
+            anonymize_openwebui_source_blocks,
+        )
 
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
@@ -5031,12 +5341,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # <source ...>...</source>. Redact only those bodies; ordinary text
             # messages, including surrounding user prose, remain unchanged.
             if isinstance(raw_content, str):
+                raw_content = anonymize_openwebui_attachment_tags(raw_content)
                 raw_content = anonymize_openwebui_source_blocks(raw_content)
             elif isinstance(raw_content, list):
                 raw_content = [
                     {
                         **part,
-                        "text": anonymize_openwebui_source_blocks(str(part.get("text") or "")),
+                        "text": anonymize_openwebui_source_blocks(
+                            anonymize_openwebui_attachment_tags(str(part.get("text") or ""))
+                        ),
                     }
                     if isinstance(part, dict) and str(part.get("type") or "").lower() in _TEXT_PART_TYPES
                     else part
@@ -5160,6 +5473,72 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        # A first-line long-task marker opts this turn into the persistent
+        # Kanban execution lane. Explicit /task controls are handled here too,
+        # before an in-process agent is created, so Open WebUI disconnects cannot
+        # cancel or duplicate the durable worker.
+        from gateway.durable_chat_tasks import (
+            execute_durable_chat_command,
+            parse_durable_chat_command,
+        )
+
+        durable_command = parse_durable_chat_command(user_message)
+        if durable_command is not None:
+            request_profile = _api_request_profile.get()
+            if not request_profile:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    request_profile = get_active_profile_name()
+                except Exception:
+                    request_profile = None
+            request_profile = request_profile or "default"
+            durable_model = None
+            durable_provider = None
+            if isinstance(route, dict):
+                durable_model = route.get("model") or None
+                durable_provider = route.get("provider") or None
+            elif model_name != self._model_name:
+                durable_model = agent_overrides.get("requested_model") or None
+                durable_provider = agent_overrides.get("requested_provider") or None
+            try:
+                durable_result = await asyncio.to_thread(
+                    execute_durable_chat_command,
+                    durable_command,
+                    session_id=session_id,
+                    assignee=request_profile,
+                    notifier_profile=self._transport_owner_profile,
+                    model_override=durable_model,
+                    provider_override=durable_provider,
+                )
+            except Exception as exc:
+                logger.exception("Durable chat command failed")
+                durable_result_text = (
+                    "Не удалось выполнить команду устойчивой задачи: "
+                    + _redact_api_error_text(str(exc), limit=300)
+                )
+                return self._durable_chat_response(
+                    request=request,
+                    text=durable_result_text,
+                    completion_id=completion_id,
+                    model=model_name,
+                    created=created,
+                    stream=stream,
+                    session_id=session_id,
+                    ok=False,
+                )
+            return self._durable_chat_response(
+                request=request,
+                text=durable_result.message,
+                completion_id=completion_id,
+                model=model_name,
+                created=created,
+                stream=stream,
+                session_id=session_id,
+                task_id=durable_result.task_id,
+                state=durable_result.state,
+                ok=durable_result.ok,
+            )
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
@@ -5403,7 +5782,10 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
-            last_activity = time.monotonic()
+            turn_started = time.monotonic()
+            last_activity = turn_started
+            is_openwebui = bool(session_id and session_id.startswith("owui-"))
+            current_status_description = "Обдумываю следующий шаг"
 
             # Role chunk
             role_chunk = {
@@ -5413,6 +5795,19 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
+            if is_openwebui:
+                initial_status = {
+                    "event": {
+                        "type": "status",
+                        "data": {
+                            "action": "hermes_work",
+                            "description": current_status_description,
+                            "done": False,
+                        },
+                    }
+                }
+                await response.write(_sse_frame(initial_status))
+                last_activity = time.monotonic()
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -5425,8 +5820,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal current_status_description
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                    progress = item[1]
+                    await response.write(_sse_frame(progress, event="hermes.tool.progress"))
+                    # Open WebUI ignores named custom SSE events, but its
+                    # middleware recognizes this vendor-neutral event envelope
+                    # and renders it as a compact transient status.  Restrict
+                    # the extra frame to the explicit Open WebUI session-id
+                    # convention configured in our integration guide.
+                    if is_openwebui:
+                        status_event = _openwebui_status_event(progress)
+                        await response.write(_sse_frame(status_event))
+                        if progress.get("status") == "running":
+                            current_status_description = status_event["event"]["data"]["description"]
+                        else:
+                            current_status_description = "Обдумываю следующий шаг"
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -5442,7 +5851,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # ThreadSafeAsyncQueue's docstring).
             while True:
                 try:
-                    delta = await asyncio.wait_for(stream_q.get(), timeout=0.5)
+                    poll_timeout = min(0.5, CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+                    delta = await asyncio.wait_for(stream_q.get(), timeout=poll_timeout)
                 except asyncio.TimeoutError:
                     if agent_task.done():
                         # Drain any remaining items
@@ -5456,6 +5866,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                 break
                         break
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        if is_openwebui:
+                            elapsed_seconds = max(1, int(time.monotonic() - turn_started))
+                            heartbeat = {
+                                "event": {
+                                    "type": "status",
+                                    "data": {
+                                        "action": "hermes_work",
+                                        "description": (
+                                            f"{current_status_description} · на связи, "
+                                            f"{elapsed_seconds} с"
+                                        ),
+                                        "done": False,
+                                        "heartbeat": True,
+                                    },
+                                }
+                            }
+                            await response.write(_sse_frame(heartbeat))
                         await response.write(b": keepalive\n\n")
                         last_activity = time.monotonic()
                     continue
@@ -5502,6 +5929,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
+
+            # OpenWebUI persists the ``files`` vendor delta through its own
+            # authenticated file store.  This avoids exposing local paths or a
+            # gateway API key to the browser and supports all media-validated
+            # file types up to 30 MiB.
+            raw_final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+            openwebui_files = _extract_openwebui_file_deltas(raw_final_response)
+            if openwebui_files:
+                file_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"files": openwebui_files},
+                        "finish_reason": None,
+                    }],
+                }
+                await response.write(_sse_frame(file_chunk))
 
             # Finish chunk
             finish_chunk = {
@@ -7270,6 +7715,29 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                     )
+                    if confirmed_runtime_lock:
+                        locked_provider = self._clean_runtime_id(
+                            (requested_runtime or {}).get("provider"), max_len=80
+                        ).lower()
+                        locked_model = self._clean_runtime_id(
+                            (requested_runtime or {}).get("model")
+                        )
+                        actual_provider = self._clean_runtime_id(
+                            getattr(agent, "provider", ""), max_len=80
+                        ).lower()
+                        actual_model = self._clean_runtime_id(getattr(agent, "model", ""))
+                        if not locked_provider or not locked_model:
+                            raise RuntimeError("MODEL_LOCK: concrete provider/model pair required")
+                        if (actual_provider, actual_model) != (locked_provider, locked_model):
+                            raise RuntimeError(
+                                "MODEL_LOCK: resolved route does not match requested immutable route"
+                            )
+                        agent._immutable_route = {
+                            "provider": locked_provider,
+                            "model": locked_model,
+                        }
+                        agent._fallback_chain = []
+                        agent._fallback_model = None
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:

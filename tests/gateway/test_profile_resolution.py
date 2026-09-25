@@ -13,6 +13,24 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 
 
+class TestRequiredGatewayProfile:
+    def test_gateway_config_reads_required_profile(self):
+        config = GatewayConfig.from_dict({"required_profile": "01-orchestrator"})
+
+        assert config.required_profile == "01-orchestrator"
+
+    @pytest.mark.asyncio
+    async def test_start_refuses_unqualified_profile(self, monkeypatch):
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(required_profile="01-orchestrator")
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        assert await runner.start() is False
+
+
 @pytest.fixture
 def mock_runner():
     """Create a minimal mock GatewayRunner with the methods we need."""

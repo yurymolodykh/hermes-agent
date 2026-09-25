@@ -1124,7 +1124,11 @@ PLATFORM_HINTS = {
         "Non-image files are NOT intercepted anywhere, and the runs endpoint "
         "intercepts nothing — a MEDIA: tag there renders as literal text exposing "
         "a raw host filesystem path. For those cases, state the plain file path "
-        "in your response text instead of a MEDIA: tag."
+        "in your response text instead of a MEDIA: tag. When you create or modify "
+        "a file, always state its exact absolute path in the final response. For "
+        "streamed Open WebUI chat-completions requests, each stated existing result "
+        "file is delivered as a native downloadable attachment; do not claim that "
+        "files cannot be sent there."
     ),
     "webui": (
         "You are in the Hermes WebUI, a browser-based chat interface. "

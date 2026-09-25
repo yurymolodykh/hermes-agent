@@ -148,3 +148,58 @@ def test_current_route_keeps_bare_custom_only_when_identity_unrecoverable(monkey
     assert route["provider"] == "custom"
     assert route["model"] == "some-model"
 
+
+
+def test_register_pre_tool_hook_wires_callback_on_plugin_manager(monkeypatch):
+    """Acceptance t_98e9a904: the plugin is registered on the LIVE plugin
+    manager (activation path), not merely imported by tests.
+
+    ``activate_for_locked_agent`` (called from agent_init once
+    ``_immutable_route`` is established) must append ``pre_tool`` to the
+    manager's ``pre_tool_call`` hook slot so a live locked agent's
+    kanban_create / cronjob calls are pinned at the tool-hook layer.
+    """
+    from agent import immutable_route_plugin as plug
+
+    fake_hooks = {}
+    manager = SimpleNamespace(_hooks=fake_hooks)
+
+    import hermes_cli.plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plug, "_PRE_TOOL_HOOK_REGISTERED", False)
+
+    plug._register_pre_tool_hook()
+    assert plug.pre_tool in fake_hooks["pre_tool_call"]
+
+    # Idempotent: a second activation must not double-register.
+    plug._register_pre_tool_hook()
+    assert fake_hooks["pre_tool_call"].count(plug.pre_tool) == 1
+
+
+def test_activate_for_locked_agent_registers_and_is_fail_soft(monkeypatch):
+    """``activate_for_locked_agent`` (the prod-runtime entry point) wires the
+    hook; a failure to reach the plugin registry degrades to a no-op instead
+    of throwing (defense-in-depth, integrated tool/DB layer is authoritative).
+    """
+    from agent import immutable_route_plugin as plug
+
+    registered = []
+    monkeypatch.setattr(plug, "_register_pre_tool_hook",
+                        lambda: registered.append(True))
+    plug.activate_for_locked_agent(None)
+    assert registered == [True]
+
+
+def test_pre_tool_defers_for_non_locked_context(monkeypatch):
+    """A live locked agent's registration must not break non-locked callers:
+    when no immutable route is provable in the execution context, the hook
+    returns None (defer) rather than hard-blocking kanban_create/cronjob.
+    Multiplexed gateway sessions share the registered global callback, so
+    this safety property is essential.
+    """
+    from agent import immutable_route_plugin as plug
+
+    monkeypatch.setattr(plug, "current_route",
+                        lambda: (_ for _ in ()).throw(RuntimeError("no route")))
+    assert plug.pre_tool("kanban_create", {"title": "x", "assignee": "a"}) is None
+    assert plug.pre_tool("cronjob", {"action": "create"}) is None

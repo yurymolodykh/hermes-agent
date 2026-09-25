@@ -23,6 +23,9 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+pytestmark = pytest.mark.usefixtures("isolated_kanban_assignee_registry")
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"

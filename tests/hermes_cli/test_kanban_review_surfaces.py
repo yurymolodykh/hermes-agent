@@ -11,6 +11,9 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
 
+pytestmark = pytest.mark.usefixtures("isolated_kanban_assignee_registry")
+
+
 @pytest.fixture
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     home = tmp_path / ".hermes"
@@ -18,6 +21,7 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-worker-session")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -25,6 +29,9 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
         task_id = kb.create_task(conn, title="Review tool contract", assignee="builder")
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
+        assert kb.bind_worker_session(
+            conn, task_id, task.current_run_id, "builder", "review-worker-session"
+        )
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     return task_id
@@ -57,8 +64,12 @@ def test_review_tools_redact_handoff_and_route_changes(
         assert secret not in json.dumps(handoff.metadata)
         review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
         assert review is not None
+        assert kb.bind_worker_session(
+            conn, review_worker, review.current_run_id, "reviewer", "reviewer-session"
+        )
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
     change_secret = "sk-" + "B" * 32
     changed = json.loads(
@@ -290,6 +301,8 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_SESSION_ID", "goal-review-worker-session")
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
@@ -302,6 +315,13 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         )
         claimed = kb.claim_task(conn, tool_task, claimer="builder:1")
         assert claimed is not None
+        assert kb.bind_worker_session(
+            conn,
+            tool_task,
+            claimed.current_run_id,
+            "builder",
+            "goal-review-worker-session",
+        )
     monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
@@ -325,7 +345,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     with kb.connect() as conn:
         tool_after = kb.get_task(conn, tool_task)
         assert tool_after is not None
-        assert tool_after.status == "running"
+        assert tool_after.status == "blocked"
 
     # The shell/CLI path applies the same gate and must not bypass the tool.
     with kb.connect() as conn:

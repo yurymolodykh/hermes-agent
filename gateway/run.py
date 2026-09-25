@@ -753,6 +753,20 @@ def _gateway_provider_error_reply(text: str) -> str:
     )
 
 
+def _explicit_model_unavailable_reply(model: str, provider: str = "") -> str:
+    """Ask what to do instead of silently changing an explicitly chosen model."""
+    model_text = str(model or "unknown").replace("\n", " ").strip()
+    provider_text = str(provider or "").replace("\n", " ").strip()
+    backend = f" ({provider_text})" if provider_text else ""
+    return (
+        f"⚠️ Явно выбранная модель `{model_text}`{backend} недоступна.\n\n"
+        "Я не переключал её автоматически. Что делать?\n"
+        "1. Повторить запрос с этой же моделью\n"
+        "2. Выбрать другую модель — используйте `/model`\n"
+        "3. Отменить текущий запрос"
+    )
+
+
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"^\s*(\W*\s*)?("
     r"api\s+(?:call\s+)?failed"
@@ -5597,6 +5611,26 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
+            if self._runner._has_explicit_model_selection(ctx.session_key):
+                _explicit_override = self._runner._peek_session_state(
+                    ctx.session_key
+                )
+                _explicit_override = (
+                    _explicit_override.conversation.model_override
+                    if _explicit_override
+                    else {}
+                )
+                return {
+                    "final_response": _explicit_model_unavailable_reply(
+                        (_explicit_override or {}).get("model"),
+                        (_explicit_override or {}).get("provider"),
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "failed": True,
+                    "error": "Explicitly selected model is unavailable",
+                }
             return {
                 "final_response": f"⚠️ Provider authentication failed: {exc}",
                 "messages": [],
@@ -5709,7 +5743,19 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        turn_route = self._runner._resolve_turn_agent_config(
+            ctx.message,
+            model,
+            {
+                **runtime_kwargs,
+                "_explicit_model_override": self._runner._has_explicit_model_selection(
+                    ctx.session_key
+                ),
+            },
+            user_config=ctx.user_config,
+            surface=platform_key,
+            has_attachments=ctx.has_attachments,
+        )
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -5992,6 +6038,16 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        # A session /model override is an explicit user instruction.  Keep the
+        # pin on the cached agent for the whole turn so failover cannot replace
+        # it, and clear the previous turn's failure marker before retrying a
+        # later user message with the same model.
+        agent._model_explicitly_selected = self._runner._has_explicit_model_selection(
+            ctx.session_key
+        )
+        agent._explicit_model_unavailable = False
+        agent._explicit_model_unavailable_reason = ""
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -6666,6 +6722,17 @@ class TurnRunner:
             except Exception:
                 pass
             reset_current_session_key(_approval_session_token)
+        if getattr(agent, "_explicit_model_unavailable", False):
+            # The agent deliberately did not activate its fallback chain.
+            # Replace any provider-specific failure text with a safe question
+            # that leaves the next model choice to the user.
+            result = dict(result or {})
+            result["final_response"] = _explicit_model_unavailable_reply(
+                getattr(agent, "model", "unknown"),
+                getattr(agent, "provider", ""),
+            )
+            result["failed"] = True
+            result["error"] = "Explicitly selected model is unavailable"
         ctx.result_holder[0] = result
 
         # Signal the stream consumer that the agent is done. Pass the
@@ -8432,16 +8499,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        """Build the effective model/runtime config for a single turn.
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: Optional[dict] = None,
+        surface: Optional[str] = None,
+        has_attachments: bool = False,
+    ) -> dict:
+        """Build the effective model/runtime config for one frozen gateway turn.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        A session's explicit model selection wins. Otherwise the optional
+        adaptive routing policy selects a tier before agent construction. A
+        provider switch is atomic: a credentials-resolution failure leaves the
+        baseline model and runtime untouched.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
+        baseline_model = model
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
@@ -8453,25 +8530,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
-        route = {
-            "model": model,
-            "runtime": runtime,
-            "signature": (
-                model,
-                runtime["provider"],
-                runtime["requested_provider"],
-                runtime["base_url"],
-                runtime["api_mode"],
-                runtime["command"],
-                tuple(runtime["args"]),
-            ),
-        }
+        route = {"model": baseline_model, "runtime": runtime}
 
+        try:
+            # A profile config can omit a global setting; omission must inherit
+            # the gateway configuration rather than silently disable routing.
+            config = (
+                user_config.get("adaptive_model_routing")
+                if isinstance(user_config, dict)
+                and "adaptive_model_routing" in user_config
+                else _load_gateway_config().get("adaptive_model_routing")
+            ) or {}
+            from agent.adaptive_model_router import route_turn
+            decision = route_turn(
+                user_message, config,
+                current_model=baseline_model,
+                current_provider=runtime["provider"] or "",
+                surface=surface,
+                explicit_session_override=bool(runtime_kwargs.get("_explicit_model_override")),
+                has_attachments=has_attachments,
+            )
+            if decision.model != baseline_model or decision.provider != (runtime["provider"] or ""):
+                candidate_runtime = runtime
+                if decision.provider and decision.provider != (runtime["provider"] or ""):
+                    candidate_runtime = _resolve_runtime_agent_kwargs_for_provider(decision.provider)
+                    candidate_runtime["max_tokens"] = runtime.get("max_tokens")
+                route["model"] = decision.model or baseline_model
+                route["runtime"] = candidate_runtime
+                logger.info("Adaptive model route: tier=%s model=%s provider=%s (%s)",
+                            decision.tier or "explicit", route["model"],
+                            route["runtime"].get("provider"), decision.reason)
+        except Exception:
+            logger.warning("Adaptive model routing failed; using baseline model", exc_info=True)
+
+        runtime = route["runtime"]
+        route["signature"] = (
+            route["model"], runtime.get("provider"), runtime.get("requested_provider"),
+            runtime.get("base_url"), runtime.get("api_mode"), runtime.get("command"),
+            tuple(runtime.get("args") or []),
+        )
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
             route["request_overrides"] = {}
             return route
-
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
@@ -12703,6 +12804,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
+        required_profile = str(getattr(self.config, "required_profile", "") or "").strip()
+        if required_profile:
+            from hermes_cli.profiles import get_active_profile_name
+
+            active_profile = get_active_profile_name()
+            if active_profile != required_profile:
+                logger.error(
+                    "Refusing gateway startup: this configuration requires profile %r, "
+                    "but the active profile is %r. Start with --profile %s.",
+                    required_profile,
+                    active_profile,
+                    required_profile,
+                )
+                return False
+
         logger.info("Starting Hermes Gateway...")
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
@@ -20629,6 +20745,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 tool_resume=getattr(event, "_hermes_validated_tool_resume", None),
+                has_attachments=bool(getattr(event, "media_urls", None)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -21967,7 +22084,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read and silently end the goal loop.
         await self._warm_goals_session_db("goal continuation")
 
-        mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+        # The completed gateway turn persists its actual provider/model before
+        # this hook runs. Resolve the judge from that session provenance only;
+        # never let /goal drift to auxiliary.goal_judge or a profile default.
+        mgr = GoalManager(
+            session_id=sid,
+            default_max_turns=max_turns,
+            require_source_route=True,
+        )
         if not mgr.is_active():
             return
 
@@ -24892,6 +25016,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        # Session profile for tools is the DELIVERY owner, not the routed
+        # runtime profile. On a multiplexed single gateway a session can be
+        # routed to run under a secondary runtime profile (e.g.
+        # 01-orchestrator via profile_routes / automatic_session_routing)
+        # that owns NO adapter of its own — the physical transport that
+        # received the message and must carry the reply is the ACTIVE gateway
+        # profile's adapter. The kanban notifier derives which bot delivers a
+        # task notification from this value (auto_subscribe stamps it into
+        # kanban_notify_subs.notifier_profile), and the delivery-side
+        # _authorization_adapter fails closed for a stamped profile with no
+        # adapter registry entry — so a routed profile would never get its
+        # notifications (silent zero-delivery). Resolve the transport-owning
+        # profile (None == active/default gateway owns the adapter, per
+        # _adapter_profile_for_source) and fall back to the active profile,
+        # so routed multiplex sessions deliver via the right bot. See
+        # tests/gateway/test_kanban_notifier_multiplex_routed_profile.py.
+        _routed_profile = getattr(context.source, "profile", "") or ""
+        _session_profile = _routed_profile
+        try:
+            _transport_owner = self._adapter_profile_for_source(context.source)
+            if _transport_owner:
+                # A secondary multiplex profile owns the transport adapter;
+                # deliver via its bot (preserves the fail-closed protection).
+                _session_profile = _transport_owner
+            else:
+                # The ACTIVE gateway profile owns the transport adapter (or a
+                # bare/restored source has none). Even when the session is
+                # routed to run under a different runtime profile, the bot
+                # that physically received the message and must carry the
+                # reply is the active gateway's — so stamp that profile.
+                try:
+                    _session_profile = self._active_profile_name() or "default"
+                except Exception:
+                    _session_profile = _routed_profile or "default"
+        except Exception:
+            # Best-effort: preserve current behaviour on any resolution failure.
+            _session_profile = _routed_profile
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -24906,7 +25067,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=_session_profile,
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -26830,6 +26991,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override = _ims_state.conversation.model_override if _ims_state else None
         return override is not None and override.get("model") == agent_model
 
+    def _has_explicit_model_selection(self, session_key: str) -> bool:
+        """Return whether this session contains a user-issued /model pin.
+
+        Session overrides are created only by the /model command (including
+        its persisted form).  Channel and global config are deliberately not
+        treated as user selection, so automatic routing/fallback remains
+        available for those scopes.
+        """
+        state = self._peek_session_state(session_key)
+        override = state.conversation.model_override if state else None
+        return bool(
+            isinstance(override, dict)
+            and str(override.get("model") or "").strip()
+        )
+
     def _release_running_agent_state(
         self,
         session_key: str,
@@ -28347,6 +28523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         tool_resume: Any = None,
+        has_attachments: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28368,6 +28545,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 tool_resume=tool_resume,
+                has_attachments=has_attachments,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28382,6 +28560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 tool_resume=tool_resume,
+                has_attachments=has_attachments,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28526,6 +28705,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         tool_resume: Any = None,
+        has_attachments: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28836,6 +29016,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             tool_resume=tool_resume,
+            has_attachments=has_attachments,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

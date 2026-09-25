@@ -1205,6 +1205,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    provider: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1226,6 +1227,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        provider: The active per-turn provider, forwarded to policy-aware
+                       plugin tool handlers. None means the caller did not
+                       attest a provider and must remain fail-closed.
 
     Returns:
         Function result as a JSON string.
@@ -1336,6 +1340,7 @@ def handle_function_call(
                 session_id=session_id,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                provider=provider,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1499,6 +1504,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        provider=provider,
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1507,6 +1513,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        provider=provider,
                         user_task=user_task,
                     )
             if skip_tool_execution_middleware:

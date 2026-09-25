@@ -2143,6 +2143,15 @@ def _skill_view_with_bump(args, **kw):
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
+            # Render only the documented home token in the tool response,
+            # after skill preprocessing. Never expand arbitrary env vars,
+            # metadata, or the file on disk (which remains portable).
+            content = parsed.get("content")
+            if isinstance(content, str) and "${HERMES_HOME}" in content:
+                parsed["content"] = content.replace(
+                    "${HERMES_HOME}", get_hermes_home().as_posix()
+                )
+                result = json.dumps(parsed, ensure_ascii=False)
             _record_skill_view(task_id, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.

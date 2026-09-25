@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import base64
 import json
 import os
 import stat
@@ -31,6 +32,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
+    _classify_openwebui_service_request,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
@@ -312,6 +314,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/api/feedback/openwebui", adapter._handle_openwebui_feedback)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -1166,6 +1169,103 @@ class TestChatCompletionsEndpoint:
 
 
     @pytest.mark.asyncio
+    async def test_stream_emits_media_as_openwebui_file_delta(self, adapter, tmp_path):
+        """A generated file must reach OpenWebUI as a native files delta."""
+        png = tmp_path / "icon.png"
+        png.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+            "h6FO1AAAAABJRU5ErkJggg=="
+        ))
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                final = f"MEDIA:{png}"
+                if callback:
+                    callback(final)
+                return (
+                    {"final_response": final, "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "create an icon"}],
+                        "stream": True,
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        file_deltas = [
+            choice["delta"]["files"]
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+            if choice.get("delta", {}).get("files")
+        ]
+        assert len(file_deltas) == 1
+        assert file_deltas[0][0]["type"] == "file"
+        assert file_deltas[0][0]["name"] == "icon.png"
+        assert file_deltas[0][0]["data"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_bare_generated_docx_as_openwebui_file_delta(self, adapter, tmp_path):
+        """A normal plain-path artifact reply is attached in Open WebUI, too."""
+        docx = tmp_path / "anonymized.docx"
+        docx.write_bytes(b"PK\x03\x04test-docx")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                callback = kwargs.get("stream_delta_callback")
+                final = f"Готовый файл: {docx}"
+                if callback:
+                    callback(final)
+                return (
+                    {"final_response": final, "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "создай документ"}],
+                        "stream": True,
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        file_deltas = [
+            choice["delta"]["files"]
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+            if choice.get("delta", {}).get("files")
+        ]
+        assert len(file_deltas) == 1
+        assert file_deltas[0][0]["name"] == "anonymized.docx"
+        assert file_deltas[0][0]["content_type"] == (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        assert file_deltas[0][0]["data"].startswith(
+            "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):
         """Regression for #16588.
 
@@ -1309,6 +1409,116 @@ class TestDeriveChatSessionId:
         a = _derive_chat_session_id("You are a pirate.", "Hello")
         b = _derive_chat_session_id("You are a robot.", "Hello")
         assert a != b
+
+
+class TestOpenWebUIServiceRequestIsolation:
+    TITLE_PROMPT = """### Task:
+Generate a concise title summarizing the chat history.
+### Guidelines:
+- Keep it short.
+### Chat History:
+<chat_history>
+USER: hello
+ASSISTANT: hi
+</chat_history>"""
+
+    FOLLOW_UP_PROMPT = """### Task:
+Suggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next in this conversation as a **user**, based on the chat history, to help continue or deepen the discussion.
+### Chat History:
+<chat_history>
+USER: hello
+ASSISTANT: hi
+</chat_history>"""
+
+    def test_classifier_is_narrow_and_recognizes_openwebui_metadata_tasks(self):
+        assert _classify_openwebui_service_request(self.TITLE_PROMPT) == "title_generation"
+        assert _classify_openwebui_service_request(self.FOLLOW_UP_PROMPT) == "follow_up_generation"
+        assert _classify_openwebui_service_request(
+            "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history\n"
+            "<chat_history>x</chat_history>"
+        ) == "tag_generation"
+        assert _classify_openwebui_service_request(
+            "### Task:\nAnalyze the chat history to determine the necessity of generating search queries, "
+            "in the given language.\n<chat_history>x</chat_history>"
+        ) == "search_query_generation"
+        assert _classify_openwebui_service_request("Please generate a concise title") is None
+        assert _classify_openwebui_service_request(
+            "### Task:\nGenerate a concise title summarizing the chat history."
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_nonstream_service_request_bypasses_agent_history_and_session_db(self, adapter):
+        app = _create_app(adapter)
+        with (
+            patch("agent.oneshot.run_oneshot", return_value='{"title":"Greeting"}') as oneshot,
+            patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent,
+            patch.object(
+                adapter,
+                "_ensure_session_db_async",
+                new_callable=AsyncMock,
+                side_effect=AssertionError("service request must not load session DB"),
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "owui-chat-123"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "hi"},
+                            {"role": "user", "content": self.TITLE_PROMPT},
+                        ],
+                    },
+                )
+                assert response.status == 200
+                data = await response.json()
+
+        assert data["choices"][0]["message"]["content"] == '{"title":"Greeting"}'
+        assert "X-Hermes-Session-Id" not in response.headers
+        run_agent.assert_not_awaited()
+        oneshot.assert_called_once()
+        assert oneshot.call_args.kwargs["task"] == "title_generation"
+        assert oneshot.call_args.kwargs["user_input"] == self.TITLE_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_stream_service_request_returns_sse_without_agent_or_session_write(self, adapter):
+        app = _create_app(adapter)
+        with (
+            patch("agent.oneshot.run_oneshot", return_value='{"follow_ups":["Next?"]}'),
+            patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent,
+            patch.object(
+                adapter,
+                "_ensure_session_db_async",
+                new_callable=AsyncMock,
+                side_effect=AssertionError("service request must not load session DB"),
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "owui-chat-123"},
+                    json={
+                        "model": "hermes-agent",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": self.FOLLOW_UP_PROMPT}],
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        assert chunks[0]["choices"][0]["delta"]["content"] == (
+            '{"follow_ups":["Next?"]}'
+        )
+        assert "data: [DONE]" in body
+        assert "X-Hermes-Session-Id" not in response.headers
+        run_agent.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -2492,6 +2702,22 @@ class TestModelRoutesParsing:
 class TestModelRoutesModelsEndpoint:
 
     @pytest.mark.asyncio
+    async def test_models_endpoint_lists_only_configured_route_aliases(self):
+        routes = {
+            "letovo-flash": {"model": "deepseek-v4-flash", "provider": "letovo"},
+            "letovo-gemma": {"model": "gemma-4-26b", "provider": "letovo"},
+            "chatgpt-terra": {"model": "gpt-5.6-terra", "provider": "openai-codex"},
+            "chatgpt-sol": {"model": "gpt-5.6-sol", "provider": "openai-codex"},
+        }
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/models")
+            assert response.status == 200
+            data = await response.json()
+        assert [model["id"] for model in data["data"]] == list(routes)
+
+    @pytest.mark.asyncio
     async def test_models_endpoint_route_alias_fields_and_no_secrets(self):
         routes = {"my-alias": {"model": "openai/gpt-5", "api_key": "sk-route-secret"}}
         adapter = _make_routing_adapter(routes)
@@ -2603,9 +2829,39 @@ class TestStoredSessionModelFilter:
         adapter = _make_routing_adapter({})
         assert adapter._stored_session_model({"model": adapter._model_name}) is None
 
-    def test_real_model_passes_through(self):
+    def test_legacy_model_only_is_not_spliced_with_ambient_provider(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) == "google/gemini-3.7-flash"
+        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) is None
+
+    def test_configured_alias_passes_as_atomic_route(self):
+        adapter = _make_routing_adapter({
+            "gemini": {"provider": "openrouter", "model": "google/gemini-3.7-flash"}
+        })
+        assert adapter._stored_session_model({"model": "gemini"}) == "gemini"
+
+    def test_confirmed_browser_lock_restores_matching_model(self):
+        adapter = _make_routing_adapter({})
+        session = {
+            "model": "google/gemini-3.7-flash",
+            "model_config": json.dumps({
+                "browser_model_lock": {
+                    "provider": "openrouter",
+                    "model": "google/gemini-3.7-flash",
+                    "confirmed": True,
+                }
+            }),
+        }
+        assert adapter._stored_session_model(session) == "google/gemini-3.7-flash"
+
+    def test_browser_lock_model_mismatch_fails_closed(self):
+        adapter = _make_routing_adapter({})
+        session = {
+            "model": "ambient/model",
+            "model_config": json.dumps({
+                "browser_model_lock": {"provider": "openrouter", "model": "locked/model"}
+            }),
+        }
+        assert adapter._stored_session_model(session) is None
 
     def test_missing_or_bad_shapes(self):
         adapter = _make_routing_adapter({})

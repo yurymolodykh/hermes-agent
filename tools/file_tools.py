@@ -805,14 +805,48 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
 
-    # The authoritative ~/.hermes home is governed by its own guards
-    # (config.yaml hard-block, cross-profile guard, write_approval); this
-    # gate targets PROJECT-LOCAL instruction files only. Checked before the
-    # ``.hermes`` component rule below, which would otherwise match the
-    # home directory itself.
+    # Profile SOUL.md is a live instruction file, including when it belongs
+    # to the active HERMES_HOME. Give it priority over the general Hermes-home
+    # exemption below; other files in that home retain their existing guards.
+    # Compare both spellings: a symlink can point TO or FROM a profile SOUL.
+    try:
+        from hermes_constants import get_default_hermes_root
+        roots = [os.path.realpath(str(get_default_hermes_root()))]
+    except Exception:
+        roots = []
     real_home = _get_real_hermes_home()
-    if real_home and (resolved == real_home
-                      or resolved.startswith(real_home + os.sep)):
+    if real_home and os.path.basename(os.path.dirname(real_home)).lower() == "profiles":
+        roots.append(os.path.dirname(os.path.dirname(real_home)))
+    # Compare the lexical, task-relative target as well as its resolved
+    # target. The lexical path matters when SOUL.md itself links to another
+    # file under the profile home; realpath alone would erase its name.
+    try:
+        from tools.environments.local import _msys_to_windows_path
+        lexical = _expand_tilde(_msys_to_windows_path(filepath))
+        if not os.path.isabs(lexical):
+            lexical = os.path.join(str(_resolve_base_dir(task_id)), lexical)
+        lexical = os.path.normpath(lexical)
+    except (OSError, ValueError, RuntimeError):
+        lexical = normalized
+    for candidate in (lexical, resolved):
+        candidate_path = os.path.normcase(os.path.abspath(candidate))
+        for root in roots:
+            root_path = os.path.normcase(os.path.realpath(root))
+            try:
+                relative = os.path.relpath(candidate_path, root_path)
+            except ValueError:  # Different Windows drive.
+                continue
+            parts = relative.replace("\\", "/").split("/")
+            if (len(parts) == 3 and parts[0].lower() == "profiles"
+                    and parts[1] not in ("", ".", "..")
+                    and parts[2].lower() == "soul.md"):
+                return os.path.basename(candidate)
+
+    # The remaining authoritative Hermes-home files are governed by their
+    # existing guards (config.yaml hard-block, cross-profile guard, etc.).
+    if real_home and (os.path.normcase(resolved) == os.path.normcase(real_home)
+                      or os.path.normcase(resolved).startswith(
+                          os.path.normcase(real_home) + os.sep)):
         return None
 
     import fnmatch
@@ -837,7 +871,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        targets: list[str], task_id: str = "default") -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -846,15 +880,30 @@ def _request_protected_instruction_approval(
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
     """
-    targets = ", ".join(dict.fromkeys(reasons))
+    target_list = ", ".join(dict.fromkeys(targets))
     description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
+        f"Write operation includes protected agent-instruction file(s). "
+        f"All modified targets: {target_list}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    display = f"<write to {target_list}>"
+    # Approval UIs truncate command previews (the shared base adapter at
+    # 3000 chars, Telegram at 3800) and Telegram sends a single message with
+    # a 4096-character visible-text limit. Never offer an approval whose
+    # operation list would be cut off or whose card could not be delivered.
+    # Leave room for adapter headings, labels, and the Smart DENY footer.
+    if len(display) > 3000 or len(display) + len(description) > 3800:
+        return (
+            "BLOCKED: protected-instruction approval target list is too large "
+            "to display in full. No approval was requested and no files were "
+            "written. Split the patch into smaller operations; each requires "
+            "its own once approval. Do NOT bypass this gate via terminal or "
+            "execute_code."
+        )
     blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        f"BLOCKED: write operation includes protected agent-instruction "
+        f"file(s); targets: {target_list}. "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.)."
@@ -885,6 +934,7 @@ def _request_protected_instruction_approval(
             "description": description,
             "allow_permanent": False,
             "allow_session": False,
+            "smart_denied": True,  # Native UI offers only once / deny.
         }
         decision = _approval._await_gateway_decision(
             session_key, notify_cb, approval_data, surface="gateway",
@@ -894,9 +944,7 @@ def _request_protected_instruction_approval(
                 why="requires approval but the approval request could not "
                     "be delivered.")
         choice = decision.get("choice")
-        if decision.get("resolved") and choice in {"once", "session", "always"}:
-            # One-operation grant regardless of the tapped scope — nothing
-            # is persisted for this gate.
+        if decision.get("resolved") and choice == "once":
             return None
         if not decision.get("resolved"):
             return blocked.format(
@@ -917,9 +965,9 @@ def _request_protected_instruction_approval(
             display, description,
             allow_permanent=False,
             approval_callback=callback,
+            smart_denied=True,
         )
-        if choice in {"once", "session", "always"}:
-            # One-operation grant; never persisted (see docstring).
+        if choice == "once":
             return None
         if choice == "timeout":
             return blocked.format(
@@ -948,15 +996,27 @@ def _check_protected_instruction_write(paths: list[str],
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons: list[str] = []
+    protected: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
-            reasons.append(reason)
-    if not reasons:
+            protected.append(p)
+    if not protected:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+
+    targets: list[str] = []
+    for p in paths:
+        # Approval covers the entire operation, including otherwise-unprotected
+        # files in a multi-file patch. Identify every exact target to the owner.
+        # Preserve the lexical path when a SOUL.md symlink points elsewhere,
+        # and expose its resolved destination as well.
+        target = os.path.abspath(str(_resolve_path_for_task(p, task_id)))
+        resolved = os.path.realpath(target)
+        if os.path.normcase(target) != os.path.normcase(resolved):
+            target = f"{target} (resolves to {resolved})"
+        targets.append(target)
+    return _request_protected_instruction_approval(targets, task_id)
 
 
 def _check_approval_required_write(paths: list[str],

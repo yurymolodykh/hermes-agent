@@ -41,6 +41,20 @@ class TestSlashCommands:
         assert "session" in response_text.lower() or "Session" in response_text
 
     @pytest.mark.asyncio
+    async def test_kanban_list_routes_to_the_shared_board(self, adapter, runner, platform):
+        """`/kanban list` is a gateway command, not an LLM prompt."""
+        runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
+
+        send = await send_and_capture(adapter, "/kanban list", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        # The isolated board is empty; this exact CLI formatter proves
+        # `run_slash("list")` handled the message rather than the agent.
+        assert response_text == "(no matching tasks)"
+        runner._handle_message_with_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_new_resets_session(self, adapter, runner, platform):
         send = await send_and_capture(adapter, "/new", platform)
 

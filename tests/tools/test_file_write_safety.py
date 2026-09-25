@@ -500,7 +500,10 @@ class TestProtectedInstructionFiles:
         real = tmp_path / "AGENTS.md"
         real.write_text("original", encoding="utf-8")
         link = tmp_path / "innocent.txt"
-        link.symlink_to(real)
+        try:
+            link.symlink_to(real)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
         approvals["answer"] = "deny"
         res = self._write(link, "injected")
         assert res.get("error") and "BLOCKED" in res["error"]
@@ -557,6 +560,354 @@ class TestProtectedInstructionFiles:
         res = self._write(fake_home / "notes" / "scratch.txt", "ok")
         assert not res.get("error"), res
         assert approvals["calls"] == []
+
+    def test_active_profile_soul_prompts_on_every_write(self, tmp_path, approvals, monkeypatch):
+        import tools.file_tools as ft
+
+        root = tmp_path / "hermes-root"
+        active = root / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        target = active / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        approvals["answer"] = "deny"
+        for content in ("first", "second"):
+            res = self._write(target, content)
+            assert res.get("error") and "BLOCKED" in res["error"]
+            assert target.read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 2
+
+    @pytest.mark.parametrize("answer", ["session", "always", "timeout"])
+    def test_profile_soul_rejects_non_once_decisions(
+        self, tmp_path, approvals, monkeypatch, answer
+    ):
+        import tools.file_tools as ft
+        import tools.approval as A
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        target = active / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        approvals["answer"] = answer
+        monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        res = self._write(target, "modified")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+        assert approvals["calls"][0].get("smart_denied") is True
+
+    def test_other_profile_soul_is_gated_from_active_profile(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        root = tmp_path / "root"
+        active = root / "profiles" / "01-orchestrator"
+        other = root / "profiles" / "03-software-engineer"
+        active.mkdir(parents=True)
+        other.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        target = other / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        approvals["answer"] = "deny"
+        res = self._write(target, "modified")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    def test_profile_soul_no_human_and_non_soul_home_file(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+        from tools.terminal_tool import set_approval_callback
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        target = active / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        set_approval_callback(None)
+        res = self._write(target, "modified")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+        ordinary = self._write(active / "notes.txt", "ok")
+        assert not ordinary.get("error"), ordinary
+        assert approvals["calls"] == []
+
+    def test_profile_soul_v4a_deny_is_atomic(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import json
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        soul = active / "SOUL.md"
+        soul.write_text("original\n", encoding="utf-8")
+        ordinary = tmp_path / "ordinary.txt"
+        ordinary.write_text("old\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {ordinary}\n@@\n-old\n+new\n"
+            f"*** Update File: {soul}\n@@\n-original\n+new\n"
+            "*** End Patch"
+        )
+        approvals["answer"] = "deny"
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert ordinary.read_text(encoding="utf-8") == "old\n"
+        assert soul.read_text(encoding="utf-8") == "original\n"
+        assert len(approvals["calls"]) == 1
+
+    def test_profile_soul_relative_dotdot_path_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda task_id: None)
+        monkeypatch.chdir(active)
+        target = active / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        approvals["answer"] = "deny"
+        res = self._write("./unused/../SOUL.md", "modified")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    def test_profile_soul_prompt_identifies_absolute_target(self, tmp_path, approvals, monkeypatch):
+        import tools.file_tools as ft
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        target = active / "SOUL.md"
+        target.write_text("original", encoding="utf-8")
+        monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda task_id: None)
+        monkeypatch.chdir(active)
+        approvals["answer"] = "deny"
+        result = self._write("./SOUL.md", "changed")
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+        prompt = approvals["calls"][0]
+        assert str(target) in prompt["command"]
+        assert str(target) in prompt["description"]
+
+    def test_profile_soul_patch_prompt_lists_every_absolute_target(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import json
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        other = tmp_path / "root" / "profiles" / "02-hermes-platform"
+        active.mkdir(parents=True)
+        other.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        targets = [active / "SOUL.md", other / "SOUL.md", tmp_path / "ordinary.txt"]
+        for target in targets:
+            target.write_text("original\n", encoding="utf-8")
+        approvals["answer"] = "deny"
+        patch = "*** Begin Patch\n" + "".join(
+            f"*** Update File: {target}\n@@\n-original\n+changed\n"
+            for target in targets
+        ) + "*** End Patch"
+        result = json.loads(patch_tool(mode="patch", patch=patch))
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert len(approvals["calls"]) == 1
+        prompt = approvals["calls"][0]
+        for target in targets:
+            assert str(target) in prompt["command"]
+            assert str(target) in prompt["description"]
+            assert target.read_text(encoding="utf-8") == "original\n"
+        from html import unescape
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        visible = unescape(TelegramAdapter._format_exec_approval(
+            object.__new__(TelegramAdapter), prompt["command"],
+            prompt["description"], smart_denied=True,
+        ))
+        assert len(visible) <= 4096
+        assert all(str(target) in visible for target in targets)
+
+    def test_profile_soul_patch_near_message_limit_is_complete(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import json
+        from html import unescape
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        active = tmp_path / "root" / "profiles" / "02-hermes-platform"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        soul = active / "SOUL.md"
+        targets = [soul] + [tmp_path / f"ordinary-{i:03d}.txt" for i in range(12)]
+        for target in targets:
+            target.write_text("original\n", encoding="utf-8")
+        patch = "*** Begin Patch\n" + "".join(
+            f"*** Update File: {target}\n@@\n-original\n+changed\n"
+            for target in targets
+        ) + "*** End Patch"
+        approvals["answer"] = "deny"
+        result = json.loads(patch_tool(mode="patch", patch=patch))
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert len(approvals["calls"]) == 1
+        prompt = approvals["calls"][0]
+        visible = unescape(TelegramAdapter._format_exec_approval(
+            object.__new__(TelegramAdapter), prompt["command"],
+            prompt["description"], smart_denied=True,
+        ))
+        assert len(visible) <= 4096
+        assert all(str(target) in visible for target in targets)
+        assert all(target.read_text(encoding="utf-8") == "original\n" for target in targets)
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from gateway.config import PlatformConfig
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        adapter._bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=7))
+        )
+        sent = asyncio.run(adapter.send_exec_approval(
+            chat_id="12345", command=prompt["command"], session_key="test",
+            description=prompt["description"], allow_permanent=False,
+            allow_session=False, smart_denied=True,
+        ))
+        assert sent.success is True
+        actual = unescape(adapter._bot.send_message.call_args.kwargs["text"])
+        assert len(actual) <= 4096
+        assert all(str(target) in actual for target in targets)
+
+    def test_protected_approval_card_budget_exact_boundary(self, approvals):
+        from html import unescape
+        import tools.file_tools as ft
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        soul = "C:/root/profiles/02-hermes-platform/SOUL.md"
+        def card_size(length):
+            target_list = ", ".join([soul, "C:/other/" + "x" * length])
+            display = f"<write to {target_list}>"
+            description = (
+                "Write operation includes protected agent-instruction file(s). "
+                f"All modified targets: {target_list}. "
+                "These files steer future agent behavior; approval is always "
+                "required (not bypassed by auto-approve)."
+            )
+            return max(len(display) - 3000, len(display) + len(description) - 3800)
+
+        length = next(n for n in range(3001) if card_size(n + 1) > 0)
+        assert card_size(length) <= 0
+        targets = [soul, "C:/other/" + "x" * length]
+        approvals["answer"] = "deny"
+        assert "BLOCKED" in ft._request_protected_instruction_approval(targets)
+        assert len(approvals["calls"]) == 1
+        prompt = approvals["calls"][0]
+        visible = unescape(TelegramAdapter._format_exec_approval(
+            object.__new__(TelegramAdapter), prompt["command"],
+            prompt["description"], smart_denied=True,
+        ))
+        assert len(visible) <= 4096
+        assert all(target in visible for target in targets)
+        assert "too large" in ft._request_protected_instruction_approval(
+            [soul, "C:/other/" + "x" * (length + 1)]
+        ).lower()
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.parametrize("count", [45, 1])
+    @pytest.mark.parametrize("surface", ["cli", "gateway"])
+    def test_oversized_profile_soul_patch_fails_closed_before_native_approval(
+        self, tmp_path, approvals, monkeypatch, count, surface
+    ):
+        """Never offer a partial/unsendable target list as a consent card."""
+        import json
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+
+        active = tmp_path / "root" / "profiles" / "02-hermes-platform"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        soul = active / "SOUL.md"
+        soul.write_text("original\n", encoding="utf-8")
+        if count == 1:
+            # Windows caps individual path components; use nested directories.
+            directory = tmp_path
+            for i in range(17):
+                directory = directory / ("long-path-component-" + str(i).zfill(3) + "x" * 170)
+            targets = [soul, directory / "plain.txt"]
+        else:
+            targets = [soul] + [tmp_path / f"ordinary-{i:03d}.txt" for i in range(count)]
+        for target in targets[1:]:
+            if count != 1:
+                target.write_text("original\n", encoding="utf-8")
+        patch = "*** Begin Patch\n" + "".join(
+            f"*** Update File: {target}\n@@\n-original\n+changed\n"
+            for target in targets
+        ) + "*** End Patch"
+        approvals["answer"] = "deny"
+        import tools.approval as A
+        notifications = []
+        if surface == "gateway":
+            session_key = "oversized-protected-card"
+            token = A.set_current_session_key(session_key)
+            A.register_gateway_notify(session_key, notifications.append)
+        try:
+            result = json.loads(patch_tool(mode="patch", patch=patch))
+        finally:
+            if surface == "gateway":
+                A.unregister_gateway_notify(session_key)
+                A.reset_current_session_key(token)
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert "too large" in result["error"].lower()
+        assert approvals["calls"] == []
+        assert notifications == []
+        assert soul.read_text(encoding="utf-8") == "original\n"
+        if count != 1:
+            assert all(target.read_text(encoding="utf-8") == "original\n" for target in targets[1:])
+
+    def test_profile_soul_patch_replace_denied_and_once_allowed(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import json
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        soul = active / "SOUL.md"
+        soul.write_text("original\n", encoding="utf-8")
+        approvals["answer"] = "deny"
+        denied = json.loads(patch_tool(
+            mode="replace", path=str(soul),
+            old_string="original", new_string="modified",
+        ))
+        assert denied.get("error") and "BLOCKED" in denied["error"]
+        assert soul.read_text(encoding="utf-8") == "original\n"
+        approvals["answer"] = "once"
+        allowed = json.loads(patch_tool(
+            mode="replace", path=str(soul),
+            old_string="original", new_string="modified",
+        ))
+        assert not allowed.get("error"), allowed
+        assert soul.read_text(encoding="utf-8") == "modified\n"
+        assert len(approvals["calls"]) == 2
 
     # ---- patch tool -----------------------------------------------------
 
@@ -620,6 +971,165 @@ class TestProtectedInstructionFiles:
         res = json.loads(patch_tool(mode="patch", patch=patch))
         assert not res.get("error"), res
         assert agents.read_text(encoding="utf-8") == "updated rules\n"
+
+    def test_gateway_profile_soul_payload_distinguishes_profiles(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.approval as A
+        import tools.file_tools as ft
+
+        root = tmp_path / "root"
+        active = root / "profiles" / "02-hermes-platform"
+        other = root / "profiles" / "09-independent-reviewer"
+        active.mkdir(parents=True)
+        other.mkdir(parents=True)
+        for target in (active / "SOUL.md", other / "SOUL.md"):
+            target.write_text("original", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        session_key = "profile-soul-path-payload"
+        token = A.set_current_session_key(session_key)
+        prompts = []
+        try:
+            def notify(data):
+                prompts.append(data.copy())
+                A.resolve_gateway_approval(session_key, "deny")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                for target in (active / "SOUL.md", other / "SOUL.md"):
+                    result = self._write(target, "changed")
+                    assert result.get("error") and "BLOCKED" in result["error"]
+                    assert target.read_text(encoding="utf-8") == "original"
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+        assert len(prompts) == 2
+        assert prompts[0]["command"] != prompts[1]["command"]
+        for prompt, target in zip(prompts, (active / "SOUL.md", other / "SOUL.md")):
+            assert str(target) in prompt["command"]
+            assert str(target) in prompt["description"]
+            assert prompt["allow_permanent"] is False
+            assert prompt["allow_session"] is False
+            assert prompt["smart_denied"] is True
+
+    def test_gateway_profile_soul_patch_payload_lists_unprotected_target(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+        import tools.approval as A
+        import tools.file_tools as ft
+        from tools.file_tools import patch_tool
+
+        active = tmp_path / "root" / "profiles" / "02-hermes-platform"
+        active.mkdir(parents=True)
+        soul = active / "SOUL.md"
+        ordinary = tmp_path / "ordinary.txt"
+        for target in (soul, ordinary):
+            target.write_text("original\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        session_key = "profile-soul-multifile-payload"
+        token = A.set_current_session_key(session_key)
+        prompts = []
+        try:
+            def notify(data):
+                prompts.append(data.copy())
+                A.resolve_gateway_approval(session_key, "deny")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                patch = "*** Begin Patch\n" + "".join(
+                    f"*** Update File: {target}\n@@\n-original\n+changed\n"
+                    for target in (soul, ordinary)
+                ) + "*** End Patch"
+                result = json.loads(patch_tool(mode="patch", patch=patch))
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert len(prompts) == 1
+        for target in (soul, ordinary):
+            assert str(target) in prompts[0]["command"]
+            assert str(target) in prompts[0]["description"]
+            assert target.read_text(encoding="utf-8") == "original\n"
+
+    def test_gateway_profile_soul_once_is_not_persistent(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.approval as A
+        import tools.file_tools as ft
+        from gateway.platforms.api_server import _approval_event_choices
+        from gateway.run import _format_exec_approval_fallback
+
+        active = tmp_path / "root" / "profiles" / "01-orchestrator"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        session_key = "profile-soul-once-test"
+        token = A.set_current_session_key(session_key)
+        prompts = []
+        try:
+            def notify(data):
+                prompts.append(data)
+                assert data["allow_permanent"] is False
+                assert data["allow_session"] is False
+                assert _approval_event_choices(
+                    smart_denied=data["smart_denied"],
+                    allow_permanent=data["allow_permanent"],
+                ) == ["once", "deny"]
+                message = _format_exec_approval_fallback(
+                    data["command"], data["description"], "/",
+                    allow_permanent=data["allow_permanent"],
+                    allow_session=data["allow_session"],
+                    smart_denied=data["smart_denied"],
+                )
+                assert "/approve`" in message
+                assert "/approve session" not in message
+                assert "/approve always" not in message
+                A.resolve_gateway_approval(session_key, "once")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                for content in ("first", "second"):
+                    result = self._write(active / "SOUL.md", content)
+                    assert not result.get("error"), result
+                    assert (active / "SOUL.md").read_text(encoding="utf-8") == content
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+        assert len(prompts) == 2
+
+    def test_gateway_profile_soul_timeout_leaves_file_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.approval as A
+        import tools.file_tools as ft
+
+        active = tmp_path / "root" / "profiles" / "02-hermes-platform"
+        active.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setattr(ft, "_get_real_hermes_home", lambda: str(active.resolve()))
+        monkeypatch.setattr(A, "_get_approval_timeout", lambda: 0)
+        soul = active / "SOUL.md"
+        soul.write_text("original", encoding="utf-8")
+        session_key = "profile-soul-timeout-test"
+        token = A.set_current_session_key(session_key)
+        notifications = []
+        try:
+            A.register_gateway_notify(session_key, notifications.append)
+            try:
+                result = self._write(soul, "modified")
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            A.reset_current_session_key(token)
+        assert notifications
+        assert result.get("error") and "BLOCKED" in result["error"]
+        assert soul.read_text(encoding="utf-8") == "original"
 
     # ---- gateway round-trip ----------------------------------------------
 

@@ -5782,6 +5782,13 @@ def run_job(
             or configured_provider_for_drift
             or None
         )
+        _pinned_provider = str(job.get("provider") or "").strip()
+        _pinned_model = str(job.get("model") or "").strip()
+        if bool(_pinned_provider) != bool(_pinned_model):
+            raise RuntimeError(
+                "MODEL_LOCK: cron provider/model pin is incomplete; refusing ambient route completion"
+            )
+        _route_pinned = bool(_pinned_provider and _pinned_model)
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -5817,6 +5824,8 @@ def run_job(
             # / Anthropic fallbacks were healthy (Daily Focus Kickoff 2026-08-11).
             # Keeping provider+model atomic still applies — never swap only the
             # provider while retaining a paid primary model.
+            if _route_pinned:
+                raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
             is_auth = isinstance(resolve_exc, AuthError)
             is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
             if not (is_auth or is_transient_net):
@@ -5968,7 +5977,7 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = None if _route_pinned else (get_fallback_chain(_cfg) or None)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

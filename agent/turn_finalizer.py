@@ -850,4 +850,6 @@ def finalize_turn(
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 
+    # Do not let tool calls between turns inherit a previous user's locator.
+    agent._memory_source_turn = None
     return result

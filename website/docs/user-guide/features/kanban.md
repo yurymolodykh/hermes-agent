@@ -732,7 +732,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--skill <name>]...
                                 [--json]
 hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived]
-        [--workflow-template-id <id>] [--current-step-key <key>]
+        [--historical] [--workflow-template-id <id>] [--current-step-key <key>]
         [--sort created|created-desc|priority|priority-desc|status|assignee|title|updated]
         [--json]
 hermes kanban show <id> [--json]
@@ -782,6 +782,10 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]
 ```
+
+`kanban list` is an operational view: by default it omits only `done` tasks whose non-null `completed_at` is at least `kanban.list_done_retention_hours` old (default `12.0`). A card completed exactly 12 hours ago is therefore omitted; a `done` card with `completed_at = NULL` and every non-`done` status remain visible. This is a presentation filter only: it does not archive or delete anything and does not change dependencies or notification subscriptions. Set `kanban.list_done_retention_hours` to tune the default window. Use `--status done` or `--historical` to retrieve older completed cards.
+
+`kanban_resolve_triage(task_id, rationale, board?)` is a separate orchestrator-only tool (not a general `kanban_unblock` relaxation). It accepts only `triage` tasks and a nonempty rationale; it records the active profile, reason and landing status in a `triage_resolved` event. Resolution resumes to `todo` while a parent is unfinished, otherwise `ready`. It retains block recurrence and failure evidence, so an unchanged blocker can put the task back in triage on its next attempt; it never marks the work done. A gateway restart/deployment is needed before a running agent sees this new tool.
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 

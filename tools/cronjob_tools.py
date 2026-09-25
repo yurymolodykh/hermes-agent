@@ -1262,6 +1262,45 @@ def cronjob(
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
+            # A cron created by an in-flight locked agent is a child execution,
+            # not a fresh ambient routing decision.  Snapshot the concrete pair
+            # atomically (or reject a conflicting explicit pair) before storage.
+            # CLI/dashboard calls have no runtime ContextVar and remain unchanged.
+            if not _no_agent:
+                from agent import auxiliary_client as _auxiliary_client
+
+                _live = _auxiliary_client._RUNTIME_MAIN_CONTEXT.get()
+                _locked = (
+                    _auxiliary_client._normalize_main_runtime(_live)
+                    if isinstance(_live, dict) and _live.get("route_locked") is True
+                    else {}
+                )
+                if _locked:
+                    _locked_provider = str(_locked.get("provider") or "").strip().lower()
+                    _locked_model = str(_locked.get("model") or "").strip()
+                    if (
+                        not _locked_provider
+                        or not _locked_model
+                        or _locked_provider in {"auto", "main", "moa"}
+                    ):
+                        return tool_error(
+                            "MODEL_LOCK: concrete live provider/model pair required; no cron job created",
+                            success=False,
+                        )
+                    _given_provider = str(provider or "").strip().lower()
+                    _given_model = str(model or "").strip()
+                    if (provider is not None or model is not None) and (
+                        _given_provider != _locked_provider
+                        or _given_model != _locked_model
+                    ):
+                        return tool_error(
+                            "MODEL_LOCK: cron provider/model conflicts with caller route; no cron job created",
+                            success=False,
+                        )
+                    provider = _locked_provider
+                    model = _locked_model
+                    if base_url is None and _locked.get("base_url"):
+                        base_url = str(_locked["base_url"])
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).

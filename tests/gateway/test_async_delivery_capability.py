@@ -174,6 +174,67 @@ class TestAdapterCapabilityFlag:
 
 
 # ---------------------------------------------------------------------------
+# Kanban worker env gate — phantom-loop regression (t_6972f101)
+# ---------------------------------------------------------------------------
+
+_KANBAN_ENV_VARS = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_PROFILE",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_ID",
+)
+
+
+class TestKanbanWorkerEnvAsyncDelivery:
+    """Only a genuine dispatcher worker (full env envelope) loses async delivery.
+
+    A bare stale ``HERMES_KANBAN_TASK`` inherited by a gateway/api_server
+    process (the t_6972f101 phantom loop) must NOT demote an interactive
+    session to the one-shot sync/polling fallbacks: that session is ordinary,
+    not a dispatcher-spawned worker.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in _KANBAN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        reset_session_vars()
+        yield
+        reset_session_vars()
+
+    def test_bare_stale_task_keeps_async_delivery(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_e05caf9a")
+        assert async_delivery_supported() is True
+
+    def test_stale_task_profile_session_keeps_async_delivery(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_e05caf9a")
+        monkeypatch.setenv("HERMES_PROFILE", "02-hermes-platform")
+        monkeypatch.setenv("HERMES_SESSION_ID", "20260922_181001_c4087c")
+        assert async_delivery_supported() is True
+
+    def test_full_worker_envelope_disables_async_delivery(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_live")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "C:/x/board.sqlite")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "C:/ws/t_live")
+        monkeypatch.setenv("HERMES_PROFILE", "02-hermes-platform")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_SESSION_ID", "sess-1")
+        assert async_delivery_supported() is False
+
+    def test_partial_envelope_keeps_async_delivery(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_live")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "C:/x/board.sqlite")
+        # no WORKSPACE / PROFILE / SESSION_SOURCE / SESSION_ID
+        assert async_delivery_supported() is True
+
+
+# ---------------------------------------------------------------------------
 # terminal_tool: refuses to register a watcher on unsupported sessions
 # ---------------------------------------------------------------------------
 

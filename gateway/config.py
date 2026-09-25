@@ -978,6 +978,10 @@ class GatewayConfig:
     # phases) per-profile adapters/credentials are resolved. When False, the
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
+    # When set, reject gateway startup unless HERMES_HOME resolves to this
+    # named profile.  This prevents an unqualified/default launcher from
+    # becoming an implicit production-routing fallback.
+    required_profile: str = ""
     # Optional named-profile allowlist for multiplex mode. None preserves the
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
@@ -1327,6 +1331,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            required_profile=str(data.get("required_profile") or "").strip(),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
@@ -1473,6 +1478,11 @@ def load_gateway_config() -> GatewayConfig:
             # ``hermes config set gateway.multiplex_profiles true``).
             if "multiplex_profiles" in yaml_cfg:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
+
+            if "required_profile" in yaml_cfg:
+                gw_data["required_profile"] = yaml_cfg["required_profile"]
+            elif isinstance(gateway_section, dict) and "required_profile" in gateway_section:
+                gw_data["required_profile"] = gateway_section["required_profile"]
 
             if "multiplex_profile_allowlist" in yaml_cfg:
                 gw_data["multiplex_profile_allowlist"] = yaml_cfg[

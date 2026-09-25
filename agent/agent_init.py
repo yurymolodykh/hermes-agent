@@ -1534,6 +1534,27 @@ def init_agent(
     # the failure to its source entry.
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
+
+    # Every AIAgent owns a concrete route. Explicit /model replaces this pair
+    # between turns via switch_model_runtime; automatic fallback may only
+    # rotate credentials within the same provider/model.
+    _locked_provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    _locked_model = str(getattr(agent, "model", "") or "").strip()
+    if not _locked_provider or not _locked_model or _locked_provider in {"auto", "main", "moa"}:
+        raise RuntimeError("MODEL_LOCK: AIAgent requires a concrete provider/model pair")
+    agent._immutable_route = {"provider": _locked_provider, "model": _locked_model}
+
+    # Defense-in-depth MODEL_LOCK: register the immutable-route plugin so the
+    # live locked agent's tool calls are pinned to the canonical caller route
+    # (kanban_create/cronjob, incl. custom:<name> identity recovery) and its
+    # auxiliary calls can never fall back to another provider/model. Gated on
+    # the immutable route being present and fail-soft (see the helper).
+    try:
+        from agent.immutable_route_plugin import activate_for_locked_agent
+
+        activate_for_locked_agent(agent)
+    except Exception:
+        logger.warning("immutable_route_plugin activation skipped", exc_info=True)
     
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
@@ -1667,6 +1688,30 @@ def init_agent(
             delegated_child = False
         if not delegated_child:
             os.environ["HERMES_SESSION_ID"] = agent.session_id
+
+    # A dispatcher worker must authenticate its concrete agent session to the
+    # single claimed run before public Kanban mutation tools are usable.  Do
+    # not inherit a permissive legacy path: malformed, foreign, reclaimed, or
+    # terminal bindings abort this worker before it can act on the board.
+    _kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if _kanban_task:
+        _raw_kanban_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        _kanban_profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+        try:
+            _kanban_run = int(_raw_kanban_run)
+        except ValueError as _binding_exc:
+            raise RuntimeError("KANBAN_BINDING: invalid worker run identity") from _binding_exc
+        if not _kanban_profile:
+            raise RuntimeError("KANBAN_BINDING: missing worker assignee identity")
+        from hermes_cli import kanban_db as _kanban_db
+        _kanban_conn = _kanban_db.connect()
+        try:
+            if not _kanban_db.bind_worker_session(
+                _kanban_conn, _kanban_task, _kanban_run, _kanban_profile, agent.session_id
+            ):
+                raise RuntimeError("KANBAN_BINDING: rejected active run/session binding")
+        finally:
+            _kanban_conn.close()
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()

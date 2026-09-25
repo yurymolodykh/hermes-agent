@@ -567,9 +567,14 @@ class GatewaySlashCommandsMixin:
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 
-        # Gateway messages have practical length caps; truncate long
-        # listings to keep the UX reasonable.
-        if len(output) > 3800:
+        # TelegramAdapter splits long messages at its 4096 UTF-16-unit limit.
+        # Do not cut a /kanban list here: this smaller gateway-side preview
+        # dropped board rows before the adapter could deliver continuations.
+        is_telegram_list = (
+            action == "list"
+            and getattr(getattr(event, "source", None), "platform", None) == Platform.TELEGRAM
+        )
+        if len(output) > 3800 and not is_telegram_list:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 

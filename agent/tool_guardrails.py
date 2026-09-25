@@ -268,7 +268,14 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        # A web-search cap is deliberately a recoverable block: the blocked
+        # search is recorded as a tool result and the model gets another loop
+        # iteration to complete the task from local/session sources. Other
+        # blocks remain hard stops, because they usually indicate an unsafe or
+        # genuinely runaway operation.
+        return self.action == "halt" or (
+            self.action == "block" and self.code != "loop_web_search_cap"
+        )
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -681,8 +688,12 @@ class ToolCallGuardrailController:
                     message=(
                         f"Blocked web_search: this turn has already made {cap} "
                         "web searches, the per-turn limit. This looks like a "
-                        "runaway search loop. Work with the results you already "
-                        "have and give the user your answer."
+                        "runaway search loop. Do not call web_search again this "
+                        "turn. Continue the task from available local/session "
+                        "sources and tools. In the final answer, explicitly note "
+                        "that online search was attempted but could not be "
+                        "completed, and do not present unsupported facts as "
+                        "web-verified."
                     ),
                     tool_name=tool_name,
                     count=self._turn_web_search_count,

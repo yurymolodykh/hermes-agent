@@ -155,6 +155,8 @@ class TestCLIJudgeGate:
             goal_mode=goal_mode,
             title="Finish report",
             body="acceptance: criteria",
+            model_override="gpt-5.6-terra",
+            provider_override="openai-codex",
         )
         fake_conn = MagicMock()
         complete_calls: list = []
@@ -205,3 +207,16 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+    def test_missing_source_route_fails_closed(self, monkeypatch):
+        import types
+        from hermes_cli.kanban import _goal_mode_handoff_rejection
+
+        task = types.SimpleNamespace(
+            goal_mode=True, title="Finish report", body="criteria",
+            model_override=None, provider_override=None,
+        )
+        reason = _goal_mode_handoff_rejection(task, "done")
+        assert "model_override" in reason
+        assert "provider_override" in reason
+        assert "refusing ambient" in reason

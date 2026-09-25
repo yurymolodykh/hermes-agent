@@ -10852,6 +10852,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "model_explicitly_selected": bool(
+                getattr(self, "_model_explicitly_selected", False)
+            ),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -10873,6 +10876,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
+
+        self._model_explicitly_selected = bool(
+            snapshot.get("model_explicitly_selected", False)
+        )
 
         agent = getattr(self, "agent", None)
         if agent is None:
@@ -10981,6 +10988,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"  ✗ {result.error_message}")
             return
 
+        # A successful /model action is an explicit user pin. It is cleared
+        # again by _restore_model_runtime_snapshot for --once switches.
+        self._model_explicitly_selected = True
+
         if self.agent is not None:
             try:
                 from hermes_cli.context_switch_guard import merge_preflight_compression_warning
@@ -11042,6 +11053,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                 )
+                self.agent._model_explicitly_selected = True
+                self.agent._explicit_model_unavailable = False
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
                 # Roll the CLI's own staged fields back too and abort the rest
@@ -20786,6 +20799,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    source_model = (task.model_override or "").strip()
+    source_provider = (task.provider_override or "").strip()
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -20828,6 +20843,24 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    if not source_model or not source_provider:
+        _block(
+            "Kanban goal_mode requires recorded source task model_override and "
+            "provider_override; refusing ambient auxiliary goal_judge route"
+        )
+        return
+
+    from hermes_cli.goals import judge_goal as _judge_goal
+
+    def _judge_source_goal(goal: str, response: str):
+        return _judge_goal(
+            goal,
+            response,
+            provider=source_provider,
+            model=source_model,
+            strict_source_route=True,
+        )
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
@@ -20837,6 +20870,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        judge_fn=_judge_source_goal,
     )
 
 

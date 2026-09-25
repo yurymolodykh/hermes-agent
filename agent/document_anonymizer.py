@@ -8,6 +8,7 @@ blocks.  Extraction and replacement happen locally and fail closed.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 from dataclasses import dataclass, field
@@ -44,7 +45,9 @@ _INN_RE = re.compile(r"(?i)(?:ИНН\s*[:№]?\s*)\d{10,12}\b")
 _ACCOUNT_RE = re.compile(r"(?i)(?:(?:р/?с|расч[её]тный сч[её]т|сч[её]т)\s*[:№]?\s*)\d{20}\b")
 # Privacy-biased Russian full-name heuristic. Requiring three title-cased words
 # avoids ordinary prose while covering nominative and common inflected forms.
-_RU_FULL_NAME_RE = re.compile(r"(?<![\w-])(?:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+){2}[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?(?![\w-])")
+_RU_FULL_NAME_RE = re.compile(r"(?<![A-Za-zА-Яа-яЁё0-9-])(?:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+){2}[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?(?![A-Za-zА-Яа-яЁё0-9-])")
+_RU_SURNAME_INITIALS_RE = re.compile(r"(?<![A-Za-zА-Яа-яЁё0-9-])[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+(?:[А-ЯЁ]\.[ ]?){1,2}(?![A-Za-zА-Яа-яЁё0-9-])")
+_RU_SCHOOL_RE = re.compile(r"(?i)\b(?:ГБОУ|ГБПОУ|МБОУ|МОУ|МАОУ|Школа)\s+(?:Школа\s*)?№?\s*\d+[\w-]*")
 _RU_INITIAL_NAME_RE = re.compile(r"(?<![\w-])(?:[А-ЯЁ]\.[ ]?){1,2}[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?(?![\w-])")
 _LATIN_FULL_NAME_RE = re.compile(
     r"(?<![\w-])[A-Z][a-z]+(?:-[A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:-[A-Z][a-z]+)?){1,3}(?![\w-])"
@@ -53,21 +56,35 @@ _LABELED_NAME_RE = re.compile(
     r"(?i)(?P<label>\b(?:ФИО|получатель|заказчик|исполнитель|сотрудник)\s*[:№-]?\s*)"
     r"(?P<name>[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})"
 )
+_FORM_NAME_RE = re.compile(
+    r"(?i)(?P<label>\(?\s*(?:ФИО|Ф\.\s*И\.)\s*\)?\s*)[_\s]*"
+    r"(?P<name>[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})"
+)
 _LABELED_PII_RE = re.compile(
     r"(?im)(?P<label>\b(?:дата рождения|адрес(?: регистрации| проживания)?|место рождения)\s*[:№-]?\s*)"
     r"(?P<value>[^\n;]{3,200})"
 )
-_OPENWEBUI_SOURCE_RE = re.compile(r"(?is)(<source\b[^>]*>)(.*?)(</source>)")
+_OPENWEBUI_SOURCE_RE = re.compile(r"(?is)(<source\b(?P<attrs>[^>]*)>)(?P<body>.*?)(</source>)")
+_OPENWEBUI_ATTR_RE = re.compile(
+    r'''(?is)(?P<name>[A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)')'''
+)
+_OPENWEBUI_RESOURCE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_OPENWEBUI_ATTACHED_FILE_RE = re.compile(r"(?is)<file\b(?P<attrs>[^>]*)/?>")
 
 
 @dataclass
 class _Tokens:
     people: dict[str, str] = field(default_factory=dict)
+    organizations: dict[str, str] = field(default_factory=dict)
     sums: dict[str, str] = field(default_factory=dict)
 
     def person(self, value: str) -> str:
         key = " ".join(value.casefold().split())
         return self.people.setdefault(key, f"person{len(self.people) + 1}")
+
+    def organization(self, value: str) -> str:
+        key = " ".join(value.casefold().split())
+        return self.organizations.setdefault(key, f"organization{len(self.organizations) + 1}")
 
     def amount(self, value: str) -> str:
         key = re.sub(r"\s+", " ", value.casefold()).strip().rstrip(".")
@@ -105,6 +122,9 @@ def anonymize_document_text(text: str) -> str:
     def labeled_pii(match: re.Match[str]) -> str:
         return f"{match.group('label')}{tokens.person(match.group('value'))}"
 
+    def organization(match: re.Match[str]) -> str:
+        return tokens.organization(match.group(0))
+
     result = _EMAIL_RE.sub(person, text)
     result = _PHONE_RE.sub(person, result)
     result = _SNILS_RE.sub(person, result)
@@ -112,7 +132,10 @@ def anonymize_document_text(text: str) -> str:
     result = _ACCOUNT_RE.sub(person, result)
     result = _PASSPORT_RE.sub(person, result)
     result = _LABELED_PII_RE.sub(labeled_pii, result)
+    result = _RU_SCHOOL_RE.sub(organization, result)
+    result = _FORM_NAME_RE.sub(labeled, result)
     result = _LABELED_NAME_RE.sub(labeled, result)
+    result = _RU_SURNAME_INITIALS_RE.sub(person, result)
     result = _RU_INITIAL_NAME_RE.sub(person, result)
     result = _RU_FULL_NAME_RE.sub(person, result)
     result = _LATIN_FULL_NAME_RE.sub(person, result)
@@ -134,16 +157,95 @@ def anonymize_document_blocks(text: str) -> str:
     return prefix + marker + anonymize_document_text(suffix)
 
 
+def _openwebui_source_attributes(raw_attributes: str) -> dict[str, str]:
+    """Parse only quoted Open WebUI source attributes; never trust paths from it."""
+    values: dict[str, str] = {}
+    for match in _OPENWEBUI_ATTR_RE.finditer(raw_attributes):
+        value = match.group("double") if match.group("double") is not None else match.group("single")
+        values[match.group("name").casefold()] = html.unescape(value or "")
+    return values
+
+
+def _openwebui_uploads_root() -> Path:
+    """Return the co-located Open WebUI upload directory without accepting a client path."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "openwebui" / "uploads"
+
+
+def _sanitized_openwebui_upload(attributes: dict[str, str]) -> str | None:
+    """Extract the real local upload, when referenced by a safe Open WebUI UUID.
+
+    Open WebUI normally sends an extracted RAG block to the OpenAI-compatible
+    backend rather than document bytes.  On a co-located installation, use the
+    upload store as the authoritative local source.  The user-controlled source
+    tag can select only one basename under that fixed root; traversal, symlinks,
+    unsupported types, and extraction failures all fall back to the already
+    supplied block instead of exposing raw bytes or a host path to the model.
+    """
+    resource_id = attributes.get("resource-id", "").strip()
+    if not _OPENWEBUI_RESOURCE_ID_RE.fullmatch(resource_id):
+        return None
+    root = _openwebui_uploads_root()
+    try:
+        root = root.resolve(strict=True)
+    except OSError:
+        return None
+    candidates = list(root.glob(f"{resource_id}_*"))
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    try:
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != root or not resolved.is_file() or not is_document_path(resolved):
+            return None
+        return sanitized_document_text(resolved)
+    except Exception:
+        return None
+
+
+def anonymize_openwebui_attachment_tags(text: str) -> str:
+    """Expand Open WebUI's ``<attached_files>`` references from the local upload store.
+
+    Some Open WebUI helper requests carry the original attachment as a compact
+    ``<file id=UUID .../>`` descriptor rather than a ``<source>`` block.  The
+    descriptor is not document content, so passing it through unchanged makes
+    the agent see only a filename.  Resolve only a UUID-named file under the
+    fixed local upload root and insert its locally anonymized text; malformed or
+    missing references remain unchanged and never select an arbitrary path.
+    """
+    if not document_anonymization_enabled() or "<attached_files" not in text.casefold():
+        return text
+
+    def expand(match: re.Match[str]) -> str:
+        attributes = _openwebui_source_attributes(match.group("attrs"))
+        resource_id = attributes.get("id", "").strip()
+        clean = _sanitized_openwebui_upload({"resource-id": resource_id})
+        if clean is None:
+            return match.group(0)
+        return "\n[Анонимизированное содержимое вложенного документа]\n" + clean + "\n"
+
+    return _OPENWEBUI_ATTACHED_FILE_RE.sub(expand, text)
+
+
 def anonymize_openwebui_source_blocks(text: str) -> str:
-    """Redact OpenWebUI RAG document bodies while preserving user prose."""
+    """Redact OpenWebUI document blocks, preferring the co-located upload bytes.
+
+    This makes uploads available to the local anonymizer even though Open WebUI
+    sends only RAG-extracted text to the API.  Only anonymized text crosses the
+    model boundary; neither the original path nor original bytes are exposed.
+    """
     if not document_anonymization_enabled() or "<source" not in text.casefold():
         return text
-    return _OPENWEBUI_SOURCE_RE.sub(
-        lambda match: '<source anonymized="true">'
-        + anonymize_document_text(match.group(2))
-        + match.group(3),
-        text,
-    )
+
+    def redact(match: re.Match[str]) -> str:
+        attributes = _openwebui_source_attributes(match.group("attrs"))
+        clean = _sanitized_openwebui_upload(attributes)
+        if clean is None:
+            clean = anonymize_document_text(match.group("body"))
+        return '<source anonymized="true">' + clean + match.group(4)
+
+    return _OPENWEBUI_SOURCE_RE.sub(redact, text)
 
 
 def anonymize_openwebui_content(content: Any) -> Any:

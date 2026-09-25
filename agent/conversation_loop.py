@@ -7541,6 +7541,11 @@ def run_conversation(
                             # this turn's fresh, not-yet-persisted rows into history_ids
                             # and skip writing them.
                             messages = _pruned_msgs
+                            # The full tool content is no longer in context;
+                            # a reload must not point back to the removed copy.
+                            from agent.context_read_dedup import invalidate_context_read_dedup
+
+                            invalidate_context_read_dedup(effective_task_id)
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

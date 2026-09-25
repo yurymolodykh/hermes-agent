@@ -97,6 +97,8 @@ class TurnContext:
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
     tool_resume: Any = None
+    # Primitive snapshot of inbound media; TurnRunner does not own MessageEvent.
+    has_attachments: bool = False
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

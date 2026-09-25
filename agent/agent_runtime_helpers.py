@@ -1497,6 +1497,11 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
+    if getattr(agent, "_immutable_route", None):
+        # The credential pool may rotate keys, but this execution cannot move
+        # to another provider/model pair.
+        agent._fallback_index = 0
+        return False
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
@@ -3027,6 +3032,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         ]
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
+    agent._immutable_route = {
+        "provider": str(agent.provider or "").strip().lower(),
+        "model": str(agent.model or "").strip(),
+    }
 
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",

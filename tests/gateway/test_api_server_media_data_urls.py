@@ -12,7 +12,10 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
-from gateway.platforms.api_server import _resolve_media_to_data_urls  # noqa: E402
+from gateway.platforms.api_server import (  # noqa: E402
+    _extract_openwebui_image_deltas,
+    _resolve_media_to_data_urls,
+)
 
 # 1x1 transparent PNG
 _PNG_BYTES = base64.b64decode(
@@ -49,6 +52,18 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
     def test_non_image_left_untouched(self):
         text = "MEDIA:/tmp/archive.zip"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+    def test_png_media_emits_openwebui_image_delta(self):
+        p = self._write_png()
+        images = _extract_openwebui_image_deltas(f"MEDIA:{p}")
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["type"], "image_url")
+        self.assertTrue(images[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_non_png_media_is_not_emitted_as_openwebui_attachment(self):
+        p = self._write_png().with_suffix(".jpg")
+        p.write_bytes(_PNG_BYTES)
+        self.assertEqual(_extract_openwebui_image_deltas(f"MEDIA:{p}"), [])
 
 
 if __name__ == "__main__":

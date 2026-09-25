@@ -1114,6 +1114,11 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Immutable provider/model route selected by the root task. Descendants
+    # copy this pair verbatim; unlike model_override/provider_override it is
+    # lineage identity, not a mutable UI preference.
+    root_model_override: Optional[str] = None
+    root_provider_override: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
     # off). When set, the dispatcher passes ``--reasoning <level>`` so the
@@ -1221,6 +1226,16 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            root_model_override=(
+                row["root_model_override"]
+                if "root_model_override" in keys and row["root_model_override"]
+                else None
+            ),
+            root_provider_override=(
+                row["root_provider_override"]
+                if "root_provider_override" in keys and row["root_provider_override"]
                 else None
             ),
             reasoning_effort=(
@@ -1396,6 +1411,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Immutable route inherited from the root(s) of this task's lineage.
+    -- NULL is retained only for legacy/unpinned rows; dispatch fails closed.
+    root_model_override  TEXT,
+    root_provider_override TEXT,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
     -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
     -- passes --reasoning <level> so the worker runs at that depth regardless
@@ -1488,6 +1507,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+    -- Session that authenticated the dispatched worker before it may mutate
+    -- the active run. NULL means legacy/unbound and must fail closed.
+    ,worker_session_id  TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2646,6 +2668,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "root_model_override" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "root_model_override", "root_model_override TEXT"
+        )
+
+    if "root_provider_override" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "root_provider_override", "root_provider_override TEXT"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -2706,6 +2738,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    # ``task_runs.worker_session_id`` is written only by the dispatcher-owned
+    # worker bootstrap. Legacy runs stay NULL and therefore cannot authorize
+    # a worker mutation through the public tool surface.
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "worker_session_id" not in run_cols:
+        _add_column_if_missing(
+            conn, "task_runs", "worker_session_id", "worker_session_id TEXT"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3168,6 +3209,162 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _validate_assignee_profile(assignee: Optional[str]) -> Optional[str]:
+    """Normalize *assignee* and reject named profiles that cannot be spawned.
+
+    ``None`` is the explicit unassigned state used by assignment/review flows.
+    Every nonempty assignee is later launched as ``hermes -p <name>`` by the
+    dispatcher, so accepting a merely well-formed but absent name creates a
+    permanently non-runnable card.  Keep this validation at the DB boundary so
+    CLI, dashboard, tool, and direct Python callers all fail closed alike.
+    """
+    canonical = _canonical_assignee(assignee)
+    if canonical is None:
+        return None
+    from hermes_cli.profiles import profile_exists
+
+    if not profile_exists(canonical):
+        raise ValueError(
+            f"unknown Kanban assignee {canonical!r}: install the named Hermes "
+            "profile before assigning work to it"
+        )
+    return canonical
+
+
+def _validate_provider_model_route(
+    provider: Optional[str], model: Optional[str]
+) -> None:
+    """Fail closed when an explicit worker route cannot start on this host.
+
+    This is intentionally the same preflight used immediately before dispatcher
+    spawn.  It prevents public mutation paths from persisting an explicit route
+    (notably bare ``custom``/``letovo`` aliases) that the dispatcher would only
+    discover as unusable after the card has entered its queue.
+    """
+    blocker = _provider_route_blocker(provider, model)
+    if blocker:
+        raise ValueError(f"unusable provider/model route: {blocker}")
+
+
+def resolve_task_root_route(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    persist: bool = False,
+    allow_unpinned: bool = False,
+) -> tuple[tuple[str, ...], str, str]:
+    """Resolve the immutable lineage route for *task_id*.
+
+    New rows carry ``root_*`` directly.  Legacy rows are derived recursively
+    from their parents and own model/provider override.  Every ambiguity is a
+    MODEL_LOCK error: incomplete pairs, parent disagreement, cycles, and a
+    task override that drifted from its ancestors all fail closed.
+
+    Returns ``(root_task_ids, provider, model)``.  Fan-in may have several root
+    ids, but only when every root has the exact same provider/model pair.
+    """
+    seen: set[str] = set()
+
+    def _walk(tid: str) -> tuple[tuple[str, ...], str, str]:
+        if tid in seen:
+            raise ValueError(f"MODEL_LOCK lineage cycle at task {tid}")
+        seen.add(tid)
+        try:
+            row = conn.execute(
+                "SELECT model_override, provider_override, "
+                "root_model_override, root_provider_override "
+                "FROM tasks WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"MODEL_LOCK unknown lineage task {tid}")
+
+            root_model = (row["root_model_override"] or "").strip()
+            root_provider = (row["root_provider_override"] or "").strip()
+            if bool(root_model) != bool(root_provider):
+                raise ValueError(
+                    f"MODEL_LOCK incomplete immutable root route on task {tid}: "
+                    f"provider={root_provider or '<missing>'} model={root_model or '<missing>'}"
+                )
+            parent_rows = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                (tid,),
+            ).fetchall()
+            parent_ids = [r["parent_id"] for r in parent_rows]
+
+            if root_model and root_provider:
+                # Stored identity is authoritative, but parent routes are still
+                # checked so manual SQL/linking cannot silently corrupt a DAG.
+                roots: tuple[str, ...] = (tid,) if not parent_ids else ()
+                if parent_ids:
+                    resolved = [_walk(pid) for pid in parent_ids]
+                    roots = tuple(sorted({rid for item in resolved for rid in item[0]}))
+                    for p_roots, provider, model in resolved:
+                        if (provider, model) != (root_provider, root_model):
+                            raise ValueError(
+                                "MODEL_LOCK lineage conflict: "
+                                f"root task(s) {','.join(p_roots)} expected "
+                                f"{root_provider}/{root_model}, actual {provider}/{model}"
+                            )
+                route = (roots, root_provider, root_model)
+            elif not parent_ids:
+                model = (row["model_override"] or "").strip()
+                provider = (row["provider_override"] or "").strip()
+                if not model or not provider:
+                    if allow_unpinned and not model and not provider:
+                        route = ((tid,), "", "")
+                    else:
+                        raise ValueError(
+                            f"MODEL_LOCK root task {tid} has no concrete provider/model route"
+                        )
+                else:
+                    route = ((tid,), provider, model)
+            else:
+                resolved = [_walk(pid) for pid in parent_ids]
+                roots = tuple(sorted({rid for item in resolved for rid in item[0]}))
+                expected_provider, expected_model = resolved[0][1], resolved[0][2]
+                for p_roots, provider, model in resolved[1:]:
+                    if (provider, model) != (expected_provider, expected_model):
+                        raise ValueError(
+                            "MODEL_LOCK lineage conflict: "
+                            f"root task(s) {','.join(roots)} expected "
+                            f"{expected_provider}/{expected_model}, actual {provider}/{model} "
+                            f"from root task(s) {','.join(p_roots)}"
+                        )
+                own_model = (row["model_override"] or "").strip()
+                own_provider = (row["provider_override"] or "").strip()
+                if bool(own_model) != bool(own_provider):
+                    raise ValueError(
+                        f"MODEL_LOCK incomplete task route on {tid}: "
+                        f"provider={own_provider or '<missing>'} model={own_model or '<missing>'}"
+                    )
+                if own_model and not expected_model:
+                    raise ValueError(
+                        "MODEL_LOCK lineage conflict: unpinned parent root(s) "
+                        f"{','.join(roots)} cannot authorize child route "
+                        f"{own_provider}/{own_model}"
+                    )
+                if own_model and (own_provider, own_model) != (expected_provider, expected_model):
+                    raise ValueError(
+                        "MODEL_LOCK lineage conflict: "
+                        f"root task(s) {','.join(roots)} expected "
+                        f"{expected_provider}/{expected_model}, actual {own_provider}/{own_model}"
+                    )
+                route = (roots, expected_provider, expected_model)
+
+            if persist and route[1] and route[2]:
+                conn.execute(
+                    "UPDATE tasks SET model_override = ?, provider_override = ?, "
+                    "root_model_override = ?, root_provider_override = ? WHERE id = ?",
+                    (route[2], route[1], route[2], route[1], tid),
+                )
+            return route
+        finally:
+            seen.remove(tid)
+
+    return _walk(task_id)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3241,7 +3438,9 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    assignee = _canonical_assignee(assignee)
+    # Global policy: every newly created unassigned task is owned by the
+    # orchestrator.  Do not persist a name that the dispatcher could not spawn.
+    assignee = _validate_assignee_profile(assignee or "01-orchestrator")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3360,6 +3559,10 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    if parents and bool(model_override) != bool(provider_override):
+        raise ValueError(
+            "MODEL_LOCK child route must specify both provider and model, or neither"
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3451,6 +3654,54 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                root_model_override = model_override
+                root_provider_override = provider_override
+                if parents:
+                    missing = _find_missing_parents(conn, parents)
+                    if missing:
+                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                    resolved = [
+                        resolve_task_root_route(
+                            conn, pid, persist=True, allow_unpinned=True
+                        )
+                        for pid in parents
+                    ]
+                    root_ids = tuple(sorted({rid for item in resolved for rid in item[0]}))
+                    expected_provider, expected_model = resolved[0][1], resolved[0][2]
+                    for p_roots, provider, model in resolved[1:]:
+                        if (provider, model) != (expected_provider, expected_model):
+                            raise ValueError(
+                                "MODEL_LOCK lineage conflict: "
+                                f"root task(s) {','.join(root_ids)} expected "
+                                f"{expected_provider}/{expected_model}, actual {provider}/{model} "
+                                f"from root task(s) {','.join(p_roots)}"
+                            )
+                    if model_override and (
+                        provider_override,
+                        model_override,
+                    ) != (expected_provider, expected_model):
+                        raise ValueError(
+                            "MODEL_LOCK lineage conflict: "
+                            f"root task(s) {','.join(root_ids)} expected "
+                            f"{expected_provider}/{expected_model}, actual "
+                            f"{provider_override}/{model_override}"
+                        )
+                    # Parent lineage, never the ambient caller, owns the child.
+                    model_override = expected_model or None
+                    provider_override = expected_provider or None
+                    root_model_override = expected_model or None
+                    root_provider_override = expected_provider or None
+                elif model_override and provider_override:
+                    # A new root's explicit concrete route becomes immutable.
+                    root_model_override = model_override
+                    root_provider_override = provider_override
+
+                # Use the dispatcher's own route preflight before persisting an
+                # explicit or inherited provider/model route.  This includes
+                # legacy parent routes that may have been written before the
+                # mutation boundary became fail-closed.
+                _validate_provider_model_route(provider_override, model_override)
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3509,9 +3760,10 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
+                        root_model_override, root_provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3533,6 +3785,8 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
+                        root_model_override,
+                        root_provider_override,
                         reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
@@ -3565,6 +3819,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "root_model_override": root_model_override,
+                        "root_provider_override": root_provider_override,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3668,6 +3924,7 @@ def list_tasks(
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
     include_archived: bool = False,
+    hide_done_completed_before: Optional[int] = None,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
@@ -3697,6 +3954,11 @@ def list_tasks(
         params.append(current_step_key)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    if hide_done_completed_before is not None:
+        query += (
+            " AND (status != 'done' OR completed_at IS NULL OR completed_at > ?)"
+        )
+        params.append(int(hide_done_completed_before))
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3718,7 +3980,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
-    profile = _canonical_assignee(profile)
+    profile = _validate_assignee_profile(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3763,28 +4025,47 @@ def set_model_override(
     against a different backend, which is exactly the mismatch class this
     feature exists to kill).
 
-    Allowed on any non-archived task, including ``running`` ones — the
-    override only takes effect on the NEXT dispatch, so setting it on a
-    running task that's about to be reclaimed/retried is the primary
-    rate-limit-recovery flow. Returns True on success.
+    Route identity is immutable after the first claim/run.  Before that point
+    an operator may still select or clear the route explicitly.  Returns True
+    on success.
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
-    if provider and not model:
-        raise ValueError("provider_override requires a model_override")
+    if bool(provider) != bool(model):
+        raise ValueError(
+            "MODEL_LOCK requires a concrete provider/model pair; set both or neither"
+        )
     if not model:
         provider = None
+    _validate_provider_model_route(provider, model)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, started_at, current_run_id, claim_lock, "
+            "root_model_override, root_provider_override "
+            "FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if row["started_at"] is not None or row["current_run_id"] or row["claim_lock"]:
+            raise RuntimeError(
+                f"cannot change model/provider route on {task_id}: task was already claimed or run"
+            )
+        locked_model = (row["root_model_override"] or "").strip()
+        locked_provider = (row["root_provider_override"] or "").strip()
+        if locked_model or locked_provider:
+            if (provider, model) != (locked_provider, locked_model):
+                raise RuntimeError(
+                    "MODEL_LOCK immutable root route conflict on task "
+                    f"{task_id}: expected {locked_provider}/{locked_model}, "
+                    f"actual {provider or '<missing>'}/{model or '<missing>'}"
+                )
         conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-            (model, provider, task_id),
+            "UPDATE tasks SET model_override = ?, provider_override = ?, "
+            "root_model_override = COALESCE(root_model_override, ?), "
+            "root_provider_override = COALESCE(root_provider_override, ?) WHERE id = ?",
+            (model, provider, model, provider, task_id),
         )
         _append_event(
             conn, task_id, "model_override_set",
@@ -3853,6 +4134,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
+        )
+        # Validate the complete post-link lineage while still inside the write
+        # transaction. Any conflict rolls the edge back atomically.
+        resolve_task_root_route(
+            conn, child_id, persist=True, allow_unpinned=True
         )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
@@ -4627,6 +4913,53 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def bind_worker_session(
+    conn: sqlite3.Connection, task_id: str, run_id: int, assignee: str, session_id: str
+) -> bool:
+    """Atomically bind one active claimed run to its worker session.
+
+    This is deliberately compare-and-set: a terminal, reclaimed, foreign, or
+    already differently-bound run is rejected without changing board state.
+    """
+    if not all(str(v).strip() for v in (task_id, run_id, assignee, session_id)):
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET worker_session_id = ?
+             WHERE id = ? AND task_id = ? AND profile = ?
+               AND status = 'running' AND ended_at IS NULL
+               AND (worker_session_id IS NULL OR worker_session_id = ?)
+               AND EXISTS (
+                   SELECT 1 FROM tasks
+                    WHERE id = ? AND assignee = ? AND status = 'running'
+                      AND current_run_id = ?
+               )
+            """,
+            (session_id, int(run_id), task_id, assignee, session_id,
+             task_id, assignee, int(run_id)),
+        )
+        return cur.rowcount == 1
+
+
+def has_authenticated_worker_binding(
+    conn: sqlite3.Connection, task_id: str, run_id: int, assignee: str, session_id: str
+) -> bool:
+    """Return whether all four active worker identity facets still match."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.id = ? AND t.assignee = ? AND t.status = 'running'
+           AND t.current_run_id = ? AND r.task_id = t.id AND r.profile = ?
+           AND r.status = 'running' AND r.ended_at IS NULL
+           AND r.worker_session_id = ?
+        """,
+        (task_id, assignee, int(run_id), assignee, session_id),
+    ).fetchone()
+    return row is not None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4688,16 +5021,24 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        # Terminal-state guard (#t_db662ef7): never claim a task that has
+        # already been terminated (``completed_at`` set → ``done``/``archived``).
+        # A broken retry path may corrupt a terminal task's ``status`` back to
+        # 'ready'; without this the dispatcher would re-spawn it forever (e.g.
+        # t_2b49cfcd, archived with completed_at set, re-spawned 29x). A
+        # legitimate reopen clears ``completed_at`` before re-promoting, so this
+        # guard only blocks re-spawning of genuinely terminal tasks.
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'ready'
+              AND claim_lock IS NULL
+              AND completed_at IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4791,13 +5132,14 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'review'
+              AND claim_lock IS NULL
+              AND completed_at IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -6908,6 +7250,48 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def resolve_triage(
+    conn: sqlite3.Connection, task_id: str, *, rationale: str, actor: str,
+) -> bool:
+    """Resume triage after an explicit, auditable orchestrator decision.
+
+    This is not a generic unblock or completion. Preserve recurrence and failure
+    evidence so an unchanged cause re-enters triage instead of looping forever.
+    The tool enforces authorization; direct DB callers must enforce their own.
+    """
+    reason = str(rationale or "").strip()
+    operator = str(actor or "").strip()
+    if not reason:
+        raise ValueError("triage resolution requires a nonempty rationale")
+    if not operator:
+        raise ValueError("triage resolution requires an actor")
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is None or current["status"] != "triage":
+            return False
+        landing = _landing_status_after_parents(conn, task_id)
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("triage",), now=now,
+            note="invariant recovery on triage resolution",
+        )
+        changed = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'triage'",
+            (landing, task_id),
+        )
+        if changed.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "triage_resolved",
+            {"rationale": reason, "actor": operator, "status": landing},
+        )
+        return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -8170,6 +8554,15 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
+        # Windows has no waitpid status protocol. Accept both a native return
+        # code and a POSIX-style status produced by compatibility reapers/tests.
+        if os.name == "nt":
+            code = raw if 0 <= raw <= 255 else (raw >> 8)
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
             if code == 0:
@@ -10432,6 +10825,18 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        try:
+            if dry_run:
+                resolve_task_root_route(conn, row["id"], persist=False)
+            else:
+                with write_txn(conn):
+                    resolve_task_root_route(conn, row["id"], persist=True)
+        except Exception as exc:
+            reason = f"MODEL_LOCK dispatch blocked: {exc}"
+            if not dry_run:
+                block_task(conn, row["id"], reason=reason, kind="capability")
+            result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -10584,6 +10989,18 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        try:
+            if dry_run:
+                resolve_task_root_route(conn, row["id"], persist=False)
+            else:
+                with write_txn(conn):
+                    resolve_task_root_route(conn, row["id"], persist=True)
+        except Exception as exc:
+            reason = f"MODEL_LOCK review dispatch blocked: {exc}"
+            if not dry_run:
+                block_task(conn, row["id"], reason=reason, kind="capability")
+            result.auto_blocked.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

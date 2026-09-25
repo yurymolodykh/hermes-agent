@@ -510,16 +510,38 @@ def async_delivery_supported() -> bool:
     registering a watcher / dispatching a detached child, so they can refuse a
     promise the channel can't keep instead of silently no-op'ing.
     """
-    import os
-
     # A Kanban worker is a one-shot subprocess. Its parent session and process
     # disappear after the quiet turn returns, so a completion queued later has
     # no durable consumer even though an ordinary CLI session can drain that
     # queue. Force tools onto their existing synchronous/polling fallbacks.
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    #
+    # Only a dispatcher-spawned worker counts as one-shot — identified by the
+    # FULL worker envelope (HERMES_KANBAN_RUN_ID / _DB / _WORKSPACE +
+    # HERMES_PROFILE + HERMES_SESSION_SOURCE=kanban), not by the bare
+    # ``HERMES_KANBAN_TASK`` var. A long-lived gateway/api_server process that
+    # inherited a stale HERMES_KANBAN_TASK from an old dispatcher launch is an
+    # ordinary interactive session, not a one-shot worker, and must keep async
+    # delivery (phantom-loop regression, t_6972f101).
+    if _is_kanban_worker_process():
         return False
 
     value = _SESSION_ASYNC_DELIVERY.get()
     if value is _UNSET:
         return True
     return bool(value)
+
+
+def _is_kanban_worker_process() -> bool:
+    """True only when this process is a dispatcher-spawned Kanban worker.
+
+    Uses the full dispatcher worker env envelope (see
+    ``agent.kanban_stop.is_dispatcher_worker_env``), so a session that merely
+    inherited a stale bare ``HERMES_KANBAN_TASK`` is never mistaken for a
+    one-shot worker. Fails safe to ``False`` (not a worker) on any error.
+    """
+    try:
+        from agent.kanban_stop import is_dispatcher_worker_env
+
+        return is_dispatcher_worker_env()
+    except Exception:
+        return False

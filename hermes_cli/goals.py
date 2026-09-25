@@ -811,6 +811,53 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
+def resolve_session_goal_judge_route(session_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return proven ``(provider, model)`` provenance for a chat /goal judge.
+
+    A chat-level goal judge evaluates a user-visible turn, so it must use the
+    same source route.  In particular, it must not consult
+    ``auxiliary.goal_judge`` and silently inherit a profile default/fallback.
+    Gateway turns persist their actual route before post-turn hooks; this
+    function reads only that record and fails closed when it is incomplete.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return None, None, "Goal judge source route is missing a session id; refusing auxiliary/default routing."
+    db = _get_session_db()
+    if db is None:
+        return None, None, "Goal judge source route is unavailable because session provenance could not be opened; refusing auxiliary/default routing."
+    try:
+        row = db.get_session(sid)
+    except Exception as exc:
+        logger.debug("GoalManager: source-route lookup failed for %s: %s", sid, exc)
+        return None, None, "Goal judge source route could not be read from the session; refusing auxiliary/default routing."
+    if not isinstance(row, dict):
+        return None, None, "Goal judge source route is not recorded for this session; refusing auxiliary/default routing."
+
+    model = str(row.get("model") or "").strip()
+    config: Dict[str, Any] = {}
+    raw_config = row.get("model_config")
+    if isinstance(raw_config, dict):
+        config = raw_config
+    elif isinstance(raw_config, str) and raw_config.strip():
+        try:
+            parsed = json.loads(raw_config)
+            if isinstance(parsed, dict):
+                config = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    runtime = config.get("gateway_runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    provider = str(runtime.get("provider") or config.get("provider") or "").strip()
+    if not model or not provider:
+        missing = "model and provider" if not model and not provider else ("model" if not model else "provider")
+        return None, None, (
+            f"Goal judge source route is missing recorded {missing} for session {sid}; "
+            "refusing auxiliary/default routing."
+        )
+    return provider, model, None
+
+
 def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     """Log a dropped state write at WARNING.
 
@@ -1174,6 +1221,9 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    strict_source_route: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1212,6 +1262,14 @@ def judge_goal(
     ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
     judge doesn't burn the entire turn budget.
     """
+    if strict_source_route and (not (provider or "").strip() or not (model or "").strip()):
+        return (
+            "continue",
+            "Kanban goal judge requires recorded source task model_override and provider_override; refusing ambient auxiliary route",
+            False,
+            None,
+            True,
+        )
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
@@ -1271,19 +1329,47 @@ def judge_goal(
         )
 
     try:
-        # Route through call_llm so auxiliary.goal_judge.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
+        # A Kanban source route is an execution boundary: do not consult
+        # auxiliary.goal_judge routing/fallback configuration for that call.
+        call_kwargs: Dict[str, Any] = {
+            "messages": [
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
+            "temperature": 0,
+            "max_tokens": _goal_judge_max_tokens(),
+            "timeout": timeout,
+        }
+        if strict_source_route:
+            # The post-turn judge runs after the conversation's live runtime
+            # ContextVar has been reset. Explicit provider/model arguments
+            # select the correct client, but runtime-model-lock also needs an
+            # execution-local route it can prove and scope for this call.
+            # Never reuse an ambient ContextVar here: multiplexed gateway
+            # sessions may have another chat (or no chat) bound at this point.
+            source_runtime = {
+                "provider": provider.strip(),
+                "model": model.strip(),
+                "route_locked": True,
+            }
+            call_kwargs.update(
+                provider=provider.strip(),
+                model=model.strip(),
+                main_runtime=source_runtime,
+                allow_fallback=False,
+            )
+        else:
+            call_kwargs["task"] = "goal_judge"
+        if strict_source_route:
+            # _resolve_task_provider_model enforces route locks from the
+            # ContextVar, not the explicit provider/model call arguments.
+            # Scope the persisted route only around this post-turn request;
+            # never leak it into another multiplexed gateway session.
+            from agent.auxiliary_client import scoped_runtime_main
+            with scoped_runtime_main(source_runtime):
+                resp = call_llm(**call_kwargs)
+        else:
+            resp = call_llm(**call_kwargs)
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False, None, True
@@ -1423,10 +1509,34 @@ class GoalManager:
       feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        default_max_turns: int = DEFAULT_MAX_TURNS,
+        source_provider: Optional[str] = None,
+        source_model: Optional[str] = None,
+        require_source_route: bool = False,
+    ):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
+        self.source_provider = (source_provider or "").strip()
+        self.source_model = (source_model or "").strip()
+        self.require_source_route = bool(require_source_route)
         self._state: Optional[GoalState] = load_goal(session_id)
+
+    def _judge_source_route(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve the exact chat route, or return a fail-closed diagnostic."""
+        if self.source_provider and self.source_model:
+            return self.source_provider, self.source_model, None
+        if self.source_provider or self.source_model:
+            return None, None, (
+                "Goal judge source route has incomplete active provider/model provenance; "
+                "refusing auxiliary/default routing."
+            )
+        if self.require_source_route:
+            return resolve_session_goal_judge_route(self.session_id)
+        return None, None, None
 
     # --- introspection ------------------------------------------------
 
@@ -1946,12 +2056,29 @@ class GoalManager:
                 }
             return gate_decision
 
+        source_provider, source_model, route_error = self._judge_source_route()
+        if route_error:
+            state.status = "paused"
+            state.paused_reason = route_error
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "route_error",
+                "reason": route_error,
+                "message": f"⏸ Goal paused — {route_error}",
+            }
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,
             last_response,
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
+            provider=source_provider,
+            model=source_model,
+            strict_source_route=bool(source_provider and source_model),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -2032,12 +2159,9 @@ class GoalManager:
                 "message": (
                     f"⏸ Goal paused — judge API returned errors "
                     f"({state.consecutive_transport_failures} turns). "
-                    "Check the goal_judge provider/key in ~/.hermes/config.yaml:\n"
-                    "  auxiliary:\n"
-                    "    goal_judge:\n"
-                    "      provider: deepseek\n"
-                    "      model: deepseek-v4-flash\n"
-                    "Then /goal resume to continue."
+                    "The judge keeps the configured route; it does not choose a replacement model. "
+                    "Inspect the active profile's auxiliary.goal_judge provider, model, and credentials "
+                    "with `hermes config get auxiliary.goal_judge`, then use /goal resume to continue."
                 ),
             }
 
@@ -2175,6 +2299,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    judge_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -2253,7 +2378,8 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        active_judge = judge_fn or judge_goal
+        verdict, reason, _parse_failed, _wait, _transport_failed = active_judge(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")

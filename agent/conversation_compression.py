@@ -3947,21 +3947,12 @@ def compress_context(
             else:
                 agent.context_compressor._verify_compaction_cleared_threshold = True
 
-        # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
-        # file it needs the full content, not a "file unchanged" stub.
-        try:
-            from tools.file_tools import reset_file_dedup
-            reset_file_dedup(task_id)
-        except Exception:
-            pass
-        # Same for the skill_view repeat-view dedup: a post-compression
-        # re-view must return the full skill content again.
-        try:
-            from tools.skills_tool import reset_skill_view_dedup
-            reset_skill_view_dedup(task_id)
-        except Exception:
-            pass
+        # Read-once assumptions no longer hold after the transcript rewrite.
+        from agent.context_read_dedup import invalidate_context_read_dedup
+
+        invalidate_context_read_dedup(
+            task_id if task_id is not None else getattr(agent, "_current_task_id", None)
+        )
 
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
@@ -4109,6 +4100,7 @@ def _compress_context_via_codex_app_server(
             result,
             approx_tokens=approx_tokens,
             force=True,
+            task_id=task_id,
         )
         # An empty usage report must consume the pending post-compaction verdict
         # rather than leaving preflight deferral armed until some unrelated later
@@ -4118,13 +4110,6 @@ def _compress_context_via_codex_app_server(
             _record_codex_app_server_usage(agent, result)
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
-
-    try:
-        from tools.file_tools import reset_file_dedup
-
-        reset_file_dedup(task_id)
-    except Exception:
-        pass
 
     logger.info(
         "codex app-server compaction done: session=%s thread=%s turn=%s",

@@ -369,8 +369,9 @@ If no backend has **ever** been selected (no `web.backend` / per-capability key 
 | `FIRECRAWL_API_KEY` or `FIRECRAWL_API_URL` (or the Nous Tool Gateway is ready) | firecrawl |
 | `SEARXNG_URL` | searxng |
 | `BRAVE_SEARCH_API_KEY` | brave-free |
-| `ddgs` package importable | ddgs |
 | *(nothing set at all)* | keyless ring: exa / parallel / tavily / firecrawl / keenable (round-robin) |
+
+The `ddgs` package remains an explicit/search-only emergency fallback. It is used only when the keyless ring is disabled or unavailable; an explicit `web.backend: ddgs` or `web.search_backend: ddgs` still pins it.
 
 **Keyless free-tier ring:** when *no* credential above is present, requests rotate across five vendors' public free tiers (Exa, Parallel, Tavily, Firecrawl, Keenable) so web tools work on a fresh install with zero setup — and a rate-limited request fails over to the next vendor in the ring automatically. Pin one vendor in `hermes tools` to stop the rotation (the ring is then only used as failover succession on throttles). All free tiers are vendor-rate-limited under burst load; sustained normal usage goes through fine. Set `web.keyless_fallback: false` to turn the tier off — with it off and no credentials, web tools are unavailable until a provider is configured.
 

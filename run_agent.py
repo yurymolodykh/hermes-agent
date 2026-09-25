@@ -1349,6 +1349,8 @@ class AIAgent:
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
+            # Non-secret execution contract consumed by auxiliary calls.
+            "route_locked": bool(getattr(self, "_immutable_route", None)),
         }
 
     def _check_compression_model_feasibility(self) -> None:

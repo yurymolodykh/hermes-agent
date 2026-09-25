@@ -646,6 +646,32 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
 
 
 @pytest.mark.asyncio
+async def test_gateway_kanban_list_preserves_long_output_for_telegram(kanban_home):
+    """The gateway must leave Telegram's long-message adapter to split list output.
+
+    ``TelegramAdapter.send`` has a 4096 UTF-16-unit chunking path.  Cutting the
+    CLI result at the gateway's smaller 3800-character convenience limit loses
+    board rows before that adapter can deliver the continuation messages.
+    """
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    event = SimpleNamespace(
+        text="/kanban list",
+        source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="chat1"),
+    )
+    original_output = "first-row\n" + ("x" * 4000) + "\nfinal-row"
+
+    with patch("hermes_cli.kanban.run_slash", return_value=original_output):
+        output = await GatewayRunner._handle_kanban_command(runner, event)
+
+    assert output == original_output
+    assert "final-row" in output
+    assert "сокращено" not in output
+
+
+@pytest.mark.asyncio
 async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     """`/kanban --board <slug> create ...` must subscribe on that board.
 

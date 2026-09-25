@@ -1,6 +1,7 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,8 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _promote_skill,
+    _promotion_files,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -174,65 +177,6 @@ class TestCreateSkill:
         assert result["success"] is False
         assert "Invalid category '../escape'" in result["error"]
         assert not (tmp_path / "escape").exists()
-
-    def test_create_similar_skill_is_advisory_not_a_blocker(self, tmp_path):
-        existing = VALID_SKILL_CONTENT.replace(
-            "name: test-skill", "name: deploy-kubernetes"
-        ).replace(
-            "A test skill for unit testing.",
-            "Use when deploying Kubernetes clusters safely."
-        )
-        new = VALID_SKILL_CONTENT.replace(
-            "name: test-skill", "name: deploy-kubernetes-canary"
-        ).replace(
-            "A test skill for unit testing.",
-            "Use when deploying Kubernetes clusters with canary releases."
-        )
-        with _skill_dir(tmp_path):
-            assert _create_skill("deploy-kubernetes", existing)["success"] is True
-            result = _create_skill("deploy-kubernetes-canary", new)
-
-        assert result["success"] is True, result
-        assert result["advisory_candidates"] == [{
-            "name": "deploy-kubernetes",
-            "description": "Use when deploying Kubernetes clusters safely.",
-            "state": "active",
-            "shared_terms": "clusters, deploying, kubernetes, use, when",
-        }]
-        assert "not blocked" in result["recommendation"]
-
-    def test_create_disabled_or_archived_match_is_still_advisory(self, tmp_path):
-        existing = VALID_SKILL_CONTENT.replace(
-            "name: test-skill", "name: deploy-kubernetes"
-        ).replace(
-            "A test skill for unit testing.",
-            "Use when deploying Kubernetes clusters safely."
-        )
-        new = VALID_SKILL_CONTENT.replace(
-            "name: test-skill", "name: deploy-kubernetes-canary"
-        ).replace(
-            "A test skill for unit testing.",
-            "Use when deploying Kubernetes clusters with canary releases."
-        )
-        with _skill_dir(tmp_path), \
-             patch("hermes_cli.config.load_config", return_value={"skills": {"disabled": ["deploy-kubernetes"]}}), \
-             patch("tools.skill_usage.load_usage", return_value={"deploy-kubernetes": {"state": "archived"}}):
-            assert _create_skill("deploy-kubernetes", existing)["success"] is True
-            result = _create_skill("deploy-kubernetes-canary", new)
-
-        assert result["success"] is True, result
-        assert result["advisory_candidates"][0]["state"] == "disabled"
-
-        archived_existing = existing.replace("deploy-kubernetes", "archive-kubernetes")
-        archived_new = new.replace("deploy-kubernetes-canary", "archive-kubernetes-canary")
-        with _skill_dir(tmp_path / "archived"), \
-             patch("hermes_cli.config.load_config", return_value={}), \
-             patch("tools.skill_usage.load_usage", return_value={"archive-kubernetes": {"state": "archived"}}):
-            assert _create_skill("archive-kubernetes", archived_existing)["success"] is True
-            archived_result = _create_skill("archive-kubernetes-canary", archived_new)
-
-        assert archived_result["success"] is True, archived_result
-        assert archived_result["advisory_candidates"][0]["state"] == "archived"
 
 
     def test_edit_long_desc_still_allowed_with_preview(self, tmp_path):
@@ -507,8 +451,8 @@ class TestSkillManageDispatcher:
                  patch("tools.skill_usage.is_hub_installed", return_value=False), \
                  patch("tools.skill_usage.is_bundled",
                        side_effect=lambda skill_name: skill_name == "bundled"):
-                skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+                _create_skill("umbrella", _skill_content("umbrella"))
+                _create_skill("bundled", _skill_content("bundled"))
                 raw = skill_manage(
                     action="delete",
                     name="bundled",
@@ -1009,3 +953,235 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestCoreLifecyclePreflight:
+    def test_disabled_skill_blocks_mutation_with_enable_recommendation(self, tmp_path):
+        with _skill_dir(tmp_path), patch("agent.skill_utils.get_disabled_skill_names", return_value={"my-skill"}):
+            _create_skill("my-skill", VALID_SKILL_CONTENT.replace("name: test-skill", "name: my-skill"))
+            result = json.loads(skill_manage(action="patch", name="my-skill", old_string="Do the thing.", new_string="Changed."))
+        assert result["success"] is False
+        assert result["preflight"]["decision"] == "enable"
+        assert result["preflight"]["recommended_action"] == "enable"
+
+    def test_ambiguous_similar_candidates_block_create(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("first", VALID_SKILL_CONTENT.replace("name: test-skill", "name: first"))
+            _create_skill("second", VALID_SKILL_CONTENT.replace("name: test-skill", "name: second"))
+            content = VALID_SKILL_CONTENT.replace("name: test-skill", "name: third")
+            result = json.loads(skill_manage(action="create", name="third", content=content))
+        assert result["success"] is False
+        assert result["preflight"]["source_state"] == "ambiguous"
+
+    def test_create_distinct_skill_with_body_overlap_and_mirrored_roots_is_advisory(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        existing = VALID_SKILL_CONTENT.replace("name: test-skill", "name: interactive-competition-guide")
+        (local / "interactive-competition-guide").mkdir()
+        (external / "interactive-competition-guide").mkdir()
+        for root in (local, external):
+            (root / "interactive-competition-guide" / "SKILL.md").write_text(existing, encoding="utf-8")
+        proposed = VALID_SKILL_CONTENT.replace("name: test-skill", "name: change-release-briefing").replace(
+            "Do the thing.", "Explain release changes with a verified manifest."
+        )
+        with _two_roots(local, external):
+            preview = json.loads(skill_manage(action="preflight", name="change-release-briefing", content=proposed))
+            result = json.loads(skill_manage(action="create", name="change-release-briefing", content=proposed))
+        assert preview["preflight"]["allowed"] is True, (preview, repr(proposed))
+        assert result["success"] is True, result
+        assert result["preflight"]["allowed"] is True
+        assert (local / "change-release-briefing" / "SKILL.md").exists()
+
+    def test_exact_mirrored_name_patches_local_and_refuses_new_create(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        content = VALID_SKILL_CONTENT.replace("name: test-skill", "name: mirrored-skill")
+        for root in (local, external):
+            (root / "mirrored-skill").mkdir()
+            (root / "mirrored-skill" / "SKILL.md").write_text(content, encoding="utf-8")
+        with _two_roots(local, external):
+            create = json.loads(skill_manage(action="create", name="mirrored-skill", content=content))
+            changed = json.loads(skill_manage(action="patch", name="mirrored-skill", old_string="Do the thing.", new_string="Do this locally."))
+        assert create["success"] is False
+        assert create["preflight"]["decision"] == "patch"
+        assert changed["success"] is True, changed
+        assert "Do this locally." in (local / "mirrored-skill" / "SKILL.md").read_text(encoding="utf-8")
+        assert (external / "mirrored-skill" / "SKILL.md").read_text(encoding="utf-8") == content
+
+    def test_single_readonly_procedure_copy_blocks_create_under_new_name(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        existing = VALID_SKILL_CONTENT.replace("name: test-skill", "name: existing-procedure")
+        _write_external_skill(external, "unrelated")
+        (external / "existing-procedure").mkdir()
+        (external / "existing-procedure" / "SKILL.md").write_text(existing, encoding="utf-8")
+        proposed = existing.replace("name: existing-procedure", "name: new-name")
+        with _two_roots(local, external):
+            result = json.loads(skill_manage(action="create", name="new-name", content=proposed))
+        assert result["success"] is False
+        assert result["preflight"]["decision"] == "fork"
+        assert result["preflight"]["source_state"] == "read_only"
+        assert not (local / "new-name").exists()
+
+    def test_exact_readonly_name_blocks_create_even_when_body_changes(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        _write_external_skill(external, "ext-skill")
+        proposed = VALID_SKILL_CONTENT.replace("name: test-skill", "name: ext-skill")
+        with _two_roots(local, external):
+            result = json.loads(skill_manage(action="create", name="ext-skill", content=proposed))
+        assert result["success"] is False
+        assert result["preflight"]["decision"] == "fork"
+        assert not (local / "ext-skill").exists()
+
+    def test_disabled_exact_name_blocks_create(self, tmp_path):
+        with _skill_dir(tmp_path), patch("agent.skill_utils.get_disabled_skill_names", return_value={"disabled-skill"}):
+            _create_skill("disabled-skill", VALID_SKILL_CONTENT.replace("name: test-skill", "name: disabled-skill"))
+            result = json.loads(skill_manage(action="create", name="disabled-skill", content=VALID_SKILL_CONTENT.replace("name: test-skill", "name: disabled-skill")))
+        assert result["success"] is False
+        assert result["preflight"]["decision"] == "enable"
+
+    def test_invalid_external_inventory_still_blocks_distinct_create(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        broken = external / "broken"
+        broken.mkdir()
+        (broken / "SKILL.md").write_text("not YAML frontmatter", encoding="utf-8")
+        with _two_roots(local, external):
+            result = json.loads(skill_manage(action="create", name="new-skill", content=VALID_SKILL_CONTENT.replace("name: test-skill", "name: new-skill")))
+        assert result["success"] is False
+        assert result["preflight"]["source_state"] == "invalid"
+        assert not (local / "new-skill").exists()
+
+    def test_readonly_external_match_recommends_fork(self, tmp_path):
+        local, external = tmp_path / "local", tmp_path / "external"
+        local.mkdir(); external.mkdir()
+        _write_external_skill(external, "ext-skill")
+        with _two_roots(local, external):
+            result = json.loads(skill_manage(action="patch", name="ext-skill", old_string="OLD_MARKER", new_string="NEW"))
+        assert result["success"] is False
+        assert result["preflight"]["decision"] == "fork"
+
+    def test_duplicate_frontmatter_name_and_provenance_rejected(self):
+        duplicate = "---\nname: a\nname: b\ndescription: x\nprovenance: one\nprovenance: two\n---\n\nBody\n"
+        err = _validate_frontmatter(duplicate, new_skill=True)
+        assert "duplicate YAML key" in err
+
+
+# ---------------------------------------------------------------------------
+# promote — profile-local skill -> configured shared/external create_dir
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteSkill:
+    @contextmanager
+    def _promotion_roots(self, tmp_path, monkeypatch):
+        local = tmp_path / "local"
+        shared = tmp_path / "shared"
+        local.mkdir()
+        shared.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with patch("tools.skill_manager_tool.SKILLS_DIR", local), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[local, shared]), \
+             patch("hermes_cli.config.load_config", return_value={"skills": {"create_dir": str(shared)}}):
+            yield local, shared
+
+    def test_promote_copies_clean_package_and_returns_readback_evidence(self, tmp_path, monkeypatch):
+        with self._promotion_roots(tmp_path, monkeypatch) as (local, shared):
+            assert _create_skill("shared-skill", _skill_content("shared-skill"))["success"] is True
+            source = local / "shared-skill"
+            (source / "references").mkdir()
+            (source / "references" / "guide.md").write_text("trusted guide\n", encoding="utf-8")
+            (source / "__pycache__").mkdir()
+            (source / "__pycache__" / "generated.pyc").write_bytes(b"generated")
+            # Exercise the registered lifecycle action rather than only its helper.
+            result = json.loads(skill_manage(action="promote", name="shared-skill"))
+
+        assert result["success"] is True, result
+        target = shared / "shared-skill"
+        assert (target / "SKILL.md").read_text(encoding="utf-8") == (source / "SKILL.md").read_text(encoding="utf-8")
+        assert (target / "references" / "guide.md").read_text(encoding="utf-8") == "trusted guide\n"
+        assert not (target / ".shared-skill.promotion-owner").exists()
+        assert not (target / "__pycache__").exists()
+        promotion = result["promotion"]
+        assert promotion["post_readback"] == "manifest_sha256_match"
+        assert Path(promotion["rollback"]["archive"]).is_file()
+        rollback_manifest = json.loads(Path(promotion["rollback"]["manifest"]).read_text(encoding="utf-8"))
+        assert rollback_manifest == promotion["manifest"]
+
+    def test_promote_refuses_existing_same_name_without_mutating_source(self, tmp_path, monkeypatch):
+        with self._promotion_roots(tmp_path, monkeypatch) as (local, shared):
+            assert _create_skill("collision", _skill_content("collision"))["success"] is True
+            original = (local / "collision" / "SKILL.md").read_text(encoding="utf-8")
+            existing = shared / "other-category" / "collision"
+            existing.mkdir(parents=True)
+            (existing / "SKILL.md").write_text(_skill_content("collision"), encoding="utf-8")
+            result = _promote_skill("collision")
+
+        assert result["success"] is False
+        assert "same-name shared collision" in result["error"]
+        assert (local / "collision" / "SKILL.md").read_text(encoding="utf-8") == original
+
+    def test_promote_preserves_target_created_during_staging(self, tmp_path, monkeypatch):
+        with self._promotion_roots(tmp_path, monkeypatch) as (local, shared):
+            assert _create_skill("race", _skill_content("race"))["success"] is True
+            source = local / "race" / "SKILL.md"
+            original_copyfile = shutil.copyfile
+
+            def copyfile_and_create_target(source_path, destination_path, *args, **kwargs):
+                result = original_copyfile(source_path, destination_path, *args, **kwargs)
+                target = shared / "race"
+                target.mkdir()
+                (target / "KEEP").write_text("concurrent target\n", encoding="utf-8")
+                return result
+
+            with patch("tools.skill_manager_tool.shutil.copyfile", side_effect=copyfile_and_create_target):
+                result = _promote_skill("race")
+
+        assert result["success"] is False
+        assert "appeared during staging" in result["error"]
+        assert (shared / "race" / "KEEP").read_text(encoding="utf-8") == "concurrent target\n"
+        assert source.read_text(encoding="utf-8") == _skill_content("race")
+
+    def test_promote_preserves_foreign_target_replaced_after_publish_before_readback(self, tmp_path, monkeypatch):
+        with self._promotion_roots(tmp_path, monkeypatch) as (local, shared):
+            assert _create_skill("race", _skill_content("race"))["success"] is True
+            source = local / "race" / "SKILL.md"
+            target = shared / "race"
+            original_promotion_files = _promotion_files
+            injected = False
+
+            def replace_target_before_readback(source_dir, root):
+                nonlocal injected
+                if source_dir == target and not injected:
+                    injected = True
+                    shutil.rmtree(target)
+                    target.mkdir()
+                    (target / "KEEP").write_text("foreign target\n", encoding="utf-8")
+                return original_promotion_files(source_dir, root)
+
+            with patch("tools.skill_manager_tool._promotion_files", side_effect=replace_target_before_readback):
+                result = _promote_skill("race")
+
+        assert injected is True
+        assert result["success"] is False
+        assert "promotion failed" in result["error"]
+        assert (shared / "race" / "KEEP").read_text(encoding="utf-8") == "foreign target\n"
+        assert source.read_text(encoding="utf-8") == _skill_content("race")
+
+    def test_promote_requires_configured_external_root(self, tmp_path, monkeypatch):
+        local = tmp_path / "local"
+        local.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with patch("tools.skill_manager_tool.SKILLS_DIR", local), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[local]), \
+             patch("hermes_cli.config.load_config", return_value={"skills": {"create_dir": str(local)}}):
+            assert _create_skill("local-only", _skill_content("local-only"))["success"] is True
+            result = json.loads(skill_manage(action="promote", name="local-only"))
+
+        assert result["success"] is False
+        assert "shared/external" in result["error"]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

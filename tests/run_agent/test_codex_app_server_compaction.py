@@ -154,6 +154,63 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
 
 
 
+@pytest.mark.parametrize("boundary", ["explicit", "native", "skipped", "failed", "interrupted", "not_compacted", "unscoped"])
+def test_codex_boundary_skill_reload_is_task_scoped(tmp_path, monkeypatch, boundary):
+    """Exercise real cache readers around the native/explicit boundary hooks."""
+    import json
+    from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+    home = tmp_path / "home"
+    skill = home / "skills" / "codex-reload-demo"
+    skill.mkdir(parents=True)
+    text = "# Instructions\nReload this procedure after context loss.\n"
+    (skill / "SKILL.md").write_text(
+        "---\nname: codex-reload-demo\ndescription: Reload test.\n---\n" + text,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    task, other = "codex-active-task", "other-running-task"
+
+    def view(t):
+        return json.loads(_skill_view_with_bump({"name": "codex-reload-demo"}, task_id=t))
+
+    try:
+        assert text in view(task)["content"]
+        assert text in view(other)["content"]
+        turn = TurnResult(thread_id="thread-1", turn_id="turn-1", compacted=True)
+        agent = DummyAgent(turn)
+        agent._current_task_id = task
+        messages = [{"role": "user", "content": "keep local transcript"}]
+        if boundary in {"native", "not_compacted", "unscoped"}:
+            if boundary == "not_compacted":
+                turn.compacted = False
+            if boundary == "unscoped":
+                agent._current_task_id = None
+            recorded = _record_codex_app_server_compaction(agent, turn)
+            assert recorded is (boundary != "not_compacted")
+        else:
+            # Explicit task scope must take precedence over agent state.
+            agent._current_task_id = other
+            if boundary == "failed":
+                turn.error = "provider failure"
+            if boundary == "interrupted":
+                turn.interrupted = True
+            returned, _ = compress_context(
+                agent, messages, "system", task_id=task, force=boundary != "skipped",
+            )
+            assert returned is messages
+            assert messages == [{"role": "user", "content": "keep local transcript"}]
+        reloaded = view(task)
+        if boundary in {"explicit", "native"}:
+            assert text in reloaded.get("content", ""), reloaded
+        else:
+            assert reloaded.get("dedup") is True
+        assert view(other).get("dedup") is True
+    finally:
+        reset_skill_view_dedup(task)
+        reset_skill_view_dedup(other)
+
+
 def test_codex_native_boundary_clears_stale_hermes_fallback_streak():
     from unittest.mock import patch
 

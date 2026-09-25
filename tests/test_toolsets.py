@@ -320,8 +320,36 @@ class TestResolveToolsetMemo:
             f"got {get_toolset_calls['n']} calls"
         )
         assert (
-            "hermes-cli", True, registry_id, generation
+            "hermes-cli", True, registry_id, generation, registry.current_scope_key()
         ) in toolsets_mod._resolve_toolset_memo
+
+    def test_same_generation_does_not_share_profile_tool_lists(self, monkeypatch, tmp_path):
+        """A multiplex gateway shares registry/generation but not plugin scope."""
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        reg = ToolRegistry()
+        monkeypatch.setattr("tools.registry.registry", reg)
+        toolsets_mod._resolve_toolset_memo.clear()
+        homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+        for home, name in zip(homes, ("ap_verified_fact", "other_fact")):
+            token = set_hermes_home_override(str(home))
+            try:
+                reg.register(name=name, toolset="upgreat_rag",
+                             schema=_make_schema(name), handler=_dummy_handler,
+                             scope=reg.current_scope_key())
+            finally:
+                reset_hermes_home_override(token)
+
+        results = []
+        for home in (homes[1], homes[0], homes[1]):
+            token = set_hermes_home_override(str(home))
+            try:
+                results.append(set(resolve_toolset("upgreat_rag")))
+            finally:
+                reset_hermes_home_override(token)
+        assert results == [
+            {"other_fact"}, {"ap_verified_fact"}, {"other_fact"}
+        ]
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):
         """A registry mutation (generation bump) must force a fresh resolve."""

@@ -306,6 +306,9 @@ def _resolve_review_runtime(
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
+    if getattr(agent, "_immutable_route", None):
+        # Review belongs to the active chain: task config cannot reroute it.
+        return parent
     task = _background_review_task_config(task_cfg)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
@@ -854,6 +857,24 @@ def summarize_background_review_actions(
     return actions
 
 
+def bind_memory_source_turn(agent: Any, message: Any, turn_number: int) -> None:
+    """Bind a real current-turn user message to provider-compatible provenance.
+
+    A missing/non-text user message deliberately leaves the bridge without a
+    locator. Never derive one from the last provider turn or from tool args.
+    """
+    agent._memory_source_turn = None
+    if not isinstance(message, str) or not message.strip():
+        return
+    import hashlib
+
+    agent._memory_source_turn = (
+        agent.session_id,
+        agent._current_turn_id,
+        f"turn:{turn_number}:sha256:{hashlib.sha256(message.encode('utf-8')).hexdigest()}",
+    )
+
+
 def build_memory_write_metadata(
     agent: Any,
     *,
@@ -878,6 +899,16 @@ def build_memory_write_metadata(
         metadata["task_id"] = task_id
     if tool_call_id:
         metadata["tool_call_id"] = tool_call_id
+    source = getattr(agent, "_memory_source_turn", None)
+    if (
+        metadata["execution_context"] == "foreground"
+        and isinstance(source, tuple)
+        and len(source) == 3
+        and source[0] == agent.session_id
+        and source[1] == getattr(agent, "_current_turn_id", None)
+        and source[2]
+    ):
+        metadata["message_id"] = source[2]
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
@@ -1201,6 +1232,10 @@ def _run_review_in_thread(
                 skip_memory=True,
                 **_fork_kwargs,
             )
+            if getattr(agent, "_immutable_route", None):
+                review_agent._immutable_route = dict(agent._immutable_route)
+                review_agent._fallback_chain = []
+                review_agent._fallback_model = None
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps

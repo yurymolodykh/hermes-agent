@@ -2047,6 +2047,10 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Explicit external/shared destination used by
+        # skill_manage(action="promote"). It must also appear in external_dirs;
+        # an empty value disables promotion rather than guessing a write target.
+        "create_dir": "",
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the
@@ -2600,6 +2604,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Default Kanban list output is an operational view: completed tasks
+        # at or beyond this age (hours) are omitted unless explicitly requested
+        # with ``kanban list --status done`` or ``--historical``. Set 0 to hide
+        # every timestamped completed task from the default view.
+        "list_done_retention_hours": 12.0,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

@@ -49,6 +49,37 @@ KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 
+def _named_provider_for_base_url(base_url: str) -> Optional[str]:
+    """Map an endpoint URL to the bare name of the ``providers:`` entry that
+    owns it (e.g. ``https://llm.letovo.site/openai`` -> ``letovo``).
+
+    Used to repair a bare ``custom`` direct-alias route (whose in-memory
+    base_url is dropped when the route is persisted onto a kanban card) so the
+    persisted provider resolves from config alone in a spawned worker.
+    ``None`` when no ``providers:`` entry claims the URL — the caller then
+    leaves the provider untouched.
+    """
+    try:
+        cfg = load_config()
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict):
+            return None
+        target = (base_url or "").strip().rstrip("/")
+        if not target:
+            return None
+        for ep_name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            bu = str(
+                entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+            ).strip().rstrip("/")
+            if bu and bu == target:
+                return str(ep_name).strip()
+    except Exception:
+        logger.debug("base_url->provider lookup failed", exc_info=True)
+    return None
+
+
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
     # negligible overhead. The check_fn results are further TTL-cached
@@ -212,6 +243,53 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_authenticated_worker_binding(kb, conn) -> Optional[str]:
+    """Fail closed unless a worker owns its bound active run before writing.
+
+    Orchestrator and CLI contexts have no ``HERMES_KANBAN_TASK`` and retain
+    their existing authority. A dispatcher worker is authenticated against its
+    own current task, rather than a supplied write target: this deliberately
+    preserves the authenticated cross-task handoff comment path.
+    """
+    worker_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not worker_task_id:
+        return None
+    run_id = _worker_run_id(worker_task_id)
+    assignee = (os.environ.get("HERMES_PROFILE") or "").strip()
+    session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip()
+    if not run_id or not assignee or not session_id or not kb.has_authenticated_worker_binding(
+        conn, worker_task_id, run_id, assignee, session_id
+    ):
+        return tool_error(
+            "authenticated Kanban run/session binding is required before mutation; "
+            "refusing unbound, foreign, reclaimed, or terminal worker context"
+        )
+    return None
+
+
+def _enforce_worker_board_scope(board: Optional[str]) -> Optional[str]:
+    """Reject a worker's forged named-board route before opening that board."""
+    if not os.environ.get("HERMES_KANBAN_TASK") or board is None:
+        return None
+    selected = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+    if selected and board == selected:
+        return None
+    return tool_error(
+        "authenticated Kanban worker binding is scoped to the dispatcher-selected "
+        "board; refusing a named-board mutation route"
+    )
+
+
+def _worker_mutation_handler(handler):
+    """Preflight worker board scope before any mutator can open a DB."""
+    def guarded(args: dict, **kw) -> str:
+        board_err = _enforce_worker_board_scope(args.get("board"))
+        if board_err:
+            return board_err
+        return handler(args, **kw)
+    return guarded
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -253,14 +331,24 @@ def _goal_judge_available() -> bool:
 
 def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
-    if not task or not task.goal_mode or not _goal_judge_available():
+    if not task or not task.goal_mode:
         return None
+    source_model = (getattr(task, "model_override", None) or "").strip()
+    source_provider = (getattr(task, "provider_override", None) or "").strip()
+    if not source_model or not source_provider:
+        return (
+            "Kanban goal_mode requires recorded source task model_override and "
+            "provider_override; refusing ambient auxiliary goal_judge route"
+        )
     verdict = "done"
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            provider=source_provider,
+            model=source_model,
+            strict_source_route=True,
         )
     except Exception as judge_exc:
         # Keep the existing fail-open semantics: an unavailable/broken
@@ -271,6 +359,14 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
             exc_info=True,
         )
     return reason if verdict != "done" else None
+
+
+def _goal_mode_missing_source_route(task) -> bool:
+    """Whether a goal-mode card cannot be judged without violating its lock."""
+    return bool(task and task.goal_mode) and not (
+        (getattr(task, "model_override", None) or "").strip()
+        and (getattr(task, "provider_override", None) or "").strip()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +599,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "root_model_override": task.root_model_override,
+        "root_provider_override": task.root_provider_override,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +647,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "root_model_override": t.root_model_override,
+                    "root_provider_override": t.root_provider_override,
                 }
 
             def _run_dict(r):
@@ -652,6 +752,7 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+@_worker_mutation_handler
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -746,6 +847,9 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -757,6 +861,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 (summary or result or "").strip(),
             )
             if rejection is not None:
+                if _goal_mode_missing_source_route(task):
+                    kb.block_task(
+                        conn,
+                        tid,
+                        reason=rejection,
+                        expected_run_id=_worker_run_id(tid),
+                    )
                 return tool_error(
                     f"Goal completion rejected by judge: {rejection}. "
                     f"To proceed, either: (1) provide explicit acceptance "
@@ -814,6 +925,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+@_worker_mutation_handler
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     delegated_err = _reject_delegated_child_mutation("kanban_block")
@@ -835,6 +947,10 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        binding_err = _enforce_authenticated_worker_binding(kb, conn)
+        if binding_err:
+            conn.close()
+            return binding_err
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -895,6 +1011,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+@_worker_mutation_handler
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
@@ -936,9 +1053,19 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
+                if _goal_mode_missing_source_route(task):
+                    kb.block_task(
+                        conn,
+                        tid,
+                        reason=rejection,
+                        expected_run_id=_worker_run_id(tid),
+                    )
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
                     "Provide acceptance evidence matching the card before "
@@ -973,6 +1100,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_review: {e}")
 
 
+@_worker_mutation_handler
 def _handle_request_changes(args: dict, **kw) -> str:
     """Return a reviewer-owned running task to its implementer."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_changes")
@@ -994,6 +1122,9 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             ok, detail = kb.request_changes(
                 conn,
                 tid,
@@ -1021,6 +1152,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_changes: {e}")
 
 
+@_worker_mutation_handler
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1047,6 +1179,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
@@ -1075,6 +1210,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return tool_error(f"kanban_heartbeat: {e}")
 
 
+@_worker_mutation_handler
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
@@ -1104,6 +1240,9 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
@@ -1115,6 +1254,7 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+@_worker_mutation_handler
 def _handle_attach(args: dict, **kw) -> str:
     """Attach an inline (base64) file to a task.
 
@@ -1153,6 +1293,9 @@ def _handle_attach(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
@@ -1238,6 +1381,7 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
     raise ValueError(f"too many redirects fetching {url}")
 
 
+@_worker_mutation_handler
 def _handle_attach_url(args: dict, **kw) -> str:
     """Attach a file fetched server-side from a URL.
 
@@ -1271,6 +1415,13 @@ def _handle_attach_url(args: dict, **kw) -> str:
     content_type = args.get("content_type")
     board = args.get("board")
     try:
+        _, conn = _connect(board=board)
+        try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
+        finally:
+            conn.close()
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
         return tool_error(f"kanban_attach_url: {e}")
@@ -1280,6 +1431,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
@@ -1340,6 +1494,7 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+@_worker_mutation_handler
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1411,18 +1566,64 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
-    if provider_override and not model_override:
-        return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    if bool(provider_override) != bool(model_override):
+        return tool_error(
+            "MODEL_LOCK requires both 'provider' and 'model', or neither"
+        )
+    if not parents and not model_override:
+        # Root tasks are born with the request's concrete effective route.
+        # Child tasks deliberately skip this: create_task resolves their route
+        # from parent lineage even when the orchestrator's ambient route drifted.
+        try:
+            from agent import auxiliary_client as _aux
+
+            _live = _aux._RUNTIME_MAIN_CONTEXT.get()
+            if not isinstance(_live, dict):
+                raise RuntimeError("live effective route unavailable")
+            _route = _aux._normalize_main_runtime(_live)
+            provider_override = str(_route.get("provider") or "").strip().lower()
+            model_override = str(_route.get("model") or "").strip()
+            if (
+                not provider_override
+                or not model_override
+                or provider_override in {"auto", "main", "moa"}
+            ):
+                raise RuntimeError("concrete live provider/model pair required")
+            # Bare ``custom`` is a direct-alias label that is only resolvable
+            # while the session's in-memory base_url is attached (see
+            # runtime_provider._resolve_custom_provider). Kanban cards persist
+            # only provider+model — the base_url is dropped, so a spawned
+            # worker gets ``--provider custom`` with no endpoint and falls
+            # through to the openrouter default with no key ("No API key found
+            # for provider 'custom'"). Normalize to the named ``providers:``
+            # entry that owns the live route's base_url (e.g. ``letovo``),
+            # which resolves from config alone in the worker.
+            if provider_override == "custom":
+                _base_url = str(_route.get("base_url") or "").strip()
+                if _base_url:
+                    _named = _named_provider_for_base_url(_base_url)
+                    if _named:
+                        provider_override = _named
+        except Exception:
+            # Legacy/offline surfaces (CLI unit tests, import-time tooling) may
+            # have no request-scoped runtime. Keep the row migratable/unpinned;
+            # dispatch_task_root_route will block it before any worker spawn,
+            # so absence can never fall back to an assignee profile model.
+            model_override = None
+            provider_override = None
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1609,6 +1810,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         return False
 
 
+@_worker_mutation_handler
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task to ready, or todo while parents remain open."""
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
@@ -1627,6 +1829,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
@@ -1641,6 +1846,44 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+@_worker_mutation_handler
+def _handle_resolve_triage(args: dict, **kw) -> str:
+    """Resume a triaged task only on an authorized, auditable decision."""
+    delegated_err = _reject_delegated_child_mutation("kanban_resolve_triage")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_resolve_triage")
+    if guard:
+        return guard
+    if not _check_kanban_orchestrator_mode():
+        return tool_error("kanban_resolve_triage requires an authorized Kanban orchestrator profile")
+    tid = args.get("task_id")
+    reason = args.get("rationale")
+    if not tid:
+        return tool_error("task_id is required")
+    if not isinstance(reason, str) or not reason.strip():
+        return tool_error("nonempty rationale is required")
+    # Do not accept a caller-provided author: bind the event to the runtime profile.
+    actor = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not actor:
+        return tool_error("kanban_resolve_triage requires a bound orchestrator profile")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            if not kb.resolve_triage(conn, str(tid), rationale=reason, actor=actor):
+                return tool_error(f"could not resolve triage for {tid} (not triage or unknown)")
+            task = kb.get_task(conn, str(tid))
+            return _ok(task_id=str(tid), status=task.status)
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return tool_error(f"kanban_resolve_triage: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_resolve_triage failed")
+        return tool_error(f"kanban_resolve_triage: {exc}")
+
+
+@_worker_mutation_handler
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     delegated_err = _reject_delegated_child_mutation("kanban_link")
@@ -1654,6 +1897,9 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            binding_err = _enforce_authenticated_worker_binding(kb, conn)
+            if binding_err:
+                return binding_err
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
@@ -2330,6 +2576,23 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_RESOLVE_TRIAGE_SCHEMA = {
+    "name": "kanban_resolve_triage",
+    "description": (
+        "Orchestrator-only: explicitly resolve a triage card with a mandatory "
+        "audited rationale. Resume to ready or parent-gated todo; retain "
+        "failure history and block recurrence. Does not complete the task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Triaged task id."},
+            "rationale": {"type": "string", "description": "Nonempty disposition rationale stored in the event."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "rationale"],
+    },
+}
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2466,6 +2729,14 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="▶",
+)
+registry.register(
+    name="kanban_resolve_triage",
+    toolset="kanban",
+    schema=KANBAN_RESOLVE_TRIAGE_SCHEMA,
+    handler=_handle_resolve_triage,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )

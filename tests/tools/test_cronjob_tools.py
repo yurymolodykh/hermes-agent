@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+from unittest.mock import patch
+
 import pytest
 
 from tools.cronjob_tools import (
@@ -615,3 +617,57 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+class TestLockedCronCreation:
+    LOCK = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "route_locked": True,
+    }
+
+    def test_conflicting_explicit_pair_is_rejected_before_storage(self):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        with scoped_runtime_main(self.LOCK), patch(
+            "cron.scheduler.create_job_with_scheduler_registration"
+        ) as create:
+            result = json.loads(cronjob(
+                action="create", prompt="safe task", schedule="every 1 hour",
+                provider="nous", model="other-model",
+            ))
+        assert result["success"] is False
+        assert "MODEL_LOCK" in result["error"]
+        create.assert_not_called()
+
+    def test_incomplete_explicit_pair_is_rejected(self):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        with scoped_runtime_main(self.LOCK):
+            result = json.loads(cronjob(
+                action="create", prompt="safe task", schedule="every 1 hour",
+                model=self.LOCK["model"],
+            ))
+        assert result["success"] is False
+        assert "MODEL_LOCK" in result["error"]
+
+    def test_no_agent_cron_is_not_given_an_llm_route(self, tmp_path):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        script = tmp_path / "task.py"
+        script.write_text("print('ok')", encoding="utf-8")
+        with scoped_runtime_main(self.LOCK), patch(
+            "tools.cronjob_tools._validate_cron_script_path", return_value=""
+        ), patch(
+            "cron.scheduler.create_job_with_scheduler_registration",
+            side_effect=RuntimeError("storage sentinel"),
+        ) as create:
+            result = json.loads(cronjob(
+                action="create", schedule="every 1 hour", no_agent=True,
+                script=str(script),
+            ))
+        assert result["success"] is False
+        assert "storage sentinel" in result["error"]
+        assert create.call_args.kwargs["provider"] is None
+        assert create.call_args.kwargs["model"] is None

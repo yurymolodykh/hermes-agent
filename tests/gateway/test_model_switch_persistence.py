@@ -144,6 +144,48 @@ class TestIsIntentionalModelSwitch:
         assert runner._is_intentional_model_switch(sk, "gpt-5.4") is True
 
 
+class TestExplicitModelPin:
+    """An explicit /model pin blocks automatic failover and is actionable."""
+
+    def test_session_override_is_detected_as_explicit_selection(self):
+        runner = _make_runner()
+        runner._peek_session_state = MagicMock(
+            return_value=SimpleNamespace(
+                conversation=SimpleNamespace(
+                    model_override={
+                        "model": "deepseek-v4-flash",
+                        "provider": "custom:letovo",
+                    }
+                )
+            )
+        )
+
+        assert runner._has_explicit_model_selection("telegram:dm:u1:c1") is True
+
+    def test_fallback_guard_marks_explicit_model_unavailable(self):
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = SimpleNamespace(
+            _model_explicitly_selected=True,
+            model="deepseek-v4-flash",
+            provider="custom:letovo",
+        )
+
+        assert try_activate_fallback(agent) is False
+        assert agent._explicit_model_unavailable is True
+
+    def test_unavailable_reply_names_model_and_refuses_silent_switch(self):
+        from gateway.run import _explicit_model_unavailable_reply
+
+        reply = _explicit_model_unavailable_reply(
+            "deepseek-v4-flash", "custom:letovo"
+        )
+
+        assert "deepseek-v4-flash" in reply
+        assert "не переключал" in reply
+        assert "/model" in reply
+
+
 class TestOneTurnModelOverrideRestore:
     """Verify gateway one-turn overrides restore previous session state."""
 

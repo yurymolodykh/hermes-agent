@@ -2436,6 +2436,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # A model selected explicitly with /model is a user instruction, not a
+    # preference for the router to reinterpret.  In particular, do not let a
+    # transient 429/timeout/auth failure silently move the session to another
+    # model.  The gateway turns this marker into a user-facing question; the
+    # next action is therefore explicit and attributable to the user.
+    if getattr(agent, "_immutable_route", None) or getattr(agent, "_model_explicitly_selected", False):
+        agent._explicit_model_unavailable = True
+        agent._explicit_model_unavailable_reason = (
+            getattr(reason, "value", None) or str(reason or "provider_error")
+        )
+        logger.warning(
+            "Explicitly selected model is unavailable; automatic fallback is disabled "
+            "(model=%s provider=%s reason=%s)",
+            getattr(agent, "model", ""),
+            getattr(agent, "provider", ""),
+            agent._explicit_model_unavailable_reason,
+        )
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

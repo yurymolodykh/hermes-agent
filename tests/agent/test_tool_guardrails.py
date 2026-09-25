@@ -151,7 +151,7 @@ def test_loop_cap_zero_disables_and_junk_falls_back():
     assert LoopCapConfig.from_mapping({"max_subagents": "nope"}).max_subagents == 50
 
 
-def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
+def test_web_search_cap_blocks_but_allows_local_recovery_after_limit():
     # Loop caps fire even with hard_stop_enabled=False (the per-turn loop
     # detector's flag). Each distinct query avoids the loop detector so we know
     # the block came from the loop cap, not exact-failure repetition.
@@ -166,7 +166,11 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     decision = controller.before_call("web_search", {"query": "q4"})
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
-    assert decision.should_halt is True
+    # The search itself must be blocked, but the conversation loop must get a
+    # follow-up iteration to use local/session evidence and report the search
+    # limitation instead of returning only a guardrail boilerplate message.
+    assert decision.should_halt is False
+    assert "local/session" in decision.message
 
 
 

@@ -135,6 +135,147 @@ def _run_tool_loop(agent, n_tool_iterations: int):
     return result
 
 
+@pytest.mark.parametrize("outcome", ["commit", "disabled", "reclaim_rejected", "db_failure"])
+def test_real_prune_skill_reload_and_task_isolation(agent, tmp_path, monkeypatch, outcome):
+    """Full skill view -> actual loop/SQLite prune -> full reload, not a stub."""
+    from agent.context_compressor import ContextCompressor
+    from hermes_state import SessionDB
+    from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+    skill_dir = tmp_path / "home" / "skills" / "prune-reload-demo"
+    skill_dir.mkdir(parents=True)
+    body = "# Procedure\n" + "Preserve this detailed operating instruction.\n" * 700
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: prune-reload-demo\ndescription: Prune reload regression.\n---\n" + body,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    task = "pruned-task"
+    other_task = "unrelated-task"
+
+    def view(task_id):
+        return json.loads(_skill_view_with_bump({"name": "prune-reload-demo"}, task_id=task_id))
+
+    reset_skill_view_dedup(task)
+    reset_skill_view_dedup(other_task)
+    db = SessionDB(db_path=tmp_path / "prune.db")
+    try:
+        first = view(task)
+        assert body in first["content"]
+        assert body in view(other_task)["content"]
+        assert view(task).get("dedup") is True
+        history = [{"role": "user", "content": "Follow the procedure."}]
+        for index in range(8):
+            name = "skill_view" if index == 0 else "web_search"
+            history.append({
+                "role": "assistant", "content": "", "tool_calls": [{
+                    "id": f"old_{index}", "type": "function", "function": {
+                        "name": name, "arguments": json.dumps({"name": "prune-reload-demo"})
+                        if index == 0 else '{"query":"prior work"}',
+                    },
+                }],
+            })
+            history.append({
+                "role": "tool", "tool_call_id": f"old_{index}",
+                "content": json.dumps(first) if index == 0 else f"result {index}",
+            })
+        db.create_session(agent.session_id, source="test")
+        db.append_messages_batch(agent.session_id, history)
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+            compressor = ContextCompressor(
+                model="test", quiet_mode=True, threshold_percent=0.50,
+                protect_first_n=2, protect_last_n=4,
+                proactive_prune_tokens=1, proactive_prune_min_result_chars=8_000,
+                proactive_prune_min_reclaim_tokens=4_096,
+            )
+        compressor._session_db = db
+        compressor._session_id = agent.session_id
+        compressor.last_prompt_tokens = 120_000
+        agent.context_compressor = compressor
+        if outcome == "disabled":
+            compressor.proactive_prune_tokens = 0
+        elif outcome == "reclaim_rejected":
+            compressor.proactive_prune_min_reclaim_tokens = 1_000_000
+        elif outcome == "db_failure":
+            monkeypatch.setattr(db, "archive_and_compact", MagicMock(side_effect=RuntimeError("disk full")))
+
+        agent.client.chat.completions.create.side_effect = [_tool_response(0), _stop_response()]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.handle_function_call", return_value='{"ok":true}'),
+        ):
+            result = agent.run_conversation("continue the work", conversation_history=history, task_id=task)
+        assert result["completed"] is True
+        row = next(m for m in result["messages"] if m.get("tool_call_id") == "old_0")
+        durable = next(m for m in db.get_messages_as_conversation(agent.session_id)
+                       if m.get("tool_call_id") == "old_0")
+        reloaded = view(task)
+        if outcome == "commit":
+            assert "[SKILL_PRUNED:" in row["content"]
+            assert durable["content"] == row["content"]
+            assert body in reloaded.get("content", ""), reloaded
+        else:
+            assert row["content"] == json.dumps(first)
+            assert durable["content"] == json.dumps(first)
+            assert reloaded.get("dedup") is True
+            assert compressor._proactive_prune_rearm_tokens == 0
+        assert view(other_task).get("dedup") is True
+    finally:
+        reset_skill_view_dedup(task)
+        reset_skill_view_dedup(other_task)
+        db.close()
+
+
+@pytest.mark.parametrize("explicit_task", [True, False])
+def test_full_compaction_reload_uses_known_task_scope(agent, tmp_path, monkeypatch, explicit_task):
+    from agent.context_compressor import ContextCompressor
+    from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+    skill = tmp_path / "home" / "skills" / "full-reload-demo"
+    skill.mkdir(parents=True)
+    body = "# Procedure\n" + "Detailed content to reload.\n" * 500
+    (skill / "SKILL.md").write_text(
+        "---\nname: full-reload-demo\ndescription: Full compaction test.\n---\n" + body,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    task, other = "full-active", "full-other"
+
+    def view(t):
+        return json.loads(_skill_view_with_bump({"name": "full-reload-demo"}, task_id=t))
+
+    try:
+        assert body in view(task)["content"]
+        assert body in view(other)["content"]
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            compressor = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=4,
+            )
+        agent.context_compressor = compressor
+        agent._current_task_id = task
+        messages = [{"role": "system", "content": "system"},
+                    {"role": "user", "content": "start"}]
+        for index in range(12):
+            messages.append({"role": "user" if index % 2 == 0 else "assistant",
+                             "content": body if index == 2 else f"work {index}"})
+        # Replace only the unavailable LLM summary, not compressor or lifecycle.
+        with patch.object(compressor, "_generate_summary", return_value="Earlier work summary."):
+            returned, _ = agent._compress_context(
+                messages, "system", approx_tokens=50_000,
+                task_id=task if explicit_task else None,
+            )
+        assert returned is not messages
+        assert len(returned) < len(messages)
+        assert not any(body in str(m.get("content", "")) for m in returned)
+        assert body in view(task).get("content", "")
+        assert view(other).get("dedup") is True
+    finally:
+        reset_skill_view_dedup(task)
+        reset_skill_view_dedup(other)
+
+
 class TestProactivePruneLoopWiring:
     def test_full_compression_preempts_proactive_prune(self, agent):
         agent.context_compressor.should_compress.return_value = True

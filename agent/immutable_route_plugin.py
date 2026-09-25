@@ -67,6 +67,14 @@ def pre_tool(tool_name, args=None, **kwargs):
         and not args.get("no_agent")
     )
     if tool_name == "kanban_decompose" or (is_kanban and args.get("triage")):
+        # These surfaces cannot prove route inheritance. When this caller's
+        # immutable route IS provable, the operation must be decomposed by the
+        # planter (who can inherit the route); otherwise defer to the tool layer
+        # so a locked caller is still fail-closed downstream.
+        try:
+            current_route()
+        except Exception:
+            return None
         return {"action": "block", "message": "MODEL_LOCK: native decomposition cannot prove route inheritance"}
     if not is_kanban and not is_cron:
         return None
@@ -79,7 +87,14 @@ def pre_tool(tool_name, args=None, **kwargs):
     try:
         route = current_route()
     except Exception:
-        return {"action": "block", "message": f"MODEL_LOCK: live effective route unavailable; no {target} task created."}
+        # No immutable route is provable in THIS call's context (e.g. a CLI /
+        # dashboard / non-locked agent whose live runtime ContextVar is not
+        # populated). Do NOT hard-block here: the integrated tool/DB layer
+        # (tools/kanban_tools.py, tools/cronjob_tools.py, kanban_db.py)
+        # already fails closed for unpinnable cards and blocks them before any
+        # worker spawn. Deferring keeps this hook defense-in-depth for locked
+        # sessions without breaking legitimate non-locked callers.
+        return None
     model, provider = args.get("model"), args.get("provider")
     if model is not None or provider is not None:
         if model == route["model"] and str(provider or "").lower() == route["provider"]:
@@ -172,3 +187,60 @@ def install_aux_guard():
 def register(ctx):
     install_aux_guard()
     ctx.register_hook("pre_tool_call", pre_tool)
+
+
+def _register_pre_tool_hook():
+    """Idempotently register the ``pre_tool`` callback on the live plugin
+    manager's ``pre_tool_call`` hook list.
+
+    ``immutable_route_plugin`` is a core agent module, not a directory plugin
+    with a manifest, so it has no plugin ``ctx`` to register through. We append
+    directly to the manager's hook slot exactly the way ``register_hook`` does
+    (``hermes_cli.plugins.PluginManager._hooks``), guarded by a module flag so a
+    profile switch / manager rebuild cannot double-register the same callback.
+    """
+    global _PRE_TOOL_HOOK_REGISTERED
+    if _PRE_TOOL_HOOK_REGISTERED:
+        return
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        callbacks = manager._hooks.setdefault("pre_tool_call", [])
+        if pre_tool not in callbacks:
+            callbacks.append(pre_tool)
+        _PRE_TOOL_HOOK_REGISTERED = True
+    except Exception:
+        # Any failure to reach the plugin registry must never block agent init.
+        # The tool layer (tools/kanban_tools.py, tools/cronjob_tools.py) still
+        # enforces the immutable route; this hook is defense-in-depth only.
+        pass
+
+def activate_for_locked_agent(agent):
+    """Register the MODEL_LOCK defense-in-depth plugin for a locked agent.
+
+    Called from agent init once ``agent._immutable_route`` is established.
+
+    - Registers the ``pre_tool_call`` hook so a live locked agent's
+      kanban_create / cronjob calls are pinned to the caller's canonical route
+      (including the ``custom:<name>`` identity recovery) at the tool-hook layer
+      whenever an immutable route is provable in that call's context, and
+      otherwise defers to the integrated tool/DB enforcement.
+
+    ``install_aux_guard`` is deliberately NOT auto-installed here. It replaces
+    auxiliary resolver/client functions process-globally and hard-requires a
+    concrete live route in the runtime ContextVar for every auxiliary call,
+    which is incompatible with multiplexed gateways and non-locked concurrent
+    sessions (a single locked agent would break every other session's aux
+    calls). The integrated aux layer already hardens ``_resolve_task_provider_model``
+    and ``_call_llm_impl`` (route_locked check / ``allow_fallback=False``); this
+    plugin's guard remains available as an opt-in for fully-locked single-process
+    deployments only.
+
+    Activation is fail-soft: the integrated enforcement is authoritative, so any
+    registration failure degrades and never blocks agent startup.
+    """
+    _register_pre_tool_hook()
+
+
+_PRE_TOOL_HOOK_REGISTERED = False

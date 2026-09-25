@@ -183,13 +183,21 @@ class TestTavilyAvailability:
             os.environ.pop("TAVILY_API_KEY", None)
             assert _get_backend() == "firecrawl"
 
-    def test_keyless_does_not_preempt_ddgs(self):
+    def test_keyless_ring_preempts_ddgs(self):
+        """An installed DDGS package must not bypass the keyless ring."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._is_tool_gateway_ready", return_value=False), \
-             patch("tools.web_tools._ddgs_package_importable", return_value=True):
+             patch("tools.web_tools._ddgs_package_importable", return_value=True), \
+             patch("tools.web_tools._list_registered_web_providers", return_value=[]), \
+             patch("tools.web_tools._registered_web_provider") as get_provider, \
+             patch("agent.web_search_registry._keyless_tier_enabled", return_value=True):
             os.environ.pop("TAVILY_API_KEY", None)
-            assert _get_backend() == "ddgs"
+            provider = type("KeylessProvider", (), {
+                "is_keyless_available": lambda self: True,
+            })()
+            get_provider.side_effect = lambda name: provider
+            assert _get_backend() in {"exa", "parallel", "tavily", "firecrawl", "keenable"}
 
     def test_no_keys_defaults_to_firecrawl(self):
         """Keyless tier disabled: zero-credential resolve hits the legacy

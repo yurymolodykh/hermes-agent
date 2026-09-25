@@ -3977,7 +3977,7 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider", "route_locked")
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4002,6 +4002,10 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     normalized: Dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
+        if field == "route_locked":
+            if value is True:
+                normalized[field] = True
+            continue
         # Preserve a callable api_key (Entra ID bearer provider) unchanged.
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
@@ -8061,6 +8065,36 @@ def _resolve_task_provider_model(
     auth, transport, and request-shaping behavior still apply. api_mode is one
     of "chat_completions", "codex_responses", or None (auto-detect).
     """
+    # A locked parent route is an execution boundary, not a hint.  It wins
+    # over task config and explicit auxiliary arguments; partial state fails
+    # closed instead of being completed from ambient configuration.
+    # A route lock is an execution-local contract.  Do not ask
+    # _normalize_main_runtime(None) here because its final compatibility
+    # fallback is process-global and may have been written by another gateway
+    # session.  Absence of a ContextVar means absence of a lock.
+    _context_runtime = _RUNTIME_MAIN_CONTEXT.get()
+    locked_runtime = (
+        _normalize_main_runtime(_context_runtime)
+        if isinstance(_context_runtime, dict)
+        else {}
+    )
+    if locked_runtime.get("route_locked") is True:
+        locked_provider = str(locked_runtime.get("provider") or "").strip().lower()
+        locked_model = str(locked_runtime.get("model") or "").strip()
+        if not locked_provider or not locked_model or locked_provider in {"auto", "main", "moa"}:
+            raise RuntimeError("MODEL_LOCK: live effective provider/model route is incomplete")
+        if provider and str(provider).strip().lower() not in {"auto", "main", locked_provider}:
+            raise RuntimeError("MODEL_LOCK: auxiliary provider conflicts with locked route")
+        if model and str(model).strip() not in {"auto", locked_model}:
+            raise RuntimeError("MODEL_LOCK: auxiliary model conflicts with locked route")
+        return (
+            locked_provider,
+            locked_model,
+            locked_runtime.get("base_url") or None,
+            locked_runtime.get("api_key") or None,
+            locked_runtime.get("api_mode") or None,
+        )
+
     cfg_provider = None
     cfg_model = None
     cfg_base_url = None
@@ -9297,6 +9331,7 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    allow_fallback: bool = True,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     semaphore = _acquire_sync_aux_semaphore(task)
@@ -9322,6 +9357,7 @@ def call_llm(
             stream=stream,
             stream_options=stream_options,
             route_info=route_info,
+            allow_fallback=allow_fallback,
         )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -9368,6 +9404,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    allow_fallback: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -9460,6 +9497,11 @@ def _call_llm_impl(
             client, resolved_provider,
         )
         if client is None:
+            if not allow_fallback:
+                raise RuntimeError(
+                    f"No client available for pinned provider={resolved_provider!r} "
+                    f"model={resolved_model!r}; fallback is disabled"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -9654,6 +9696,10 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        # Execution-bound routes (for example Kanban goal judges) may retry
+        # the same request above, but may never move to a fallback route.
+        if not allow_fallback:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
