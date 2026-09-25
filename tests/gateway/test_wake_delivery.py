@@ -79,7 +79,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
         seen["body"] = await request.json()
-        return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+        return web.json_response({"object": "chat.completion", "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
 
     async def run():
         runner, port = await _serve(handler)
@@ -111,7 +111,7 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return web.json_response({"error": "busy"}, status=429)
-        return web.json_response({"choices": []})
+        return web.json_response({"object": "chat.completion", "choices": [{"finish_reason": "stop"}]})
 
     async def run():
         runner, port = await _serve(handler)
@@ -123,5 +123,30 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
+
+
+@pytest.mark.parametrize("status,body", [
+    (200, {"object": "chat.completion", "hermes": {"failed": True, "completed": False},
+           "choices": [{"finish_reason": "error", "message": {"content": "partial"}}]}),
+    (200, {"object": "chat.completion", "hermes": {"completed": False},
+           "choices": [{"finish_reason": "stop"}]}),
+    (200, {"object": "chat.completion", "choices": [{"finish_reason": "error"}]}),
+    (502, {"error": {"message": "agent incomplete"}}),
+])
+def test_self_post_rejects_failed_agent_turn(status, body):
+    from aiohttp import web
+
+    async def handler(request):
+        return web.json_response(body, status=status)
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            with pytest.raises(RuntimeError):
+                await deliver_wake(ApiServerLikeAdapter(port=port), text="question", session_id="origin")
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
 
 

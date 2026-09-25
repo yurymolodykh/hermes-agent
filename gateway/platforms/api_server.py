@@ -80,6 +80,14 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default=""
 )
+# Verified Open WebUI origin binding for the current request (JSON, or "").
+# Produced ONLY by _make_origin_binding_middleware from the WebUI-signed
+# identity claim (X-OpenWebUI-User-Jwt) — never from client-controllable
+# request parameters. "" means unverified: such a session is never eligible
+# for an exact-origin (owner-bound) kanban subscription.
+_api_request_origin_binding: ContextVar[str] = ContextVar(
+    "api_server_request_origin_binding", default=""
+)
 
 #: Minimal scope shape accepted by :func:`gateway.browser_control_artifacts
 #: .artifact_scope_key`: principal + session + transport family.  The API
@@ -2331,6 +2339,44 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.profiles import get_profile_dir
 
         return _profile_runtime_scope(get_profile_dir(profile))
+
+    def _make_origin_binding_middleware(self):
+        """Verify the WebUI-signed origin claim once per request.
+
+        Runs INSIDE the profile-prefix middleware so the multiplex
+        ``/p/<profile>/`` prefix is already resolved and scoped. Any client
+        WITHOUT a verifiable claim stays unbound (``""``) and keeps working
+        exactly as before; a PRESENT but invalid/expired/mismatched claim is
+        rejected outright (401) rather than silently downgraded, so a
+        misconfigured WebUI cannot masquerade as an anonymous client while
+        believing it is owner-bound. Raw headers never travel with the
+        session; only the verified JSON binding does.
+        """
+
+        @web.middleware
+        async def origin_binding_middleware(request: "web.Request", handler):
+            from gateway import origin_binding
+
+            token_present = bool(
+                origin_binding._header(request.headers, origin_binding._JWT_HEADER).strip()
+            )
+            binding = origin_binding.resolve_request_origin(
+                request.headers, _api_request_profile.get()
+            )
+            if token_present and binding is None:
+                return web.json_response(
+                    {"error": "Invalid Open WebUI origin claim"},
+                    status=401,
+                )
+            token = _api_request_origin_binding.set(
+                json.dumps(binding) if binding else ""
+            )
+            try:
+                return await handler(request)
+            finally:
+                _api_request_origin_binding.reset(token)
+
+        return origin_binding_middleware
 
     def _make_profile_prefix_middleware(self):
         """Reject unknown /p/<profile>/ prefixes and scope the request home."""
@@ -7591,6 +7637,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        origin: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
     ) -> list:
@@ -7616,6 +7663,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            origin=origin,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
@@ -7684,6 +7732,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_browser_control_transport_family = (
             _api_request_browser_control_transport_family.get()
         )
+        request_origin_binding = _api_request_origin_binding.get()
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -7693,6 +7742,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    origin=request_origin_binding or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=(
                         request_browser_control_transport_family
@@ -8820,6 +8870,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_origin_binding_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

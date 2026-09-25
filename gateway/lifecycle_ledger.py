@@ -77,10 +77,22 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
 def sample_memory() -> Dict[str, Any]:
     """Cheap memory snapshot: own RSS + system availability + swap.
 
-    Pure ``/proc`` reads, Linux-only (returns ``{}`` elsewhere), never
-    raises.  Values in KiB to match the kernel's units.
+    Linux reads ``/proc``; Windows uses psutil when available. Never raises.
+    Values in KiB to match the kernel's units.
     """
     sample: Dict[str, Any] = {}
+    if os.name == "nt":
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            sample["mem_total_kib"] = int(memory.total // 1024)
+            sample["mem_available_kib"] = int(memory.available // 1024)
+            sample["swap_used_kib"] = int(swap.used // 1024)
+            sample["rss_kib"] = int(psutil.Process().memory_info().rss // 1024)
+        except (ImportError, OSError, ValueError, AttributeError):
+            pass
+        return sample
     try:
         with open("/proc/self/status", encoding="utf-8") as fh:
             for line in fh:

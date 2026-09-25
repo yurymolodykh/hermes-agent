@@ -1086,6 +1086,36 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["delivery_mode"] == "notify"
 
 
+def test_api_server_create_does_not_claim_an_unverified_delivery_route(worker_env):
+    """An API request's session id and optional user claim are not an OWUI owner proof."""
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    tokens = APIServerAdapter._bind_api_server_session(
+        chat_id="owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
+        session_key="api-key", session_id="owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
+    )
+    try:
+        out = json.loads(kt._handle_create({"title": "api origin", "assignee": "peer"}))
+        assert out["ok"] is True
+        assert out["subscribed"] is False
+        assert _list_subs_for_task(out["task_id"]) == []
+
+        # Even a caller-supplied user id cannot be promoted to an authenticated
+        # WebUI owner without a trusted server-side ingress binding.
+        claim = set_session_vars(user_id="owner-A")
+        try:
+            claimed = json.loads(kt._handle_create({"title": "claimed owner", "assignee": "peer"}))
+            assert claimed["ok"] is True
+            assert claimed["subscribed"] is False
+            assert _list_subs_for_task(claimed["task_id"]) == []
+        finally:
+            clear_session_vars(claim)
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""

@@ -290,6 +290,19 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                # Opt-in privileged local registry: drain cron and Kanban
+                # outbox even if the board has no subscriptions this tick.
+                # A missing registry never turns an HTTP self-post into ACK.
+                _owui_registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                if (_owui_registry
+                        and os.environ.get("HERMES_OPENWEBUI_DELIVERY_WRITE_ENABLED") == "1"):
+                    from hermes_constants import get_hermes_home
+                    from gateway.origin_delivery_worker import drain_openwebui
+                    await asyncio.to_thread(
+                        drain_openwebui,
+                        get_hermes_home() / "delivery-outbox.sqlite",
+                        _owui_registry,
+                    )
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
                 if _gc_due:
@@ -530,17 +543,20 @@ class GatewayKanbanWatchersMixin:
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
-                    # Per-subscription failure-counter key. Hoisted out of the
-                    # event loop: the wake self-post path (in the loop's
-                    # ``else`` clause) needs it even when every event in the
-                    # claim was skipped before reaching the send site.
+                    # API notifications are staged by exact event id below.
+                    # A self-post cannot deliver into the owner's browser; the
+                    # outbox ACK alone allows the provisional cursor to advance.
+                    # Per-subscription failure-counter key for push delivery
+                    # and non-API wake failures.
                     sub_key = (
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
                     mode = sub.get("delivery_mode") or "notify"
-                    wake_agent = mode in ("notify+wake", "wake")
-                    send_passive = mode != "wake"
+                    # API self-post is NOT a user-visible receipt. Its exact
+                    # terminal event goes through the persisted chat outbox.
+                    wake_agent = mode in ("notify+wake", "wake") and platform_str != "api_server"
+                    send_passive = mode != "wake" or platform_str == "api_server"
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -580,7 +596,14 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                if ev.payload.get("provider_route"):
+                                    # A provider outage requires an actual
+                                    # operator choice. Never truncate the
+                                    # question before the alternative is shown.
+                                    reason = f": {str(ev.payload['reason'])[:500]}"
+                                    wake_handoff = str(ev.payload["reason"])[:500]
+                                else:
+                                    reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
@@ -655,6 +678,33 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if platform_str == "api_server":
+                            # A claimed cursor is only provisional. Stage one
+                            # exact event and wait for server-owned chat readback
+                            # before letting the cursor move. Repeated ticks
+                            # never create another message/agent turn.
+                            from hermes_constants import get_hermes_home
+                            from gateway.kanban_origin_delivery import stage_terminal
+                            _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                            _state = "unbound"
+                            if _registry and (not sub_profile or sub_profile == notifier_profile):
+                                _state, _delivery_id = await asyncio.to_thread(
+                                    stage_terminal,
+                                    get_hermes_home() / "delivery-outbox.sqlite",
+                                    _registry, sub, sub_profile or notifier_profile,
+                                    board_slug or "default", ev.id, msg,
+                                )
+                            if _state != "acknowledged":
+                                logger.warning(
+                                    "kanban notifier: exact api_server event %s/%s delivery %s; cursor retained",
+                                    sub["task_id"], ev.id, _state,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind, sub, d["cursor"],
+                                    d.get("old_cursor", 0), board_slug,
+                                )
+                                break
+                            continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -772,14 +822,10 @@ class GatewayKanbanWatchersMixin:
                         # * push-capable: the text send WAS the delivery, so
                         #   advance immediately (pre-existing behavior); the
                         #   wake injection below stays best-effort.
-                        # * non-push (api_server): the wake self-post IS the
-                        #   delivery. Advancing first would let a failed /
-                        #   retry-exhausted self-post (swallowed by the
-                        #   best-effort except) permanently lose the event.
-                        #   So the self-post runs FIRST and the cursor only
-                        #   advances after it succeeds — a failure rewinds the
-                        #   claim exactly like a failed send() above, so the
-                        #   next tick retries.
+                        # * non-API adapters without a push channel retain the
+                        #   historical best-effort wake path. API server events
+                        #   are handled above: only outbox readback ACK advances
+                        #   their claimed cursor, never an HTTP self-post.
                         task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = (
@@ -867,24 +913,22 @@ class GatewayKanbanWatchersMixin:
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
                                 if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
+                                    logger.error(
+                                        "kanban notifier: delivery pending for %s on %s after %d wake failures; "
+                                        "subscription and cursor retained for retry/operator inspection",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
-                                    # is NOT lost.
-                                    await _to_thread_process_service(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
+                                # Never drop the sole delivery path for a
+                                # blocked model-choice question. The event is
+                                # durable in task_events; rewind the claim on
+                                # every failure, including after the threshold.
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
                                 continue
 
                         async def _push_wake() -> None:

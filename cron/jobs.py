@@ -2471,9 +2471,11 @@ def _mark_job_run_locked(
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
-    can succeed (agent produced output) but fail delivery (platform down).
+    can succeed (agent produced output) but have pending/failed delivery.
+    Such jobs do not report an overall ``ok`` status; the agent error and
+    failure streak remain independent of delivery.
 
-    ``status`` overrides the derived ``last_status`` ("ok"/"error") with a
+    ``status`` overrides the derived ``last_status`` with a
     specific terminal status for this run — e.g. ``"blocked_config"`` when
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
@@ -2494,7 +2496,17 @@ def _mark_job_run_locked(
                         return False
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = status or ("ok" if success else "error")
+                if status:
+                    job["last_status"] = status
+                elif not success:
+                    job["last_status"] = "error"
+                elif delivery_error:
+                    job["last_status"] = (
+                        "delivery_pending" if delivery_error.startswith("api_server delivery pending client ACK")
+                        else "delivery_failed"
+                    )
+                else:
+                    job["last_status"] = "ok"
                 job["last_error"] = error if not success else None
                 # A healthy run means the configuration validates again — drop
                 # the preflight alert-dedup marker so a FUTURE config break

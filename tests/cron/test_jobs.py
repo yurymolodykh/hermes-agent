@@ -476,13 +476,22 @@ class TestMarkJobRun:
         assert updated["last_error"] == "timeout"
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
-        """Agent succeeds but delivery fails — both tracked independently."""
+        """Agent succeeds but delivery fails — no misleading overall OK."""
         job = create_job(prompt="Report", schedule="every 1h")
         mark_job_run(job["id"], success=True, delivery_error="platform 'telegram' not configured")
         updated = get_job(job["id"])
-        assert updated["last_status"] == "ok"
+        assert updated["last_status"] == "delivery_failed"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+
+    def test_delivery_pending_not_reported_as_ok(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True,
+                     delivery_error="api_server delivery pending client ACK (outbox=fixture)")
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "delivery_pending"
+        assert updated["last_error"] is None
+        assert "pending" in updated["last_delivery_error"]
 
     def test_failure_streak_increments_and_resets(self, tmp_cron_dir):
         """failure_streak counts consecutive agent failures; success resets."""
