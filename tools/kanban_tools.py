@@ -1536,10 +1536,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if platform.lower() == "api_server":
             # A request-scoped API session id (and even its user_id context)
-            # does not authenticate ownership of an Open WebUI chat. Do not
-            # register an undeliverable or client-claimable subscription; the
-            # opt-in exact-origin worker can only use independently bound rows.
-            return False
+            # does not authenticate ownership of an Open WebUI chat. Only the
+            # gateway's origin-binding middleware can produce a trusted
+            # binding (WebUI-signed identity claim + server-owned chat
+            # registry); with one verified, subscribe owner-bound so the
+            # exact-origin worker can deliver to the originating chat.
+            # Anything else — including a client-supplied user id — stays
+            # unsubscribed (fail closed).
+            from tools.kanban_origin_subscribe import subscribe_verified_origin
+
+            return subscribe_verified_origin(conn, task_id)
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
