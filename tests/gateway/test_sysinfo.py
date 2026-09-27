@@ -158,6 +158,27 @@ class TestTicker:
         ticker = _Ticker(lambda: (1, 2), io_sampler=lambda: None, cpu_sample_s=0.0)
         assert ticker.io_pct() is None
 
+    def test_io_write_heavy_reports_busy_not_read_only(self):
+        # Regression for t_e99544ac: a write-heavy disk (tiny read_time, large
+        # write_time) must report ~the combined busy ratio, not ~read-only %.
+        # Window ~= 50ms per sample; read delta 5ms + write delta 95ms = 100ms
+        # busy over a 50ms elapsed window -> clamped to 100%.
+        calls = {"n": 0}
+
+        def fake_io():
+            calls["n"] += 1
+            return {"sda": (calls["n"] * 5.0, calls["n"] * 95.0)}
+
+        ticker = _Ticker(lambda: (1, 2), io_sampler=fake_io, cpu_sample_s=0.05)
+        val = ticker.io_pct()
+        assert val is not None
+        assert 0.0 <= val <= 100.0
+        # If write_time were ignored (old bug), 5ms/50ms = 10%; combined busy
+        # is 100ms/50ms, clamped to 100%.  Assert firmly above the read-only
+        # figure so a re-introduced regression fails loudly.
+        assert val > 10.0
+        assert val == 100.0
+
     def test_thread_safety_smoke(self):
         # No exception under concurrent access; values never out of range.
         calls = {"n": 0}

@@ -363,11 +363,12 @@ class _Ticker:
     """Two-sample delta -> utilisation percent, shared per process.
 
     ``sampler`` returns opaque per-key tick values (CPU ``(busy, total)`` or
-    a per-device ``(busy_ms, 0)`` dict).  The first call establishes a
+    a per-device busy-ms tuple ``(read_ms, write_ms)`` dict; the Linux
+    sampler reports ``write_ms`` as 0).  The first call establishes a
     baseline; the second and later calls within the process return a real
-    delta-derived percent.  IO computes busy/elapsed-wall-time per device and
-    reports the busiest device.  ``cpu_sample_s`` bounds the single baseline
-    sleep.  Thread-safe.
+    delta-derived percent.  IO computes busy = read-delta + write-delta over
+    elapsed wall time per device and reports the busiest device.
+    ``cpu_sample_s`` bounds the single baseline sleep.  Thread-safe.
     """
 
     def __init__(
@@ -446,11 +447,14 @@ class _Ticker:
                 return None
             elapsed_ms = elapsed * 1000.0
             best: Optional[float] = None
-            for dev, (busy, _marker) in sample.items():
+            for dev, (read, write) in sample.items():
                 prev_pair = prev.get(dev)
                 if prev_pair is None:
                     prev_pair = (0.0, 0.0)
-                d_busy = max(0.0, busy - prev_pair[0])
+                # Busy delta is read delta + write delta.  A write-heavy disk
+                # (small read_time, large write_time) must not report ~0% --
+                # see t_e99544ac (reviewer blocker t_4b4191b1).
+                d_busy = max(0.0, (read - prev_pair[0]) + (write - prev_pair[1]))
                 frac = _pct(d_busy, elapsed_ms)
                 if frac is None:
                     continue
