@@ -768,6 +768,22 @@ class GatewaySlashCommandsMixin:
                     session_key=self._redact_matrix_session_key(session_key),
                 ),
             ])
+        # Host load block (CPU/RAM/SWAP/IO %) -- best-effort, never fails.
+        # Collected natively (ctypes P/Invoke on Windows, /proc on Linux);
+        # any failure degrades a metric to "н/д" instead of breaking /status.
+        try:
+            from gateway.sysinfo import collect_load, format_load_line
+
+            _load = collect_load()
+            _load_line = format_load_line(_load)
+        except Exception as exc:  # pragma: no cover - defensive; never crash /status
+            logger.warning("/status sysinfo collection failed: %s", exc)
+            _load_line = None
+        if _load_line:
+            lines.extend([
+                "",
+                _load_line,
+            ])
         lines.extend([
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
@@ -1771,6 +1787,7 @@ class GatewaySlashCommandsMixin:
             resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
+            format_model_for_display,
         )
         from hermes_cli.providers import get_label
 
@@ -1857,6 +1874,97 @@ class GatewaySlashCommandsMixin:
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
+            # Flat 4-choice picker when the api_server model_routes table is
+            # configured: one tap = one session-scoped switch, no drill-down.
+            # Read from the same config block the api_server advertises at
+            # /v1/models, so Telegram and Open WebUI stay in lockstep.
+            try:
+                _mr_cfg = cfg if cfg else {}
+                _model_routes = (_mr_cfg.get("gateway", {}) or {}).get(
+                    "platforms", {}
+                ).get("api_server", {}).get("extra", {}).get("model_routes", {})
+            except Exception:
+                _model_routes = {}
+            if (
+                isinstance(_model_routes, dict)
+                and len(_model_routes) > 0
+            ):
+                adapter = getattr(self, "_adapter_for_source")(source)
+                has_choice_picker = (
+                    adapter is not None
+                    and getattr(type(adapter), "send_choice_picker", None) is not None
+                )
+                if has_choice_picker:
+                    _route_items = list(_model_routes.items())
+                    _cur_model_lc = (current_model or "").strip().lower()
+
+                    def _route_label(alias: str, route: dict) -> str:
+                        nice = alias.replace("-", " ").replace("_", " ")
+                        return nice[:64]
+
+                    choices = [
+                        {
+                            "value": alias,
+                            "label": _route_label(alias, route),
+                            "is_current": (
+                                _cur_model_lc == str(route.get("model", "")).strip().lower()
+                            ),
+                        }
+                        for alias, route in _route_items
+                    ]
+
+                    _fr_session_key = session_key
+                    _fr_profile_home = _command_profile_home
+                    _fr_cur_model = current_model
+                    _fr_cur_provider = current_provider
+                    _fr_cur_base_url = current_base_url
+                    _fr_cur_api_key = current_api_key
+                    _fr_user_provs = user_provs
+                    _fr_custom_provs = custom_provs
+
+                    async def _on_flat_model_selected(
+                        _chat_id: str, alias: str
+                    ) -> str:
+                        route = _model_routes.get(alias) or {}
+                        from gateway.run import _profile_runtime_scope
+
+                        async def _apply() -> str:
+                            result = await asyncio.to_thread(
+                                _switch_model,
+                                raw_input=str(route.get("model", alias)),
+                                current_provider=_fr_cur_provider,
+                                current_model=_fr_cur_model,
+                                current_base_url=_fr_cur_base_url,
+                                current_api_key=_fr_cur_api_key,
+                                is_global=False,
+                                explicit_provider=str(route.get("provider", "")),
+                                user_providers=_fr_user_provs,
+                                custom_providers=_fr_custom_provs,
+                            )
+                            if not result.success:
+                                return t("gateway.model.error_prefix", error=result.error_message)
+                            plabel = result.provider_label or result.target_provider
+                            return t(
+                                "gateway.model.switched",
+                                model=format_model_for_display(result.new_model),
+                            ) + "\n" + t("gateway.model.provider_label", provider=plabel) + "\n" + t("gateway.model.session_only_hint")
+
+                        if _fr_profile_home is None:
+                            return await _apply()
+                        with _profile_runtime_scope(_fr_profile_home):
+                            return await _apply()
+
+                    picker_sent = await self._try_send_choice_picker(
+                        event,
+                        session_key,
+                        title=t("gateway.model.current_label", model=current_model or "unknown", provider=get_label(current_provider)),
+                        choices=choices,
+                        on_choice_selected=_on_flat_model_selected,
+                    )
+                    if picker_sent:
+                        return None  # Flat picker sent — adapter handles the response
+                    # Fall through to the drill-down picker / text list.
+
             # Try interactive picker if the platform supports it
             adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
