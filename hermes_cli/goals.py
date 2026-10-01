@@ -2300,6 +2300,7 @@ def run_kanban_goal_loop(
     first_response: str = "",
     log=None,
     judge_fn=None,
+    budget_split_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -2404,6 +2405,39 @@ def run_kanban_goal_loop(
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
+            # Budget exhausted: try the automatic budget split FIRST (no
+            # human in the loop — the card fans out into 2+ children and
+            # the dispatcher re-runs the work in smaller pieces). Only
+            # fall back to the legacy sticky block when splitting is
+            # disabled/refused (depth cap, task no longer running, DB error).
+            if budget_split_fn is not None:
+                try:
+                    split_res = budget_split_fn(
+                        task_id,
+                        source="goal_loop",
+                        progress_note=last_response,
+                    )
+                except Exception as exc:
+                    _log(f"kanban goal loop: budget_split_fn failed ({exc})")
+                    split_res = None
+                if split_res is not None and getattr(split_res, "ok", False):
+                    kids = getattr(split_res, "child_ids", None) or []
+                    _log(
+                        f"kanban goal loop: task {task_id} exhausted "
+                        f"{turns_used}/{max_turns} turns; budget-split into "
+                        f"{len(kids)} children ({getattr(split_res, 'via', '')})"
+                    )
+                    return {
+                        "outcome": "budget_split",
+                        "turns_used": turns_used,
+                        "reason": "turn budget exhausted; card split automatically",
+                        "child_ids": kids,
+                    }
+                if split_res is not None:
+                    _log(
+                        "kanban goal loop: budget split refused "
+                        f"({getattr(split_res, 'reason', 'unknown')}); blocking"
+                    )
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
                 block_fn(

@@ -2680,6 +2680,17 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Automatic budget split: when a worker exhausts its operation
+        # budget (goal-loop turns or agent iterations) without completing
+        # the card, the card is automatically split into 2+ child cards
+        # (aux LLM proposes the graph; a deterministic 2-card fallback
+        # always applies) and the original waits for the children. Set
+        # false to restore the legacy behaviour (sticky block / failure
+        # record + circuit breaker).
+        "budget_split": True,
+        # Runaway-fan-out guard: how many budget splits deep a lineage may
+        # go before the split is refused and the legacy path takes over.
+        "budget_split_max_depth": 3,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

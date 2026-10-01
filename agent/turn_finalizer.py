@@ -67,11 +67,51 @@ def _record_kanban_budget_exhausted(
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
 
+    Budget split first (kanban.budget_split, default on): the card fans out
+    into 2+ child cards and the original waits on the graph — no human. Only
+    when the split is disabled/refused (depth cap, task not running, DB
+    error) does this fall back to the legacy failure record below.
+
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
     """
+    # --- automatic budget split -------------------------------------------
+    try:
+        from hermes_cli.kanban_budget_split import run_budget_split
+
+        _run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+        _expected_run_id = None
+        if _run_id_raw:
+            try:
+                _expected_run_id = int(_run_id_raw)
+            except ValueError:
+                _expected_run_id = None
+        split = run_budget_split(
+            kanban_task,
+            source="iteration_budget",
+            expected_run_id=_expected_run_id,
+        )
+        if split.ok:
+            logger.info(
+                "kanban budget split: task %s split into %d children (%s)",
+                kanban_task, len(split.child_ids or []), split.via,
+            )
+            return  # split closed the run + released the claim
+        logger.info(
+            "kanban budget split refused for task %s (%s); "
+            "recording legacy budget-exhausted failure",
+            kanban_task, split.reason,
+        )
+    except Exception:
+        logger.warning(
+            "kanban budget split attempt failed for task %s; "
+            "falling back to failure record",
+            kanban_task,
+            exc_info=True,
+        )
+    # --- legacy failure record --------------------------------------------
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()

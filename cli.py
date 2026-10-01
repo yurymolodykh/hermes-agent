@@ -20867,6 +20867,19 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             strict_source_route=True,
         )
 
+    def _budget_split(task_id: str, *, source: str, progress_note: str = ""):
+        # Automatic budget split (kanban.budget_split, default on): the card
+        # fans out into 2+ children instead of landing in sticky blocked.
+        # Pinned to THIS run so a dispatcher reclaim can't race the split.
+        from hermes_cli.kanban_budget_split import run_budget_split
+
+        return run_budget_split(
+            task_id,
+            source=source,
+            progress_note=progress_note or "",
+            expected_run_id=worker_run_id,
+        )
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
@@ -20877,6 +20890,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
         judge_fn=_judge_source_goal,
+        budget_split_fn=_budget_split,
     )
 
 

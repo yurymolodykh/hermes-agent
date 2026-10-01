@@ -7919,6 +7919,252 @@ def decompose_triage_task(
     return child_ids
 
 
+# ---------------------------------------------------------------------------
+# Budget split — automatic fan-out of a card whose worker exhausted its
+# operation budget (goal-loop turns or agent iterations). The orchestration
+# layer (LLM proposal + deterministic fallback) lives in
+# hermes_cli/kanban_budget_split.py; this is the atomic DB transition.
+# ---------------------------------------------------------------------------
+
+DEFAULT_BUDGET_SPLIT_MAX_DEPTH = 3
+
+
+def _budget_split_depth(conn: sqlite3.Connection, task_id: str) -> int:
+    """Return how many budget splits this task sits below in its lineage.
+
+    Walks the ``from_budget_split_of`` chain on ``created`` events (NOT
+    task_links — the waiting-trick links point the wrong way for this).
+    Each split child carries exactly one such event, so the walk is a simple
+    parent chain. Hard iteration cap guards against malformed data; json
+    errors just stop the walk.
+    """
+    depth = 0
+    current = task_id
+    seen = {current}
+    for _ in range(64):
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'created' "
+            "  AND payload LIKE '%from_budget_split_of%' "
+            "ORDER BY id LIMIT 1",
+            (current,),
+        ).fetchone()
+        if row is None or not row["payload"]:
+            break
+        try:
+            payload = json.loads(row["payload"])
+            parent = payload.get("from_budget_split_of")
+        except (ValueError, TypeError, AttributeError):
+            break
+        if not isinstance(parent, str) or not parent or parent in seen:
+            break
+        depth += 1
+        seen.add(parent)
+        current = parent
+    return depth
+
+
+def split_task_on_budget(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    children: list,
+    author: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    source: str = "unknown",
+    max_depth: Optional[int] = None,
+    progress_note: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Atomically split a ``running`` card into 2+ child cards.
+
+    Invoked when a worker exhausted its operation budget (turns or agent
+    iterations) without completing the card. Mirrors the atomic shape of
+    :func:`decompose_triage_task`, but operates on a live ``running`` task:
+
+    * children are created in ``todo`` with the card's assignee, workspace,
+      tenant, priority, skills, model/provider route and runtime cap
+      inherited (``goal_mode`` is NOT inherited — children run as classic
+      single-shot workers with a fresh budget);
+    * internal ``parents`` indices among the children express dependencies;
+    * the ORIGINAL card becomes a child of every child (waits for the whole
+      graph in ``todo``), exactly like a triage fan-out root;
+    * the active run is closed with ``outcome='budget_split'`` and the claim
+      is released;
+    * a ``budget_split`` event + audit comment is written on the card and a
+      ``created`` event (``from_budget_split_of``) on each child.
+
+    Refusals (returns ``None``, never raises): card not ``running``,
+    ``expected_run_id`` mismatch, fewer than 2 valid children, or the task
+    already sits at ``max_depth`` budget splits in its lineage
+    (infinite-fan-out guard — caller falls back to the legacy
+    blocked/failure path).
+
+    After the txn commits, ``recompute_ready`` promotes parent-free children
+    to ``ready`` so the dispatcher picks them up on its next tick.
+    """
+    if not isinstance(children, list) or len(children) < 2:
+        return None
+    cleaned: list[dict] = []
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            return None
+        title = child.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return None
+        body = child.get("body")
+        parents = child.get("parents") or []
+        if not isinstance(parents, list):
+            parents = []
+        clean_parents = [
+            p for p in parents
+            if isinstance(p, int) and 0 <= p < len(children) and p != idx
+        ]
+        cleaned.append({
+            "title": title.strip()[:200],
+            "body": body if isinstance(body, str) else "",
+            "parents": clean_parents,
+        })
+
+    depth_cap = int(max_depth or DEFAULT_BUDGET_SPLIT_MAX_DEPTH)
+    now = int(time.time())
+    child_ids: list[str] = []
+
+    with write_txn(conn):
+        base_depth = _budget_split_depth(conn, task_id)
+        if base_depth >= depth_cap:
+            return None
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return None
+        if expected_run_id is not None:
+            try:
+                if int(row["current_run_id"] or 0) != int(expected_run_id):
+                    return None
+            except (TypeError, ValueError):
+                return None
+
+        # CAS-flip the root out of 'running' first — if a dispatcher reclaim
+        # won the race, abort before creating anything.
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, last_heartbeat_at = NULL "
+            "WHERE id = ? AND status = 'running'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return None
+
+        root_ws_kind = row["workspace_kind"] or "scratch"
+        root_ws_path = row["workspace_path"]
+        for child in cleaned:
+            new_id = _new_task_id()
+            # Same workspace inheritance rules as decompose_triage_task:
+            # never share one worktree checkout between siblings.
+            if child.get("workspace_path"):
+                child_ws_path = child.get("workspace_path")
+            elif root_ws_kind == "worktree":
+                child_ws_path = None
+            else:
+                child_ws_path = root_ws_path
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, body, assignee, status, priority, workspace_kind, "
+                " workspace_path, tenant, created_at, created_by, skills, "
+                " model_override, provider_override, root_model_override, "
+                " root_provider_override, reasoning_effort, max_runtime_seconds) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_id,
+                    child["title"],
+                    child["body"] or None,
+                    _canonical_assignee(row["assignee"]),
+                    int(row["priority"] or 0),
+                    root_ws_kind,
+                    child_ws_path,
+                    row["tenant"],
+                    now,
+                    (author or "budget-splitter"),
+                    row["skills"],
+                    row["model_override"],
+                    row["provider_override"],
+                    row["root_model_override"],
+                    row["root_provider_override"],
+                    row["reasoning_effort"],
+                    row["max_runtime_seconds"],
+                ),
+            )
+            _append_event(
+                conn, new_id, "created",
+                {
+                    "by": author or "budget-splitter",
+                    "from_budget_split_of": task_id,
+                    "budget_split_depth": base_depth + 1,
+                },
+            )
+            _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
+            child_ids.append(new_id)
+
+        for idx, child in enumerate(cleaned):
+            for p_idx in child["parents"]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (child_ids[p_idx], child_ids[idx]),
+                )
+                _append_event(
+                    conn, child_ids[idx], "linked",
+                    {"parent": child_ids[p_idx], "child": child_ids[idx]},
+                )
+
+        # Original card waits for the whole child graph (root becomes a
+        # child of every child) — same trick as decompose_triage_task.
+        for cid in child_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                "VALUES (?, ?)",
+                (cid, task_id),
+            )
+
+        split_depth = base_depth + 1
+        run_id = _end_run(
+            conn, task_id,
+            outcome="budget_split", status="budget_split",
+            summary=(
+                f"operation budget exhausted ({source}); split into "
+                f"{len(child_ids)} children (depth {split_depth})"
+            ),
+        )
+        audit_author = (author or "").strip() or "budget-splitter"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                audit_author,
+                "Budget split into " + ", ".join(child_ids)
+                + ". Card wakes when all children complete.",
+                now,
+            ),
+        )
+        _append_event(
+            conn, task_id, "budget_split",
+            {
+                "child_ids": child_ids,
+                "source": source,
+                "depth": split_depth,
+                "progress_note": (progress_note or "")[:300],
+            },
+            run_id=run_id,
+        )
+
+    # Outside the write_txn: promote parent-free children to 'ready' so the
+    # dispatcher picks them up on its next tick.
+    recompute_ready(conn)
+    return child_ids
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
