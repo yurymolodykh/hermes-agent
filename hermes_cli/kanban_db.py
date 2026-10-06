@@ -8706,6 +8706,16 @@ class DispatchResult:
     "task is genuinely stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    reserved_by_daytime: list[str] = field(default_factory=list)
+    """Ready/review task ids deferred this tick by the daytime worker reserve
+    (``kanban.daytime_reserve_*``, t_b12721ab): background cards (priority
+    below ``daytime_reserve_priority_below``) may not occupy the last
+    ``daytime_reserve_slots`` pool slots during the reserve window, so those
+    slots stay free for urgent user work. NOT an operator-actionable
+    failure — the task is picked up on a later tick (or after the window
+    closes). Tracked separately from ``skipped_unassigned`` / the other
+    skip buckets because the deferred tasks are perfectly spawnable, just
+    intentionally parked by the reserve."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -10674,6 +10684,209 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+# ---------------------------------------------------------------------------
+# Daytime worker reserve (t_b12721ab)
+#
+# During a configured daytime window (e.g. 08:00–20:00 Europe/Moscow),
+# background cards (``priority < kanban.daytime_reserve_priority_below``)
+# must not occupy the last ``kanban.daytime_reserve_slots`` worker slots of
+# the pool — those stay free for urgent user work (``priority >= threshold``).
+# Outside the window (or when the reserve block is missing/invalid) there is
+# no reservation: the pool is fully available to background work.
+#
+# Boundary semantics: ``now`` is clamped to the reserve's timezone; the window
+# is start-inclusive / end-exclusive (08:00 in, 20:00 out). A window that
+# wraps past midnight (start > end, e.g. 22:00 -> 06:00) is supported.
+# Only NEW spawns are limited; already-running workers are never touched.
+#
+# The dispatcher reads the reserve block itself via ``load_config_readonly``
+# (mirroring ``configured_max_in_progress``) so the gateway watcher needs no
+# changes — and no restart is required for config edits to take effect.
+# ---------------------------------------------------------------------------
+
+
+def _parse_daytime_clock(value: Any) -> Optional["datetime.time"]:
+    """Parse an ``HH:MM`` string into ``datetime.time``, or None when invalid."""
+    from datetime import time as _clock
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return _clock(hour, minute)
+
+
+def daytime_reserve_config() -> Optional[dict]:
+    """Read the ``kanban.daytime_reserve_*`` block from config, or None.
+
+    Returns a dict like::
+
+        {
+            "slots": 2,
+            "window_start": time(8, 0),
+            "window_end": time(20, 0),
+            "tz": ZoneInfo("Europe/Moscow"),
+            "priority_below": 0,
+        }
+
+    ``None`` when the block is absent or any key is invalid — the caller then
+    applies NO reservation (current behaviour). Mirrors
+    :func:`configured_max_in_progress`'s config-resolution pattern so the
+    dispatcher and the CLI agree on what "configured" means.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        slots = int(raw.get("daytime_reserve_slots"))
+    except (TypeError, ValueError):
+        return None
+    if slots < 1:
+        return None
+    window = raw.get("daytime_reserve_window")
+    if not (isinstance(window, (list, tuple)) and len(window) == 2):
+        return None
+    window_start = _parse_daytime_clock(window[0])
+    window_end = _parse_daytime_clock(window[1])
+    if window_start is None or window_end is None:
+        return None
+    tz_name = str(raw.get("daytime_reserve_tz") or "").strip()
+    if not tz_name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return None
+    try:
+        priority_below = int(raw.get("daytime_reserve_priority_below"))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "slots": slots,
+        "window_start": window_start,
+        "window_end": window_end,
+        "tz": tz,
+        "priority_below": priority_below,
+    }
+
+
+def _daytime_reserve_now(tz) -> "datetime.datetime":
+    """Current wall-clock in ``tz``. Module-level seam so tests can pin time."""
+    from datetime import datetime
+    return datetime.now(tz)
+
+
+def in_daytime_window(reserve_cfg: dict, now: Optional["datetime.datetime"] = None) -> bool:
+    """Whether ``now`` (default: real clock in the reserve's tz) is inside the window.
+
+    Start-inclusive, end-exclusive. A wrap-around window (start > end) is
+    handled. ``now`` may be any tz-aware datetime (it is clamped to the
+    reserve tz); naive datetimes are treated as being in the reserve tz.
+    """
+    if now is None:
+        now = _daytime_reserve_now(reserve_cfg["tz"])
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=reserve_cfg["tz"])
+    else:
+        now = now.astimezone(reserve_cfg["tz"])
+    t = now.time()
+    start = reserve_cfg["window_start"]
+    end = reserve_cfg["window_end"]
+    if start <= end:
+        return start <= t < end
+    # Overnight window wraps past midnight.
+    return t >= start or t < end
+
+
+def _count_running_background_other_boards(
+    board: Optional[str] = None, priority_below: int = 0,
+) -> int:
+    """Total ``running`` background tasks (priority < ``priority_below``) on
+    every board EXCEPT ``board``.
+
+    Mirrors :func:`count_running_tasks_other_boards` (host-level accounting
+    for OOF-30) but scoped to the background class, so the daytime reserve
+    sees background workers on the whole host, not just one board's queue.
+    Fails open to 0 per board — a broken board must not disable the reserve
+    on healthy ones.
+    """
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                total += int(
+                    other.execute(
+                        "SELECT COUNT(*) FROM tasks "
+                        "WHERE status = 'running' AND priority < ?",
+                        (int(priority_below),),
+                    ).fetchone()[0]
+                )
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return total
+
+
+def count_running_background_tasks(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    priority_below: int = 0,
+) -> int:
+    """Running background tasks (priority < ``priority_below``) on EVERY board.
+
+    Host-level view used by the daytime reserve: the background counter must
+    see this board's running workers plus those on all other boards, exactly
+    like the ``max_in_progress`` accounting does for the total pool. Fails
+    open to 0 for any unreadable board.
+    """
+    total = 0
+    try:
+        total += int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND priority < ?",
+                (int(priority_below),),
+            ).fetchone()[0]
+        )
+    except Exception:
+        pass
+    total += _count_running_background_other_boards(board, priority_below)
+    return total
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Return the number of tasks currently in ``status='running'``.
 
@@ -11062,7 +11275,8 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, model_override, provider_override FROM tasks "
+        "SELECT id, assignee, model_override, provider_override, priority "
+        "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -11071,7 +11285,8 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, model_override, provider_override FROM tasks "
+            "SELECT id, assignee, model_override, provider_override, priority "
+            "FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -11139,10 +11354,39 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # ---- daytime worker reserve (t_b12721ab) -------------------------------
+    # During the configured daytime window (default 08:00–20:00 Europe/Moscow)
+    # background-class cards (priority < kanban.daytime_reserve_priority_below)
+    # may occupy at most (max_in_progress - kanban.daytime_reserve_slots) host
+    # workers; the last slots stay free for urgent user work (priority >= the
+    # threshold). Outside the window — or when the reserve block is
+    # missing/invalid, or no explicit positive max_in_progress pool is in play
+    # — there is NO reservation and pre-change behaviour is preserved.
+    #
+    # The background counter is host-wide (every board, mirroring the
+    # max_in_progress accounting) and is seeded with the running background
+    # workers at tick start; each successful background spawn in THIS tick
+    # increments it, so a bursty tick can't double-spawn past the ceiling by
+    # racing its own running count. Only NEW spawns are limited —
+    # already-running background workers are never touched.
+    reserve_cfg = daytime_reserve_config()
+    reserve_active = False
+    reserve_bg_limit = 0
+    reserve_bg_counter = 0
+    if reserve_cfg is not None and isinstance(max_in_progress, int) and max_in_progress > 0:
+        _reserve_limit = max_in_progress - reserve_cfg["slots"]
+        if _reserve_limit > 0 and in_daytime_window(reserve_cfg):
+            reserve_active = True
+            reserve_bg_limit = _reserve_limit
+            reserve_bg_counter = count_running_background_tasks(
+                conn, board=board, priority_below=reserve_cfg["priority_below"],
+            )
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
+        row_priority = int(row["priority"] or 0)
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -11243,6 +11487,20 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Daytime worker reserve (t_b12721ab): during the reserve window a
+        # background-class ready card (priority < threshold) may only spawn
+        # while the host-wide background counter is below the ceiling
+        # (max_in_progress - reserve_slots). Deferred cards stay in 'ready'
+        # and wait for a later tick — they are NOT operator-actionable
+        # (distinct from skipped_unassigned / skipped_nonspawnable), so they
+        # land in their own DispatchResult bucket.
+        if (
+            reserve_active
+            and row_priority < reserve_cfg["priority_below"]
+            and reserve_bg_counter >= reserve_bg_limit
+        ):
+            result.reserved_by_daytime.append(row["id"])
+            continue
         try:
             if dry_run:
                 resolve_task_root_route(conn, row["id"], persist=False)
@@ -11266,6 +11524,11 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            # Same for the daytime reserve: count would-be background spawns
+            # so dry_run reflects the reserve ceiling on subsequent
+            # iterations, not just the running backlog (t_b12721ab).
+            if reserve_active and row_priority < reserve_cfg["priority_below"]:
+                reserve_bg_counter += 1
             continue
         if not dry_run:
             # Defense-in-depth provider pre-flight: a card pinned to a route
@@ -11350,6 +11613,11 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            # Daytime reserve: a background card just consumed one of the
+            # reserved slots this tick — count it so a burst in a single
+            # tick can't push background past the ceiling (t_b12721ab).
+            if reserve_active and row_priority < reserve_cfg["priority_below"]:
+                reserve_bg_counter += 1
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11381,6 +11649,7 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        row_priority = int(row["priority"] or 0)
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -11408,6 +11677,17 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Daytime worker reserve (t_b12721ab): same ceiling as the ready lane —
+        # a background-class review card defers when the host-wide background
+        # counter is exhausted (its own spawn still consumes the applied
+        # ceiling, so it is bucketed like the ready lane, not as unassigned).
+        if (
+            reserve_active
+            and row_priority < reserve_cfg["priority_below"]
+            and reserve_bg_counter >= reserve_bg_limit
+        ):
+            result.reserved_by_daytime.append(row["id"])
+            continue
         try:
             if dry_run:
                 resolve_task_root_route(conn, row["id"], persist=False)
@@ -11427,6 +11707,8 @@ def _dispatch_once_locked(
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
+            if reserve_active and row_priority < reserve_cfg["priority_below"]:
+                reserve_bg_counter += 1
             continue
         if not dry_run:
             # Same provider pre-flight as the ready lane (see above): never
@@ -11498,6 +11780,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            if reserve_active and row_priority < reserve_cfg["priority_below"]:
+                reserve_bg_counter += 1
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

@@ -1761,3 +1761,262 @@ def test_dispatch_once_does_not_respawn_terminal_task(kanban_home, monkeypatch):
         assert kb.get_task(conn, term).status == "ready"
         run = kb.latest_run(conn, term)
         assert run is not None and run.outcome == "completed"  # terminal run only
+
+# ---------------------------------------------------------------------------
+# Daytime worker reserve (t_b12721ab)
+# ---------------------------------------------------------------------------
+
+def _reserve_cfg_dict(**overrides):
+    """Build a valid kanban config dict carrying the daytime reserve block."""
+    cfg = {
+        "kanban": {
+            "max_in_progress": 8,
+            "daytime_reserve_slots": 2,
+            "daytime_reserve_window": ["08:00", "20:00"],
+            "daytime_reserve_tz": "Europe/Moscow",
+            "daytime_reserve_priority_below": 0,
+        },
+    }
+    kanban = cfg["kanban"]
+    for key, val in overrides.items():
+        kanban[key] = val
+    return cfg
+
+
+def _patch_daytime_reserve(monkeypatch, now, cfg_dict=None):
+    """Pin the reserve clock to ``now`` (tz-aware) and stub config read.
+
+    ``daytime_reserve_config()`` reads via ``load_config_readonly``; the
+    dispatcher must see the synthetic kanban block. ``now`` drives
+    ``_daytime_reserve_now`` so the window check is deterministic.
+    """
+    import hermes_cli.config as hcfg
+    from datetime import datetime, timezone
+
+    if cfg_dict is None:
+        cfg_dict = _reserve_cfg_dict()
+    monkeypatch.setattr(hcfg, "load_config_readonly", lambda: cfg_dict)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    monkeypatch.setattr(kb, "_daytime_reserve_now", lambda tz: now)
+    # Bypass the unrelated MODEL_LOCK route-resolution and respawn cooldown
+    # gates (same hermetic pattern as the existing dispatch tests) so these
+    # tests exercise exactly the reserve ceiling, not route wiring.
+    monkeypatch.setattr(
+        kb, "resolve_task_root_route",
+        lambda conn, tid, persist=False, allow_unpinned=False: ((tid,), "prof", "prof-model"),
+    )
+    monkeypatch.setattr(kb, "check_respawn_guard", lambda conn, tid: None)
+    return now
+
+
+def test_daytime_reserve_window_msk_boundary():
+    """10:00 MSK is inside the window; 22:00 MSK is outside; edges inclusive/exclusive."""
+    from datetime import datetime, time as clock_time
+    from zoneinfo import ZoneInfo
+
+    cfg = {
+        "window_start": clock_time(8, 0),
+        "window_end": clock_time(20, 0),
+        "tz": ZoneInfo("Europe/Moscow"),
+        "priority_below": 0,
+    }
+
+    def _msk(y=2026, mo=5, d=10, h=0, mi=0):
+        return datetime(y, mo, d, h, mi, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert kb.in_daytime_window(cfg, now=_msk(h=10, mi=0)) is True
+    assert kb.in_daytime_window(cfg, now=_msk(h=22, mi=0)) is False
+    assert kb.in_daytime_window(cfg, now=_msk(h=7, mi=59)) is False
+    assert kb.in_daytime_window(cfg, now=_msk(h=8, mi=0)) is True   # start inclusive
+    assert kb.in_daytime_window(cfg, now=_msk(h=19, mi=59)) is True
+    assert kb.in_daytime_window(cfg, now=_msk(h=20, mi=0)) is False  # end exclusive
+    # Non-MSK wall clock is clamped into the reserve tz before comparison.
+    assert kb.in_daytime_window(
+        cfg, now=datetime(2026, 5, 10, 7, 0, tzinfo=ZoneInfo("UTC")),
+    ) is True  # 07:00 UTC == 10:00 MSK
+
+
+def test_daytime_reserve_config_parses_valid_block(monkeypatch):
+    """A configured block returns a normalised dict; empty/invalid -> None."""
+    import hermes_cli.config as hcfg
+
+    cfg = _reserve_cfg_dict()
+    monkeypatch.setattr(hcfg, "load_config_readonly", lambda: cfg)
+    parsed = kb.daytime_reserve_config()
+    assert parsed is not None
+    assert parsed["slots"] == 2
+    assert parsed["window_start"].hour == 8
+    assert parsed["window_end"].hour == 20
+    assert parsed["priority_below"] == 0
+    assert str(parsed["tz"]) == "Europe/Moscow"
+
+    # Missing block -> None (no reservation).
+    monkeypatch.setattr(hcfg, "load_config_readonly", lambda: {"kanban": {}})
+    assert kb.daytime_reserve_config() is None
+    # Partially invalid -> None.
+    monkeypatch.setattr(
+        hcfg, "load_config_readonly",
+        lambda: _reserve_cfg_dict(daytime_reserve_slots=0),
+    )
+    assert kb.daytime_reserve_config() is None
+    monkeypatch.setattr(
+        hcfg, "load_config_readonly",
+        lambda: _reserve_cfg_dict(daytime_reserve_window="08:00"),
+    )
+    assert kb.daytime_reserve_config() is None
+
+
+def test_dispatch_daytime_reserve_background_capped_in_window(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """In-window: background ready cards (priority<0) may not exceed
+    max_in_progress - slots = 6; the extra ones land in reserved_by_daytime."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _patch_daytime_reserve(
+        monkeypatch,
+        now=datetime(2026, 5, 10, 10, 0, tzinfo=ZoneInfo("Europe/Moscow")),
+        cfg_dict=_reserve_cfg_dict(),
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        bg_ids = []
+        for i in range(8):
+            bg_ids.append(
+                kb.create_task(
+                    conn, title=f"bg-{i}", assignee="alice", priority=-1,
+                )
+            )
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, max_in_progress=8, dry_run=True,
+        )
+
+    assert len(res.spawned) == 6
+    assert len(res.reserved_by_daytime) == 2
+    assert set(res.reserved_by_daytime) <= set(bg_ids)
+    assert not res.skipped_unassigned
+    assert not res.skipped_nonspawnable
+
+
+def test_dispatch_daytime_reserve_background_capped_in_window_real(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Same ceiling on the REAL (non-dry-run) spawn path."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _patch_daytime_reserve(
+        monkeypatch,
+        now=datetime(2026, 5, 10, 10, 0, tzinfo=ZoneInfo("Europe/Moscow")),
+        cfg_dict=_reserve_cfg_dict(),
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        for i in range(8):
+            kb.create_task(conn, title=f"bg-{i}", assignee="alice", priority=-1)
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, max_in_progress=8, dry_run=False,
+        )
+
+    assert len(res.spawned) == 6
+    assert len(res.reserved_by_daytime) == 2
+    assert len(spawns) == 6
+
+
+def test_dispatch_daytime_reserve_priority_passes_to_full_pool(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """In-window: priority>=0 ready cards are NOT limited by the reserve — a
+    fully priority board still spawns up to the whole pool (8)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _patch_daytime_reserve(
+        monkeypatch,
+        now=datetime(2026, 5, 10, 10, 0, tzinfo=ZoneInfo("Europe/Moscow")),
+        cfg_dict=_reserve_cfg_dict(),
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        for i in range(8):
+            kb.create_task(conn, title=f"urg-{i}", assignee="alice", priority=5)
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, max_in_progress=8, dry_run=True,
+        )
+
+    assert len(res.spawned) == 8
+    assert not res.reserved_by_daytime
+
+
+def test_dispatch_daytime_reserve_inactive_outside_window(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Outside the window (22:00 MSK) the reserve is OFF: background ready
+    cards occupy the whole pool up to max_in_progress (8)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _patch_daytime_reserve(
+        monkeypatch,
+        now=datetime(2026, 5, 10, 22, 0, tzinfo=ZoneInfo("Europe/Moscow")),
+        cfg_dict=_reserve_cfg_dict(),
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        for i in range(8):
+            kb.create_task(conn, title=f"bg-{i}", assignee="alice", priority=-1)
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, max_in_progress=8, dry_run=True,
+        )
+
+    assert len(res.spawned) == 8
+    assert not res.reserved_by_daytime
+
+
+def test_dispatch_daytime_reserve_inactive_without_pool(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """No explicit positive max_in_progress pool -> no reservation (fails open)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _patch_daytime_reserve(
+        monkeypatch,
+        now=datetime(2026, 5, 10, 10, 0, tzinfo=ZoneInfo("Europe/Moscow")),
+        cfg_dict=_reserve_cfg_dict(),
+    )
+
+    def fake_spawn(task, workspace, board=None):
+        return 42
+
+    with kb.connect() as conn:
+        for i in range(8):
+            kb.create_task(conn, title=f"bg-{i}", assignee="alice", priority=-1)
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, max_in_progress=None, dry_run=True,
+        )
+
+    assert not res.reserved_by_daytime
+
