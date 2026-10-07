@@ -11145,6 +11145,61 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _adaptive_effective_cap(
+    base: Optional[int],
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+    now: Optional[float] = None,
+) -> tuple[Optional[object], Optional[int]]:
+    """Return ``(adaptive_module_or_None, effective_cap)`` for this tick.
+
+    M2 AIMD-adaptive host cap (:mod:`hermes_cli.kanban_adaptive`): when
+    ``kanban.adaptive`` is enabled (off by default — flag rollout is tracked
+    separately), the effective host cap for THIS tick is produced by the
+    automaton (fed live memory pressure from :func:`_memory_pressure_level`
+    and the board's spawnable-ready queue via :func:`has_spawnable_ready`)
+    instead of staying fixed at the static ``base``.
+
+    Fail-open contract — in every disable/failure case the effective cap is
+    exactly ``base`` and dispatch behaves bit-for-bit as it did before this
+    feature:
+
+    * ``base`` is None (no static cap to grow from / unknown memory);
+    * the module is unavailable;
+    * ``adaptive_enabled()`` is False;
+    * the automaton raises while ticking.
+    """
+    if base is None:
+        return None, base
+    try:
+        from hermes_cli import kanban_adaptive
+    except Exception:
+        return None, base
+    try:
+        if not kanban_adaptive.adaptive_enabled():
+            return None, base
+    except Exception:
+        return None, base
+    try:
+        effective = kanban_adaptive.tick_for_dispatch(
+            base=base,
+            queue_exists=has_spawnable_ready(conn),
+            board=board,
+            dry_run=dry_run,
+            now=now,
+        )
+    except Exception:
+        _log.warning(
+            "kanban dispatch: adaptive cap tick failed; using static "
+            "max_in_progress=%s for this tick",
+            base, exc_info=True,
+        )
+        return None, base
+    return kanban_adaptive, (base if effective is None else effective)
+
+
 def _provider_route_blocker(
     provider: Optional[str],
     model: Optional[str],
@@ -11413,11 +11468,24 @@ def _dispatch_once_locked(
     # workers on every other board count against the same budget. Without
     # this, N active boards multiply the cap by N — exactly the fan-out
     # the memory-derived default exists to prevent.
+    #
+    # M2 (AIMD-adaptive cap): when kanban.adaptive is enabled (off by
+    # default), the effective host cap for THIS tick comes from the
+    # kanban_adaptive automaton instead of staying fixed at the static
+    # max_in_progress (the automaton's base). With the flag off it returns
+    # the static base unchanged, so this block behaves bit-for-bit as
+    # before. _adaptive_mod is consumed at the bottom of the tick to arm
+    # the post-spawn stabilization window.
+    _adaptive_mod, effective_max_in_progress = None, None
     if max_in_progress is not None:
+        _adaptive_mod, effective_max_in_progress = _adaptive_effective_cap(
+            max_in_progress, conn, board=board, dry_run=dry_run,
+        )
+    if effective_max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
+        if total_running >= effective_max_in_progress:
             return result
-        remaining = max_in_progress - total_running
+        remaining = effective_max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
@@ -11960,6 +12028,19 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # M2: a newly spawned worker allocates memory lazily, so the adaptive
+    # automaton's 180s post-spawn stabilization window must not be armed for
+    # this interval until a real spawn actually happened. dry_run ticks never
+    # spawn processes, so they must not arm it either.
+    if _adaptive_mod is not None and not dry_run and spawned > 0:
+        try:
+            _adaptive_mod.note_spawned()
+        except Exception:
+            _log.debug(
+                "kanban dispatch: adaptive note_spawned failed", exc_info=True,
+            )
+
     return result
 
 
