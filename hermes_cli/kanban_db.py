@@ -10851,6 +10851,233 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Weighted worker slots (``kanban.weighted_slots``, M3)
+#
+# Concurrency accounting normally counts occupied workers as a plain card
+# count. With ``kanban.weighted_slots`` enabled (off by default) the
+# accounting switches to a weighted SUM of occupied SLOTS: a normal card
+# occupies 1.0 slot, a ``goal_mode=1`` controller (a lightweight goal-loop
+# that shares one worker process) occupies 0.5. Cheap goal-mode controllers
+# can then pack against the host cap without squeezing out full-weight
+# workers. The flag also makes a goal-mode card ALWAYS count as *background*
+# for the daytime worker reserve regardless of its priority — closing the
+# prior bypass where a goal-mode controller pinned to priority 20 escaped the
+# reserve — and routes the reserve ceiling through the M2 adaptive effective
+# cap (``bg_limit = effective_max_in_progress - reserve_slots``).
+#
+# With the flag OFF every function here returns the exact pre-M3 card-count
+# view (bit-for-bit identical dispatch behaviour), so the flag is a clean
+# master switch for the whole feature.
+# ---------------------------------------------------------------------------
+
+
+def weighted_slots_enabled() -> bool:
+    """Whether ``kanban.weighted_slots`` is enabled in config (default: off)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return False
+    return bool(raw.get("weighted_slots", False)) if isinstance(raw, dict) else False
+
+
+def _task_slot_weight(goal_mode: bool, weighted: bool) -> float:
+    """Occupied-slot weight of one task.
+
+    0.5 for a ``goal_mode`` controller when weighted accounting is on, 1.0
+    otherwise (so the flag-off path stays an exact card count).
+    """
+    return 0.5 if (weighted and goal_mode) else 1.0
+
+
+def _slots_select(weighted: bool) -> str:
+    """SQL selector for occupied slots: weighted SUM when on, COUNT(*) when off."""
+    if weighted:
+        return "SUM(CASE WHEN goal_mode != 0 THEN 0.5 ELSE 1.0 END)"
+    return "COUNT(*)"
+
+
+def count_running_slots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    weighted: Optional[bool] = None,
+) -> float:
+    """Occupied worker slots on EVERY board (host-level view).
+
+    With ``kanban.weighted_slots`` on, running ``goal_mode`` controllers
+    count 0.5 and normal cards 1.0; with the flag off this is exactly the
+    plain running-card count (bit-identical to the pre-M3 view). Used by the
+    ``max_in_progress`` cap, which bounds the machine: workers on every other
+    board count against the same budget (OOF-30). Fails open to 0 for any
+    unreadable board.
+    """
+    if weighted is None:
+        weighted = weighted_slots_enabled()
+    total = 0
+    try:
+        total += float(
+            conn.execute(
+                "SELECT " + _slots_select(weighted) + " AS slots "
+                "FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+            or 0
+        )
+    except Exception:
+        pass
+    total += _count_running_slots_other_boards(board, weighted)
+    return total
+
+
+def _count_running_slots_other_boards(
+    board: Optional[str] = None,
+    weighted: bool = False,
+) -> float:
+    """Occupied slots on every board EXCEPT ``board`` (weighted view).
+
+    Mirrors :func:`count_running_tasks_other_boards` for the weighted
+    occupancy accounting; both resolve to the plain card count when
+    ``weighted`` is False.
+    """
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                total += float(
+                    other.execute(
+                        "SELECT " + _slots_select(weighted) + " AS slots "
+                        "FROM tasks WHERE status = 'running'"
+                    ).fetchone()[0]
+                    or 0
+                )
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return total
+
+
+def count_running_background_slots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    priority_below: int = 0,
+    weighted: Optional[bool] = None,
+) -> float:
+    """Occupied BACKGROUND worker slots on EVERY board (host-level view).
+
+    With ``kanban.weighted_slots`` on, the background class is ``priority <
+    priority_below OR goal_mode != 0`` — a goal-mode controller always counts
+    as background, closing the priority-20 bypass — and its occupied slots
+    are weighted (goal_mode = 0.5). With the flag off this is exactly
+    :func:`count_running_background_tasks`: a plain count restricted to
+    ``priority < priority_below`` (goal_mode plays no role), keeping the
+    flag-off path bit-identical to pre-M3.
+    """
+    if weighted is None:
+        weighted = weighted_slots_enabled()
+    total = 0
+    try:
+        if weighted:
+            total += float(
+                conn.execute(
+                    "SELECT SUM(CASE WHEN goal_mode != 0 THEN 0.5 ELSE 1.0 END) "
+                    "AS slots FROM tasks WHERE status = 'running' "
+                    "AND (priority < ? OR goal_mode != 0)",
+                    (int(priority_below),),
+                ).fetchone()[0]
+                or 0
+            )
+        else:
+            total += int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status = 'running' AND priority < ?",
+                    (int(priority_below),),
+                ).fetchone()[0]
+            )
+    except Exception:
+        pass
+    total += _count_running_background_slots_other_boards(
+        board, priority_below, weighted
+    )
+    return total
+
+
+def _count_running_background_slots_other_boards(
+    board: Optional[str] = None,
+    priority_below: int = 0,
+    weighted: bool = False,
+) -> float:
+    """Background occupied slots on every board EXCEPT ``board`` (weighted view)."""
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                if weighted:
+                    total += float(
+                        other.execute(
+                            "SELECT SUM(CASE WHEN goal_mode != 0 THEN 0.5 ELSE 1.0 END) "
+                            "AS slots FROM tasks WHERE status = 'running' "
+                            "AND (priority < ? OR goal_mode != 0)",
+                            (int(priority_below),),
+                        ).fetchone()[0]
+                        or 0
+                    )
+                else:
+                    total += int(
+                        other.execute(
+                            "SELECT COUNT(*) FROM tasks "
+                            "WHERE status = 'running' AND priority < ?",
+                            (int(priority_below),),
+                        ).fetchone()[0]
+                    )
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Daytime worker reserve (t_b12721ab)
 #
 # During a configured daytime window (e.g. 08:00–20:00 Europe/Moscow),
@@ -11446,9 +11673,19 @@ def _dispatch_once_locked(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
-    spawn_budget: Optional[int] = None
+    spawn_budget: Optional[float] = None
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
+    # M3 (weighted slots): when ``kanban.weighted_slots`` is on, the
+    # max_in_progress / daytime-reserve accounting counts occupied SLOTS as a
+    # weighted sum (goal-mode controller = 0.5, normal card = 1.0) instead of
+    # a plain card count; ``max_spawn`` keeps plain card semantics (it bounds
+    # distinct workers, not memory). With the flag off ``slots_running`` is
+    # exactly the host-wide card count, so this block is bit-for-bit as before.
+    weighted = weighted_slots_enabled()
+    slots_running: float = 0.0
+    if max_in_progress is not None:
+        slots_running = count_running_slots(conn, board=board, weighted=weighted)
 
     # Convert any concurrency caps into a shared additional-spawns budget
     # for this tick. Both ready and review loops consume from the same
@@ -11482,10 +11719,14 @@ def _dispatch_once_locked(
             max_in_progress, conn, board=board, dry_run=dry_run,
         )
     if effective_max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= effective_max_in_progress:
+        # M3: compare the host cap against weighted occupied SLOTS when the
+        # flag is on (``slots_running`` already includes every other board);
+        # with the flag off it is exactly the plain host-wide running-card
+        # count, preserving pre-M3 behaviour.
+        total_slots = slots_running
+        if total_slots >= effective_max_in_progress:
             return result
-        remaining = effective_max_in_progress - total_running
+        remaining = effective_max_in_progress - total_slots
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
@@ -11514,7 +11755,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, model_override, provider_override, priority "
+        "SELECT id, assignee, model_override, provider_override, priority, goal_mode "
         "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
@@ -11524,7 +11765,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, model_override, provider_override, priority "
+            "SELECT id, assignee, model_override, provider_override, priority, goal_mode "
             "FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
@@ -11612,13 +11853,42 @@ def _dispatch_once_locked(
     reserve_active = False
     reserve_bg_limit = 0
     reserve_bg_counter = 0
-    if reserve_cfg is not None and isinstance(max_in_progress, int) and max_in_progress > 0:
-        _reserve_limit = max_in_progress - reserve_cfg["slots"]
+
+    def _is_reserve_background(row_priority: int, row_goal_mode: bool) -> bool:
+        """Background class for the daytime reserve.
+
+        Priority below the threshold — or, only with ``kanban.weighted_slots``
+        on, any goal-mode controller — closes the prior priority-20 bypass.
+        With the flag off this is exactly the pre-M3 priority-only
+        classification, so no existing reserve behaviour changes.
+        """
+        if reserve_cfg is None:
+            return False
+        return (
+            row_priority < reserve_cfg["priority_below"]
+            or (weighted and row_goal_mode)
+        )
+
+    # M3: the reserve ceiling is derived from the EFFECTIVE host cap when
+    # weighted accounting is on (``bg_limit = effective_max_in_progress -
+    # reserve_slots`` — the M2 adaptive automaton's cap when kanban.adaptive
+    # is enabled, the static base otherwise) and the census counts weighted
+    # background slots. With the flag off the ceiling comes from the static
+    # base exactly as pre-M3.
+    reserve_base = effective_max_in_progress if weighted else max_in_progress
+    if (
+        reserve_cfg is not None
+        and isinstance(reserve_base, int)
+        and reserve_base > 0
+    ):
+        _reserve_limit = reserve_base - reserve_cfg["slots"]
         if _reserve_limit > 0 and in_daytime_window(reserve_cfg):
             reserve_active = True
             reserve_bg_limit = _reserve_limit
-            reserve_bg_counter = count_running_background_tasks(
-                conn, board=board, priority_below=reserve_cfg["priority_below"],
+            reserve_bg_counter = count_running_background_slots(
+                conn, board=board,
+                priority_below=reserve_cfg["priority_below"],
+                weighted=weighted,
             )
 
     for row in ready_rows:
@@ -11626,6 +11896,10 @@ def _dispatch_once_locked(
             break
         row_assignee = row["assignee"]
         row_priority = int(row["priority"] or 0)
+        # M3: weighted-slot bookkeeping for this card (goal-mode controller =
+        # 0.5 when the flag is on, 1.0 otherwise).
+        row_goal_mode = bool(row["goal_mode"])
+        row_weight = _task_slot_weight(row_goal_mode, weighted)
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -11727,15 +12001,16 @@ def _dispatch_once_locked(
                     )
             continue
         # Daytime worker reserve (t_b12721ab): during the reserve window a
-        # background-class ready card (priority < threshold) may only spawn
+        # background-class ready card (priority < threshold, or — with
+        # weighted_slots on — any goal-mode controller) may only spawn
         # while the host-wide background counter is below the ceiling
-        # (max_in_progress - reserve_slots). Deferred cards stay in 'ready'
+        # (effective_max - reserve_slots). Deferred cards stay in 'ready'
         # and wait for a later tick — they are NOT operator-actionable
         # (distinct from skipped_unassigned / skipped_nonspawnable), so they
         # land in their own DispatchResult bucket.
         if (
             reserve_active
-            and row_priority < reserve_cfg["priority_below"]
+            and _is_reserve_background(row_priority, row_goal_mode)
             and reserve_bg_counter >= reserve_bg_limit
         ):
             result.reserved_by_daytime.append(row["id"])
@@ -11754,7 +12029,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
-            spawned += 1
+            spawned += row_weight
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -11766,8 +12041,8 @@ def _dispatch_once_locked(
             # Same for the daytime reserve: count would-be background spawns
             # so dry_run reflects the reserve ceiling on subsequent
             # iterations, not just the running backlog (t_b12721ab).
-            if reserve_active and row_priority < reserve_cfg["priority_below"]:
-                reserve_bg_counter += 1
+            if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
+                reserve_bg_counter += row_weight
             continue
         if not dry_run:
             # Defense-in-depth provider pre-flight: a card pinned to a route
@@ -11844,7 +12119,7 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
+            spawned += row_weight
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
@@ -11855,8 +12130,8 @@ def _dispatch_once_locked(
             # Daytime reserve: a background card just consumed one of the
             # reserved slots this tick — count it so a burst in a single
             # tick can't push background past the ceiling (t_b12721ab).
-            if reserve_active and row_priority < reserve_cfg["priority_below"]:
-                reserve_bg_counter += 1
+            if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
+                reserve_bg_counter += row_weight
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11889,6 +12164,9 @@ def _dispatch_once_locked(
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         row_priority = int(row["priority"] or 0)
+        # M3: weighted-slot bookkeeping for this review card (same as ready).
+        row_goal_mode = bool(row["goal_mode"])
+        row_weight = _task_slot_weight(row_goal_mode, weighted)
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -11922,7 +12200,7 @@ def _dispatch_once_locked(
         # ceiling, so it is bucketed like the ready lane, not as unassigned).
         if (
             reserve_active
-            and row_priority < reserve_cfg["priority_below"]
+            and _is_reserve_background(row_priority, row_goal_mode)
             and reserve_bg_counter >= reserve_bg_limit
         ):
             result.reserved_by_daytime.append(row["id"])
@@ -11941,13 +12219,13 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
-            spawned += 1
+            spawned += row_weight
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
-            if reserve_active and row_priority < reserve_cfg["priority_below"]:
-                reserve_bg_counter += 1
+            if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
+                reserve_bg_counter += row_weight
             continue
         if not dry_run:
             # Same provider pre-flight as the ready lane (see above): never
@@ -12014,13 +12292,13 @@ def _dispatch_once_locked(
                 conn, claimed, str(workspace), pid, board=board,
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
+            spawned += row_weight
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
-            if reserve_active and row_priority < reserve_cfg["priority_below"]:
-                reserve_bg_counter += 1
+            if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
+                reserve_bg_counter += row_weight
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
