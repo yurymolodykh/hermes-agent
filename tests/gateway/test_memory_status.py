@@ -47,13 +47,13 @@ class TestClassifyPressure:
         assert classify_pressure(32 * 1024, 8 * 1024 * 1024) == "critical"
 
     def test_low_fraction_is_critical(self) -> None:
-        # 300 MiB available of 8 GiB ≈ 3.7% < 5%.
+        # 300 MiB available of 8 GiB ≈ 3.7% < 10%.
         assert classify_pressure(300 * 1024, 8 * 1024 * 1024) == "critical"
 
     def test_elevated_band(self) -> None:
-        # 100 MiB available of 1 GiB ≈ 9.8% — above critical, below elevated
-        # thresholds (128 MiB / 15%).
-        assert classify_pressure(100 * 1024, 1024 * 1024) == "elevated"
+        # 150 MiB available of 1 GiB ≈ 14.6% — above critical (10%), below
+        # elevated thresholds (128 MiB / 20%).
+        assert classify_pressure(150 * 1024, 1024 * 1024) == "elevated"
 
     def test_missing_sample_is_unknown(self) -> None:
         assert classify_pressure(None, None) == "unknown"

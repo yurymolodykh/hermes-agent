@@ -10610,21 +10610,187 @@ DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 
-def _system_memory_sample() -> dict:
-    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
+def _unified_memory_sample(
+    *,
+    mem_total_kib: int,
+    mem_available_kib: int,
+    swap_total_kib: int,
+    swap_used_kib: int,
+) -> dict:
+    """Assemble one arm's raw KiB numbers into the unified sample format.
 
-    Delegates to :func:`gateway.lifecycle_ledger.sample_memory` (pure /proc
-    reads, Linux-only, never raises). Local import keeps ``kanban_db``
-    importable in stripped-down environments without the gateway package.
+    Every sampler arm returns this same shape so ``classify_pressure`` and
+    the dashboard consumer see identical keys regardless of which platform
+    served the numbers. Percentages are derived once here (available % of
+    RAM, swap used % of swap) to keep callers trivial.
+    """
+    out = {
+        "mem_total_kib": mem_total_kib,
+        "mem_available_kib": mem_available_kib,
+        "swap_total_kib": swap_total_kib,
+        "swap_used_kib": swap_used_kib,
+        "mem_total_gb": mem_total_kib / (1024 * 1024),
+        "mem_available_gb": mem_available_kib / (1024 * 1024),
+        "swap_total_gb": swap_total_kib / (1024 * 1024),
+        "swap_used_gb": swap_used_kib / (1024 * 1024),
+    }
+    if mem_total_kib > 0:
+        out["mem_available_pct"] = (
+            mem_available_kib / mem_total_kib
+        ) * 100.0
+    else:
+        out["mem_available_pct"] = None
+    if swap_total_kib > 0:
+        out["swap_used_pct"] = (swap_used_kib / swap_total_kib) * 100.0
+    else:
+        out["swap_used_pct"] = None
+    return out
+
+
+def _sample_via_psutil() -> Optional[dict]:
+    """(a) psutil arm. Returns the unified sample or ``None`` on any failure.
+
+    psutil is the preferred source when it is importable (it is present in
+    the bundled venv on this prod host): one call gives physical memory and
+    swap on both Windows and Linux without platform branching.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        if vm is None:
+            return None
+        total_kib = int(vm.total // 1024)
+        avail_kib = int(getattr(vm, "available", vm.total) // 1024)
+        swap_total_kib = int(getattr(sm, "total", 0) // 1024) if sm else 0
+        swap_used_kib = int(getattr(sm, "used", 0) // 1024) if sm else 0
+    except Exception:
+        return None
+    if total_kib <= 0:
+        return None
+    return _unified_memory_sample(
+        mem_total_kib=total_kib,
+        mem_available_kib=avail_kib,
+        swap_total_kib=swap_total_kib,
+        swap_used_kib=swap_used_kib,
+    )
+
+
+def _sample_via_windows_ctypes() -> Optional[dict]:
+    """(b) Windows ``ctypes`` arm — stdlib-only, no external dependency.
+
+    ``GlobalMemoryStatusEx`` returns physical RAM plus the page file (the
+    Windows analogue of Linux swap). ``ullTotalPageFile - ullAvailPageFile``
+    is the used swap. Returns ``None`` on non-Windows or any API failure so
+    the cascade falls through.
+    """
+    if os.name != "nt":  # pragma: no cover - Windows-only branch
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        global_memory_status_ex = kernel32.GlobalMemoryStatusEx
+        global_memory_status_ex.restype = wintypes.BOOL
+        global_memory_status_ex.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+
+        status = _MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if not global_memory_status_ex(ctypes.byref(status)):  # pragma: no cover
+            return None
+    except Exception:  # pragma: no cover - depends on host
+        return None
+    total_kib = int(status.ullTotalPhys // 1024)
+    avail_kib = int(status.ullAvailPhys // 1024)
+    swap_total_kib = int(status.ullTotalPageFile // 1024)
+    swap_used_kib = max(0, swap_total_kib - int(status.ullAvailPageFile // 1024))
+    if total_kib <= 0:
+        return None
+    return _unified_memory_sample(
+        mem_total_kib=total_kib,
+        mem_available_kib=avail_kib,
+        swap_total_kib=swap_total_kib,
+        swap_used_kib=swap_used_kib,
+    )
+
+
+def _sample_via_proc_meminfo() -> Optional[dict]:
+    """(c) Linux ``/proc/meminfo`` arm — the legacy behaviour, preserved.
+
+    Pure file read, never raises, returns ``None`` when the file is missing
+    or unusable (so the cascade continues or the whole sample degrades to
+    ``{}``).
+    """
+    try:
+        meminfo: dict[str, int] = {}
+        wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                key = line.split(":", 1)[0]
+                if key in wanted:
+                    meminfo[key] = int(line.split()[1])
+        total_kib = meminfo.get("MemTotal", 0)
+        if total_kib <= 0:
+            return None
+        avail_kib = meminfo.get("MemAvailable", total_kib)
+        swap_total_kib = meminfo.get("SwapTotal", 0)
+        swap_used_kib = max(
+            0, swap_total_kib - meminfo.get("SwapFree", swap_total_kib)
+        )
+    except Exception:
+        return None
+    return _unified_memory_sample(
+        mem_total_kib=total_kib,
+        mem_available_kib=avail_kib,
+        swap_total_kib=swap_total_kib,
+        swap_used_kib=swap_used_kib,
+    )
+
+
+def _system_memory_sample() -> dict:
+    """Best-effort cross-platform memory snapshot, ``{}`` when unknown.
+
+    Tries, in order: (a) psutil (when importable), (b) Windows
+    ``ctypes.GlobalMemoryStatusEx`` (stdlib, no dependencies),
+    (c) Linux ``/proc/meminfo`` (legacy behaviour). Each arm returns the
+    unified sample shape produced by :func:`_unified_memory_sample`
+    (KiB + GB values + derived percentages). When every arm is unavailable
+    or fails, returns ``{}`` so the dispatcher behaves exactly as it did
+    before this change (``unknown`` pressure, no spawn restriction).
+
     Module-level indirection is also the test seam — the shared conftest
     patches this to ``{}`` so suite results don't depend on the CI runner's
     live memory state.
     """
-    try:
-        from gateway.lifecycle_ledger import sample_memory
-        return sample_memory() or {}
-    except Exception:
-        return {}
+    for arm in (
+        _sample_via_psutil,
+        _sample_via_windows_ctypes,
+        _sample_via_proc_meminfo,
+    ):
+        try:
+            sample = arm()
+        except Exception:
+            continue
+        if sample:
+            return sample
+    return {}
 
 
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
@@ -10958,8 +11124,10 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     Reuses :func:`gateway.memory_status.classify_pressure` so the dispatcher's
     idea of "critical" matches the memory banner users see on the dashboard
     and the lifecycle ledger's OOM-suspicion heuristics (NS-608/NS-656).
-    ``unknown`` (non-Linux, read failure) imposes no restriction — the guard
-    must never brick dispatch on hosts where /proc isn't available.
+    Swap is passed through so the swap-aware thresholds apply — elevated when
+    swap usage exceeds 40%, critical when it exceeds 60% (M1).
+    ``unknown`` (no sampler available, read failure) imposes no restriction —
+    the guard must never brick dispatch on hosts where memory can't be read.
     """
     if sample is None:
         sample = _system_memory_sample()
@@ -10968,7 +11136,10 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     try:
         from gateway.memory_status import classify_pressure
         return classify_pressure(
-            sample.get("mem_available_kib"), sample.get("mem_total_kib")
+            sample.get("mem_available_kib"),
+            sample.get("mem_total_kib"),
+            swap_used_kib=sample.get("swap_used_kib"),
+            swap_total_kib=sample.get("swap_total_kib"),
         )
     except Exception:
         return "unknown"

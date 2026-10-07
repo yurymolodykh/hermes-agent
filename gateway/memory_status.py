@@ -42,16 +42,26 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Pressure thresholds on system MemAvailable.  ``critical`` deliberately
-# mirrors the lifecycle ledger's OOM-suspicion heuristics
+# Pressure thresholds on system MemAvailable.  The absolute KiB floors
+# deliberately mirror the lifecycle ledger's OOM-suspicion heuristics
 # (:data:`gateway.lifecycle_ledger._LOW_MEM_AVAILABLE_KIB` /
 # ``_LOW_MEM_AVAILABLE_FRACTION``): if a memory level would make a
 # subsequent unclean death "suspected OOM", the user should already have
 # been warned at that level while the process was still alive.
+# The fraction thresholds are unified with the worker-limit dashboard
+# (M1): critical below 10% of MemTotal, elevated below 20%.
 _CRITICAL_AVAILABLE_KIB = 64 * 1024  # < 64 MiB available
-_CRITICAL_AVAILABLE_FRACTION = 0.05  # < 5% of MemTotal
+_CRITICAL_AVAILABLE_FRACTION = 0.10  # < 10% of MemTotal
 _ELEVATED_AVAILABLE_KIB = 128 * 1024  # < 128 MiB available
-_ELEVATED_AVAILABLE_FRACTION = 0.15  # < 15% of MemTotal
+_ELEVATED_AVAILABLE_FRACTION = 0.20  # < 20% of MemTotal
+
+# Swap-pressure thresholds (M1, worker-limit mission): swap is a second
+# independent pressure signal.  A host can sit at 75% RAM available yet
+# thrash on a swap file that is nearly full, so swap can raise the pressure
+# class on its own.  Strictly-greater comparisons: 40% used is still ok,
+# 60% used is elevated (not yet critical).
+_ELEVATED_SWAP_FRACTION = 0.40  # > 40% of swap used
+_CRITICAL_SWAP_FRACTION = 0.60  # > 60% of swap used
 
 # A heartbeat older than this no longer describes the present.  The writer
 # cadence is 30s (DEFAULT_HEARTBEAT_INTERVAL_S); 150s of slack tolerates a
@@ -81,12 +91,23 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 
 
 def classify_pressure(
-    available_kib: Any, total_kib: Any
+    available_kib: Any,
+    total_kib: Any,
+    swap_used_kib: Any = None,
+    swap_total_kib: Any = None,
 ) -> str:
-    """Map a MemAvailable/MemTotal pair to ``ok``/``elevated``/``critical``.
+    """Map memory + swap to ``ok``/``elevated``/``critical``.
 
     ``unknown`` when the sample is missing or malformed — the caller must
     not treat "we could not read it" as "memory is fine".
+
+    Available-memory thresholds (absolute KiB floors + fractions, aligned
+    with the worker-limit dashboard at 10% critical / 20% elevated) are the
+    primary pressure signal; ``swap_used_kib``/``swap_total_kib`` add a
+    second, independent pressure signal (M1): swap usage strictly above 40%
+    forces ``elevated``, strictly above 60% forces ``critical``, regardless
+    of how much RAM is free.  Swap contributes nothing when its total is
+    missing or zero.
     """
     if (
         isinstance(available_kib, bool)
@@ -101,12 +122,32 @@ def classify_pressure(
         and total_kib > 0
     ):
         fraction = available_kib / total_kib
-    if available_kib < _CRITICAL_AVAILABLE_KIB or (
-        fraction is not None and fraction < _CRITICAL_AVAILABLE_FRACTION
+    swap_fraction: Optional[float] = None
+    if (
+        not isinstance(swap_used_kib, bool)
+        and isinstance(swap_used_kib, int)
+        and swap_used_kib >= 0
+        and not isinstance(swap_total_kib, bool)
+        and isinstance(swap_total_kib, int)
+        and swap_total_kib > 0
+    ):
+        swap_fraction = swap_used_kib / swap_total_kib
+    if (
+        available_kib < _CRITICAL_AVAILABLE_KIB
+        or (fraction is not None and fraction < _CRITICAL_AVAILABLE_FRACTION)
+        or (
+            swap_fraction is not None
+            and swap_fraction > _CRITICAL_SWAP_FRACTION
+        )
     ):
         return "critical"
-    if available_kib < _ELEVATED_AVAILABLE_KIB or (
-        fraction is not None and fraction < _ELEVATED_AVAILABLE_FRACTION
+    if (
+        available_kib < _ELEVATED_AVAILABLE_KIB
+        or (fraction is not None and fraction < _ELEVATED_AVAILABLE_FRACTION)
+        or (
+            swap_fraction is not None
+            and swap_fraction > _ELEVATED_SWAP_FRACTION
+        )
     ):
         return "elevated"
     return "ok"

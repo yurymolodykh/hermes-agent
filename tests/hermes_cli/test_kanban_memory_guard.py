@@ -99,7 +99,8 @@ def test_pressure_level_unknown_on_empty_sample(monkeypatch):
 def test_pressure_level_classifies_via_gateway_thresholds():
     ok = {"mem_available_kib": GIB // 2, "mem_total_kib": 1 * GIB}
     critical = {"mem_available_kib": 32 * 1024, "mem_total_kib": 1 * GIB}
-    elevated = {"mem_available_kib": 100 * 1024, "mem_total_kib": 1 * GIB}
+    # 150 MiB of 1 GiB ≈ 14.6% — between critical (10%) and elevated (20%).
+    elevated = {"mem_available_kib": 150 * 1024, "mem_total_kib": 1 * GIB}
     assert kb._memory_pressure_level(ok) == "ok"
     assert kb._memory_pressure_level(critical) == "critical"
     assert kb._memory_pressure_level(elevated) == "elevated"
@@ -115,7 +116,9 @@ def _pressure_sample(level: str) -> dict:
     if level == "critical":
         return {"mem_available_kib": 32 * 1024, "mem_total_kib": total}
     if level == "elevated":
-        return {"mem_available_kib": 100 * 1024, "mem_total_kib": total}
+        # 150 MiB of 1 GiB ≈ 14.6% — elevated (not critical) under unified
+        # 20%/10% thresholds.
+        return {"mem_available_kib": 150 * 1024, "mem_total_kib": total}
     return {"mem_available_kib": total // 2, "mem_total_kib": total}
 
 
