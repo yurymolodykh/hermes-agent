@@ -11350,9 +11350,10 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 
     Reuses :func:`gateway.memory_status.classify_pressure` so the dispatcher's
     idea of "critical" matches the memory banner users see on the dashboard
-    and the lifecycle ledger's OOM-suspicion heuristics (NS-608/NS-656).
-    Swap is passed through so the swap-aware thresholds apply — elevated when
-    swap usage exceeds 40%, critical when it exceeds 60% (M1).
+    (NS-608/NS-656). v2 thresholds (owner directive 08.10): available-bytes
+    only — elevated when available < 2.4 GiB, critical when < 1 GiB; swap
+    and MemTotal fractions no longer influence the class (passed through
+    for signature compatibility, ignored by the classifier).
     ``unknown`` (no sampler available, read failure) imposes no restriction —
     the guard must never brick dispatch on hosts where memory can't be read.
     """

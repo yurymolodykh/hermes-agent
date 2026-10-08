@@ -1,6 +1,6 @@
-"""Cross-platform kanban memory sampler + swap-aware pressure classification (M1).
+"""Cross-platform kanban memory sampler + v2 pressure classification.
 
-Covers the M1 slice of the worker-limit mission (t_45f7c356):
+Covers the K1 sampler and the v2 thresholds (owner directive 08.10):
 
 1. :func:`hermes_cli.kanban_db._system_memory_sample` — cascade sampler:
    psutil (when importable) -> Windows ``ctypes`` GlobalMemoryStatusEx
@@ -9,11 +9,11 @@ Covers the M1 slice of the worker-limit mission (t_45f7c356):
    Fail-safe: when every arm is unavailable the function returns ``{}`` and
    the dispatcher behaves exactly as before the change (``unknown``, no
    spawn restriction).
-2. Swap-aware :func:`gateway.memory_status.classify_pressure` — elevated
-   when avail < 20% OR swap_used > 40%; critical when avail < 10% OR
-   swap_used > 60%.  Available-memory thresholds stay in the same shape
-   (absolute KiB floors + fractions, now aligned with the worker-limit
-   dashboard at 20%/10%) so the dashboard banner does not regress.
+2. v2 :func:`gateway.memory_status.classify_pressure` — elevated when
+   available < 2_592_215_552 bytes (2.4 GiB), critical when available <
+   1_073_741_824 bytes (1 GiB). Absolute available bytes ONLY: swap usage
+   and MemTotal fractions are retired as triggers (dynamically managed
+   swap percentages carry no signal on this host).
 """
 
 from __future__ import annotations
@@ -154,28 +154,28 @@ def test_cascade_unknown_when_every_arm_empty(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _memory_pressure_level: swap aware
+# _memory_pressure_level: v2 available-bytes thresholds (swap ignored)
 # ---------------------------------------------------------------------------
 
 
-def test_pressure_level_elevated_by_swap_with_plenty_available():
-    """avail ok but swap_used > 40% -> elevated."""
-    sample = {
-        "mem_total_kib": 8 * GIB,
-        "mem_available_kib": 6 * GIB,  # 75% available — not the trigger
-        "swap_total_kib": 10 * GIB,
-        "swap_used_kib": 5 * GIB,  # 50% used — swap is the trigger
-    }
-    assert kb._memory_pressure_level(sample) == "elevated"
-
-
-def test_pressure_level_critical_by_swap():
-    """avail ok but swap_used > 60% -> critical."""
+def test_pressure_level_ok_with_half_swap_used():
+    """v2: 6 GiB avail, 50% swap used -> swap ignored, level ok."""
     sample = {
         "mem_total_kib": 8 * GIB,
         "mem_available_kib": 6 * GIB,
         "swap_total_kib": 10 * GIB,
-        "swap_used_kib": 7 * GIB,  # 70% used
+        "swap_used_kib": 5 * GIB,  # 50% used — was an elevated trigger in v1
+    }
+    assert kb._memory_pressure_level(sample) == "ok"
+
+
+def test_pressure_level_critical_by_available_with_high_swap():
+    """v2: 512 MiB avail -> critical regardless of swap (70% used)."""
+    sample = {
+        "mem_total_kib": 8 * GIB,
+        "mem_available_kib": 512 * 1024,
+        "swap_total_kib": 10 * GIB,
+        "swap_used_kib": 7 * GIB,  # 70% used — irrelevant now
     }
     assert kb._memory_pressure_level(sample) == "critical"
 
@@ -192,85 +192,61 @@ def test_pressure_level_ok_with_low_swap():
 
 
 # ---------------------------------------------------------------------------
-# classify_pressure swap thresholds (incl. boundaries)
+# classify_pressure v2 absolute-bytes thresholds (incl. boundaries)
 # ---------------------------------------------------------------------------
 
 
-class TestClassifyPressureSwap:
-    def test_elevated_swap_boundary_exclusive(self) -> None:
-        # 40% swap used is NOT elevated (strictly greater than 40%).
+class TestClassifyPressureV2:
+    def test_exact_2_4_gib_boundary_is_ok(self) -> None:
+        # 2_531_461 KiB = 2_592_221_184 bytes >= 2_592_215_552 -> ok.
+        assert classify_pressure(2_531_461, 24 * GIB) == "ok"
+
+    def test_just_below_2_4_gib_is_elevated(self) -> None:
+        # 2_531_460 KiB = 2_592_150_528 bytes < 2_592_215_552 -> elevated.
+        assert classify_pressure(2_531_460, 24 * GIB) == "elevated"
+
+    def test_elevated_band_sample(self) -> None:
+        # 1.5 GiB available — inside (1 GiB, 2.4 GiB).
+        assert classify_pressure(int(1.5 * GIB), 24 * GIB) == "elevated"
+
+    def test_exact_one_gib_is_elevated_not_critical(self) -> None:
+        # critical is strictly below 1 GiB; exactly 1 GiB is elevated.
+        assert classify_pressure(1 * GIB, 24 * GIB) == "elevated"
+
+    def test_just_below_one_gib_is_critical(self) -> None:
+        # 1 GiB minus 1 KiB — the last KiB sample strictly below 1 GiB.
+        assert classify_pressure(1 * GIB - 1, 24 * GIB) == "critical"
+
+    def test_deep_critical_sample(self) -> None:
+        # 300 MiB available — far below the 1 GiB line.
+        assert classify_pressure(300 * 1024, 24 * GIB) == "critical"
+
+    def test_swap_fully_retired_high_swap_keeps_ok(self) -> None:
+        # 8 GiB available of 16 GiB, 50% swap used — v1 said elevated
+        # (swap trigger), v2 says ok.
         assert (
             classify_pressure(
-                8 * GIB, 16 * GIB, swap_used_kib=4 * GIB, swap_total_kib=10 * GIB
+                8 * GIB, 16 * GIB, swap_used_kib=5 * GIB, swap_total_kib=10 * GIB
             )
             == "ok"
         )
 
-    def test_elevated_swap_above_40(self) -> None:
+    def test_swap_fully_retired_70pct_swap_keeps_ok(self) -> None:
+        # v1 critical via swap (70% > 60%); v2 ok — 6 GiB avail.
         assert (
             classify_pressure(
-                8 * GIB,
-                16 * GIB,
-                swap_used_kib=5 * GIB,
-                swap_total_kib=10 * GIB,
-            )
-            == "elevated"
-        )
-
-    def test_critical_swap_boundary_exclusive(self) -> None:
-        # 60% swap used is elevated, not critical.
-        assert (
-            classify_pressure(
-                8 * GIB,
-                16 * GIB,
-                swap_used_kib=6 * GIB,
-                swap_total_kib=10 * GIB,
-            )
-            == "elevated"
-        )
-
-    def test_critical_swap_above_60(self) -> None:
-        assert (
-            classify_pressure(
-                8 * GIB,
-                16 * GIB,
-                swap_used_kib=7 * GIB,
-                swap_total_kib=10 * GIB,
-            )
-            == "critical"
-        )
-
-    def test_swap_ignored_when_total_unknown(self) -> None:
-        # No swap_total -> swap cannot contribute; avail keeps it ok.
-        assert (
-            classify_pressure(
-                8 * GIB, 16 * GIB, swap_used_kib=9 * GIB, swap_total_kib=None
+                6 * GIB, 16 * GIB, swap_used_kib=7 * GIB, swap_total_kib=10 * GIB
             )
             == "ok"
         )
 
-    def test_swap_ignored_when_total_zero(self) -> None:
-        assert (
-            classify_pressure(
-                8 * GIB, 16 * GIB, swap_used_kib=0, swap_total_kib=0
-            )
-            == "ok"
-        )
+    def test_no_total_still_classifies_by_absolute_bytes(self) -> None:
+        # total unknown: 512 MiB available is still critical; 2 GiB is
+        # elevated; 4 GiB is ok.
+        assert classify_pressure(512 * 1024, None) == "critical"
+        assert classify_pressure(2 * GIB, None) == "elevated"
+        assert classify_pressure(4 * GIB, None) == "ok"
 
-    def test_swap_can_elevate_without_available_fraction(self) -> None:
-        # total available unknown but swap high -> still classified.
-        assert (
-            classify_pressure(
-                8 * GIB, None, swap_used_kib=5 * GIB, swap_total_kib=10 * GIB
-            )
-            == "elevated"
-        )
-
-    def test_existing_available_thresholds_still_apply(self) -> None:
-        # Regression: absolute KiB floors + unified 20%/10% fractions.
-        assert classify_pressure(32 * 1024, 8 * GIB) == "critical"
-        assert classify_pressure(300 * 1024, 8 * GIB) == "critical"
-        # 150 MiB of 1 GiB ≈ 14.6% — between critical (10%) and elevated (20%).
-        assert classify_pressure(150 * 1024, 1 * GIB) == "elevated"
-        assert classify_pressure(GIB, 2 * GIB) == "ok"
+    def test_malformed_sample_is_unknown(self) -> None:
         assert classify_pressure(None, None) == "unknown"
+        assert classify_pressure(True, 2048 * 1024) == "unknown"

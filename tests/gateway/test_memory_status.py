@@ -38,22 +38,65 @@ def _write_sentinel(home: Path, payload: dict) -> None:
 
 
 class TestClassifyPressure:
+    """v2 thresholds (owner directive 08.10): absolute available bytes only.
+
+    elevated: available < 2_592_215_552 bytes (2.4 GiB);
+    critical: available < 1_073_741_824 bytes (1 GiB);
+    swap and MemTotal fractions are NOT triggers any more.
+    """
+
     def test_plentiful_memory_is_ok(self) -> None:
-        # 1 GiB available of 2 GiB total.
-        assert classify_pressure(1024 * 1024, 2048 * 1024) == "ok"
+        # 4 GiB available of 8 GiB total — far above the 2.4 GiB line.
+        assert classify_pressure(4 * 1024 * 1024, 8 * 1024 * 1024) == "ok"
 
-    def test_low_absolute_available_is_critical(self) -> None:
-        # 32 MiB available — below the 64 MiB floor regardless of total.
-        assert classify_pressure(32 * 1024, 8 * 1024 * 1024) == "critical"
+    def test_exact_2_4_gib_boundary_is_ok(self) -> None:
+        # 2_531_461 KiB = 2_592_221_184 bytes — the first KiB sample at or
+        # above the 2.4 GiB threshold (2_592_215_552 bytes): ok.
+        assert classify_pressure(2_531_461, 8 * 1024 * 1024) == "ok"
 
-    def test_low_fraction_is_critical(self) -> None:
-        # 300 MiB available of 8 GiB ≈ 3.7% < 10%.
-        assert classify_pressure(300 * 1024, 8 * 1024 * 1024) == "critical"
+    def test_just_below_2_4_gib_is_elevated(self) -> None:
+        # 2_531_460 KiB = 2_592_150_528 bytes — the last KiB sample strictly
+        # below the 2.4 GiB threshold: elevated.
+        assert classify_pressure(2_531_460, 8 * 1024 * 1024) == "elevated"
 
-    def test_elevated_band(self) -> None:
-        # 150 MiB available of 1 GiB ≈ 14.6% — above critical (10%), below
-        # elevated thresholds (128 MiB / 20%).
-        assert classify_pressure(150 * 1024, 1024 * 1024) == "elevated"
+    def test_exact_one_gib_is_not_critical(self) -> None:
+        # Exactly 1 GiB available: critical is strictly-less-than, so this
+        # lands in the elevated band (1 GiB <= avail < 2.4 GiB).
+        assert classify_pressure(1024 * 1024, 2 * 1024 * 1024) == "elevated"
+
+    def test_just_below_one_gib_is_critical(self) -> None:
+        # 1 GiB minus 1 KiB — the last sample strictly below 1 GiB.
+        assert (
+            classify_pressure(1024 * 1024 - 1, 8 * 1024 * 1024) == "critical"
+        )
+
+    def test_absolute_bytes_work_without_total(self) -> None:
+        # total is ignored: 512 MiB available is critical with any total.
+        assert classify_pressure(512 * 1024, None) == "critical"
+        # 2 GiB available, unknown total: above 2.4 GiB? No — elevated.
+        assert classify_pressure(2 * 1024 * 1024, None) == "elevated"
+
+    def test_swap_no_longer_raises_pressure(self) -> None:
+        # v2: swap fully retired as a trigger. 70% swap used with 6 GiB
+        # available stays ok; 95% swap used likewise.
+        assert (
+            classify_pressure(
+                6 * 1024 * 1024,
+                8 * 1024 * 1024,
+                swap_used_kib=7 * 1024 * 1024,
+                swap_total_kib=10 * 1024 * 1024,
+            )
+            == "ok"
+        )
+        assert (
+            classify_pressure(
+                3 * 1024 * 1024,
+                8 * 1024 * 1024,
+                swap_used_kib=19 * 1024 * 1024,
+                swap_total_kib=20 * 1024 * 1024,
+            )
+            == "ok"
+        )
 
     def test_missing_sample_is_unknown(self) -> None:
         assert classify_pressure(None, None) == "unknown"
@@ -61,11 +104,6 @@ class TestClassifyPressure:
     def test_bool_is_not_an_int(self) -> None:
         # True == 1 in Python — must not classify as "1 KiB available".
         assert classify_pressure(True, 2048 * 1024) == "unknown"
-
-    def test_absolute_floor_works_without_total(self) -> None:
-        assert classify_pressure(32 * 1024, None) == "critical"
-        # 1 GiB available, unknown total: passes both absolute floors → ok.
-        assert classify_pressure(1024 * 1024, None) == "ok"
 
 
 class TestCollectMemoryStatus:

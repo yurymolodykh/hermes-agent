@@ -54,14 +54,14 @@ GIB = 1024 * 1024  # KiB per GiB
 
 
 def _pressure_sample(level: str) -> dict:
-    total = 1 * GIB
+    # v2 thresholds (owner directive 08.10): critical < 1 GiB available,
+    # elevated < 2.4 GiB, ok above — swap is not a trigger.
+    total = 8 * GIB
     if level == "critical":
-        return {"mem_available_kib": 32 * 1024, "mem_total_kib": total}
+        return {"mem_available_kib": 512 * 1024, "mem_total_kib": total}
     if level == "elevated":
-        # 150 MiB of 1 GiB ~= 14.6% — elevated (not critical) under the
-        # unified 20%/10% thresholds.
-        return {"mem_available_kib": 150 * 1024, "mem_total_kib": total}
-    return {"mem_available_kib": total // 2, "mem_total_kib": total}
+        return {"mem_available_kib": int(1.5 * GIB), "mem_total_kib": total}
+    return {"mem_available_kib": 6 * GIB, "mem_total_kib": total}
 
 
 @pytest.fixture

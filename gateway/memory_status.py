@@ -42,26 +42,19 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Pressure thresholds on system MemAvailable.  The absolute KiB floors
-# deliberately mirror the lifecycle ledger's OOM-suspicion heuristics
-# (:data:`gateway.lifecycle_ledger._LOW_MEM_AVAILABLE_KIB` /
-# ``_LOW_MEM_AVAILABLE_FRACTION``): if a memory level would make a
-# subsequent unclean death "suspected OOM", the user should already have
-# been warned at that level while the process was still alive.
-# The fraction thresholds are unified with the worker-limit dashboard
-# (M1): critical below 10% of MemTotal, elevated below 20%.
-_CRITICAL_AVAILABLE_KIB = 64 * 1024  # < 64 MiB available
-_CRITICAL_AVAILABLE_FRACTION = 0.10  # < 10% of MemTotal
-_ELEVATED_AVAILABLE_KIB = 128 * 1024  # < 128 MiB available
-_ELEVATED_AVAILABLE_FRACTION = 0.20  # < 20% of MemTotal
-
-# Swap-pressure thresholds (M1, worker-limit mission): swap is a second
-# independent pressure signal.  A host can sit at 75% RAM available yet
-# thrash on a swap file that is nearly full, so swap can raise the pressure
-# class on its own.  Strictly-greater comparisons: 40% used is still ok,
-# 60% used is elevated (not yet critical).
-_ELEVATED_SWAP_FRACTION = 0.40  # > 40% of swap used
-_CRITICAL_SWAP_FRACTION = 0.60  # > 60% of swap used
+# Pressure thresholds on system MemAvailable (owner directive 08.10, v2):
+# classify STRICTLY on absolute available bytes — elevated when the host has
+# less than 2.4 GiB available, critical when it has less than 1 GiB. The
+# former fraction floors (20%/10% of MemTotal) and the swap signals are
+# RETIRED as triggers: on this host the swap file is dynamically managed
+# (AutomaticManagedPagefile, ~25.6 GiB backing on 24 GiB RAM) so swap
+# percentages carry no signal, and percentage thresholds fired far from
+# real need. ``available_pct`` stays a dashboard indicator, not a trigger.
+# The bytes thresholds are exact integers: 2.4 GiB = 2_592_215_552 bytes
+# (2_531_460.5 KiB — deliberately compared in bytes, not KiB, so the
+# boundary is exact), 1 GiB = 1_073_741_824 bytes.
+_ELEVATED_AVAILABLE_BYTES = 2_592_215_552  # < 2.4 GiB available
+_CRITICAL_AVAILABLE_BYTES = 1_073_741_824  # < 1 GiB available
 
 # A heartbeat older than this no longer describes the present.  The writer
 # cadence is 30s (DEFAULT_HEARTBEAT_INTERVAL_S); 150s of slack tolerates a
@@ -96,18 +89,19 @@ def classify_pressure(
     swap_used_kib: Any = None,
     swap_total_kib: Any = None,
 ) -> str:
-    """Map memory + swap to ``ok``/``elevated``/``critical``.
+    """Map available memory to ``ok``/``elevated``/``critical``.
 
     ``unknown`` when the sample is missing or malformed — the caller must
     not treat "we could not read it" as "memory is fine".
 
-    Available-memory thresholds (absolute KiB floors + fractions, aligned
-    with the worker-limit dashboard at 10% critical / 20% elevated) are the
-    primary pressure signal; ``swap_used_kib``/``swap_total_kib`` add a
-    second, independent pressure signal (M1): swap usage strictly above 40%
-    forces ``elevated``, strictly above 60% forces ``critical``, regardless
-    of how much RAM is free.  Swap contributes nothing when its total is
-    missing or zero.
+    v2 (owner directive 08.10): classification uses ONLY absolute available
+    bytes — ``critical`` when available < 1 GiB, ``elevated`` when
+    available < 2.4 GiB, ``ok`` otherwise. Fractions of MemTotal and swap
+    usage are no longer triggers (dynamically managed swap percentages
+    carry no signal; see the constants above). ``total_kib`` is accepted
+    for signature compatibility but ignored; ``swap_used_kib`` /
+    ``swap_total_kib`` are likewise accepted and ignored — callers keep
+    passing them so no call site changes.
     """
     if (
         isinstance(available_kib, bool)
@@ -115,40 +109,10 @@ def classify_pressure(
         or available_kib < 0
     ):
         return "unknown"
-    fraction: Optional[float] = None
-    if (
-        not isinstance(total_kib, bool)
-        and isinstance(total_kib, int)
-        and total_kib > 0
-    ):
-        fraction = available_kib / total_kib
-    swap_fraction: Optional[float] = None
-    if (
-        not isinstance(swap_used_kib, bool)
-        and isinstance(swap_used_kib, int)
-        and swap_used_kib >= 0
-        and not isinstance(swap_total_kib, bool)
-        and isinstance(swap_total_kib, int)
-        and swap_total_kib > 0
-    ):
-        swap_fraction = swap_used_kib / swap_total_kib
-    if (
-        available_kib < _CRITICAL_AVAILABLE_KIB
-        or (fraction is not None and fraction < _CRITICAL_AVAILABLE_FRACTION)
-        or (
-            swap_fraction is not None
-            and swap_fraction > _CRITICAL_SWAP_FRACTION
-        )
-    ):
+    available_bytes = available_kib * 1024
+    if available_bytes < _CRITICAL_AVAILABLE_BYTES:
         return "critical"
-    if (
-        available_kib < _ELEVATED_AVAILABLE_KIB
-        or (fraction is not None and fraction < _ELEVATED_AVAILABLE_FRACTION)
-        or (
-            swap_fraction is not None
-            and swap_fraction > _ELEVATED_SWAP_FRACTION
-        )
-    ):
+    if available_bytes < _ELEVATED_AVAILABLE_BYTES:
         return "elevated"
     return "ok"
 

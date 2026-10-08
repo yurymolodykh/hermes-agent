@@ -97,10 +97,11 @@ def test_pressure_level_unknown_on_empty_sample(monkeypatch):
 
 
 def test_pressure_level_classifies_via_gateway_thresholds():
-    ok = {"mem_available_kib": GIB // 2, "mem_total_kib": 1 * GIB}
-    critical = {"mem_available_kib": 32 * 1024, "mem_total_kib": 1 * GIB}
-    # 150 MiB of 1 GiB ≈ 14.6% — between critical (10%) and elevated (20%).
-    elevated = {"mem_available_kib": 150 * 1024, "mem_total_kib": 1 * GIB}
+    # v2: absolute available bytes — ok >= 2.4 GiB, elevated in
+    # [1 GiB, 2.4 GiB), critical < 1 GiB; total/swap do not matter.
+    ok = {"mem_available_kib": 6 * GIB, "mem_total_kib": 8 * GIB}
+    critical = {"mem_available_kib": 512 * 1024, "mem_total_kib": 8 * GIB}
+    elevated = {"mem_available_kib": int(1.5 * GIB), "mem_total_kib": 8 * GIB}
     assert kb._memory_pressure_level(ok) == "ok"
     assert kb._memory_pressure_level(critical) == "critical"
     assert kb._memory_pressure_level(elevated) == "elevated"
@@ -111,15 +112,35 @@ def test_pressure_level_classifies_via_gateway_thresholds():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def bypass_model_route(monkeypatch):
+    """Hermetic dispatch path under the host's runtime MODEL_LOCK config.
+
+    Same stub as the weighted-slots suite: ``resolve_task_root_route`` and
+    the respawn cooldown are unrelated to the memory guard, so pin a
+    concrete route so unpinned synthetic tasks reach the spawn path
+    instead of ``auto_blocked`` (the global runtime-model-lock plugin
+    would otherwise block tasks with no provider/model route).
+    """
+    monkeypatch.setattr(
+        kb,
+        "resolve_task_root_route",
+        lambda conn, tid, persist=False, allow_unpinned=False: (
+            (tid,), "prof", "prof-model"
+        ),
+    )
+    monkeypatch.setattr(kb, "check_respawn_guard", lambda conn, tid: None)
+
+
 def _pressure_sample(level: str) -> dict:
-    total = 1 * GIB
+    # v2 thresholds (owner directive 08.10): critical < 1 GiB available,
+    # elevated < 2.4 GiB, ok above — swap is not a trigger.
+    total = 8 * GIB
     if level == "critical":
-        return {"mem_available_kib": 32 * 1024, "mem_total_kib": total}
+        return {"mem_available_kib": 512 * 1024, "mem_total_kib": total}
     if level == "elevated":
-        # 150 MiB of 1 GiB ≈ 14.6% — elevated (not critical) under unified
-        # 20%/10% thresholds.
-        return {"mem_available_kib": 150 * 1024, "mem_total_kib": total}
-    return {"mem_available_kib": total // 2, "mem_total_kib": total}
+        return {"mem_available_kib": int(1.5 * GIB), "mem_total_kib": total}
+    return {"mem_available_kib": 6 * GIB, "mem_total_kib": total}
 
 
 def test_dispatch_spawns_nothing_under_critical_pressure(
@@ -145,7 +166,7 @@ def test_dispatch_spawns_nothing_under_critical_pressure(
 
 
 def test_dispatch_critical_pressure_defers_not_drops(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, monkeypatch, bypass_model_route,
 ):
     """Tasks skipped under pressure stay 'ready' and spawn once memory clears."""
     sample = {"value": _pressure_sample("critical")}
@@ -171,7 +192,7 @@ def test_dispatch_critical_pressure_defers_not_drops(
 
 
 def test_dispatch_elevated_pressure_spawns_at_most_one(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, monkeypatch, bypass_model_route,
 ):
     monkeypatch.setattr(
         kb, "_system_memory_sample", lambda: _pressure_sample("elevated")
@@ -215,7 +236,7 @@ def test_dispatch_elevated_pressure_does_not_widen_tighter_budget(
 
 
 def test_dispatch_unknown_pressure_imposes_no_restriction(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, monkeypatch, bypass_model_route,
 ):
     monkeypatch.setattr(kb, "_system_memory_sample", lambda: {})
     spawns = []
