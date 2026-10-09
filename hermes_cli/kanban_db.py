@@ -3969,12 +3969,29 @@ def create_task(
                         provider_override,
                         model_override,
                     ) != (expected_provider, expected_model):
-                        raise ValueError(
-                            "MODEL_LOCK lineage conflict: "
-                            f"root task(s) {','.join(root_ids)} expected "
-                            f"{expected_provider}/{expected_model}, actual "
-                            f"{provider_override}/{model_override}"
-                        )
+                        # MODEL_LOCK fail-closed applies to genuine lineage
+                        # conflicts. t_f2341b7a relaxation: when the inherited
+                        # lineage route cannot run in the ASSIGNEE profile (e.g.
+                        # deepseek-kb pinned by the orchestrator, assignee only
+                        # has letovo), the assignee's explicit route is
+                        # authoritative — allow re-create/reassign onto a route
+                        # the profile can actually run instead of bricking the
+                        # line. The strict conflict is kept when the inherited
+                        # route IS usable by the assignee.
+                        if _assignee_route_usable(
+                            assignee, expected_provider, expected_model
+                        ):
+                            raise ValueError(
+                                "MODEL_LOCK lineage conflict: "
+                                f"root task(s) {','.join(root_ids)} expected "
+                                f"{expected_provider}/{expected_model}, actual "
+                                f"{provider_override}/{model_override}"
+                            )
+                        # Relaxed: the inherited route cannot run in the
+                        # assignee profile; the caller's explicit route replaces
+                        # the inherited one. The child's immutable route becomes
+                        # the caller's, not the parent's.
+                        expected_provider, expected_model = provider_override, model_override
                     # Parent lineage, never the ambient caller, owns the child.
                     model_override = expected_model or None
                     provider_override = expected_provider or None
@@ -12105,6 +12122,140 @@ def _provider_route_blocker(
     return None
 
 
+def _assignee_home(assignee: str):
+    """Context manager: temporarily switch ``HERMES_HOME`` to the assignee
+    profile's env so *subsequent ``_provider_route_blocker`` / config reads*
+    resolve against that profile's config.yaml, not the dispatcher's host env.
+
+    ``_provider_route_blocker`` validates a route against the CURRENT process
+    ``HERMES_HOME`` (via ``get_config_path()`` / ``resolve_runtime_provider``).
+    The dispatcher host may have a provider the *assignee* profile does not —
+    that mismatch previously let the pre-flight pass and spawned a worker that
+    died on startup ("No API key found" -> exit 1, kanban t_2e74e975). Swapping
+    to the assignee home makes the check reflect what the worker will actually
+    see. The worker is spawned with ``HERMES_HOME=<assignee profile env>``
+    (see ``_default_spawn``), so this is the single source of truth.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        from hermes_cli.profiles import resolve_profile_env
+
+        prev = os.environ.get("HERMES_HOME")
+        try:
+            profile_home = resolve_profile_env(assignee)
+            os.environ["HERMES_HOME"] = profile_home
+            yield profile_home
+        finally:
+            if prev is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = prev
+
+    return _cm()
+
+
+def _assignee_profile_default_route(assignee: str) -> tuple[Optional[str], Optional[str]]:
+    """Return the assignee profile's configured default ``(provider, model)``,
+    or ``(None, None)`` when it has none / it cannot be read. Never raises on
+    a missing profile — callers that need to fail closed decide the meaning.
+    """
+    try:
+        with _assignee_home(assignee):
+            from hermes_cli.config import load_config_readonly
+
+            cfg = load_config_readonly() or {}
+            m = cfg.get("model") if isinstance(cfg, dict) else None
+            if not isinstance(m, dict):
+                return None, None
+            provider = str(m.get("provider") or "").strip() or None
+            default = str(m.get("default") or "").strip() or None
+            return provider, default
+    except Exception:
+        return None, None
+
+
+def _assignee_route_usable(assignee: str, provider: Optional[str], model: Optional[str]) -> bool:
+    """True when (provider, model) resolves to a usable route in the assignee
+    profile's own config context (not merely the dispatcher host's).``"""
+    if not provider or not model:
+        return False
+    try:
+        with _assignee_home(assignee):
+            return _provider_route_blocker(provider, model) is None
+    except Exception:
+        return False
+
+
+def resolve_assignee_spawn_route(
+    assignee: Optional[str],
+    card_provider: Optional[str],
+    card_model: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Decide the effective ``(provider, model)`` a worker for *assignee* spawns.
+
+    The card's resolved route (an explicit pin, or a route inherited from parent
+    lineage via ``resolve_task_root_route``) is only valid if it is *usable in
+    the assignee profile* — the dispatcher host and the assigned profile can
+    (and in the deepseek-kb incident did) disagree about which providers exist.
+
+    Returns ``(provider, model, note)``:
+      * usable card route            -> ``(card_provider, card_model, None)``
+      * card unpinned (no override)  -> ``(card_provider, card_model, None)``
+      * card route unusable in the assignee profile but its default IS usable
+                                     -> ``(None, None, note)``  — the overrides are
+                                        cleared so the worker falls back to the
+                                        assignee profile's default route instead
+                                        of crashing on startup.
+      * unusable card route AND no usable default -> raises ``ValueError`` with a
+        readable reason (fail-closed; the caller blocks the card with it).
+
+    This is the assignee-aware replacement for the host-scoped pre-flight in
+    the dispatch loop (``_provider_route_blocker`` alone validates against the
+    dispatcher host and lets the doomed worker crash). MODEL_LOCK lineage
+    integrity is untouched: a route that IS usable by the assignee keeps the
+    worker pinned to it.
+    """
+    if not assignee:
+        return (card_provider or "").strip() or None, (card_model or "").strip() or None, None
+    card_provider = (card_provider or "").strip() or None
+    card_model = (card_model or "").strip() or None
+    if not card_provider and not card_model:
+        # Nothing pinned -> worker boots on the assignee profile default; no
+        # route to validate and no fallback decision to make.
+        return None, None, None
+    block_reason = None
+    if card_provider and card_model:
+        with _assignee_home(assignee):
+            block_reason = _provider_route_blocker(card_provider, card_model)
+        if block_reason is None:
+            return card_provider, card_model, None
+    # Card is unpinned, or pinned but unusable in the assignee profile.
+    dp, dm = _assignee_profile_default_route(assignee)
+    if dp and dm:
+        with _assignee_home(assignee):
+            default_block = _provider_route_blocker(dp, dm)
+        if default_block is None:
+            return None, None, (
+                f"assignee profile {assignee!r} cannot run card route "
+                f"{card_provider}/{card_model or '(default)'}; falling back to "
+                f"assignee default {dp}/{dm}"
+            )
+        reason = (
+            f"card route {card_provider}/{card_model or '(default)'} is unusable "
+            f"in assignee profile {assignee!r}: {block_reason}; its default "
+            f"route {dp}/{dm} is also unusable: {default_block}"
+        )
+    else:
+        reason = (
+            f"card route {card_provider}/{card_model or '(default)'} is unusable "
+            f"in assignee profile {assignee!r}: {block_reason}; the assignee "
+            f"defines no default provider/model route"
+        )
+    raise ValueError(reason)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -12690,13 +12841,21 @@ def _dispatch_once_locked(
             # reach here; a bare/unresolvable provider is caught deterministically.
             row_model = (row["model_override"] or "").strip()
             row_provider = (row["provider_override"] or "").strip()
-            _provider_block = _provider_route_blocker(
-                row_provider or None, row_model or None,
-            )
-            if _provider_block:
+            # Assignee-aware provider pre-flight (t_f2341b7a): a card pinned to
+            # (or inheriting) a route that cannot run in the ASSIGNEE profile —
+            # not merely on the dispatcher host — used to spawn a worker that
+            # died on startup ("No API key found", exit 1) with no heartbeat.
+            # resolve_assignee_spawn_route falls back to the assignee's own
+            # default route when the card route is unusable there, and only
+            # raises (→ block) when the assignee has no usable route at all.
+            try:
+                resolve_assignee_spawn_route(
+                    row_assignee, row_provider or None, row_model or None,
+                )
+            except ValueError as _exc:
                 block_task(
                     conn, row["id"],
-                    reason=f"provider pre-flight blocked before spawn: {_provider_block}",
+                    reason=f"provider pre-flight blocked before spawn: {_exc}",
                     kind="capability",
                 )
                 result.auto_blocked.append(row["id"])
@@ -12863,17 +13022,19 @@ def _dispatch_once_locked(
                 reserve_bg_counter += row_weight
             continue
         if not dry_run:
-            # Same provider pre-flight as the ready lane (see above): never
-            # spawn a review worker pinned to an unresolvable provider route.
+            # Same assignee-aware provider pre-flight as the ready lane (see
+            # above): never spawn a review worker pinned to a route the
+            # assignee profile cannot run (t_f2341b7a).
             row_model = (row["model_override"] or "").strip()
             row_provider = (row["provider_override"] or "").strip()
-            _provider_block = _provider_route_blocker(
-                row_provider or None, row_model or None,
-            )
-            if _provider_block:
+            try:
+                resolve_assignee_spawn_route(
+                    row["assignee"], row_provider or None, row_model or None,
+                )
+            except ValueError as _exc:
                 block_task(
                     conn, row["id"],
-                    reason=f"provider pre-flight blocked before review spawn: {_provider_block}",
+                    reason=f"provider pre-flight blocked before review spawn: {_exc}",
                     kind="capability",
                 )
                 result.auto_blocked.append(row["id"])
@@ -13425,13 +13586,23 @@ def _default_spawn(
             if sk:
                 cmd.extend(["--skills", sk])
     if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+        row_provider = (task.provider_override or "").strip() or None
+        row_model = (task.model_override or "").strip() or None
+        if row_provider:
+            # Assignee-aware route resolution (t_f2341b7a): when the card's
+            # pinned/inherited route cannot run in the ASSIGNEE profile (the
+            # deepseek-kb incident), fall back to the assignee's own default
+            # route by clearing both overrides so the worker boots on its
+            # profile default instead of dying at startup with exit 1.
+            _eff_provider, _eff_model, _note = resolve_assignee_spawn_route(
+                profile_arg, row_provider, row_model,
+            )
+            if _eff_model:
+                cmd.extend(["-m", _eff_model])
+                cmd.extend(["--provider", _eff_provider])
+            # _eff_model None -> fallback to assignee default: omit both.
+        else:
+            cmd.extend(["-m", task.model_override])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
