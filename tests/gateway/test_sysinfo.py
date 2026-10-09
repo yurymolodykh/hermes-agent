@@ -69,12 +69,15 @@ class TestFormatLoadLine:
             "swap_gb": 37.0,
             "swap_total_gb": 71.6,
             "io_pct": 12.7,
+            "disk_free_pct": 19.6,
+            "disk_free_gb": 93.0,
+            "disk_total_gb": 475.1,
         })
-        assert line == "CPU: 97% · RAM: 96% (22.8/23.6 ГБ) · SWAP: 52% · IO: 13%"
+        assert line == "CPU: 97% · RAM: 96% (22.8/23.6 ГБ) · SWAP: 52% · IO: 13% · ДИСК: 20% свободно (93/475 ГБ)"
 
     def test_all_na(self):
         line = format_load_line({})
-        assert line == "CPU: н/д · RAM: н/д · SWAP: н/д · IO: н/д"
+        assert line == "CPU: н/д · RAM: н/д · SWAP: н/д · IO: н/д · ДИСК: н/д"
 
     def test_ram_no_gb_still_renders(self):
         line = format_load_line({"ram_pct": 50.0})
@@ -84,6 +87,11 @@ class TestFormatLoadLine:
         # Garbage types must degrade, never crash /status.
         line = format_load_line({"cpu_pct": "nope", "ram_pct": {}, "io_pct": []})
         assert "CPU: н/д" in line and "RAM: н/д" in line and "IO: н/д" in line
+
+    def test_disk_no_gb_still_renders_pct(self):
+        # When only the percent is available, render it without GB.
+        line = format_load_line({"disk_free_pct": 33.0})
+        assert "ДИСК: 33% свободно" in line and "ГБ" not in line
 
 
 class TestSnapshot:

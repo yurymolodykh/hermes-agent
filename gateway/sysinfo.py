@@ -32,8 +32,10 @@ Public API:
 
 * ``collect_load()`` -> ``dict`` with keys ``cpu_pct``, ``ram_pct``,
   ``ram_gb``, ``ram_total_gb``, ``swap_pct``, ``swap_gb``, ``swap_total_gb``,
-  ``io_pct``.  Percent fields are floats in ``[0, 100]`` or ``None``;
-  GB fields are rounded floats or ``None``.
+  ``io_pct``, ``disk_free_pct``, ``disk_free_gb``, ``disk_total_gb``.
+  Percent fields are floats in ``[0, 100]`` or ``None``; GB fields are rounded
+  floats or ``None``. ``disk_free_pct`` is the percent of the disk **free**
+  on the filesystem holding the Hermes home.
 * ``format_load_line(raw)`` -> the one-line ``/status`` block.
 * ``LoadSnapshot`` dataclass view (optional).
 """
@@ -76,6 +78,12 @@ class LoadSnapshot:
     swap_gb: Optional[float] = None
     swap_total_gb: Optional[float] = None
     io_pct: Optional[float] = None
+    # Disk free space (percent free + free/total GB) of the filesystem the
+    # Hermes home lives on. ``disk_free_pct`` in ``[0, 100]`` (percent FREE),
+    # ``disk_free_gb`` / ``disk_total_gb`` rounded gigabytes (or ``None``).
+    disk_free_pct: Optional[float] = None
+    disk_free_gb: Optional[float] = None
+    disk_total_gb: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -87,6 +95,9 @@ class LoadSnapshot:
             "swap_gb": self.swap_gb,
             "swap_total_gb": self.swap_total_gb,
             "io_pct": self.io_pct,
+            "disk_free_pct": self.disk_free_pct,
+            "disk_free_gb": self.disk_free_gb,
+            "disk_total_gb": self.disk_total_gb,
         }
 
 
@@ -517,9 +528,35 @@ def collect_load() -> Dict[str, Any]:
         ticker = _active_ticker()
         snap.cpu_pct = ticker.cpu_pct()
         snap.io_pct = ticker.io_pct()
+        _fill_disk_free(snap)
     except Exception as exc:  # never propagate -- /status must not crash
         logger.warning("collect_load failed: %s", exc)
     return asdict(snap)
+
+
+def _fill_disk_free(snap: LoadSnapshot) -> None:
+    """Populate ``disk_free_*`` on ``snap`` from the filesystem that holds the
+    Hermes home. Best-effort: any failure leaves the fields ``None``.
+
+    ``psutil`` (a hard project dependency) reports the usage of the mounted
+    volume containing the given path, so pointing at the Hermes home gives
+    the free space the operator actually cares about (the data/system disk).
+    """
+    try:
+        import psutil
+
+        home = os.environ.get("HERMES_HOME", "")
+        probe = home or os.path.expanduser("~")
+        du = psutil.disk_usage(probe)
+        total = du.total
+        if total <= 0:
+            return
+        free = du.free
+        snap.disk_free_pct = _pct(free, total)
+        snap.disk_free_gb = _gb(free)
+        snap.disk_total_gb = _gb(total)
+    except Exception as exc:  # metrics are best-effort; never raise
+        logger.warning("disk-free collection failed: %s", exc)
 
 
 def _f(value: Any) -> Optional[float]:
@@ -553,4 +590,14 @@ def format_load_line(raw: Dict[str, Any]) -> str:
     swap_pct = raw.get("swap_pct")
     parts.append(f"SWAP: {_pct_text(swap_pct)}")
     parts.append(f"IO: {_pct_text(raw.get('io_pct'))}")
+    disk_free_pct = raw.get("disk_free_pct")
+    if _f(disk_free_pct) is not None:
+        free_gb = _f(raw.get("disk_free_gb"))
+        total_gb = _f(raw.get("disk_total_gb"))
+        if free_gb is not None and total_gb is not None:
+            parts.append(f"ДИСК: {_f(disk_free_pct):.0f}% свободно ({free_gb:.0f}/{total_gb:.0f} ГБ)")
+        else:
+            parts.append(f"ДИСК: {_f(disk_free_pct):.0f}% свободно")
+    else:
+        parts.append(f"ДИСК: {_NA}")
     return " · ".join(parts)
