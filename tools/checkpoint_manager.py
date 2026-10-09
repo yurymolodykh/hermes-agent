@@ -65,6 +65,98 @@ from utils import env_int
 
 logger = logging.getLogger(__name__)
 
+# Rate-limit repeated identical git failures. A persistently corrupted store
+# (e.g. an unreadable tree object) makes the same git command fail on every
+# 5s checkpoint tick; without a debounce that floods ERROR logs with
+# thousands of identical "Git command failed" lines (incident 2026-10-08/09,
+# ~800 lines/day from tools.checkpoint_manager). The first occurrence of a
+# (cmd, rc, stderr) signature logs at ERROR; identical repeats are demoted
+# to DEBUG for GIT_ERROR_DEBOUNCE_SECONDS, then one ERROR re-log acts as a
+# "still failing" heartbeat. Keyed by (store, cmd-tuple, returncode, stderr)
+# so distinct failures keep distinct log lines.
+_GIT_ERROR_DEBOUNCE_SECONDS = 600.0
+_git_error_last_logged: Dict[Tuple, float] = {}
+
+# Snapshots whose tree object is unreadable (git corruption signatures) are
+# skipped during chain rebuild instead of aborting the whole size-cap/prune
+# pass. Log the skip once per (store, ref) per process so the user can see
+# which checkpoint history was dropped without spamming.
+_corrupt_skip_notified: Set[Tuple[Path, str]] = set()
+
+
+def _looks_like_corrupt_object(stderr: str) -> bool:
+    """True when git's stderr indicates a genuinely missing/bad object.
+
+    Only these signatures justify permanently dropping a checkpoint snapshot;
+    transient failures (lock busy, timeout, filesystem errors) must not skip.
+    """
+    if not stderr:
+        return False
+    low = stderr.lower()
+    markers = (
+        "bad object",
+        "bad tree object",
+        "bad tree",
+        "not a valid object name",
+        "ambiguous argument",
+        "unknown revision",
+        "could not open",
+        "missing object",
+        "does not exist in the object database",
+        "no such object",
+    )
+    return any(m in low for m in markers)
+
+
+def _log_git_failure(cmd: List[str], returncode: int, stderr: str, store: Path) -> None:
+    """Log a git failure, debouncing identical repeats to DEBUG."""
+    sig = (str(store), tuple(cmd[:2]), tuple(cmd), returncode, stderr[:2048])
+    now = time.monotonic()
+    last = _git_error_last_logged.get(sig)
+    if last is not None and (now - last) < _GIT_ERROR_DEBOUNCE_SECONDS:
+        logger.debug(
+            "Git command failed (suppressed repeat): %s (rc=%d) stderr=%s",
+            " ".join(cmd), returncode, stderr,
+        )
+        return
+    _git_error_last_logged[sig] = now
+    logger.error(
+        "Git command failed: %s (rc=%d) stderr=%s",
+        " ".join(cmd), returncode, stderr,
+    )
+    # Bound the cache: the error count is small; prune the oldest entry when
+    # it would otherwise grow unbounded over a long-lived gateway.
+    if len(_git_error_last_logged) > 256:
+        oldest_key = min(_git_error_last_logged, key=_git_error_last_logged.get)
+        _git_error_last_logged.pop(oldest_key, None)
+
+
+def _log_git_timeout(cmd: List[str], timeout: int, store: Path) -> None:
+    """Log a git timeout, debouncing identical repeats to DEBUG.
+
+    A slow store can make the same ``git add -A`` time out on every 5s
+    checkpoint tick; without a debounce that also floods ERROR logs (and, via
+    ``exc_info``, prints a full traceback per occurrence).  First occurrence
+    logs at ERROR; identical repeats are demoted to DEBUG for the same window
+    as regular git failures, then one ERROR re-log acts as a "still slow"
+    heartbeat.
+    """
+    sig = (str(store), tuple(cmd), "timeout", timeout)
+    now = time.monotonic()
+    last = _git_error_last_logged.get(sig)
+    if last is not None and (now - last) < _GIT_ERROR_DEBOUNCE_SECONDS:
+        logger.debug(
+            "git timed out (suppressed repeat): %s after %ds",
+            " ".join(cmd), timeout,
+        )
+        return
+    _git_error_last_logged[sig] = now
+    logger.error("git timed out after %ds: %s", timeout, " ".join(cmd))
+    if len(_git_error_last_logged) > 256:
+        oldest_key = min(_git_error_last_logged, key=_git_error_last_logged.get)
+        _git_error_last_logged.pop(oldest_key, None)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -398,14 +490,11 @@ def _run_git(
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if not ok and result.returncode not in allowed_returncodes:
-            logger.error(
-                "Git command failed: %s (rc=%d) stderr=%s",
-                " ".join(cmd), result.returncode, stderr,
-            )
+            _log_git_failure(cmd, result.returncode, stderr, store)
         return ok, stdout, stderr
     except subprocess.TimeoutExpired:
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
-        logger.error(msg, exc_info=True)
+        _log_git_timeout(cmd, timeout, store)
         return False, "", msg
     except FileNotFoundError as exc:
         missing_target = getattr(exc, "filename", None)
@@ -1443,10 +1532,20 @@ class CheckpointManager:
         # Rebuild a linear chain off keep[0]'s tree.
         new_parent: Optional[str] = None
         for sha in keep:
-            ok_tree, tree_sha, _ = _run_git(
+            ok_tree, tree_sha, tree_err = _run_git(
                 ["rev-parse", f"{sha}^{{tree}}"], store, working_dir,
             )
             if not ok_tree or not tree_sha:
+                if tree_err and _looks_like_corrupt_object(tree_err):
+                    key = (store, ref)
+                    if key not in _corrupt_skip_notified:
+                        _corrupt_skip_notified.add(key)
+                        logger.warning(
+                            "checkpoint: %s snapshot %s tree unreadable "
+                            "(%s); dropping it from the chain",
+                            ref, sha, tree_err.strip()[:200],
+                        )
+                    continue
                 return
             ok_msg, msg, _ = _run_git(
                 ["log", "--format=%s", "-1", sha], store, working_dir,
@@ -1526,13 +1625,23 @@ class CheckpointManager:
                 commits = list_out.splitlines()
                 keep = commits[1:]  # drop oldest
                 new_parent: Optional[str] = None
-                fail = False
+                fatal = False
                 for sha in keep:
-                    ok_tree, tree_sha, _ = _run_git(
+                    ok_tree, tree_sha, tree_err = _run_git(
                         ["rev-parse", f"{sha}^{{tree}}"], store, str(store.parent),
                     )
                     if not ok_tree or not tree_sha:
-                        fail = True
+                        if tree_err and _looks_like_corrupt_object(tree_err):
+                            key = (store, ref)
+                            if key not in _corrupt_skip_notified:
+                                _corrupt_skip_notified.add(key)
+                                logger.warning(
+                                    "checkpoint: %s snapshot %s tree unreadable "
+                                    "(%s); dropping it from the chain",
+                                    ref, sha, tree_err.strip()[:200],
+                                )
+                            continue
+                        fatal = True
                         break
                     ok_msg, msg, _ = _run_git(
                         ["log", "--format=%s", "-1", sha], store, str(store.parent),
@@ -1544,10 +1653,10 @@ class CheckpointManager:
                                 "-m", commit_msg, "--no-gpg-sign"]
                     ok_commit, new_sha, _ = _run_git(args, store, str(store.parent))
                     if not ok_commit or not new_sha:
-                        fail = True
+                        fatal = True
                         break
                     new_parent = new_sha
-                if fail or new_parent is None:
+                if fatal or new_parent is None:
                     continue
                 _run_git(["update-ref", ref, new_parent], store, str(store.parent))
                 any_dropped = True
@@ -1956,13 +2065,23 @@ def prune_checkpoints(
                     commits = lo.splitlines()
                     keep = commits[1:]
                     new_parent: Optional[str] = None
-                    fail = False
+                    fatal = False
                     for sha in keep:
-                        ok_t, tsha, _ = _run_git(
+                        ok_t, tsha, terr = _run_git(
                             ["rev-parse", f"{sha}^{{tree}}"], store, str(base),
                         )
                         if not ok_t or not tsha:
-                            fail = True
+                            if terr and _looks_like_corrupt_object(terr):
+                                key = (store, ref)
+                                if key not in _corrupt_skip_notified:
+                                    _corrupt_skip_notified.add(key)
+                                    logger.warning(
+                                        "checkpoint: %s snapshot %s tree unreadable "
+                                        "(%s); dropping it from the chain",
+                                        ref, sha, terr.strip()[:200],
+                                    )
+                                continue
+                            fatal = True
                             break
                         ok_m, m, _ = _run_git(
                             ["log", "--format=%s", "-1", sha], store, str(base),
@@ -1974,10 +2093,10 @@ def prune_checkpoints(
                                     "-m", msg, "--no-gpg-sign"]
                         ok_cm, new_sha, _ = _run_git(args, store, str(base))
                         if not ok_cm or not new_sha:
-                            fail = True
+                            fatal = True
                             break
                         new_parent = new_sha
-                    if fail or new_parent is None:
+                    if fatal or new_parent is None:
                         continue
                     _run_git(["update-ref", ref, new_parent], store, str(base))
                     any_drop = True
