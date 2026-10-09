@@ -706,6 +706,93 @@ _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 
+# ---------------------------------------------------------------------------
+# Inbound document inbox
+#
+# Inline OpenAI file/input_file parts arrive as base64 document bytes inside
+# the request body.  Independently of ``privacy.anonymize_documents`` the
+# operator wants every incoming document persisted verbatim to a local inbox
+# so it can be opened on disk afterwards (the raw bytes are decoded here, the
+# one place they exist in the pipeline).  The save is strictly best-effort —
+# a write failure or an unwritable inbox must never fail the chat turn — and
+# honours the same ``gateway.max_inbound_media_bytes`` cap that bounds other
+# inbound media, so a hostile oversized upload is neither saved nor processed.
+# ---------------------------------------------------------------------------
+DEFAULT_INBOX_DIR = str(Path.home() / "workspaces" / "inbox")
+
+
+def _inbox_dir() -> Path:
+    """Resolve the inbound-file inbox directory (env-overridable).
+
+    ``HERMES_INBOX_DIR`` wins when set and non-empty; otherwise the default
+    ``~/workspaces/inbox`` is used.  The directory is created lazily on first
+    use by :func:`_save_inbound_document`.
+    """
+    override = os.getenv("HERMES_INBOX_DIR")
+    if override and str(override).strip():
+        return Path(str(override).strip())
+    return Path(DEFAULT_INBOX_DIR)
+
+
+def _inbound_document_over_limit(size: int) -> bool:
+    """True when ``size`` exceeds ``gateway.max_inbound_media_bytes``.
+
+    ``0`` (or an unreadable/unparseable config) disables the cap — same
+    semantics as :func:`gateway.platforms.base.get_inbound_media_max_bytes`.
+    """
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+
+        limit = get_inbound_media_max_bytes()
+    except Exception:  # pragma: no cover - defensive; cap disabled on error
+        return False
+    return bool(limit) and size > limit
+
+
+def _save_inbound_document(raw: bytes, filename: str) -> Optional[str]:
+    """Persist one inbound document to the inbox on a best-effort basis.
+
+    The original filename is reduced to its basename so a hostile
+    ``../server.log`` or an absolute path cannot escape the inbox.  A name
+    collision gets an increasing ``(N)`` suffix instead of overwriting the
+    existing file.  Oversized payloads are skipped (return ``None``), and any
+    write/encoding error is logged and swallowed — the chat turn must never
+    fail because the inbox is unwritable.
+
+    Returns the absolute path written, or ``None`` when nothing was saved.
+    """
+    if _inbound_document_over_limit(len(raw)):
+        logger.warning(
+            "Inbound document skipped by gateway.max_inbound_media_bytes: %d bytes",
+            len(raw),
+        )
+        return None
+    safe_name = Path(filename).name
+    if not safe_name or safe_name in {".", ".."}:
+        return None
+    try:
+        directory = _inbox_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("Inbound inbox unavailable: %s", exc)
+        return None
+    target = directory / safe_name
+    if target.exists():
+        stem, suffix = (target.stem, target.suffix) if target.suffix else (target.name, "")
+        counter = 1
+        target = directory / f"{stem} ({counter}){suffix}"
+        while target.exists():
+            counter += 1
+            target = directory / f"{stem} ({counter}){suffix}"
+    try:
+        with target.open("wb") as fh:
+            fh.write(raw)
+    except Exception as exc:
+        logger.warning("Failed to save inbound document %r to %s: %s", safe_name, target, exc)
+        return None
+    logger.info("Saved inbound document %r to %s", safe_name, target)
+    return str(target)
+
 
 def _anonymize_inline_document_part(part: Dict[str, Any]) -> Dict[str, str]:
     """Turn an OpenAI file/input_file part into local anonymized text."""
@@ -731,6 +818,15 @@ def _anonymize_inline_document_part(part: Dict[str, Any]) -> Dict[str, str]:
         raw = base64.b64decode(encoded, validate=True)
     except Exception as exc:
         raise ValueError("invalid_content_part:Document file_data is not valid base64.") from exc
+    # Persist the raw inbound document to the inbox (best-effort, size-capped)
+    # BEFORE anonymization — the operator wants the original bytes regardless
+    # of the anonymize_documents flag.  A save failure must not fail the turn.
+    try:
+        _save_inbound_document(raw, filename)
+    except Exception:
+        logger.warning(
+            "Inbound document %r could not be saved to inbox", filename, exc_info=True
+        )
     try:
         clean = sanitized_document_bytes(raw, filename)
     except Exception as exc:
