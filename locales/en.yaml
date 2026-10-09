@@ -345,6 +345,10 @@ gateway:
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"
     platforms:             "**Connected Platforms:** {platforms}"
+    provider_health_header: "**LLM Provider Health (24h drop rate):**"
+    provider_health_none:   "  no LLM requests recorded in the last 24h"
+    provider_health_line:   "  {provider}: {pct}% dropped ({dropped}/{count} requests)"
+    provider_health_more:   "  ... and {count} more providers"
 
   stop:
     stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."

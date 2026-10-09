@@ -10,16 +10,20 @@ logger = logging.getLogger(__name__)
 
 def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     """Dispatch a Hermes lifecycle event to built-in observability features."""
-    from . import relay_shared_metrics
+    from . import provider_health, relay_shared_metrics
 
     _safe_observe(relay_shared_metrics.observe_lifecycle, hook_name, kwargs)
+    _safe_observe(provider_health.observe_lifecycle, hook_name, kwargs)
 
 
 def handles_hook(hook_name: str) -> bool:
     """Return whether any built-in observability feature handles a hook."""
-    from . import relay_shared_metrics
+    from . import provider_health, relay_shared_metrics
 
-    return relay_shared_metrics.handles_hook(hook_name)
+    return (
+        relay_shared_metrics.handles_hook(hook_name)
+        or provider_health.handles_hook(hook_name)
+    )
 
 
 def _safe_observe(callback: Any, hook_name: str, kwargs: dict[str, Any]) -> None:

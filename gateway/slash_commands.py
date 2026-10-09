@@ -784,6 +784,60 @@ class GatewaySlashCommandsMixin:
                 "",
                 _load_line,
             ])
+        # Active-Hermes-tasks block (running user requests + active kanban cards).
+        # Computed natively (no LLM): running agents are counted from the
+        # gateway's in-memory slot map; active kanban cards are a read-only
+        # SQLite COUNT on the shared board db. Best-effort -- any failure
+        # degrades a line to "н/д" instead of breaking /status.
+        active_tasks = []
+        try:
+            running = self._running_agent_count()
+            active_tasks.append(f"Запросы: {running}")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("/status active-request count failed: %s", exc)
+            active_tasks.append("Запросы: н/д")
+        try:
+            from hermes_cli import kanban_db
+            import sqlite3
+
+            db_path = kanban_db.kanban_db_path()
+            if db_path and db_path.exists():
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    cur = con.cursor()
+                    cur.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status IN ('todo','ready','running')"
+                    )
+                    kanban_active = cur.fetchone()[0]
+                finally:
+                    con.close()
+                active_tasks.append(f"Карточки: {kanban_active}")
+            else:
+                active_tasks.append("Карточки: н/д")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("/status kanban count failed: %s", exc)
+            active_tasks.append("Карточки: н/д")
+        if active_tasks:
+            lines.extend([
+                "Активные задачи: " + " · ".join(active_tasks),
+            ])
+        # Per-provider LLM drop-rate block (last 24h).  Aggregated read-only
+        # from the append-only provider_health JSONL ledger written by the
+        # first-party observability observer
+        # (hermes_cli/observability/provider_health.py) on the
+        # post_api_request / api_request_error hooks.  Best-effort: any
+        # failure degrades the whole block to a log line, never breaks
+        # /status.
+        try:
+            from hermes_cli.observability import provider_health as _provider_health
+
+            _drop_stats = _provider_health.provider_drop_stats(window_hours=24.0)
+            lines.extend([
+                "",
+                _provider_health.format_provider_health_lines(_drop_stats),
+            ])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("/status provider-health block failed: %s", exc)
         lines.extend([
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
