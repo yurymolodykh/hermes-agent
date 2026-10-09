@@ -152,7 +152,17 @@ class CronScheduler(ABC):
         from cron.jobs import rearm_resumable_cron_jobs
 
         recovered = recover_interrupted_executions()
-        recovered += rearm_resumable_cron_jobs()
+        rearmed = rearm_resumable_cron_jobs()
+        recovered += rearmed
+        # FAST_RESTART_STATS observer: count resume-mode re-arms so the next
+        # boot's stats marker reports how many interrupted cron sessions were
+        # continued (no-op on non-fast boots — no stamp → no emit).
+        try:
+            from gateway.fast_restart_stats import record_cron_recovered
+
+            record_cron_recovered(int(rearmed))
+        except Exception:
+            pass
         return recovered
 
     @property

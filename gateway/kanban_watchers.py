@@ -2660,6 +2660,7 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
+                    reclaimed_this_tick = 0
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
@@ -2676,6 +2677,20 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
+                        if res is not None:
+                            _gen_reclaimed = getattr(res, "generation_reclaimed", None) or []
+                            if getattr(_gen_reclaimed, "__len__", None):
+                                reclaimed_this_tick += len(_gen_reclaimed)
+                    # FAST_RESTART_STATS observer: count dead-generation cards
+                    # claimed back to ready on this boot's dispatch pass
+                    # (no-op on non-fast boots — no stamp → no emit).
+                    if reclaimed_this_tick:
+                        try:
+                            from gateway.fast_restart_stats import record_cards_reclaimed
+
+                            record_cards_reclaimed(reclaimed_this_tick)
+                        except Exception:
+                            pass
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:

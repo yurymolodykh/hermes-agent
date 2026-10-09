@@ -2299,6 +2299,108 @@ def clear_planned_stop_marker() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Fast-restart request marker
+#
+# The in-band fast-restart trigger on platforms without SIGUSR1 (native
+# Windows): an operator writes ``.gateway-fast-restart-request.json`` into
+# the gateway's hermes home, a gateway watcher thread consumes it and calls
+# ``request_restart(fast=True, detached=False, via_service=False)``. This
+# mirrors the planned-stop marker (same TTL / stale-drop semantics) so a
+# leftover file can never crash-loop or wedge a freshly booted gateway.
+# ---------------------------------------------------------------------------
+
+_FAST_RESTART_REQUEST_FILENAME = ".gateway-fast-restart-request.json"
+_FAST_RESTART_REQUEST_TTL_S = 60
+
+
+def _get_fast_restart_request_path() -> Path:
+    """Return the path to the fast-restart request marker file."""
+    home = _get_process_hermes_home()
+    return home / _FAST_RESTART_REQUEST_FILENAME
+
+
+def write_fast_restart_request(
+    *,
+    fast: bool = True,
+    reason: str = "",
+    target_pid: Optional[int] = None,
+) -> bool:
+    """Request that the running gateway in this hermes home fast-restarts.
+
+    ``target_pid`` is optional: when omitted the marker is consumed by the
+    first gateway that sees it (bounded by the 60s TTL); when set it is a
+    PID-reuse guard exactly like the planned-stop marker. Returns False on
+    any write error.
+    """
+    record: dict[str, Any] = {
+        "fast": bool(fast),
+        "reason": reason,
+        "requester_pid": os.getpid(),
+        "written_at": _utc_now_iso(),
+    }
+    if target_pid is not None:
+        record["target_pid"] = int(target_pid)
+    try:
+        _write_json_file(_get_fast_restart_request_path(), record)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def consume_fast_restart_request_for_self() -> Optional[dict[str, Any]]:
+    """Consume a fast-restart request addressed to the current process.
+
+    Returns the payload (``{"fast": bool, "reason": str, ...}``) when the
+    marker names this process (or names no PID) and is not stale; otherwise
+    returns None. Stale or malformed markers are unlinked so they cannot
+    wedge the next gateway generation. Markers naming another PID are left
+    in place.
+    """
+    path = _get_fast_restart_request_path()
+    record = _read_json_file(path)
+    if not record:
+        return None
+
+    try:
+        target_pid = record.get("target_pid")
+        if target_pid is not None:
+            target_pid = int(target_pid)
+        written_at = record.get("written_at") or ""
+        fast = bool(record.get("fast", True))
+        reason = str(record.get("reason", "")) or ""
+    except (KeyError, TypeError, ValueError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    if _marker_is_stale(written_at, _FAST_RESTART_REQUEST_TTL_S):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    if target_pid is not None and target_pid != os.getpid():
+        return None
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {"fast": fast, "reason": reason, "written_at": written_at}
+
+
+def clear_fast_restart_request() -> None:
+    """Remove any fast-restart request marker unconditionally."""
+    try:
+        _get_fast_restart_request_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def get_running_pid(
     pid_path: Optional[Path] = None,
     *,
