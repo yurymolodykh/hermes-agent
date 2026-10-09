@@ -1,0 +1,45 @@
+# Isolated fast-restart e2e test profile — api_server ONLY.
+#
+# THIS IS A TEMPLATE.  It is never used directly as HERMES_HOME.  Each run
+# materializes a fresh copy into a temporary directory (see
+# ../bootstrap_test_profile.py) so:
+#   * HERMES_HOME always points at a fresh temp dir, never production;
+#   * the checked-in tree carries NO secrets (api keys are generated per run);
+#   * there is no reference to the production gateway port 8642 anywhere.
+#
+# Based on C:/Users/hermes/AppData/Local/hermes/profiles/01-orchestrator but
+# minimal: only what api_server + gateway startup need.  No telegram, no
+# yadisk, no other messaging platform configuration.
+#
+# Placeholder __MOCK_PORT__ is substituted by the bootstrap with the mock LLM
+# port (default 18643).
+
+telegram_delivery_policy: off
+
+model:
+  default: mock-model
+  provider: mock
+  context_length: 131072
+
+providers:
+  mock:
+    base_url: http://127.0.0.1:__MOCK_PORT__/v1
+    model: mock-model
+    key_env: MOCK_API_KEY
+    request_timeout_seconds: 300
+    stale_timeout_seconds: 400
+    discover_models: false
+    models:
+      mock-model: {}
+
+custom_providers:
+  - name: mock
+    base_url: http://127.0.0.1:__MOCK_PORT__/v1
+    key_env: MOCK_API_KEY
+    models:
+      mock-model:
+        context_length: 131072
+
+kanban:
+  # Small dispatch cadence so the card-reclaim assert (<= 60 s) is met fast.
+  dispatch_interval_seconds: 5
