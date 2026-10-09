@@ -1830,3 +1830,53 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+class TestSendSourceLabel:
+    """K1 RF4: outbound send_message carries a cron/kanban source marker."""
+
+    def test_no_context_empty(self, monkeypatch):
+        from tools.send_message_tool import _send_source_label
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        # No cron session context -> no label.
+        assert _send_source_label() == ""
+
+    def test_kanban_worker_label(self, monkeypatch):
+        from tools.send_message_tool import _send_source_label
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run1")
+        assert _send_source_label() == "kanban"
+
+    def test_kanban_bare_env_not_enough(self, monkeypatch):
+        # A stale bare HERMES_KANBAN_TASK without the run envelope must NOT be
+        # labelled kanban (matches _check_send_message's contract).
+        from tools.send_message_tool import _send_source_label
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_stale")
+        assert _send_source_label() == ""
+
+    def test_cron_session_label(self, monkeypatch):
+        from tools.send_message_tool import _send_source_label
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        try:
+            from gateway.session_context import set_session_vars, clear_session_vars
+
+            tokens = set_session_vars(
+                platform="telegram", source="cron", chat_id="1",
+                cron_session="1",
+            )
+            try:
+                assert _send_source_label() == "cron"
+            finally:
+                clear_session_vars(tokens)
+        except ImportError:
+            assert _send_source_label() == ""  # env-only fallback

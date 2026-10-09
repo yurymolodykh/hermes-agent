@@ -827,6 +827,38 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+def _send_source_label() -> str:
+    """K1 RF4: label a send as coming from a cron/kanban automated context.
+
+    The send_message tool is available to cron and kanban workers (spec D0 §4
+    deliberately does not hard-block it), so outbound metadata carries a
+    ``source`` marker for auditing.  Returns:
+
+      * ``"cron"``   — inside a cron job run (``HERMES_CRON_SESSION=1`` or the
+        scheduler's auto-delivery vars are set for this session).
+      * ``"kanban"`` — inside a kanban worker run (``HERMES_KANBAN_TASK`` in
+        the process env, the dispatcher's worker envelope marker).
+      * ``""``       — no automated context (interactive CLI / gateway turn);
+        caller then omits the ``source`` metadata key entirely.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        cron_session = get_session_env("HERMES_CRON_SESSION", "").strip()
+        if cron_session:
+            return "cron"
+        auto = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip()
+        if auto:
+            return "cron"
+    except Exception:
+        pass
+    # Kanban worker envelope (only the full dispatcher envelope is trusted —
+    # a bare stale env var is ignored, matching _check_send_message's contract).
+    if os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_RUN_ID"):
+        return "kanban"
+    return ""
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -868,6 +900,9 @@ async def _send_via_adapter(
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                src_label = _send_source_label()
+                if src_label:
+                    metadata["source"] = src_label
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)

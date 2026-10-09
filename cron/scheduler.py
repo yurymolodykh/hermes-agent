@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, Sequence
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -2850,6 +2850,175 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
+                                home_channel: Optional[str],
+                                allowed_users: Optional[Sequence[str]]):
+    """Build the delivery-policy context for one cron job (D0 F1).
+
+    Return value semantics (K1 RF1 — fail-open закрыт):
+      * dict without ``policy_disabled`` — gate ACTIVE: per-target decisions
+        via ``_tg_gate_target``.
+      * ``{"policy_disabled": True}`` — gate OFF (policy disabled / no
+        telegram channel): ``_tg_gate_target`` returns True for every target
+        (historical, byte-identical behaviour).
+      * ``None`` — policy UNAVAILABLE (module import failed or
+        ``policy_enabled()`` raised): ``_tg_gate_target`` FAILS CLOSED
+        (suppress + journal + ERROR log).  NEVER falls back to "deliver".
+    """
+    try:
+        from hermes_cli.delivery_policy import (
+            InitiatorRef,
+            TargetRef,
+            classify,
+            default_context,
+            log_suppression,
+            policy_enabled,
+            verify_recipient,
+        )
+    except Exception as exc:  # policy module must never break delivery
+        logger.error(
+            "delivery-policy: module import failed (%s) — telegram cron "
+            "targets FAIL-CLOSED (suppressed)", exc,
+        )
+        return None
+    try:
+        if not policy_enabled():
+            # Gate off: historical behaviour (fail-open is NOT applied here —
+            # disabled is a deliberate operator choice, not an error).
+            return {"policy_disabled": True}
+    except Exception as exc:
+        logger.error(
+            "delivery-policy: policy_enabled() raised (%s) — telegram cron "
+            "targets FAIL-CLOSED (suppressed)", exc,
+        )
+        return None
+
+    from hermes_cli.delivery_policy import (  # noqa: F811  (re-import ok)
+        InitiatorRef,
+        TargetRef,
+        classify,
+        default_context,
+        log_suppression,
+        verify_recipient,
+    )
+
+    return {
+        "initiator": InitiatorRef.from_origin(_resolve_origin(job) or {}),
+        "home_channel": home_channel,
+        "allowed_users": allowed_users or (),
+        "has_media": bool(media_files),
+        "media_files": media_files,
+        "no_agent": bool(job.get("no_agent")),
+        "policy_disabled": False,
+        "classify": classify,
+        "default_context": default_context,
+        "log_suppression": log_suppression,
+        "verify_recipient": verify_recipient,
+    }
+
+
+def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
+    """Apply the telegram delivery-policy gate to ONE delivery target.
+
+    Returns True when delivery to ``target`` is ALLOWED (or the gate is off
+    / target is not telegram).  Returns False when the target must be
+    skipped (suppression), logging the reason to the policy journal.
+
+    K1 RF1: ``policy_ctx is None`` (policy module unavailable / policy_enabled
+    raised) is FAIL-CLOSED — the telegram target is suppressed and journaled
+    with ``suppress("policy unavailable")`` + ERROR log.  It NEVER degrades to
+    "deliver".  ``{"policy_disabled": True}`` is the only "gate off" path and
+    returns True (historical behaviour).
+    """
+    platform_name = str(target.get("platform") or "").lower()
+    if platform_name != "telegram":
+        return True  # policy applies to telegram targets only
+    chat_id = str(target.get("chat_id") or "")
+    if policy_ctx is None:
+        # FAIL-CLOSED (K1 RF1 CRITICAL): a broken/unavailable policy must
+        # suppress, never silently pass a telegram delivery through.
+        logger.error(
+            "delivery-policy: context unavailable (module/policy_enabled "
+            "failed) — telegram target %s FAIL-CLOSED (suppressed)", chat_id,
+        )
+        _journal_policy_unavailable("cron", chat_id, delivery_content)
+        return False
+    if policy_ctx.get("policy_disabled"):
+        return True  # gate disabled -> historical behaviour
+    from hermes_cli.delivery_policy import TargetRef  # noqa: F811 (re-import ok)
+    target_ref = TargetRef.from_dict({
+        "platform": platform_name, "chat_id": chat_id,
+        "thread_id": target.get("thread_id"),
+    })
+    ctx = policy_ctx["default_context"](
+        kind="cron",
+        initiator=policy_ctx["initiator"],
+        target=target_ref,
+        home_channel=policy_ctx["home_channel"],
+        allowed_users=policy_ctx["allowed_users"],
+        no_agent=policy_ctx.get("no_agent", False),
+        completed_terminal=True,  # _deliver_result carries the final output
+        has_media=policy_ctx["has_media"],
+    )
+    decision = policy_ctx["classify"](delivery_content, ctx)
+    if not decision.suppressed:
+        # Content is acceptable; enforce recipient == initiator (ИНВ1).
+        if policy_ctx["verify_recipient"](
+            policy_ctx["initiator"], target_ref,
+            home_channel=policy_ctx["home_channel"],
+            allowed_users=policy_ctx["allowed_users"],
+        ):
+            return True
+        policy_ctx["log_suppression"](
+            app="cron",
+            who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
+            target=f"telegram:{chat_id}",
+            decision=_suppress_decision("recipient mismatch",
+                                        detail=f"chat={chat_id}"),
+            snippet=(delivery_content or "")[:200],
+        )
+        return False
+    policy_ctx["log_suppression"](
+        app="cron",
+        who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
+        target=f"telegram:{chat_id}",
+        decision=decision,
+        snippet=(delivery_content or "")[:200],
+    )
+    return False
+
+
+def _suppress_decision(reason: str = "", detail: str = "") -> "PolicyDecision":
+    from hermes_cli.delivery_policy import suppress
+
+    return suppress(reason, detail)
+
+
+def _journal_policy_unavailable(app: str, chat_id: str, delivery_content: str) -> None:
+    """Journal a ``policy unavailable`` suppression (K1 RF1 fail-closed).
+
+    Best-effort: when the policy module is importable, writes the standard
+    JSONL suppression record with reason ``policy unavailable``.  When the
+    module itself is gone/degraded, the caller's ERROR log is the audit trail
+    (the journal must never break delivery).
+    """
+    try:
+        from hermes_cli.delivery_policy import log_suppression as _log
+        from hermes_cli.delivery_policy import suppress as _suppress
+
+        _log(
+            app=app,
+            who=f"cron:{chat_id}",
+            target=f"telegram:{chat_id}",
+            decision=_suppress(
+                "policy unavailable", detail="module import / policy_enabled() failed"
+            ),
+            snippet=(delivery_content or "")[:200],
+        )
+    except Exception:
+        pass  # ERROR log above is the record
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None,
                     source_id: Optional[str] = None) -> Optional[str]:
     """
@@ -3016,6 +3185,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
 
     delivery_errors = []
 
+    # --- TG delivery-policy gate (D0 F1) --------------------------------
+    # Compute the policy context once per job; the per-target decision is
+    # applied inside the loop below (telegram targets only). When off, the
+    # gate is inert and behaviour is byte-identical to before.
+    _tg_policy_home = None
+    _tg_policy_allowed = None
+    try:
+        _tg_policy_home = _get_home_target_chat_id("telegram")
+    except Exception:
+        _tg_policy_home = None
+    try:
+        _tg_policy_allowed = [
+            p.strip() for p in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+            if p.strip()
+        ]
+    except Exception:
+        _tg_policy_allowed = []
+    _tg_policy_ctx = _tg_delivery_policy_context(
+        job, delivery_content, requested_media,
+        home_channel=_tg_policy_home,
+        allowed_users=_tg_policy_allowed,
+    )
+
     for target in targets:
         platform_name = target["platform"]
         chat_id = target["chat_id"]
@@ -3096,6 +3288,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            continue
+
+        # TG delivery-policy gate (D0 F1): suppress routine/recipient-
+        # mismatched telegram deliveries (ИНВ1/ИНВ2). Skipping here keeps
+        # platform-not-enabled semantics above intact and does not touch
+        # non-telegram targets or the api_server exact-origin early return.
+        if not _tg_gate_target(target, delivery_content, _tg_policy_ctx):
+            logger.info(
+                "Job '%s': telegram delivery to %s suppressed by delivery policy",
+                job["id"], chat_id,
+            )
             continue
 
         # Prefer the resolved live transport when the gateway is running. This
