@@ -152,7 +152,9 @@ class TestMakeToolResultMessage:
         assert msg["content"].startswith(
             '<untrusted_tool_result source="web_extract">'
         )
-        assert SAMPLE_LONG_TEXT in msg["content"]
+        # N2 no-LLM trim strips the sample's trailing space — all semantic
+        # bytes (and the inline single spaces) are preserved.
+        assert SAMPLE_LONG_TEXT.rstrip() in msg["content"]
 
 
 
@@ -196,7 +198,8 @@ class TestMakeToolResultMessage:
 
         msg = make_tool_result_message("web_extract", SAMPLE_LONG_TEXT, "call_failure")
 
-        assert SAMPLE_LONG_TEXT in msg["content"]
+        # N2 trim strips the trailing space; semantic bytes all present.
+        assert SAMPLE_LONG_TEXT.rstrip() in msg["content"]
         assert "_tool_output_risk" not in msg
 
 
@@ -305,3 +308,139 @@ class TestElisionNoticeWiring:
         assert content.index("hermes note") < content.index("</untrusted_tool_result>")
         # Exactly one notice.
         assert content.count("hermes note") == 1
+
+
+# =========================================================================
+# N2: deterministic no-LLM format-noise trim (neutral measure)
+# =========================================================================
+
+import json
+import re
+
+from agent.tool_dispatch_helpers import (
+    _trim_tool_output_no_llm,
+    no_llm_trim_enabled,
+    set_no_llm_trim_enabled,
+)
+
+
+def _meaning_bytes(text: str) -> str:
+    """Non-whitespace bytes in order — the byte-equivalence-of-meaning rule
+    that N2 must satisfy: trimming never removes a semantic byte."""
+    return re.sub(r"\s+", "", text)
+
+
+class TestToolOutputTrimNoLlm:
+    """Regression set of 'noisy' formats (W4): the result parses to the same
+    meaning — only formatting / serialization whitespace is removed."""
+
+    def test_pretty_json_compacted_same_object(self):
+        original = '{\n  "name": "demo",\n  "items": [\n    1,\n    2,\n    3\n  ],\n  "flag": true\n}'
+        out = _trim_tool_output_no_llm(original)
+        assert json.loads(out) == json.loads(original)  # semantic equivalence
+        assert out == '{"name":"demo","items":[1,2,3],"flag":true}'
+
+    def test_json_array_compacted(self):
+        original = '[\n  "a",\n  "b"\n]'
+        out = _trim_tool_output_no_llm(original)
+        assert json.loads(out) == json.loads(original)
+        assert out == '["a","b"]'
+
+    def test_json_unicode_and_nested_round_trip(self):
+        original = '{\n  "title": "Привет мир",\n  "nested": {\n    "x": 1\n  }\n}'
+        out = _trim_tool_output_no_llm(original)
+        assert json.loads(out) == json.loads(original)
+        assert "Привет мир" in out  # ensure_ascii=False
+
+    def test_invalid_json_falls_back_to_whitespace_only(self):
+        original = "{\n  \"broken\": [1, 2,\n}"  # invalid JSON
+        out = _trim_tool_output_no_llm(original)
+        # Compaction declines (not parseable) — whitespace normalisation still applies.
+        assert _meaning_bytes(out) == _meaning_bytes(original)
+        assert "broken" in out
+
+    def test_trailing_whitespace_per_line_stripped(self):
+        original = "line one   \nline two\t \nline three \n"
+        out = _trim_tool_output_no_llm(original)
+        assert _meaning_bytes(out) == _meaning_bytes(original)
+        assert out == "line one\nline two\nline three"
+
+    def test_blank_line_runs_collapsed_to_one(self):
+        original = "head\n\n\n\nmid\n\n\n\n\n\ntail"
+        out = _trim_tool_output_no_llm(original)
+        assert _meaning_bytes(out) == _meaning_bytes(original)
+        assert out == "head\n\nmid\n\ntail"
+
+    def test_leading_and_trailing_blank_lines_stripped(self):
+        original = "\n\n\nstart\ncontent\n\n\n\n"
+        out = _trim_tool_output_no_llm(original)
+        assert out == "start\ncontent"
+
+    def test_whitespace_only_output_becomes_empty(self):
+        assert _trim_tool_output_no_llm("   \n\n\t \n") == ""
+
+    def test_clean_plain_text_untouched(self):
+        original = "clean single line"
+        assert _trim_tool_output_no_llm(original) == original
+
+    def test_code_block_single_blank_line_preserved(self):
+        # One blank line between blocks is meaningful and must survive.
+        original = "def f():\n    return 1\n\ndef g():\n    return 2"
+        assert _trim_tool_output_no_llm(original) == original
+
+    @pytest.mark.parametrize(
+        "noisy,_expected_meaning",
+        [
+            ("  a  \nb\n", "ab"),
+            ("a\r\nb\r\nc", "abc"),
+            ("a \n\n\n b \n", "ab"),
+            ("\talpha\t\n\n\n\nbeta  \n", "alphabeta"),
+        ],
+    )
+    def test_meaning_preserved_across_noise_shapes(self, noisy, _expected_meaning):
+        out = _trim_tool_output_no_llm(noisy)
+        assert _meaning_bytes(out) == _expected_meaning
+
+    def test_partial_json_style_text_not_mangled(self):
+        # Starts with '{' but is NOT pure JSON (e.g. a config snippet with
+        # a trailing prose line) — must not be compacted, only whitespace-
+        # normalized, with every semantic byte intact.
+        original = '{\n  "a": 1,\n# trailing comment\n}  '
+        out = _trim_tool_output_no_llm(original)
+        assert _meaning_bytes(out) == _meaning_bytes(original)
+        assert out == '{\n  "a": 1,\n# trailing comment\n}'
+
+
+class TestToolOutputTrimWiring:
+    """Trim runs at make_tool_result_message when the flag is on and is a
+    one-line no-op rollback when the flag is off."""
+
+    def test_trim_applied_to_json_tool_result(self):
+        msg = make_tool_result_message(
+            "search_files", '{\n  "count": 2,\n  "ok": true\n}', "call_trim"
+        )
+        assert json.loads(msg["content"]) == {"count": 2, "ok": True}
+
+    def test_whitespace_noise_trimmed_in_plain_result(self):
+        msg = make_tool_result_message("terminal", "a  \n\n\n\nb\n", "call_ws")
+        assert msg["content"] == "a\n\nb"
+
+    def test_non_string_content_untouched(self):
+        blob = {"payload": "  spaced  \n"}
+        msg = make_tool_result_message("terminal", blob, "call_blob")
+        assert msg["content"] == blob
+        assert msg["content"] is blob
+
+    def test_disable_flag_restores_original_content(self):
+        original = "  keep me  \n\n\n\nend\n"
+        try:
+            set_no_llm_trim_enabled(False)
+            assert not no_llm_trim_enabled()
+            msg = make_tool_result_message("terminal", original, "call_off")
+            assert msg["content"] == original
+        finally:
+            set_no_llm_trim_enabled(True)
+        assert no_llm_trim_enabled()
+        # Re-enabled → trimmed again.
+        msg2 = make_tool_result_message("terminal", original, "call_on")
+        assert msg2["content"] == "  keep me\n\nend"

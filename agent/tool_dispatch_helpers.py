@@ -561,6 +561,12 @@ def make_tool_result_message(
     # append the notice first, THEN wrap — so the notice lives inside the
     # untrusted block next to the data it describes, appended exactly once
     # at construction time (cache-safe).
+    #
+    # N2 first: the deterministic no-LLM format-noise trim runs on the raw
+    # tool output BEFORE elision/wrap so every non-semantic whitespace byte
+    # is gone before it enters model-facing content. Elision detection and
+    # untrusted wrapping then see the trimmed (still fully informative) text.
+    content = _maybe_trim_tool_output(content)
     wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
     message = stamp_message_timestamp({
         "role": "tool",
@@ -579,6 +585,105 @@ def make_tool_result_message(
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
     return message
+
+
+# ── N2: deterministic no-LLM format-noise trim (neutral) ─────────────────
+# Strips only redundant serialization / whitespace from tool outputs AFTER
+# receipt, without touching any semantic field. Two provably-neutral rules:
+#
+#   1. JSON compaction: a pure-JSON output (starts with '{' or '[' and
+#      parses) is re-serialized compactly — json.loads(trimmed) ==
+#      json.loads(original), so names/values/order/structure are identical;
+#      only the formatting whitespace ("JSON-обвязка") is removed.
+#   2. Whitespace normalization on any non-JSON text: trailing spaces per
+#      line are dropped and runs of 2+ blank lines collapse to one. Every
+#      non-whitespace byte is preserved verbatim.
+#
+# The trim happens at tool-message construction (make_tool_result_message),
+# i.e. before the result is sent to the model. Model generation is untouched;
+# the model receives semantically equivalent information, so the only effect
+# is volume (credited to M7). One-line rollback:
+#   compression.tool_output_no_llm_trim: false   (then restart)
+_NO_LLM_TRIM_ENABLED = True
+
+# Cap for JSON compaction attempts: larger blobs are still whitespace-
+# normalized but not re-serialized (avoids pathological deep-recursion /
+# transient memory on giant dumps).
+_NO_LLM_TRIM_JSON_CAP_CHARS = 4_000_000
+
+
+def set_no_llm_trim_enabled(enabled: bool) -> None:
+    """Set the process-wide no-LLM tool-output trim switch (config-driven)."""
+    global _NO_LLM_TRIM_ENABLED
+    _NO_LLM_TRIM_ENABLED = bool(enabled)
+
+
+def no_llm_trim_enabled() -> bool:
+    """Current value of the no-LLM tool-output trim switch."""
+    return _NO_LLM_TRIM_ENABLED
+
+
+def _compact_json_no_llm(text: str) -> str:
+    """Re-serialize a pure-JSON string compactly; return original on any mismatch."""
+    if len(text) > _NO_LLM_TRIM_JSON_CAP_CHARS:
+        return text
+    _stripped = text.lstrip()
+    if not _stripped or _stripped[0] not in "{[":
+        return text
+    try:
+        _obj = json.loads(text)
+    except Exception:
+        return text
+    try:
+        return json.dumps(_obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return text
+
+
+def _trim_tool_output_no_llm(text: str) -> str:
+    """Deterministic, no-LLM, semantic-preserving format-noise trim.
+
+    Removes only redundant serialization / whitespace:
+      * pure JSON -> compact (identical parsed object);
+      * trailing whitespace per line;
+      * runs of 2+ blank lines -> a single blank line;
+      * leading / trailing (padding) blank lines stripped.
+    Every non-whitespace byte is preserved, so the model receives the same
+    information; only the volume shrinks.
+    """
+    if not isinstance(text, str):
+        return text
+    _compacted = _compact_json_no_llm(text)
+    _lines = [_l.rstrip() for _l in _compacted.splitlines()]
+    # Strip leading and trailing blank lines — pure padding noise.
+    _start = 0
+    _end = len(_lines)
+    while _start < _end and not _lines[_start]:
+        _start += 1
+    while _end > _start and not _lines[_end - 1]:
+        _end -= 1
+    # Collapse internal runs of 2+ blank lines into a single blank separator.
+    _out: list[str] = []
+    _prev_blank = False
+    for _ln in _lines[_start:_end]:
+        if not _ln:
+            if _prev_blank:
+                continue
+            _prev_blank = True
+        else:
+            _prev_blank = False
+        _out.append(_ln)
+    return "\n".join(_out)
+
+
+def _maybe_trim_tool_output(content: Any) -> Any:
+    """Apply the no-LLM format-noise trim to tool-message content when enabled."""
+    if not _NO_LLM_TRIM_ENABLED or not isinstance(content, str):
+        return content
+    try:
+        return _trim_tool_output_no_llm(content)
+    except Exception:
+        return content
 
 
 # Tools whose results carry attacker-controllable content.  Wrapping their
@@ -799,5 +904,8 @@ __all__ = [
     "_trajectory_normalize_msg",
     "_detect_upstream_elision",
     "_maybe_append_elision_notice",
+    "set_no_llm_trim_enabled",
+    "no_llm_trim_enabled",
+    "_trim_tool_output_no_llm",
     "make_tool_result_message",
 ]

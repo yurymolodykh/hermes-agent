@@ -6585,6 +6585,11 @@ def run_job(
             "prompt_tokens": result.get("prompt_tokens"),
             "completion_tokens": result.get("completion_tokens"),
             "total_tokens": result.get("total_tokens"),
+            # Cache telemetry (N1 extension): the per-fire cache-read/write
+            # buckets from the run result, so cron cache behavior can be
+            # measured without re-deriving it from prompt_tokens deltas.
+            "cache_read_tokens": result.get("cache_read_tokens"),
+            "cache_write_tokens": result.get("cache_write_tokens"),
             "response_silent": _audit_response_silent,
             "deliver_target": job.get("deliver"),
             "model": model or None,
@@ -6608,6 +6613,8 @@ def run_job(
                 "prompt_tokens": None,
                 "completion_tokens": None,
                 "total_tokens": None,
+                "cache_read_tokens": None,
+                "cache_write_tokens": None,
                 "response_silent": False,
                 "deliver_target": job.get("deliver"),
                 "model": model or None,

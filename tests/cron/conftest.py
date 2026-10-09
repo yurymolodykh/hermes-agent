@@ -70,3 +70,20 @@ def _reset_session_context_vars():
     _reset_all()
     yield
     _reset_all()
+
+
+@pytest.fixture(autouse=True)
+def _cron_tg_delivery_policy_default_off(monkeypatch):
+    """Keep the TG delivery-policy gate OFF for legacy cron delivery tests.
+
+    D0 ``tg-delivery-hygiene`` made the policy flag ``telegram_delivery_policy``
+    default ON (see hermes_cli/delivery_policy.py).  That gate suppresses
+    routine/recipient-mismatched telegram deliveries inside ``_deliver_result``
+    (cron/scheduler.py), which would change the behaviour these existing
+    delivery tests assert on (jobs built without an origin, etc.).  Rather than
+    rewriting every legacy delivery test, flip the gate OFF globally for this
+    test package; the dedicated policy tests (test_delivery_policy.py) turn it
+    ON explicitly via the same env override.
+    """
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
+    yield

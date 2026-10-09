@@ -1376,6 +1376,24 @@ def normalize_usage(
             cache_write_tokens = _usage_count(
                 _usage_get(response_usage, "cache_write_tokens", 0)
             )
+        # vLLM (llm.letovo.site, deepseek-v4-flash) reports cache writes in a
+        # NON-OpenAI field `prompt_tokens_details.created_cache_tokens`
+        # (confirmed with a live probe: first no-cache request returned
+        # created_cache=256; a repeat request returned created_cache=0).
+        # The code used to look only for cache_write_tokens /
+        # cache_creation_input_tokens, which vLLM never emits, so letovo
+        # cache writes were invisible in local accounting (cache_write=0
+        # in every profile). Accounting-only fix (N1): maps the field into
+        # the canonical cache_write_tokens bucket; no request bytes or
+        # model parameters change, so model output is bit-identical.
+        if not cache_write_tokens:
+            cache_write_tokens = _usage_count(
+                _usage_get(details, "created_cache_tokens", 0) if details else 0
+            )
+        if not cache_write_tokens:
+            cache_write_tokens = _usage_count(
+                _usage_get(response_usage, "created_cache_tokens", 0)
+            )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0

@@ -766,3 +766,47 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+def test_normalize_usage_vllm_created_cache_tokens_nested():
+    """vLLM (llm.letovo.site) reports cache writes as the NON-OpenAI field
+    prompt_tokens_details.created_cache_tokens on chat-completions responses
+    (confirmed with a live probe of deepseek-v4-flash: first no-cache request
+    returned created_cache=256, a repeat request returned created_cache=0).
+    Before this fix (N1) the chat-completions branch only looked for
+    cache_write_tokens / cache_creation_input_tokens, which vLLM never emits,
+    so letovo cache writes normalized to 0 in every profile."""
+    usage = SimpleNamespace(
+        prompt_tokens=1000,
+        completion_tokens=200,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=500, created_cache_tokens=250
+        ),
+    )
+
+    normalized = normalize_usage(usage, provider="letovo", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 500
+    assert normalized.cache_write_tokens == 250
+    # input = prompt_total - cache_read - cache_write = 1000 - 500 - 250
+    assert normalized.input_tokens == 250
+    assert normalized.output_tokens == 200
+
+
+def test_normalize_usage_vllm_created_cache_tokens_top_level():
+    """Some OpenAI-compatible servers surface created_cache_tokens at the top
+    level of usage instead of nested; the fallback must still map it into
+    cache_write_tokens rather than dropping it to 0."""
+    usage = SimpleNamespace(
+        prompt_tokens=700,
+        completion_tokens=90,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=400),
+        created_cache_tokens=100,
+    )
+
+    normalized = normalize_usage(usage, provider="vllm", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 400
+    assert normalized.cache_write_tokens == 100
+    assert normalized.input_tokens == 700 - 400 - 100
+    assert normalized.output_tokens == 90

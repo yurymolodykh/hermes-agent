@@ -2828,6 +2828,25 @@ def init_agent(
         compression_idle_compact_after_seconds
     )
 
+    # N2 (neutral): deterministic no-LLM format-noise trim of tool outputs.
+    # Applied at tool-message construction (make_tool_result_message) before
+    # the result reaches the model; removes only redundant whitespace /
+    # JSON serialization, preserving every semantic field. Default True —
+    # the measure is live per the neutral-measures plan. One-line rollback:
+    # set `compression.tool_output_no_llm_trim: false` and restart.
+    _tool_output_no_llm_trim = is_truthy_value(
+        _compression_cfg.get("tool_output_no_llm_trim"), default=True
+    )
+    try:
+        from agent.tool_dispatch_helpers import set_no_llm_trim_enabled as _set_no_llm_trim
+        _set_no_llm_trim(_tool_output_no_llm_trim)
+    except Exception:
+        logger.warning(
+            "no-LLM tool-output trim flag could not be applied; leaving trim enabled",
+            exc_info=False,
+        )
+    agent.tool_output_no_llm_trim = _tool_output_no_llm_trim
+
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)

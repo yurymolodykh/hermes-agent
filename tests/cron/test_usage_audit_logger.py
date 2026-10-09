@@ -63,6 +63,9 @@ class TestWriteUsageAudit:
             "prompt_tokens": 11894,
             "completion_tokens": 287,
             "total_tokens": 12181,
+            # N1 extension: per-fire cache buckets flow from the run result.
+            "cache_read_tokens": 9410,
+            "cache_write_tokens": 2484,
             "response_silent": False,
             "deliver_target": None,
             "model": "google/gemma-4-31b-it",

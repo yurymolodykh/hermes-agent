@@ -673,6 +673,15 @@ compression:
   # prune. Default 4096.
   proactive_prune_min_reclaim_tokens: 4096
 
+  # Deterministic no-LLM format-noise trim of tool outputs (neutral measure
+  # N2). Applied at tool-message construction: pure-JSON outputs are
+  # re-serialized compactly (identical parsed object) and non-JSON text has
+  # trailing whitespace per line and run of 2+ blank lines collapsed.
+  # Removes only redundant whitespace/serialization — every semantic field
+  # is preserved, so model quality is unchanged; only the volume shrinks.
+  # Rollback (one line): set to false and restart.
+  tool_output_no_llm_trim: true
+
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
 
