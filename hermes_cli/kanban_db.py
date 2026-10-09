@@ -10608,7 +10608,8 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "block_kind, block_recurrences "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -10634,24 +10635,50 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            # Unblock-loop breaker (#t_543dd51f): the circuit-breaker block is
+            # un-typed (kind=None). A prior un-typed block (an earlier breaker
+            # trip that survived an unblock — ``unblock_task`` deliberately
+            # preserves ``block_recurrences``) is the SAME cause, so count it;
+            # a typed block (worker ``needs_input`` / operator ``capability``)
+            # is a different cause and restarts the count. Once recurrences
+            # reach ``BLOCK_RECURRENCE_LIMIT`` the task is routed to ``triage``
+            # instead of ``blocked`` — the same escalation ``block_task`` uses
+            # to break a cron-unblock ↔ worker-re-block loop. Without this,
+            # repeated crash/timed_out trips stay in ``blocked`` where an
+            # external auto-unblock cron can revive them forever, defeating the
+            # failure-limit breaker (observed 2026-10-08/09 cyclic restart).
+            prev_kind = row["block_kind"] if "block_kind" in row.keys() else None
+            prev_rec = (
+                int(row["block_recurrences"])
+                if "block_recurrences" in row.keys()
+                and row["block_recurrences"] is not None
+                else 0
+            )
+            # Same cause iff the previous block was also un-typed (breaker).
+            same_cause = prev_kind is None
+            recurrences = prev_rec + 1 if same_cause else 1
+            escalate_to_triage = recurrences >= BLOCK_RECURRENCE_LIMIT
+            landing = "triage" if escalate_to_triage else "blocked"
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = NULL, block_recurrences = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (landing, failures, error[:500], recurrences, task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
+                # cleared; just flip to landing status + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "UPDATE tasks SET status = ?, "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = NULL, block_recurrences = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (landing, failures, error[:500], recurrences, task_id),
                 )
             run_id = None
             if end_run:
@@ -10681,6 +10708,22 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if escalate_to_triage:
+                # Mirrors block_task's loop escalation event: surface WHY this
+                # breaker-trip loop was routed to triage so an operator (or a
+                # triage-automation cron) can distinguish a same-cause crash
+                # loop from a resolved transient cause.
+                _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": error[:500],
+                        "kind": None,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "source_status": retry_status,
+                    },
+                    run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
