@@ -2829,6 +2829,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    FAST_RESTART_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_cron_drain_timeout,
@@ -3385,6 +3386,12 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+_INTERRUPT_REASON_GATEWAY_FAST_RESTART = "Gateway fast-restarting"
+
+# Downtime target advertised by the FAST_RESTART JSON marker (seconds).
+# Path A1's acceptance bound: stop() must complete in <= 15s even with an
+# active ~10-hour turn, so the marker reports the same contract.
+FAST_RESTART_DOWNTIME_TARGET_S = 15.0
 
 
 def _reap_gateway_turn_processes(
@@ -12077,9 +12084,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    @staticmethod
+    def _fast_restart_env_requested() -> bool:
+        """True when the fast-restart env alternative is set to a truthy value.
+
+        ``HERMES_GATEWAY_FAST_RESTART=1`` (and ``true``/``yes``/``on``) is the
+        operator-facing alternative to ``/restart fast`` / ``hermes gateway
+        restart --fast`` (path A1).  ``0``, ``no``, empty or absent all mean
+        the slow, drain-respecting path.
+        """
+        return os.environ.get(FAST_RESTART_ENV, "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def request_restart(
+        self,
+        *,
+        detached: bool = False,
+        via_service: bool = False,
+        fast: bool = False,
+    ) -> bool:
         if self._restart_task_started:
             return False
+        # The env alternative resolves to the same in-band mode as an explicit
+        # ``fast=True``, so an operator can flip the knob without changing the
+        # command shape (path A1).
+        fast = bool(fast) or self._fast_restart_env_requested()
+        self._fast_restart = fast
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -12090,7 +12124,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = True
 
         async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
+            # Facts fast mode, skip the after-turn wait entirely —
+            # restart_after_turn_timeout can be 1800s, and the whole point of
+            # fast is to trade that grace for an immediate, resumable hard
+            # stop.  In-flight sessions are pre-marked resume_pending by
+            # stop() instead of being given 30 minutes to finish.
+            if not fast:
+                await self._await_active_work_before_restart()
             # Launch the detached helper only AFTER the after-turn wait.
             # Its deadline is drain_timeout+5 and covers stop() teardown —
             # launching earlier would fire `hermes gateway restart` while
@@ -12101,7 +12141,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
             await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            await self.stop(
+                restart=True,
+                detached_restart=detached,
+                service_restart=via_service,
+                fast=fast,
+            )
 
         # _run_restart is a short-lived self-terminating task (calls stop()
         # then returns).  Don't add it to _background_tasks — _stop_impl
@@ -12121,10 +12166,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # .clean_shutdown marker), "fast_restart" by the fast-restart path
+    # (run.py stop() with fast=True, path A1).  All four mean "the agent was
+    # mid-turn and we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted", "fast_restart"}
     )
 
     async def _run_startup_resume_event(
@@ -15098,8 +15144,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart: bool = False,
         detached_restart: bool = False,
         service_restart: bool = False,
+        fast: bool = False,
     ) -> None:
-        """Stop the gateway and disconnect all adapters."""
+        """Stop the gateway and disconnect all adapters.
+
+        ``fast=True`` (path A1: ``/restart fast`` / ``hermes gateway restart
+        -fast`` / ``HERMES_GATEWAY_FAST_RESTART=1``) skips the drain
+        entirely: the after-turn wait has already been skipped by
+        ``request_restart``, the drain budget is zero for both chat agents
+        and cron work (the cron floor is not applied), interrupted sessions
+        are pre-marked ``resume_pending`` with reason ``fast_restart`` so
+        the next boot auto-resumes them, and a machine-readable ``FAST_RESTART``
+        JSON marker is written to the log.
+        """
+        self._fast_restart = bool(fast)
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
@@ -15244,6 +15302,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._clear_plugin_message_injector()
             self._draining = True
 
+            # Fast-restart path (A1).  ``fast`` is captured from stop()'s
+            # closure; mirror it on self so the watchdog snapshot and the
+            # final-exit branch can read the same truth.
+            _fast = bool(fast)
+
+            # Machine-readable FAST_RESTART marker written early — before the
+            # drain wipes the counters — so gateway.log always carries a
+            # record of a fast stop even if a later teardown step swallows
+            # the usual "Shutdown phase" logs.
+            if _fast:
+                try:
+                    _marker = {
+                        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reason": "fast-restart",
+                        "active_agents": self._running_agent_count(),
+                        "active_cron": self._active_cron_job_count(),
+                        "active_api_runs": self._active_api_run_count(),
+                        "downtime_target": FAST_RESTART_DOWNTIME_TARGET_S,
+                    }
+                    logger.info("FAST_RESTART %s", json.dumps(_marker))
+                except Exception as _e:
+                    logger.debug("FAST_RESTART marker failed: %s", _e)
+
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
                 await stop_watchdog()
@@ -15258,7 +15339,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
-            timeout = self._restart_drain_timeout
+            # Fast mode trades the drain budget for an immediate, resumable
+            # hard stop: zero seconds for chat agents AND cron work (the cron
+            # floor in resolve_cron_drain_budget is short-circuited by
+            # fast=True), so _drain_active_agents() exits on its first probe
+            # and the interrupt path below fires right away.
+            timeout = 0.0 if _fast else self._restart_drain_timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
             # If the process is killed by the service manager during the
@@ -15271,7 +15357,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     await self.async_session_store.mark_resume_pending(
                         _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                        "fast_restart"
+                        if _fast
+                        else ("restart_timeout" if self._restart_requested else "shutdown_timeout"),
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
@@ -15293,6 +15381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cron_drain_cfg,
                 watchdog_delay=resolve_shutdown_watchdog_delay(timeout),
                 elapsed=_phase_elapsed(),
+                fast=_fast,
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(
@@ -15371,7 +15460,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
                 _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                    "fast_restart"
+                    if _fast
+                    else ("restart_timeout" if self._restart_requested else "shutdown_timeout")
                 )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
@@ -15384,8 +15475,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _sk, _e,
                         )
                 self._interrupt_running_agents(
-                    _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    _INTERRUPT_REASON_GATEWAY_FAST_RESTART
+                    if _fast
+                    else (
+                        _INTERRUPT_REASON_GATEWAY_RESTART
+                        if self._restart_requested
+                        else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    )
                 )
+                # Fast mode reaches the interrupt before the drain-timed-out
+                # logging below; _kill_tool_subprocesses() further along ALSO
+                # marks cron runs, but only once tool subprocesses are swept.
+                # Mark in-flight cron work interrupted immediately here so the
+                # scheduler can never report success for a run we just
+                # fast-killed even if teardown between now and the tool sweep
+                # takes a beat (path A1).
+                if _fast:
+                    try:
+                        from cron.scheduler import mark_running_jobs_interrupted
+                        _fast_cron_marked = mark_running_jobs_interrupted(
+                            "fast-restart"
+                        )
+                        if _fast_cron_marked:
+                            logger.warning(
+                                "Fast restart: marked %d in-flight cron job(s) interrupted: %s",
+                                len(_fast_cron_marked),
+                                ", ".join(_fast_cron_marked),
+                            )
+                    except Exception as _e:
+                        logger.debug(
+                            "mark_running_jobs_interrupted (fast-restart) error: %s", _e
+                        )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 # Wait on API-server work too. The interrupt is cooperative:
                 # without this the settle window closes the instant
@@ -15410,9 +15530,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # straight to the tool-subprocess kill.
                 if self._running_agents or self._active_api_run_count():
                     self._interrupt_running_agents(
-                        _INTERRUPT_REASON_GATEWAY_RESTART
-                        if self._restart_requested
-                        else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                        _INTERRUPT_REASON_GATEWAY_FAST_RESTART
+                        if _fast
+                        else (
+                            _INTERRUPT_REASON_GATEWAY_RESTART
+                            if self._restart_requested
+                            else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                        )
                     )
                     logger.debug(
                         "Re-signaled interrupt for work still live at settle-window exit"

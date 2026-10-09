@@ -1708,6 +1708,13 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+        # Path A1: ``/restart fast`` skips the drain entirely (see
+        # gateway/restart.py FAST_RESTART_ENV) — traded for an immediate,
+        # resumable hard stop.  Without the ``fast`` argument behavior is
+        # unchanged (the draining restart).
+        _restart_fast = (
+            "fast" in event.get_command_args().strip().lower().split()
+        )
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
@@ -1725,11 +1732,17 @@ class GatewaySlashCommandsMixin:
         _under_service = is_gateway_supervisor_process()
         _in_container = is_container_restart_context()
         if _under_service or _in_container:
-            self.request_restart(detached=False, via_service=True)
+            self.request_restart(
+                detached=False, via_service=True, fast=_restart_fast
+            )
         else:
-            self.request_restart(detached=True, via_service=False)
+            self.request_restart(
+                detached=True, via_service=False, fast=_restart_fast
+            )
         if active_agents:
             return t("gateway.draining", count=active_agents)
+        if _restart_fast:
+            return EphemeralReply(t("gateway.restart.fast_restarting"))
         return EphemeralReply(t("gateway.restart.restarting"))
 
     async def _handle_version_command(self, event: MessageEvent) -> str:

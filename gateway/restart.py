@@ -20,6 +20,14 @@ GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 # intentionally replace the child environment (for example ``sudo env -i``).
 EXTERNAL_GATEWAY_SUPERVISOR_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"
 
+# Env alternative for the fast-restart path: ``/restart fast``, CLI
+# ``hermes gateway restart --fast``, and a fast-restart marker file all
+# resolve to the same in-band mode.  When set (truthy), a gateway restart
+# skips the after-turn wait and the drain budget is zero for both chat
+# agents and cron work; in-flight sessions are pre-marked resume_pending so
+# the next boot auto-resumes them.  See path A1.
+FAST_RESTART_ENV = "HERMES_GATEWAY_FAST_RESTART"
+
 DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = float(
     DEFAULT_CONFIG["agent"]["restart_drain_timeout"]
 )
@@ -135,6 +143,7 @@ def resolve_cron_drain_budget(
     watchdog_delay: float,
     elapsed: float = 0.0,
     cleanup_reserve_s: float = CRON_DRAIN_CLEANUP_RESERVE_S,
+    fast: bool = False,
 ) -> float:
     """Seconds the shutdown drain may spend waiting on in-flight cron work.
 
@@ -148,7 +157,14 @@ def resolve_cron_drain_budget(
     Never returns less than ``drain_timeout``: the cron floor only ever
     extends the wait, so an operator who deliberately configured a long
     ``restart_drain_timeout`` keeps it.
+
+    ``fast=True`` (the fast-restart path A1) returns zero outright: cron work
+    is interrupted on the same zero budget as chat work and the wait never
+    starts, so in-flight sessions get their cooperative interrupt at once.
     """
+
+    if fast:
+        return 0.0
 
     def _seconds(value: object, fallback: float = 0.0) -> float:
         try:

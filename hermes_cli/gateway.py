@@ -36,6 +36,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
+    FAST_RESTART_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     is_gateway_supervisor_process,
@@ -8088,6 +8089,15 @@ def _gateway_command_inner(args):
                 "Use `hermes gateway restart` from a shell outside the running gateway."
             )
             sys.exit(1)
+
+        # ``--fast`` resolves to the same in-band fast-restart mode as
+        # ``/restart fast`` / ``HERMES_GATEWAY_FAST_RESTART=1`` (path A1):
+        # skip the post-turn drain, force-interrupt in-flight work and
+        # auto-resume it on the next boot.  Setting the env var here makes the
+        # replacement gateway process (spawned below via systemd/launchd/
+        # gateway_windows/run_gateway) inherit fast mode for its own restarts.
+        if getattr(args, "fast", False):
+            os.environ[FAST_RESTART_ENV] = "1"
 
         # Try service first, fall back to killing and restarting
         service_available = False

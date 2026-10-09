@@ -141,6 +141,13 @@ def build_gateway_parser(
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
     )
+    gateway_restart.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast restart: skip the post-turn drain and force-interrupt in-flight "
+        "work (auto-resumed on the next boot). Equivalent to setting "
+        "HERMES_GATEWAY_FAST_RESTART=1.",
+    )
     _add_compat_platform_flag(gateway_restart)
 
     # gateway status

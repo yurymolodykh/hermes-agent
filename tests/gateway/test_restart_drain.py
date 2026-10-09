@@ -53,7 +53,9 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     assert expected != "gateway.draining"
     assert "Draining" in expected and "1" in expected
     running_agent.interrupt.assert_not_called()
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    runner.request_restart.assert_called_once_with(
+        detached=True, via_service=False, fast=False
+    )
 
 
 def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monkeypatch):
@@ -110,7 +112,7 @@ async def test_request_restart_is_idempotent():
 
     runner._launch_detached_restart_command.assert_awaited_once_with()
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=True, service_restart=False
+        restart=True, detached_restart=True, service_restart=False, fast=False
     )
 
 
@@ -137,7 +139,7 @@ async def test_request_restart_defers_stop_until_active_turn_finishes():
     await runner._restart_task
 
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=False, service_restart=True
+        restart=True, detached_restart=False, service_restart=True, fast=False
     )
     # Detached helper is only for the non-service path.
     runner._launch_detached_restart_command.assert_not_awaited()
@@ -155,7 +157,7 @@ async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately()
     await runner._restart_task
 
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=False, service_restart=True
+        restart=True, detached_restart=False, service_restart=True, fast=False
     )
 
 
@@ -171,7 +173,7 @@ async def test_request_restart_after_turn_cap_elapsed_still_calls_stop():
     await runner._restart_task
 
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=False, service_restart=True
+        restart=True, detached_restart=False, service_restart=True, fast=False
     )
     # Agent was still present — stop() owns the interrupt path from here.
     assert runner._running_agents
@@ -216,7 +218,7 @@ async def test_run_restart_excluded_from_stop_cancel_loop():
 
     await restart_task
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=False, service_restart=True
+        restart=True, detached_restart=False, service_restart=True, fast=False
     )
 
 
@@ -414,7 +416,7 @@ async def test_request_restart_skips_wait_when_only_wedged_turns(monkeypatch):
     await asyncio.wait_for(runner._restart_task, timeout=5.0)
 
     runner.stop.assert_awaited_once_with(
-        restart=True, detached_restart=False, service_restart=True
+        restart=True, detached_restart=False, service_restart=True, fast=False
     )
     # Wedged agent stays in the map — stop() owns the interrupt from here.
     assert runner._running_agents
