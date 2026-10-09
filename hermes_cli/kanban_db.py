@@ -445,6 +445,13 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # outage. Unlike an ordinary crash this needs an explicit routing decision;
 # spawning the same pinned model again cannot solve a persistent outage.
 KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE = 74
+# How many consecutive provider/API-unavailable occurrences for ONE task are
+# auto-returned to its source phase before the user is asked. Mirrors the
+# per-task streak on top of the dispatcher's regular breaker: these requeues
+# never count into ``consecutive_failures`` (so ``failure_limit`` can't trip on
+# a provider outage), and the 4th+ consecutive occurrence for the same task is
+# blocked with ``needs_input`` and the existing question text.
+KANBAN_API_UNAVAILABLE_RETRY_LIMIT = 3
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1097,6 +1104,11 @@ class Task:
     # ``_record_task_failure`` for the circuit-breaker trip rule.
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
+    # Consecutive provider/API-unavailable requeues for this task only (see the
+    # column comment in SCHEMA_SQL / ``detect_crashed_workers``). Reset on
+    # successful completion and operator interventions; independent of
+    # ``consecutive_failures``.
+    api_unavailable_streak: int = 0
     worker_pid: Optional[int] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
@@ -1203,6 +1215,10 @@ class Task:
                 # on a DB that was never opened since pre-#20410 code ran. Keep for
                 # belt-and-suspenders safety; in practice it is dead code post-migration.
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
+            ),
+            api_unavailable_streak=(
+                row["api_unavailable_streak"]
+                if "api_unavailable_streak" in keys else 0
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
             last_failure_error=(
@@ -1390,6 +1406,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- The circuit breaker in _record_task_failure trips when this
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- Consecutive provider/API-unavailable requeues for this task ONLY (the
+    -- provider-outage policy). Unlike consecutive_failures this is NOT touched
+    -- by _record_task_failure: detect_crashed_workers auto-returns the task to
+    -- its source phase for the first KANBAN_API_UNAVAILABLE_RETRY_LIMIT
+    -- consecutive occurrences and asks the user only from the 4th onward. The
+    -- count is persisted here so it survives a dispatcher restart; reset on
+    -- successful completion / operator reclaim / unblock.
+    api_unavailable_streak INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
@@ -2627,6 +2651,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE tasks SET consecutive_failures = COALESCE(spawn_failures, 0)"
             )
+    if "api_unavailable_streak" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "api_unavailable_streak",
+            "api_unavailable_streak INTEGER NOT NULL DEFAULT 0",
+        )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
     if "last_failure_error" not in cols:
@@ -7640,7 +7671,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "api_unavailable_streak = 0 "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -9048,6 +9080,15 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    api_unavailable: list[str] = field(default_factory=list)
+    """Task ids whose workers bailed on a provider/API outage (the
+    ``KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE`` sentinel exit) and were
+    auto-returned to their source phase WITHOUT counting a failure
+    (``api_unavailable_streak`` at or below the retry limit). These never
+    trip the circuit breaker and are never routed to another model or a
+    different pinned worker. Past the retry limit the task is blocked with
+    the user question instead and lands in ``auto_blocked``/``blocked``,
+    not here."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10181,6 +10222,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    api_unavailable: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -10195,7 +10237,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id, "
-            "model_override, provider_override "
+            "model_override, provider_override, api_unavailable_streak "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -10247,9 +10289,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     continue
             if kind == "provider_unavailable":
                 # The CLI exhausted its in-process provider/transport retries.
-                # Never route to another model or bounce this pinned worker in
-                # a dispatcher retry loop. A blocked event is consumed by the
-                # existing notifier (including the api_server session wake).
+                # This is NOT a task failure: the first
+                # KANBAN_API_UNAVAILABLE_RETRY_LIMIT consecutive occurrences for
+                # the same task auto-return it to its source phase (claim
+                # released, run closed as ``api_unavailable``, event emitted) so
+                # the dispatcher can try again once the provider is back — no
+                # breaker trip, no user question. Only from the 4th consecutive
+                # occurrence onward is the user asked (blocked + needs_input,
+                # existing question text + notifier accounting), because by then
+                # an automatic retry loop is not going to clear a persistent
+                # outage on its own. The repeat count lives in
+                # ``tasks.api_unavailable_streak`` (persisted across dispatcher
+                # restarts), NOT in ``consecutive_failures``, so the regular
+                # circuit breaker (DEFAULT_FAILURE_LIMIT=2) can never trip on a
+                # transient provider outage.
                 marker = _read_worker_exit_marker(
                     row["id"], int(row["current_run_id"])
                 ) if row["current_run_id"] else None
@@ -10275,6 +10328,67 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     except Exception as exc:
                         _log.warning("cannot resolve legacy worker route for %s: %s", row["id"], exc)
                 route = "/".join((str(provider or "не установлен"), str(model or "не установлена")))
+                streak = (
+                    int(row["api_unavailable_streak"])
+                    if "api_unavailable_streak" in row.keys()
+                    else 0
+                ) + 1
+                if streak <= KANBAN_API_UNAVAILABLE_RETRY_LIMIT:
+                    # Auto-return without counting a failure: mirror the
+                    # ``rate_limited`` requeue below (release claim, restore the
+                    # source phase, close the run, emit a task event) but with an
+                    # ``api_unavailable`` outcome that says "provider was down,
+                    # not a task problem".
+                    error_text = (
+                        f"API/provider недоступен ({route}) — задача автоматически "
+                        f"возвращена в очередь (повтор {streak}/{KANBAN_API_UNAVAILABLE_RETRY_LIMIT}); "
+                        "failure не засчитан"
+                    )
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        "provider_route": route,
+                        "api_unavailable_streak": streak,
+                    }
+                    retry_status = _retry_status_for_run(conn, row["id"])
+                    event_payload["retry_status"] = retry_status
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "api_unavailable_streak = ? "
+                        "WHERE id = ? AND status = 'running' "
+                        "  AND worker_pid = ? AND claim_lock IS ?",
+                        (retry_status, streak, row["id"], pid, row["claim_lock"]),
+                    )
+                    if cur.rowcount == 1:
+                        run_id = _end_run(
+                            conn, row["id"],
+                            outcome="api_unavailable", status="api_unavailable",
+                            error=error_text,
+                            metadata=dict(event_payload),
+                        )
+                        _append_event(
+                            conn, row["id"], "api_unavailable",
+                            event_payload, run_id=run_id,
+                        )
+                        exited_hook_payloads.append({
+                            "task_id": row["id"],
+                            "assignee": row["assignee"],
+                            "run_id": run_id,
+                            "worker_pid": pid,
+                            "exit_kind": kind,
+                            "exit_code": code,
+                            "outcome": "api_unavailable",
+                            "retry_status": retry_status,
+                        })
+                        api_unavailable.append(row["id"])
+                    continue
+                # 4th+ consecutive provider/API outage for the SAME task: an
+                # automatic retry loop has already had its budget — the user
+                # must decide (same route later vs a per-task route switch).
+                # A blocked event is consumed by the existing notifier
+                # (including the api_server session wake).
                 question = (
                     f"Провайдер/модель {route}: после повторов API всё ещё недоступен "
                     "(ошибка соединения, таймаут или сбой сервера). Задача остановлена "
@@ -10287,14 +10401,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 cur = conn.execute(
                     "UPDATE tasks SET status='blocked', block_kind='needs_input', "
                     "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "api_unavailable_streak = ?, "
                     "last_failure_error=? WHERE id=? AND status='running' "
                     "AND worker_pid=? AND claim_lock IS ?",
-                    (question[:500], row["id"], pid, row["claim_lock"]),
+                    (streak, question[:500], row["id"], pid, row["claim_lock"]),
                 )
                 if cur.rowcount == 1:
                     payload = {"pid": pid, "exit_code": code,
                                "reason": question, "kind": "needs_input",
-                               "provider_route": route}
+                               "provider_route": route,
+                               "api_unavailable_streak": streak}
                     run_id = _end_run(
                         conn, row["id"], outcome="blocked", status="blocked",
                         error=question, summary=question, metadata=payload,
@@ -10531,6 +10647,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for API-unavailable requeues — these also did NOT count
+    # a failure and were NOT crashes; they went back to their source phase to
+    # retry once the provider is back (or, past the streak limit, were blocked
+    # with the user question, which lands in ``_last_auto_blocked``).
+    detect_crashed_workers._last_api_unavailable = api_unavailable  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -10827,7 +10948,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, api_unavailable_streak = 0 WHERE id = ?",
             (task_id,),
         )
 
@@ -12167,6 +12288,15 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Provider/API-unavailable requeues (provider down, no failure counted)
+    # — surface for telemetry / tests. These tasks went back to their source
+    # phase and will be retried once the provider is back; past the retry
+    # limit they are blocked with the user question instead (auto_blocked).
+    _crash_api_unavailable = getattr(
+        detect_crashed_workers, "_last_api_unavailable", []
+    )
+    if _crash_api_unavailable:
+        result.api_unavailable.extend(_crash_api_unavailable)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -14928,6 +15058,23 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
         (task_id,),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+    """Return the currently active (unfinished) run for ``task_id``, or None.
+
+    A run counts as active while it has no ``ended_at`` — claimed and not
+    yet closed by complete/block/crash/timeout/spawn_failure/reclaim.
+    Convenience used by the Kanban WebUI dashboards so they can show the
+    live run without scanning the full history via :func:`list_runs`.
+    """
+    row = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return Run.from_row(row) if row else None
+
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:

@@ -1085,47 +1085,20 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
 
 def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home):
     """Full _migrate_add_optional_columns must not raise when columns already
-    exist (issue #21708 race window — two connections migrate concurrently)."""
+    exist (issue #21708 race window — two connections migrate concurrently).
+
+    The in-memory DB is built from the REAL production SCHEMA_SQL so the state
+    genuinely is the fully-migrated one (all optional columns + task_runs +
+    task_events + kanban_notify_subs present). A hand-written minimal schema
+    drifts: the migration pass also ALTERs task_runs.worker_session_id and
+    backfills in-flight ``running`` rows from task columns (assignee,
+    started_at, ...), so a stale subset raises instead of testing idempotency.
+    """
     import sqlite3
 
-    # Schema already in fully-migrated state (all optional columns present).
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE tasks (
-            id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
-            tenant TEXT,
-            result TEXT,
-            idempotency_key TEXT,
-            branch_name TEXT,
-            consecutive_failures INTEGER NOT NULL DEFAULT 0,
-            worker_pid INTEGER,
-            last_failure_error TEXT,
-            max_runtime_seconds INTEGER,
-            last_heartbeat_at INTEGER,
-            current_run_id INTEGER,
-            workflow_template_id TEXT,
-            current_step_key TEXT,
-            skills TEXT,
-            max_retries INTEGER,
-            session_id TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE task_events (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id    TEXT NOT NULL DEFAULT '',
-            run_id     INTEGER,
-            kind       TEXT NOT NULL DEFAULT '',
-            payload    TEXT,
-            created_at INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
+    conn.executescript(kb.SCHEMA_SQL)
 
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
@@ -1181,7 +1154,12 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kb._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    # Real subprocess run of `python -m hermes_cli.main --version`. The
+    # timeout is generous: a cold CLI import is heavy (site-packages, plugins,
+    # toolset registration) and on a loaded CI/desktop box the full-suite wall
+    # time can spike well past the raw 10-15s startup. 120s bounds an actual
+    # hang while never flaking on a merely slow machine.
+    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
@@ -2019,4 +1997,344 @@ def test_dispatch_daytime_reserve_inactive_without_pool(
         )
 
     assert not res.reserved_by_daytime
+
+# ---------------------------------------------------------------------------
+# active_run() — Kanban WebUI live-run lookup (WebUI /api/operations 500 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_active_run_returns_claimed_run_until_completed(kanban_home):
+    """Once a task is claimed, ``active_run`` reports the live run; after
+    completion it returns None while ``latest_run`` still resolves it."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="active-run-probe", assignee="a")
+        assert kb.active_run(conn, t) is None  # never claimed yet
+
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        active = kb.active_run(conn, t)
+        assert active is not None
+        assert active.id == claimed.current_run_id
+        assert active.outcome is None  # not yet terminal
+
+        assert kb.complete_task(conn, t, result="ok")
+        assert kb.active_run(conn, t) is None  # no live run remains
+        run = kb.latest_run(conn, t)
+        assert run is not None and run.outcome == "completed"
+
+
+def test_active_run_ignores_older_completed_runs(kanban_home):
+    """A task with a previously completed run and no new claim must not
+    report a stale run as active."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="active-run-stale", assignee="a")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert kb.complete_task(conn, t, result="ok")
+        # Re-query: latest_run exists but active_run must be None.
+        assert kb.active_run(conn, t) is None
+        assert kb.latest_run(conn, t) is not None
+
+
+# ---------------------------------------------------------------------------
+# API/provider-unavailable requeue (kanban provider-outage policy).
+#
+# A worker that bails with KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE (74) did so
+# because the provider/API was down, not because the task failed. The FIRST
+# KANBAN_API_UNAVAILABLE_RETRY_LIMIT (=3) consecutive occurrences for the same
+# task auto-return it to its source phase WITHOUT counting into
+# ``consecutive_failures`` — so the regular failure_limit=2 circuit breaker can
+# never trip on a provider outage. Only on the 4th+ consecutive occurrence is
+# the user asked (blocked + needs_input, existing question text). The repeat
+# count lives in ``tasks.api_unavailable_streak`` (persisted across dispatcher
+# restarts) and is reset on successful completion / operator reclaim.
+# ---------------------------------------------------------------------------
+
+
+def _provider_unavailable_hit(conn, tid, n, *, host):
+    """Claim → repoint at a dead pid → record an exit-74 reap → run one
+    ``detect_crashed_workers`` pass. Returns the pid used."""
+    import hermes_cli.kanban_db as _kb
+
+    assert kb.claim_task(conn, tid, claimer=f"{host}:w{n}")
+    pid = 90000 + n
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    conn.commit()
+    _kb._record_worker_exit(
+        pid, _exited_status(_kb.KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE)
+    )
+    assert tid not in kb.detect_crashed_workers(conn)  # never a regular crash
+    return pid
+
+
+def test_provider_unavailable_first_three_auto_return_to_ready(
+    kanban_home, monkeypatch,
+):
+    """Occurrences 1..3 of provider_unavailable for one task go back to
+    ``ready`` — not ``blocked`` — with no failure counted and no user
+    question; the repeat streak is persisted in the DB column."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="api-down", assignee="a",
+                             model_override="deepseek-v4-flash",
+                             provider_override="letovo")
+        for i in range(3):
+            _provider_unavailable_hit(conn, tid, i, host=host)
+            # Auto-returned requeues are surfaced via the side-channel (they
+            # are NOT crashes), mirroring the rate_limited reporting pattern.
+            api_na = getattr(
+                _kb.detect_crashed_workers, "_last_api_unavailable", []
+            )
+            assert tid in api_na
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.block_kind is None
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: provider outage must NOT count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+            streak = conn.execute(
+                "SELECT api_unavailable_streak FROM tasks WHERE id=?", (tid,),
+            ).fetchone()[0]
+            assert streak == i + 1
+
+        # No blocked-with-question event, no delivery_pending on this path.
+        blocked = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind='blocked'",
+            (tid,),
+        ).fetchall()
+        assert blocked == []
+        # The requeued run is closed with the api_unavailable outcome.
+        outcomes = [r["outcome"] for r in conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()]
+        assert outcomes == ["api_unavailable"] * 3
+        assert "crashed" not in outcomes
+
+
+def test_provider_unavailable_fourth_repeat_blocks_with_question(
+    kanban_home, monkeypatch,
+):
+    """After three auto-returns without success, the 4th consecutive
+    provider_unavailable for the SAME task asks the user (blocked +
+    needs_input) with the existing question text, and the regular breaker
+    never tripped (consecutive_failures stays 0)."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="api-down-4", assignee="a",
+                             model_override="deepseek-v4-flash",
+                             provider_override="letovo")
+        for i in range(3):
+            _provider_unavailable_hit(conn, tid, i, host=host)
+            assert kb.get_task(conn, tid).status == "ready"
+
+        # 4th consecutive occurrence for the same task → ask the user.
+        _provider_unavailable_hit(conn, tid, 3, host=host)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.consecutive_failures == 0, (
+            "breaker must not trip through the provider-outage path"
+        )
+        assert "после повторов API всё ещё недоступен" in task.last_failure_error
+
+        blocked = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='blocked'", (tid,),
+        ).fetchall()
+        assert len(blocked) == 1
+        payload = json.loads(blocked[0]["payload"])
+        assert payload["kind"] == "needs_input"
+        assert payload["provider_route"] == "letovo/deepseek-v4-flash"
+
+        outcomes = [r["outcome"] for r in conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()]
+        assert outcomes[:3] == ["api_unavailable"] * 3
+        assert outcomes[3] == "blocked"
+
+
+def test_provider_unavailable_streak_persists_and_completion_resets(
+    kanban_home, monkeypatch,
+):
+    """The repeat counter is backed by a DB column (survives a dispatcher
+    restart / fresh connection), and a successful ``complete_task`` resets it
+    so the next outage gets a full 3-attempt budget."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="streak", assignee="a",
+                             model_override="deepseek-v4-flash",
+                             provider_override="letovo")
+        _provider_unavailable_hit(conn, tid, 0, host=host)
+        _provider_unavailable_hit(conn, tid, 1, host=host)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT api_unavailable_streak FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == 2
+
+    # Fresh connection ≈ dispatcher restart: streak comes from the DB.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT api_unavailable_streak FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == 2
+        # Still inside budget: hit #3 auto-returns.
+        _provider_unavailable_hit(conn, tid, 2, host=host)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Successful completion resets the counter.
+        assert kb.claim_task(conn, tid, claimer=f"{host}:w3")
+        assert kb.complete_task(conn, tid, result="ok")
+        assert kb.get_task(conn, tid).status == "done"
+        assert conn.execute(
+            "SELECT api_unavailable_streak FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == 0
+
+
+def test_provider_unavailable_streak_reset_on_unblock(kanban_home, monkeypatch):
+    """A human unblocking the card is operator intervention — it resets the
+    API-outage streak so the next attempt gets a fresh 3-attempt budget
+    instead of re-asking immediately."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="streak-unblock", assignee="a",
+                             model_override="deepseek-v4-flash",
+                             provider_override="letovo")
+        for i in range(4):
+            _provider_unavailable_hit(conn, tid, i, host=host)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT api_unavailable_streak FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == 0
+
+
+def test_regular_crash_still_blocks_at_failure_limit_two(
+    kanban_home, monkeypatch,
+):
+    """Regression: a real crash (nonzero exit) is unaffected by the new
+    provider-outage policy — it still trips the breaker at failure_limit=2."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    def crash(conn, tid, n):
+        assert kb.claim_task(conn, tid, claimer=f"{host}:c{n}")
+        pid = 92000 + n
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(2))  # real nonzero crash
+        return kb.detect_crashed_workers(conn)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="crash-loop", assignee="a")
+        assert tid in crash(conn, tid, 0)
+        t = kb.get_task(conn, tid)
+        assert t.status == "ready" and t.consecutive_failures == 1
+        assert tid in crash(conn, tid, 1)
+        t = kb.get_task(conn, tid)
+        assert t.status == "blocked"  # DEFAULT_FAILURE_LIMIT == 2 reached
+        assert t.consecutive_failures == 2
+
+
+def test_dispatch_once_reports_api_unavailable_in_result(
+    kanban_home, monkeypatch,
+):
+    """``DispatchResult.api_unavailable`` is populated by ``dispatch_once``:
+    an exit-74 requeue inside the full tick surfaces on the result object
+    (not only on the private side-channel), so telemetry / dashboards see
+    it, mirroring ``rate_limited`` reporting."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    # Stub route preflight: these unit tests exercise detect_crashed_workers,
+    # not create_task route validation against the live host.
+    monkeypatch.setattr(_kb, "_provider_route_blocker", lambda provider, model: None)
+    # The assignee-aware spawn pre-flight resolves the card's pinned route in
+    # the ASSIGNEE profile's filesystem config — under the synthetic-assignee
+    # registry that would raise FileNotFoundError for the real (non-existent)
+    # profile. This tick's intent is the provider-outage requeue reporting, not
+    # spawn-route validation, so accept any pinned route as usable (same
+    # hermetic pattern as the ``_provider_route_blocker`` stub above).
+    monkeypatch.setattr(
+        _kb, "resolve_assignee_spawn_route",
+        lambda assignee, provider, model: (provider, model, None),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # Stub the actual subprocess launcher: after this tick reclaims the task
+    # back to ``ready``, the ready lane re-spawns it in the same pass. Mirror a
+    # real spawn's int-pid return, but do not launch any subprocess.
+    monkeypatch.setattr(_kb, "_default_spawn", lambda task, workspace, board=None: 424242)
+    monkeypatch.setattr(_kb, "check_respawn_guard", lambda conn, tid: None)
+    monkeypatch.setattr(_kb, "resolve_task_root_route",
+                        lambda conn, tid, persist=False, allow_unpinned=False:
+                        ((tid,), "prof", "prof-model"))
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="api-down-tick", assignee="a",
+                             model_override="deepseek-v4-flash",
+                             provider_override="letovo")
+        # Leave the task ``running`` with a dead pid reaped as exit 74 so THIS
+        # dispatch tick performs the provider-outage requeue itself (streak
+        # 0 -> 1, within the retry limit: auto-return to ready, not blocked).
+        assert kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        fake_pid = 909900
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (fake_pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(
+            fake_pid, _exited_status(_kb.KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE)
+        )
+
+        res = _kb.dispatch_once(conn)
+        # The requeue was reported on the result object, and did NOT trip
+        # the breaker or get counted as a failure/crash.
+        assert tid in res.api_unavailable
+        assert tid not in res.crashed
+        assert tid not in res.rate_limited
+        assert tid not in res.auto_blocked
+        t = kb.get_task(conn, tid)
+        assert t.consecutive_failures == 0
 

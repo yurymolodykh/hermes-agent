@@ -10,6 +10,15 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+# Same hermetic harness as test_kanban_db.py: unit tests of this module run
+# against the synthetic assignee registry + stub route blocker, so they don't
+# depend on a named Hermes profile or host provider config existing on the
+# machine running the suite.
+pytestmark = pytest.mark.usefixtures(
+    "isolated_kanban_assignee_registry", "isolated_kanban_route_resolver",
+)
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
@@ -42,7 +51,7 @@ def test_provider_outage_blocks_and_wakes_owner_not_respawn(board, monkeypatch):
     # A real exited worker, not a synthesized POSIX wait status. The same
     # blocked event is what the gateway notification subscription consumes.
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="pinned", assignee="test",
+        tid = kb.create_task(conn, title="pinned", assignee="test-worker",
                              model_override="gemma4:26b", provider_override="local")
         kb.add_notify_sub(conn, task_id=tid, platform="api_server",
                           chat_id="owner-session", delivery_mode="notify+wake")
@@ -52,13 +61,19 @@ def test_provider_outage_blocks_and_wakes_owner_not_respawn(board, monkeypatch):
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         kb._windows_worker_processes[proc.pid] = proc
         assert proc.wait(timeout=10) == 74
-        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (proc.pid, tid))
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, api_unavailable_streak=? WHERE id=?",
+            (proc.pid, 3, tid),
+        )
         conn.commit()
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         kb.reap_worker_zombies()
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, tid)
         assert task.status == "blocked" and task.block_kind == "needs_input"
+        # The first 3 consecutive provider-unavailable occurrences auto-return
+        # to ready (no user question); this pre-seeded streak makes this the
+        # 4th consecutive one — the point where the user is asked.
         assert task.consecutive_failures == 0
         assert "local/gemma4:26b" in task.last_failure_error
         assert "letovo/deepseek-v4-flash" in task.last_failure_error
@@ -106,7 +121,7 @@ def test_restart_recovers_bound_exit_receipt_and_profile_route(board, monkeypatc
     )
     monkeypatch.setattr(profiles, "resolve_profile_env", lambda _name: str(profile))
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="profile default", assignee="test")
+        tid = kb.create_task(conn, title="profile default", assignee="test-worker")
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:test")
         run_id = kb.get_task(conn, tid).current_run_id
@@ -123,13 +138,18 @@ def test_restart_recovers_bound_exit_receipt_and_profile_route(board, monkeypatc
         (profile / "config.yaml").write_text(
             "model:\n  provider: other\n  default: other-model\n", encoding="utf-8"
         )
-        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (proc.pid, tid))
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, api_unavailable_streak=? WHERE id=?",
+            (proc.pid, 3, tid),
+        )
         conn.commit()
         kb._windows_worker_processes.clear()
         kb._recent_worker_exits.clear()
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, tid)
+        # Pre-seeded streak makes this the 4th consecutive occurrence — only
+        # then is the user asked (the first 3 auto-return to ready).
         assert task.status == "blocked" and task.block_kind == "needs_input"
         assert "local/gemma4:26b" in task.last_failure_error
         assert "other/other-model" not in task.last_failure_error
@@ -140,7 +160,7 @@ def test_restart_recovers_bound_exit_receipt_and_profile_route(board, monkeypatc
 @pytest.mark.windows_only
 def test_restart_without_receipt_never_guesses_exit_or_retries(board, monkeypatch):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="no receipt", assignee="test")
+        tid = kb.create_task(conn, title="no receipt", assignee="test-worker")
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:test")
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (998877, tid))
@@ -163,10 +183,14 @@ def test_profile_defaults_used_for_legacy_exit_without_receipt(board, monkeypatc
     )
     monkeypatch.setattr(profiles, "resolve_profile_env", lambda _name: str(profile))
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="legacy default", assignee="test")
+        tid = kb.create_task(conn, title="legacy default", assignee="test-worker")
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:test")
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (999, tid))
+        # Pre-seed the streak so this single provider-unavailable exit is the
+        # 4th consecutive occurrence — the point where the user is asked (the
+        # first 3 auto-return to ready without a question).
+        conn.execute("UPDATE tasks SET api_unavailable_streak=? WHERE id=?", (3, tid))
         conn.commit()
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("provider_unavailable", 74))
