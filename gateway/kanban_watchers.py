@@ -287,6 +287,23 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Per-source-event api_server staging retry budget (TTL). The exact
+        # api_server branch below rewinds the notify cursor on any
+        # non-acknowledged stage result so a server-owned readback can gate
+        # advancement. A permanently-undeliverable event (missing/unbound
+        # registry, outbox row stuck in a bad state) would otherwise rewind
+        # and re-claim the SAME event every 5s tick forever, spamming
+        # "delivery ...; cursor retained" at WARNING (incident 2026-10-08/09,
+        # 12,689 identical lines for one event in ~24h). After
+        # MAX_API_STAGE_RETRIES consecutive non-acknowledged results for one
+        # (task, event) the notifier gives up on it: it advances the cursor
+        # past the event (the row stays in the outbox for independent drain)
+        # and logs the drop once, instead of pinning the cursor forever.
+        MAX_API_STAGE_RETRIES = 8
+        api_stage_counts: dict[tuple, int] = getattr(
+            self, "_kanban_api_stage_failures", {}
+        )
+        self._kanban_api_stage_failures = api_stage_counts
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -742,15 +759,41 @@ class GatewayKanbanWatchersMixin:
                                     board_slug or "default", ev.id, msg,
                                 )
                             if _state != "acknowledged":
-                                logger.warning(
-                                    "kanban notifier: exact api_server event %s/%s delivery %s; cursor retained",
-                                    sub["task_id"], ev.id, _state,
-                                )
-                                await _to_thread_process_service(
-                                    self._kanban_rewind, sub, d["cursor"],
-                                    d.get("old_cursor", 0), board_slug,
-                                )
+                                _stage_key = (sub["task_id"], ev.id)
+                                _stage_fails = api_stage_counts.get(_stage_key, 0) + 1
+                                api_stage_counts[_stage_key] = _stage_fails
+                                # Every non-acknowledged result counts toward
+                                # one budget — pending (staged, awaiting
+                                # server-owned readback that normally lands next
+                                # tick) AND failed/unbound. Dropping past a
+                                # pending event is lossless: the row is already
+                                # persisted in the outbox and the delivery
+                                # worker performs the actual chat-write/ack
+                                # independently of this notifier cursor.
+                                if _stage_fails >= MAX_API_STAGE_RETRIES:
+                                    logger.warning(
+                                        "kanban notifier: exact api_server event %s/%s "
+                                        "stuck at delivery %s after %d ticks; dropping "
+                                        "event (cursor advances, row stays in outbox)",
+                                        sub["task_id"], ev.id, _state, _stage_fails,
+                                    )
+                                    api_stage_counts.pop(_stage_key, None)
+                                    await _to_thread_process_service(
+                                        self._kanban_advance, sub, d["cursor"], board_slug,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "kanban notifier: exact api_server event %s/%s "
+                                        "delivery %s; cursor retained (attempt %d/%d)",
+                                        sub["task_id"], ev.id, _state,
+                                        _stage_fails, MAX_API_STAGE_RETRIES,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind, sub, d["cursor"],
+                                        d.get("old_cursor", 0), board_slug,
+                                    )
                                 break
+                            api_stage_counts.pop((sub["task_id"], ev.id), None)
                             continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
