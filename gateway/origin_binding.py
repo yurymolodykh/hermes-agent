@@ -20,7 +20,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Union
 
 from gateway.session_context import get_session_env
 
@@ -110,6 +110,36 @@ def configured_secret() -> str:
     return (os.environ.get("FORWARD_USER_INFO_HEADER_JWT_SECRET") or "").strip()
 
 
+_TOKEN_REJECTED = object()
+
+
+def verify_request_token(headers: Mapping[str, str]) -> Union[dict, None, object]:
+    """Verify ONLY the WebUI-signed identity claim.
+
+    Returns the JWT payload dict when a claim is present AND valid, ``None``
+    when no claim is present, and :data:`_TOKEN_REJECTED` when a claim is
+    present but fails verification (bad signature/expiry/shape). The caller
+    distinguishes the three so a well-formed claim can stay "unbound" (e.g.
+    no chat header on GET /v1/models) instead of being mistaken for a
+    forged one.
+    """
+    secret = configured_secret()
+    if not secret:
+        return None
+    token = _header(headers, _JWT_HEADER).strip()
+    if not token:
+        return None
+    payload = _verify_hs256(token, secret)
+    if payload is None:
+        return _TOKEN_REJECTED
+    subject = payload.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        return _TOKEN_REJECTED
+    if len(subject) > _MAX_SUBJECT_LEN:
+        return _TOKEN_REJECTED
+    return payload
+
+
 def resolve_request_origin(
     headers: Mapping[str, str], profile: Optional[str] = None
 ) -> Optional[dict]:
@@ -120,20 +150,10 @@ def resolve_request_origin(
     mismatch (unsigned, foreign secret, expired, missing/foreign chat id)
     fails closed as "unbound".
     """
-    secret = configured_secret()
-    if not secret:
-        return None
-    token = _header(headers, _JWT_HEADER).strip()
-    if not token:
-        return None
-    payload = _verify_hs256(token, secret)
-    if payload is None:
+    payload = verify_request_token(headers)
+    if payload is None or payload is _TOKEN_REJECTED:
         return None
     subject = payload.get("sub")
-    if not isinstance(subject, str) or not subject.strip():
-        return None
-    if len(subject) > _MAX_SUBJECT_LEN:
-        return None
     raw_chat = _header(headers, _CHAT_HEADER).strip()
     match = _CHAT_UUID_RE.fullmatch(raw_chat)
     if not match:

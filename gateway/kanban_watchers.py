@@ -1936,6 +1936,10 @@ class GatewayKanbanWatchersMixin:
             _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
             _state = "unbound"
             marker_id = plan.get("marker_id") or 0
+            # In branch_summary_replace mode the individual completed pings
+            # are suppressed — the branch итог must then carry the report
+            # inline itself, or the api_server channel never sees it.
+            _msg = _owui_branch_result_text(plan, msg)
             if (
                 _registry
                 and (not sub_profile or sub_profile == notifier_profile)
@@ -1945,7 +1949,7 @@ class GatewayKanbanWatchersMixin:
                     stage_terminal,
                     get_hermes_home() / "delivery-outbox.sqlite",
                     _registry, sub, sub_profile or notifier_profile,
-                    board or "default", int(marker_id), msg,
+                    board or "default", int(marker_id), _msg,
                 )
             if _state != "acknowledged":
                 logger.warning(

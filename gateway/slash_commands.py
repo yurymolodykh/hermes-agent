@@ -1956,6 +1956,29 @@ class GatewaySlashCommandsMixin:
                             )
                             if not result.success:
                                 return t("gateway.model.error_prefix", error=result.error_message)
+                            # Store session override so the next agent creation
+                            # (and /status) actually uses the picked model.
+                            self._session_model_overrides[session_key] = {
+                                "model": result.new_model,
+                                "provider": result.target_provider,
+                                "api_key": result.api_key,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            }
+                            if hasattr(self, "_pending_one_turn_model_restores"):
+                                self._pending_one_turn_model_restores.pop(session_key, None)
+                            # Write-through non-secret parts so the choice survives
+                            # a gateway restart (session store strips secrets).
+                            try:
+                                await self.async_session_store.set_model_override(
+                                    session_key,
+                                    self._session_model_overrides[session_key],
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "flat model picker: failed to persist model override",
+                                    exc_info=True,
+                                )
                             plabel = result.provider_label or result.target_provider
                             return t(
                                 "gateway.model.switched",

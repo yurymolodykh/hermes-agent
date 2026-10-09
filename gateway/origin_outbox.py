@@ -72,8 +72,22 @@ def enqueue(path: str | Path, source_id: str, origin: Mapping[str, object], cont
         db.execute("BEGIN IMMEDIATE")
         db.execute("""INSERT OR IGNORE INTO origin_delivery(id, source_id, destination, content)
                       VALUES(?, ?, ?, ?)""", (event_id, source_id, destination, content))
-        row = db.execute("SELECT content FROM origin_delivery WHERE id = ?", (event_id,)).fetchone()
-        if row is None or row[0] != content:
+        row = db.execute(
+            "SELECT content, status FROM origin_delivery WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("source event enqueue lost its row")
+        existing_content, existing_status = row[0], row[1]
+        # An acknowledged row is terminal: the source event was already
+        # delivered and read back, so re-staging it (e.g. the notifier
+        # recomputing a terminal summary that grew since delivery) must be
+        # an idempotent no-op returning the existing event id — NOT a
+        # hard conflict that would make the notifier rewind its cursor and
+        # re-claim the same event forever ("delivery failed; cursor
+        # retained" spam, incident 2026-10-08/09). Only a still-pending
+        # (undelivered) row with changed content is a genuine conflict.
+        if existing_content != content and existing_status != "acknowledged":
             raise ValueError("source event already bound to different content")
     return event_id
 

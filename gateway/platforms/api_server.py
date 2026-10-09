@@ -2357,13 +2357,16 @@ class APIServerAdapter(BasePlatformAdapter):
         async def origin_binding_middleware(request: "web.Request", handler):
             from gateway import origin_binding
 
-            token_present = bool(
-                origin_binding._header(request.headers, origin_binding._JWT_HEADER).strip()
-            )
+            token_state = origin_binding.verify_request_token(request.headers)
             binding = origin_binding.resolve_request_origin(
                 request.headers, _api_request_profile.get()
             )
-            if token_present and binding is None:
+            # Reject (401) ONLY a present-but-invalid claim: bad signature,
+            # expired, malformed subject. A valid claim without a chat header
+            # (e.g. Open WebUI GET /v1/models, which sends the identity JWT
+            # but no X-OpenWebUI-Chat-Id) stays unbound ("") and keeps
+            # working — it is authenticated, just not chat-bound.
+            if token_state is origin_binding._TOKEN_REJECTED:
                 return web.json_response(
                     {"error": "Invalid Open WebUI origin claim"},
                     status=401,
