@@ -134,6 +134,80 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
 
 
+def _spawn_unregistered_detached_process(log_path) -> subprocess.Popen:
+    """Spawn a real detached subprocess mirroring how kanban workers launch.
+
+    ``hermes_cli/kanban_db.py:_default_spawn()`` starts each dispatcher worker
+    with a raw ``subprocess.Popen`` — never through
+    ``process_registry.spawn_local``/``spawn_via_env`` — using stdin=DEVNULL,
+    ``stdout``→a per-task log file, ``stderr=STDOUT``, ``start_new_session=True``,
+    and ``creationflags=CREATE_NO_WINDOW`` on Windows. The Popen handle is
+    cached only in the module-level ``kanban_db._windows_worker_processes``
+    dict; ``kanban_db.py`` contains zero references to ``tools.process_registry``.
+    Keep that here: this process is deliberately NOT registered.
+    """
+    kwargs = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=log_path,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    # Like kanban_db._default_spawn, pass an open file object (not a path):
+    # the Windows subprocess implementation resolves stdout via ``.fileno()``,
+    # and the child inherits its own copy of the OS handle.
+    log_f = open(log_path, "wb")
+    kwargs["stdout"] = log_f
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            **kwargs,
+        )
+    finally:
+        # The child already holds its inherited copy; release the parent's.
+        log_f.close()
+
+
+def test_kill_all_leaves_unregistered_detached_process_alive(registry, tmp_path):
+    """Regression guard (t_83dff32f): the fast-stop subprocess sweep must not
+    kill live kanban workers.
+
+    Kanban workers are OUTSIDE process_registry (see
+    ``_spawn_unregistered_detached_process`` for the locator:
+    ``hermes_cli/kanban_db.py`` ``_default_spawn()`` → raw
+    ``subprocess.Popen(..., start_new_session=True, CREATE_NO_WINDOW)``,
+    handle only in ``kanban_db._windows_worker_processes``). ``kill_all()``
+    (``tools/process_registry.py``) iterates only sessions registered via
+    ``spawn_local``/``spawn_via_env``, so an unregistered detached subprocess
+    of exactly the kanban-worker shape must survive it untouched.
+
+    Fast-stop (``gateway/run.py`` ``_kill_tool_subprocesses``) performs
+    precisely ``process_registry.kill_all()`` — the same method exercised
+    here — so this proves the fast-stop sweep cannot reach a worker spawned
+    outside the registry. A fresh registry is used on purpose: the module
+    singleton may hold other *registered* sessions, and sweeping it in this
+    test would kill unrelated live processes.
+    """
+    log_file = tmp_path / "kanban_task.log"
+    proc = _spawn_unregistered_detached_process(log_file)
+    try:
+        assert proc.poll() is None, "detached worker died before the sweep"
+        pid = proc.pid
+
+        # Exactly the call gateway/run.py fast-stop makes on shutdown.
+        assert registry.kill_all() == 0
+
+        # The worker must still be alive: kill_all never saw it.
+        assert proc.poll() is None, (
+            f"kill_all() killed unregistered detached pid {pid}; "
+            "kanban workers live outside process_registry"
+        )
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout

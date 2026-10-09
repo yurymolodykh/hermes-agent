@@ -544,6 +544,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     mark_job_run,
     save_job_output,
+    set_resume_token,
     use_cron_store,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
@@ -1149,6 +1150,11 @@ def mark_running_jobs_interrupted(
                     job_id,
                     False,
                     reason,
+                    # Graceful shutdown is NOT a terminal completion of the
+                    # interrupted run: preserve its resume_token so the next
+                    # scheduler start can resume the LLM run from its stored
+                    # session instead of losing it (cron resume tokens).
+                    preserve_resume_token=True,
                     expected_fire_owner=fire_owner,
                 ):
                     marked.append(job_id)
@@ -5414,6 +5420,40 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Durable resume token (cron resume tokens): write it BEFORE the agent is
+    # constructed so a mid-run gateway kill/restart leaves enough state in
+    # jobs.json for the next scheduler to resume this run from its stored
+    # session (see rearm_resumable_cron_jobs at scheduler start). Best-effort:
+    # a store write failure must never abort the run itself.
+    resume_prompt = None
+    _resume_session_id = job.get("resume_session")
+    if _resume_session_id:
+        # This is a re-armed continuation of an interrupted run: launch the
+        # fresh agent on the SAME stored session so it can read the prior
+        # run's history, and prepend an explicit continuation instruction.
+        _cron_session_id = str(_resume_session_id)
+        resume_prompt = (
+            "Продолжай выполнение cron-задачи с последней точки.\n"
+            f"Сессия {_cron_session_id} в session DB содержит историю предыдущего "
+            "запуска. НЕ повторяй уже выполненные шаги (см. историю). Заверши задачу "
+            "и выдай финальный ответ.\n\n"
+        )
+        if isinstance(prompt, str) and prompt:
+            prompt = resume_prompt + prompt
+        else:
+            prompt = resume_prompt
+    try:
+        set_resume_token(
+            job_id,
+            {
+                "fire_owner": str((job.get("fire_claim") or {}).get("by") or ""),
+                "session_id": _cron_session_id,
+                "started_at": _hermes_now().isoformat(),
+            },
+        )
+    except Exception as e:
+        logger.warning("Job '%s': failed to persist resume token (non-fatal): %s", job_id, e)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])

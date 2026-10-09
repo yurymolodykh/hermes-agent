@@ -1458,7 +1458,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Generation-scoped claim stamp (t_ae461ad6). Value of the gateway
+    -- generation marker (pid + process start time + boot id) captured when a
+    -- claim was written by a gateway dispatcher. NULL for pre-feature claims
+    -- and anything claimed outside the gateway. A ``running`` card whose stamp
+    -- no longer matches the CURRENT gateway generation AND whose worker PID is
+    -- not alive is reclaimed to ``ready`` on the next dispatch tick instead of
+    -- waiting out the ``release_stale_claims`` TTL.
+    gateway_generation   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2728,6 +2736,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "gateway_generation" not in cols:
+        # Generation stamp written at claim time by the gateway dispatcher
+        # (t_ae461ad6). NULL on legacy rows and non-gateway claims — those
+        # stay on the normal TTL/crash recovery paths and are never swept by
+        # the generation-reclaim pass.
+        _add_column_if_missing(
+            conn, "tasks", "gateway_generation", "gateway_generation TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3198,6 +3215,243 @@ def _claimer_id() -> str:
     except Exception:
         host = "unknown"
     return f"{host}:{os.getpid()}"
+
+
+# ---------------------------------------------------------------------------
+# Gateway generation (t_ae461ad6)
+#
+# A per-process boot stamp (pid + process start time + boot id) that a fresh
+# gateway instance writes to a shared marker file at startup and stamps onto
+# every claim it writes. When a gateway dies (crash, kill -9, host reboot) its
+# worker children die with it, but the cards they claimed stay ``running``
+# until release_stale_claims's TTL (~4h) expires. The next gateway instance
+# recognizes those cards as foreign (stamp != its own) and reclaims them to
+# ``ready`` immediately on the next dispatch tick — as long as the worker pid
+# is not alive, so it never spawns a duplicate beside real work.
+# ---------------------------------------------------------------------------
+
+_GENERATION_MARKER_NAME = ".gateway_generation"
+
+
+def gateway_generation_marker_path() -> Path:
+    """Return the marker file path naming the CURRENT gateway generation.
+
+    Lives in the shared ``<root>/kanban`` directory (not per-board): one
+    gateway runs a dispatcher for every board, so the generation is a property
+    of the gateway process, not of any single board.
+    """
+    return kanban_home() / "kanban" / _GENERATION_MARKER_NAME
+
+
+def _machine_boot_id() -> str:
+    """Best-effort boot identifier (the ``boot`` segment of the stamp).
+
+    Prefers a real per-machine id where cheaply readable (Linux
+    ``/proc/sys/kernel/random/boot_id``, Windows registry ``MachineGuid``,
+    macOS ``IOPlatformUUID``), falling back to the hostname so the field is
+    always a non-empty string.
+    """
+    try:
+        if sys.platform == "linux":
+            for probe in (
+                "/proc/sys/kernel/random/boot_id",
+                "/etc/machine-id",
+                "/var/lib/dbus/machine-id",
+            ):
+                try:
+                    val = (
+                        Path(probe).read_text(encoding="utf-8")
+                        .strip().splitlines()[0].strip()
+                    )
+                    if val:
+                        return val
+                except OSError:
+                    continue
+        elif sys.platform == "win32":
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Cryptography",
+                ) as key:
+                    val, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if val:
+                        return str(val)
+            except (OSError, ImportError):
+                pass
+        else:
+            # macOS / BSD: IOPlatformUUID via ioreg (best-effort, bounded).
+            try:
+                out = subprocess.run(
+                    ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+                for line in out.splitlines():
+                    if "IOPlatformUUID" in line:
+                        parts = line.split('"')
+                        for i, p in enumerate(parts[:-1]):
+                            if p.strip() == "IOPlatformUUID" and parts[i + 1]:
+                                return parts[i + 1]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import platform
+        return platform.node() or "machine"
+    except Exception:
+        return "machine"
+
+
+_GATEWAY_GENERATION_CACHE: "Optional[str]" = None
+
+
+def current_gateway_generation() -> str:
+    """Return the generation stamp of THIS process, cached per process.
+
+    Format ``pid:<pid>:start:<create>:boot:<boot>``. A fresh gateway (or any
+    process) gets a pid + process start time that differ from the previous
+    incarnation, so a card stamped by the old generation is recognised as
+    foreign the moment the new process starts ticking.
+    """
+    global _GATEWAY_GENERATION_CACHE
+    if _GATEWAY_GENERATION_CACHE is None:
+        create: "Optional[float]" = None
+        try:
+            from hermes_cli.process_identity import _own_create_time
+            create = _own_create_time()
+        except Exception:
+            create = None
+        create_part = f"{create:.3f}" if create is not None else "?"
+        _GATEWAY_GENERATION_CACHE = (
+            f"pid:{os.getpid()}:start:{create_part}:boot:{_machine_boot_id()}"
+        )
+    return _GATEWAY_GENERATION_CACHE
+
+
+def read_gateway_generation() -> "Optional[str]":
+    """Read the current generation stamp from the marker file (None if absent)."""
+    try:
+        val = gateway_generation_marker_path().read_text(encoding="utf-8").strip()
+        return val or None
+    except OSError:
+        return None
+
+
+def write_gateway_generation() -> None:
+    """Persist THIS process's generation stamp to the shared marker file.
+
+    Called at gateway startup and again on every dispatch tick / successful
+    spawn so the marker always reflects the currently-running dispatcher
+    process. Cheap: a byte-identical file is left untouched.
+    """
+    stamp = current_gateway_generation()
+    try:
+        path = gateway_generation_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.read_text(encoding="utf-8").strip() == stamp:
+                return
+        except OSError:
+            pass
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(stamp + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log.warning("kanban: could not write gateway generation marker: %s", exc)
+
+
+def reclaim_dead_generation_running(conn: sqlite3.Connection) -> list[str]:
+    """Immediately requeue ``running`` cards owned by a dead gateway generation.
+
+    Scope: cards that (a) carry a non-NULL ``gateway_generation`` stamp (i.e.
+    they were claimed by some gateway instance) and (b) whose stamp differs
+    from the CURRENT generation. Those were claimed by a previous gateway
+    process — the one that died, taking its workers with it (crash, kill, or
+    host reboot). The normal recovery paths would leave such cards in
+    ``running`` until ``release_stale_claims``' TTL (~4h) expires, because
+    their heartbeat simply stops and nothing notices. This sweep breaks that
+    long stall by reclaiming them to ``ready`` immediately.
+
+    Safety: a card whose recorded ``worker_pid`` is still alive on this host is
+    NEVER touched — the old gateway may be gone but its worker is doing real
+    work, so spawning a duplicate beside it would be wrong. Cards with no stamp
+    (legacy / non-gateway claims) are also left alone: they are handled by the
+    existing TTL / crash / heartbeat paths.
+
+    Returns the list of reclaimed task ids. Idempotent — safe to run every
+    tick (reclaimed cards are no longer ``running`` on the next pass).
+    """
+    current = read_gateway_generation() or current_gateway_generation()
+    reclaimed: list[str] = []
+    rows = conn.execute(
+        "SELECT id, claim_lock, claim_expires, worker_pid, gateway_generation "
+        "FROM tasks "
+        "WHERE status = 'running' "
+        "  AND gateway_generation IS NOT NULL "
+        "  AND gateway_generation != ?",
+        (current,),
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        pid = row["worker_pid"]
+        if _pid_alive(pid):
+            _log.debug(
+                "kanban generation reclaim: task %s stamped by %s (foreign to "
+                "current %s) but pid %s is alive — leaving untouched",
+                tid, row["gateway_generation"], current, pid,
+            )
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND gateway_generation IS ?",
+                (tid, row["gateway_generation"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            now = int(time.time())
+            payload = {
+                "reason": "dead_gateway_generation",
+                "gateway_generation": row["gateway_generation"],
+                "current_generation": current,
+                "claim_lock": row["claim_lock"],
+                "claim_expires": (
+                    int(row["claim_expires"])
+                    if row["claim_expires"] is not None else None
+                ),
+                "worker_pid": int(pid) if pid else None,
+                "now": now,
+            }
+            run_id = _end_run(
+                conn, tid,
+                outcome="reclaimed", status="reclaimed",
+                error="running card claimed by a dead gateway generation "
+                      "(worker not alive) — requeued to ready",
+                metadata=payload,
+            )
+            # Inline comment INSERT — add_comment opens its own write_txn
+            # and would raise on nesting (see write_txn pitfalls).
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    tid, "dispatcher",
+                    "generation reclaim: card was 'running' under a previous "
+                    "gateway generation with no live worker — requeued to ready",
+                    now,
+                ),
+            )
+            _append_event(conn, tid, "reclaimed", payload, run_id=run_id)
+            reclaimed.append(tid)
+        _log.info(
+            "kanban generation reclaim: requeued %s (stamp=%s, current=%s, "
+            "worker_pid=%r)", tid, row["gateway_generation"], current, pid,
+        )
+    return reclaimed
 
 
 # ---------------------------------------------------------------------------
@@ -5038,13 +5292,14 @@ def claim_task(
               SET status        = 'running',
                   claim_lock    = ?,
                   claim_expires = ?,
+                  gateway_generation = ?,
                   started_at    = COALESCE(started_at, ?)
             WHERE id = ?
               AND status = 'ready'
               AND claim_lock IS NULL
               AND completed_at IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, current_gateway_generation(), now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -8678,6 +8933,12 @@ class DispatchResult:
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
     dead/gone worker). See the reconciliation pass for details."""
+    generation_reclaimed: list[str] = field(default_factory=list)
+    """Task ids reclaimed immediately because they were claimed by a previous
+    (different) gateway generation whose worker PID is no longer alive
+    (t_ae461ad6). Requeued to ``ready`` on the dispatch tick instead of waiting
+    out the ``release_stale_claims`` TTL (~4h). Live-worker cards are never
+    included — see :func:`reclaim_dead_generation_running`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -10315,11 +10576,19 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    Also refreshes the gateway-generation marker ("at every tick spawn")
+    and back-stamps the generation onto the task (defensive: the claim-time
+    stamp in :func:`claim_task` is the primary path; this covers any spawn
+    whose claim predates it, e.g. a mid-migration race).
     """
+    write_gateway_generation()
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, "
+            "gateway_generation = COALESCE(gateway_generation, ?) "
+            "WHERE id = ?",
+            (int(pid), current_gateway_generation(), task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
@@ -11636,6 +11905,13 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    # Refresh the gateway-generation marker so the generation-reclaim pass
+    # below compares against THIS process's generation even on the very first
+    # tick after a restart (t_ae461ad6). Dry-run ticks must not touch the
+    # filesystem, so they skip the marker write.
+    if not dry_run:
+        write_gateway_generation()
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
@@ -11643,6 +11919,12 @@ def _dispatch_once_locked(
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    # Immediate reclaim of cards owned by a DEAD gateway generation
+    # (t_ae461ad6): running cards stamped by a previous gateway instance whose
+    # worker PID is no longer alive go straight back to 'ready' on the first
+    # tick after a restart, instead of waiting out the ~4h release_stale_claims
+    # TTL. Live-worker cards are never touched (see the function docstring).
+    result.generation_reclaimed = reclaim_dead_generation_running(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )

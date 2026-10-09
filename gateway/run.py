@@ -31743,6 +31743,16 @@ def main():
     except Exception:
         pass
 
+    # Stamp the kanban gateway-generation marker so the dispatcher tick can
+    # tell cards claimed by THIS gateway process apart from cards left by a
+    # previous (dead) gateway generation (t_ae461ad6). Best-effort.
+    try:
+        from hermes_cli.kanban_db import write_gateway_generation
+
+        write_gateway_generation()
+    except Exception:
+        pass
+
     # Force UTF-8 stdio on Windows — gateway logs and startup banner would
     # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.
     try:

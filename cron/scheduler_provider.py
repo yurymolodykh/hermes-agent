@@ -133,10 +133,27 @@ class CronScheduler(ABC):
         return None
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
-        from cron.executions import recover_interrupted_executions
+        """Run profile-local attempt recovery for every provider lifecycle.
 
-        return recover_interrupted_executions()
+        Two independent recoveries run on every scheduler start:
+
+        1. ``recover_interrupted_executions`` — the execution ledger marks
+           provably-abandoned in-flight executions ``unknown``.
+        2. ``rearm_resumable_cron_jobs`` — cron jobs carrying a durable
+           ``resume_token`` whose run never reached a terminal write (gateway
+           killed/restarted mid-run) are re-armed to fire on the next tick and
+           continue the interrupted LLM session (``resume`` mode) or re-run
+           plainly (``resume_mode="rerun"`` / no_agent / script jobs).
+
+        Returns the total number of interrupted executions recovered +
+        resume runs staged, so callers can log a truthful combined count.
+        """
+        from cron.executions import recover_interrupted_executions
+        from cron.jobs import rearm_resumable_cron_jobs
+
+        recovered = recover_interrupted_executions()
+        recovered += rearm_resumable_cron_jobs()
+        return recovered
 
     @property
     def supports_force_fire(self) -> bool:
@@ -545,7 +562,7 @@ class InProcessCronScheduler(CronScheduler):
         recovered = self.recover_interrupted()
         if recovered:
             logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
+                "Recovered %d interrupted cron execution(s) after restart",
                 recovered,
             )
         # Heartbeat once before the first sleep so `hermes cron status` sees a
@@ -644,7 +661,7 @@ class InProcessCronScheduler(CronScheduler):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
-                            "Marked %d interrupted cron execution(s) for profile at %s",
+                            "Recovered %d interrupted cron execution(s) for profile at %s",
                             recovered,
                             home,
                         )

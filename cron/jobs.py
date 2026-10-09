@@ -2358,6 +2358,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    preserve_resume_token: bool = False,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2369,7 +2370,148 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            preserve_resume_token=preserve_resume_token,
         )
+
+
+def set_resume_token(job_id: str, token: dict) -> bool:
+    """Persist a durable resume_token on the job record (best-effort).
+
+    Written by the scheduler BEFORE the LLM agent for a fire launches, so a
+    mid-run gateway kill/restart leaves enough state in jobs.json for the next
+    scheduler to resume the interrupted run from its stored session instead of
+    leaving it stranded as an ``unknown`` execution. Consumed by
+    ``rearm_resumable_cron_jobs`` at scheduler start; cleared by
+    ``_mark_job_run_locked`` once the run reaches a terminal write.
+
+    Never raises: a store write failure must not abort the run itself — the
+    caller wraps the run regardless, so the token is best-effort durability.
+    """
+    try:
+        with _jobs_lock():
+            jobs = load_jobs()
+            for i, job in enumerate(jobs):
+                if job["id"] == job_id:
+                    job["resume_token"] = token
+                    jobs[i] = job
+                    save_jobs(jobs)
+                    return True
+            return False
+    except Exception as e:
+        logger.warning(
+            "set_resume_token(%s) failed: %s", job_id, e,
+        )
+        return False
+
+
+def clear_resume_token(job_id: str) -> bool:
+    """Drop the job's resume_token + per-run resume marker (best-effort).
+
+    ``rearm_resumable_cron_jobs`` and the terminal-write path use this so a
+    re-armed recurring job or re-dispatched one-shot never resumes a finished
+    run. Never raises.
+    """
+    try:
+        with _jobs_lock():
+            jobs = load_jobs()
+            for i, job in enumerate(jobs):
+                if job["id"] == job_id:
+                    had = "resume_token" in job
+                    job.pop("resume_token", None)
+                    job.pop("resume_session", None)
+                    if had:
+                        jobs[i] = job
+                        save_jobs(jobs)
+                    return True
+            return False
+    except Exception as e:
+        logger.warning(
+            "clear_resume_token(%s) failed: %s", job_id, e,
+        )
+        return False
+
+
+def _effective_resume_mode(job: Dict[str, Any]) -> str:
+    """Resolve the resume policy for a job record.
+
+    Side-effect/no_agent/script jobs ALWAYS rerun — their ``stdout`` script is
+    re-executed and that rerun IS the recovery; there is no agent session to
+    continue. Every other (LLM-agent) job honours ``resume_mode`` when set:
+    ``"resume"`` (default) continues the interrupted session, ``"rerun"``
+    re-runs from scratch.
+    """
+    if job.get("no_agent") or job.get("script"):
+        return "rerun"
+    mode = str(job.get("resume_mode") or "resume").strip().lower()
+    return mode if mode in ("resume", "rerun") else "resume"
+
+
+def rearm_resumable_cron_jobs() -> int:
+    """Re-arm interrupted cron runs for an immediate resume on scheduler start.
+
+    Called from ``CronScheduler.recover_interrupted`` (single-profile and
+    multiplex paths) at every provider lifecycle. A job carrying a
+    ``resume_token`` whose run NEVER reached a terminal write (gateway
+    killed/restarted mid-run) is re-scheduled to fire on the next tick:
+
+    - ``resume`` mode → the run continues the interrupted session: we stamp
+      ``resume_session`` with the stored session id and force
+      ``next_run_at = now`` so the first tick dispatches it. ``run_job`` picks
+      up the marker and launches the agent on the SAME session id.
+    - ``rerun`` mode (no_agent / script jobs, or ``resume_mode="rerun"``) →
+      the token is cleared and the job re-fires per its normal schedule (a
+      plain rerun; the stdout script re-executes).
+
+    ``fire_owner`` lineage: when a job currently carries a fire claim whose
+    owner differs from the token's, another actor owns the execution — we must
+    not re-arm it under a competing owner, so it is treated as a plain rerun.
+
+    Returns the number of jobs staged for an immediate resume-run.
+    """
+    staged = 0
+    now_iso = _hermes_now().isoformat()
+    try:
+        with _jobs_lock():
+            jobs = load_jobs()
+            changed = False
+            for i, job in enumerate(jobs):
+                token = job.get("resume_token")
+                if not isinstance(token, dict) or not token.get("session_id"):
+                    continue
+                if token.get("fire_owner"):
+                    claim = job.get("fire_claim")
+                    if (
+                        isinstance(claim, dict)
+                        and claim.get("by")
+                        and claim["by"] != token["fire_owner"]
+                    ):
+                        # Another owner holds the execution — don't re-arm
+                        # under it; treat as a plain rerun.
+                        job.pop("resume_token", None)
+                        job.pop("resume_session", None)
+                        changed = True
+                        continue
+                if _effective_resume_mode(job) == "rerun":
+                    job.pop("resume_token", None)
+                    job.pop("resume_session", None)
+                    changed = True
+                    continue
+                # Resume: continue the interrupted session on the next tick.
+                job["resume_session"] = token["session_id"]
+                job["next_run_at"] = now_iso
+                changed = True
+                staged += 1
+            if changed:
+                save_jobs(jobs)
+    except Exception as e:
+        logger.warning("rearm_resumable_cron_jobs failed: %s", e)
+        return 0
+    if staged:
+        logger.info(
+            "Staged %d interrupted cron run(s) for resume on scheduler start",
+            staged,
+        )
+    return staged
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -2463,6 +2605,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    preserve_resume_token: bool = False,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -2480,6 +2623,11 @@ def _mark_job_run_locked(
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    ``preserve_resume_token`` keeps the job's ``resume_token`` across this
+    write. The interrupt-marking path (gateway shutdown) passes True so the
+    interrupted run can still be resumed by the NEXT scheduler; every genuine
+    terminal completion clears the token.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2534,6 +2682,15 @@ def _mark_job_run_locked(
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
+                # The run reached a terminal status. Its resume_token was only
+                # meaningful for interrupted-run recovery: a genuine completion
+                # (success, real failure, or delivery-terminal) means there is
+                # nothing left to resume. The gateway shutdown's interrupt
+                # marking passes preserve_resume_token=True so the next
+                # scheduler can still resume the interrupted run.
+                if not preserve_resume_token:
+                    job.pop("resume_token", None)
+                    job.pop("resume_session", None)
                 # Clear the one-shot running-claim (#59229): the run is over, so
                 # a re-armed recurring job or a re-dispatched one-shot recovery
                 # is claimable again. No-op if the job never carried a claim.
