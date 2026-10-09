@@ -2817,6 +2817,7 @@ from gateway.platforms.base import (
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
+    DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     _arm_loop_floor_timer,
@@ -11383,7 +11384,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
                     try:
-                        _flush(_session_messages)
+                        await asyncio.to_thread(_flush, _session_messages)
                     except Exception as _flush_err:
                         # The in-memory transcript could not be persisted
                         # (e.g. FTS/SQLite index corruption — #72680). A plain
@@ -12756,11 +12757,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "loop_watchdog_max_strikes",
                     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
                 )
+                db_lock_grace = getattr(
+                    config,
+                    "loop_watchdog_db_lock_grace_s",
+                    DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S,
+                )
                 self._loop_liveness_watchdog = start_loop_liveness_watchdog(
                     loop,
                     probe_interval=float(interval),
                     probe_timeout=float(timeout),
                     max_strikes=int(strikes),
+                    db_lock_grace_s=float(db_lock_grace),
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
@@ -13752,6 +13759,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+
+        # FAST_RESTART_STATS observer: after the first kanban dispatch tick
+        # and the cron recovery pass on this boot, log the single stats line
+        # when this boot followed a fast restart (no stamp → silent no-op).
+        # Delayed a few seconds so the first tick's generation-reclaim count
+        # lands before we read the counters.
+        try:
+            import asyncio as _asyncio
+
+            async def _emit_fast_restart_stats_later() -> None:
+                try:
+                    await _asyncio.sleep(6)
+                except _asyncio.CancelledError:
+                    return
+                try:
+                    from gateway.fast_restart_stats import emit_stats_if_fast_restart
+
+                    emit_stats_if_fast_restart()
+                except Exception as _e:
+                    logger.debug("fast_restart_stats emit failed: %s", _e)
+
+            self._fast_restart_stats_emit_task = _asyncio.create_task(
+                _emit_fast_restart_stats_later()
+            )
+        except Exception as _e:
+            logger.debug("fast_restart_stats emit scheduling failed: %s", _e)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -15322,6 +15355,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "downtime_target": FAST_RESTART_DOWNTIME_TARGET_S,
                     }
                     logger.info("FAST_RESTART %s", json.dumps(_marker))
+                    # Durably stamp the fast-stop so the next boot can measure
+                    # downtime and emit FAST_RESTART_STATS (#A3). Best-effort:
+                    # a failed stamp must never crash shutdown.
+                    try:
+                        from gateway.fast_restart_stats import record_shutdown
+
+                        record_shutdown(
+                            ts_utc_iso=_marker["ts"],
+                            active_agents=_marker.get("active_agents", 0),
+                            active_cron=_marker.get("active_cron", 0),
+                            active_api_runs=_marker.get("active_api_runs", 0),
+                        )
+                    except Exception as _e2:
+                        logger.debug("fast_restart_stats.record_shutdown failed: %s", _e2)
                 except Exception as _e:
                     logger.debug("FAST_RESTART marker failed: %s", _e)
 
@@ -30744,6 +30791,47 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
+def _run_fast_restart_request_watcher(
+    stop_event: threading.Event,
+    runner,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    poll_interval: float = 0.5,
+) -> None:
+    """Poll for the fast-restart request marker and trigger an in-band restart.
+
+    The in-band fast-restart signal on platforms without SIGUSR1 (native
+    Windows): an operator writes ``.gateway-fast-restart-request.json``
+    into the gateway's hermes home. This thread consumes it (only when it
+    targets this process and is not stale) and drives ``request_restart``
+    — the same in-band path ``signal_fast_restart`` uses, so the shutdown
+    is a graceful drain that pre-marks ``resume_pending`` (A1). Without
+    this watcher a Windows operator has no clean, in-contract way to
+    request a *fast* restart while the gateway keeps running.
+    """
+    from gateway.status import consume_fast_restart_request_for_self
+
+    while not stop_event.is_set():
+        try:
+            if not getattr(runner, "_draining", False) and getattr(runner, "_running", False):
+                payload = consume_fast_restart_request_for_self()
+                if payload and payload.get("fast", True):
+                    logger.info(
+                        "FAST_RESTART_REQUEST marker consumed; requesting in-band fast restart "
+                        "(reason=%r)",
+                        payload.get("reason", ""),
+                    )
+                    loop.call_soon_threadsafe(
+                        lambda: runner.request_restart(
+                            fast=True, detached=False, via_service=False
+                        )
+                    )
+                    break
+        except Exception as _e:
+            logger.debug("Fast-restart request watcher tick error: %s", _e)
+        stop_event.wait(poll_interval)
+
+
 def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
@@ -31417,6 +31505,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     _planned_stop_watcher_thread.start()
 
+    # In-band fast-restart trigger watcher (completes the A1 marker-file
+    # contract for platforms without SIGUSR1 — native Windows). An operator
+    # drops .gateway-fast-restart-request.json into the hermes home; this
+    # thread consumes it and drives request_restart(fast=True), the same
+    # graceful in-band drain as the /restart fast command.
+    _fast_restart_watcher_stop = threading.Event()
+    _fast_restart_watcher_thread = threading.Thread(
+        target=_run_fast_restart_request_watcher,
+        args=(_fast_restart_watcher_stop, runner, loop),
+        daemon=True,
+        name="fast-restart-request-watcher",
+    )
+    _fast_restart_watcher_thread.start()
+
     # Claim the PID file BEFORE bringing up any platform adapters.
     # This closes the --replace race window: two concurrent `gateway run
     # --replace` invocations both pass the termination-wait above, but
@@ -31680,6 +31782,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
+    _fast_restart_watcher_stop.set()
+    _fast_restart_watcher_thread.join(timeout=2)
 
     # Close MCP server connections
     try:

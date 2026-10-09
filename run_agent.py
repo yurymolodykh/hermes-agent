@@ -409,6 +409,29 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _warn_if_on_event_loop_thread(caller: str) -> None:
+    """Log loudly if a sync state.db write is attempted on the asyncio loop.
+
+    A synchronous SessionDB write on the event-loop thread blocks the whole
+    gateway surface for the duration of the lock wait and, under contention,
+    starves the loop past the liveness watchdog's window -> exit code 75
+    (incident 2026-10-09 01:21:13, main thread inside
+    ``SessionDB._execute_write`` -> ``BEGIN IMMEDIATE``).  The gateway must
+    dispatch such writes via ``asyncio.to_thread``/``run_in_executor``;
+    any caller that reaches a DB write while a loop is running here is a
+    regression and is surfaced (warning, not exception) so operators see it.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # not on an event loop (CLI / worker thread) — fine
+    logger.warning(
+        "%s invoked on the asyncio event-loop thread: the synchronous "
+        "state.db write will block the gateway loop on any lock wait. "
+        "Dispatch it via asyncio.to_thread / run_in_executor instead.",
+        caller,
+    )
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -2098,6 +2121,7 @@ class AIAgent:
         conversation_history: Optional[List[Dict]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
+        _warn_if_on_event_loop_thread("_flush_messages_to_session_db")
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)

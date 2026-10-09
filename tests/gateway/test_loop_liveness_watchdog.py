@@ -300,6 +300,7 @@ def test_gateway_runner_liveness_guards_start_and_stop():
         probe_interval=30.0,
         probe_timeout=10.0,
         max_strikes=3,
+        db_lock_grace_s=300.0,
     )
     assert runner._loop_floor_timer_handle is floor_timer
     assert runner._loop_liveness_watchdog is watchdog
@@ -310,3 +311,128 @@ def test_gateway_runner_liveness_guards_start_and_stop():
     floor_timer.cancel.assert_called_once_with()
     assert runner._loop_liveness_watchdog is None
     assert runner._loop_floor_timer_handle is None
+
+
+def test_gateway_config_loop_watchdog_db_lock_grace_round_trip():
+    """The DB-lock grace budget parses, clamps, and round-trips (default 300s)."""
+    from gateway.config import GatewayConfig
+    from gateway.shutdown_watchdog import DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S
+
+    assert DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S == 300.0
+    assert GatewayConfig.from_dict({}).loop_watchdog_db_lock_grace_s == 300.0
+
+    explicit = GatewayConfig.from_dict({"loop_watchdog_db_lock_grace_s": 600})
+    assert explicit.loop_watchdog_db_lock_grace_s == 600.0
+    assert explicit.to_dict()["loop_watchdog_db_lock_grace_s"] == 600.0
+
+    nested = GatewayConfig.from_dict(
+        {"gateway": {"loop_watchdog_db_lock_grace_s": 900}}
+    )
+    assert nested.loop_watchdog_db_lock_grace_s == 900.0
+
+    # Degenerate values fall back to the 300s default.
+    for bad in (-5, float("nan"), float("inf"), 999999):
+        cfg = GatewayConfig.from_dict({"loop_watchdog_db_lock_grace_s": bad})
+        assert cfg.loop_watchdog_db_lock_grace_s == 300.0, bad
+
+
+def test_loop_watchdog_db_lock_grace_defers_hard_exit_within_budget():
+    """A loop frozen on a state.db write lock must NOT be killed inside grace."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    # Probes are scheduled but never respond: the loop looks frozen.
+    loop.call_soon_threadsafe.side_effect = lambda callback: None
+    exit_codes = []
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical") as critical,
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop,
+            probe_interval=0.01,
+            probe_timeout=0.001,
+            max_strikes=1,
+            db_lock_grace_s=30.0,
+            db_lock_detector=lambda: True,  # freeze classified as DB-lock wait
+        )
+        assert handle is not None
+        # Several probe cycles, still far inside the 30s grace budget.
+        time.sleep(0.12)
+        handle.stop()
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert exit_codes == []  # the hard exit must have been deferred
+    assert dump.call_count == 0
+    # The distinct DB-lock grace message must have been logged.
+    grace_messages = " | ".join(
+        str(call[0][0]) if call and call[0] else ""
+        for call in critical.call_args_list
+    )
+    assert "DB-lock grace" in grace_messages, grace_messages
+
+
+def test_loop_watchdog_db_lock_grace_budget_exhausted_hard_exits_with_reason():
+    """Past the DB-lock grace budget the watchdog still hard-exits (75), with a
+    distinct lifecycle reason so operators see it was a waited-out DB lock."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    loop.call_soon_threadsafe.side_effect = lambda callback: None
+    exit_codes = []
+    mark_reasons = []
+
+    mono = [0]
+
+    def advancing_monotonic() -> float:
+        mono[0] += 50.0
+        return mono[0]
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical"),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited",
+            side_effect=lambda *a, **kw: mark_reasons.append(kw.get("reason")),
+        ),
+        patch("gateway.shutdown_watchdog.time.monotonic", side_effect=advancing_monotonic),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop,
+            probe_interval=0.005,
+            probe_timeout=0.005,
+            max_strikes=1,
+            db_lock_grace_s=5.0,
+            db_lock_detector=lambda: True,
+        )
+        handle.join(timeout=3.0)
+
+    assert exit_codes == [75]
+    assert mark_reasons == ["loop_liveness_watchdog_db_lock"]
+    dump.assert_called_once_with(all_threads=True)
+
+
+def test_loop_watchdog_non_db_freeze_keeps_fast_exit():
+    """Regression guard: a NON-DB wedge keeps the tight 3-strike hard exit."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    loop.call_soon_threadsafe.side_effect = lambda callback: None
+    exit_codes = []
+    mark_reasons = []
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical"),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited",
+            side_effect=lambda *a, **kw: mark_reasons.append(kw.get("reason")),
+        ),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.005, probe_timeout=0.005, max_strikes=1
+        )
+        handle.join(timeout=3.0)
+
+    assert exit_codes == [75]
+    assert mark_reasons == ["loop_liveness_watchdog"]
+    dump.assert_called_once_with(all_threads=True)

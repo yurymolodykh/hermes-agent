@@ -55,6 +55,16 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # for genuine wedges. Deployments with legitimately slow loops can tune via
 # gateway.loop_watchdog_* in config.yaml.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# When the loop freezes while the main thread is stuck inside a synchronous
+# state.db (session-store) write — a BEGIN IMMEDIATE lock wait — a hard exit
+# after ~90-120s turns a legitimate lock-contention stall (a maintenance
+# VACUUM / FTS pass / sibling writer holding the write lock for tens of
+# seconds) into a needless restart that then re-collides with that very same
+# maintenance (restart-time "database is locked" loop).  This budget extends
+# the liveness window for the *DB-lock* freeze class only: the process waits
+# out the lock up to ``db_lock_grace_s`` and hard-exits only if the wait
+# outlasts the budget.  Non-DB wedges keep the tight 3-strike policy.
+DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S = 300.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -113,6 +123,49 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, resolved_interval)
 
 
+# Code-object markers that identify a frozen main thread whose stall class is
+# a synchronous SQLite write into the session store (state.db), rather than a
+# generic unresponsive wedge.  Observed live in the 2026-10-09 01:21:13
+# incident: the event loop starved inside ``SessionDB._execute_write`` waiting
+# on ``BEGIN IMMEDIATE`` (via ``append_messages_batch``) while the write lock
+# was held elsewhere for >90s, then the watchdog hard-exited with code 75.
+_DB_LOCK_FROZEN_MARKERS = (
+    "hermes_state.py",
+    "_execute_write",
+    "_try_wal_checkpoint",
+    "_try_incremental_merge_fts",
+    "append_messages_batch",
+    "append_message",
+)
+
+
+def _main_thread_is_db_lock_wait() -> bool:
+    """Return True if the main (event-loop) thread is inside a state.db write.
+
+    Walks the frozen main thread's stack looking for SessionDB write frames.
+    The loop-liveness watchdog uses this to tell "paused while waiting for the
+    state.db lock" apart from "genuinely wedged": the two need different
+    recovery policies (wait out a lock vs. hard-exit a wedge).  Cheap and
+    exception-safe — ``sys._current_frames()`` is an O(threads) registry lookup
+    and the walk only inspects code-object names/filenames.
+    """
+    try:
+        frames = sys._current_frames()
+    except Exception:
+        return False
+    main_id = threading.main_thread().ident
+    frame = frames.get(main_id)
+    while frame is not None:
+        name = frame.f_code.co_name or ""
+        if name in _DB_LOCK_FROZEN_MARKERS:
+            return True
+        fname = frame.f_code.co_filename or ""
+        if "hermes_state.py" in fname or "kanban_db.py" in fname:
+            return True
+        frame = frame.f_back
+    return False
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop,
     *,
@@ -120,6 +173,8 @@ def start_loop_liveness_watchdog(
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    db_lock_grace_s: float = DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S,
+    db_lock_detector: Optional[Callable[[], bool]] = None,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes.
 
@@ -131,6 +186,15 @@ def start_loop_liveness_watchdog(
     interval = probe_interval
     timeout = probe_timeout
     strikes_limit = max_strikes
+    # DB-lock grace: extended liveness window for the "main thread waiting on a
+    # state.db write lock" freeze class, and the detector that classifies it.
+    try:
+        db_grace = max(float(db_lock_grace_s if db_lock_grace_s is not None else 0.0), 0.0)
+    except (TypeError, ValueError):
+        db_grace = DEFAULT_LOOP_WATCHDOG_DB_LOCK_GRACE_S
+    detect_db_lock = (
+        db_lock_detector if db_lock_detector is not None else _main_thread_is_db_lock_wait
+    )
     stop_event = threading.Event()
 
     def _wait_for_probe(probe_event: threading.Event) -> Optional[bool]:
@@ -146,6 +210,12 @@ def start_loop_liveness_watchdog(
 
     def _watchdog() -> None:
         strikes = 0
+        # Monotonic deadline for the *state.db lock wait* freeze class.  When
+        # the loop freezes while the main thread is parked inside a session-store
+        # write, we extend the liveness window up to this deadline instead of
+        # hard-exiting at strike limit — a restart would just re-collide with the
+        # same maintenance (VACUUM / FTS pass / sibling writer) holding the lock.
+        db_lock_deadline: Optional[float] = None
         while not stop_event.wait(timeout=interval):
             probe_event = threading.Event()
             try:
@@ -165,26 +235,71 @@ def start_loop_liveness_watchdog(
                 return
             if responded:
                 strikes = 0
+                db_lock_deadline = None
                 continue
 
             if stop_event.is_set():
                 return
             strikes += 1
-            if strikes < strikes_limit:
+            if strikes < strikes_limit and db_lock_deadline is None:
                 continue
 
+            # Classify the freeze before escalating: a main thread parked inside
+            # a state.db write gets the DB-lock grace budget (wait the lock out)
+            # instead of the tight-strike wedge policy (hard exit).
             if stop_event.is_set():
                 return
             try:
-                logger.critical(
-                    "Gateway event loop missed %d consecutive liveness probes; "
-                    "dumping all thread stacks and exiting with code %d so the "
-                    "service supervisor can restart it.",
-                    strikes,
-                    exit_code,
-                )
+                db_locked = bool(detect_db_lock())
             except Exception:
-                pass
+                db_locked = False
+            if db_locked:
+                if db_lock_deadline is None:
+                    db_lock_deadline = time.monotonic() + db_grace
+                    try:
+                        logger.critical(
+                            "Gateway event loop frozen on a state.db write-lock "
+                            "wait (%d missed liveness probes) — pausing for up to "
+                            "%.0fs of DB-lock grace instead of hard-exiting, since "
+                            "a restart would re-collide with the lock holder "
+                            "(maintenance VACUUM/FTS/sibling writer).",
+                            strikes,
+                            db_grace,
+                        )
+                    except Exception:
+                        pass
+                if time.monotonic() < db_lock_deadline:
+                    continue  # keep waiting the lock out within the grace budget
+                # The DB wait outlasted the grace budget: treat as a wedge now.
+                try:
+                    logger.critical(
+                        "Gateway event loop still frozen on the state.db lock "
+                        "after %.0fs of DB-lock grace (%d missed probes); "
+                        "dumping all thread stacks and exiting with code %d so "
+                        "the service supervisor can restart it.",
+                        db_grace,
+                        strikes,
+                        exit_code,
+                    )
+                except Exception:
+                    pass
+                exit_reason = "loop_liveness_watchdog_db_lock"
+            else:
+                db_lock_deadline = None
+                exit_reason = "loop_liveness_watchdog"
+                try:
+                    logger.critical(
+                        "Gateway event loop missed %d consecutive liveness probes; "
+                        "dumping all thread stacks and exiting with code %d so the "
+                        "service supervisor can restart it.",
+                        strikes,
+                        exit_code,
+                    )
+                except Exception:
+                    pass
+
+            if stop_event.is_set():
+                return
             try:
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:
@@ -196,7 +311,8 @@ def start_loop_liveness_watchdog(
             # this as an unclean SIGKILL/OOM death (NS-608).
             try:
                 from gateway.lifecycle_ledger import mark_exited
-                mark_exited(exit_code, reason="loop_liveness_watchdog")
+
+                mark_exited(exit_code, reason=exit_reason)
             except Exception:
                 pass
             os._exit(exit_code)

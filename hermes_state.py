@@ -1507,6 +1507,51 @@ def apply_database_pragmas(
             pass
 
 
+# Floor for the session-store write wait.  A contended WAL write must park in
+# SQLite's busy handler for at least this long instead of surfacing
+# "database is locked" after the connect-default timeout — lock churn was the
+# direct cause of the 2026-10-09 01:21:13 event-loop freeze (on-loop
+# ``BEGIN IMMEDIATE`` inside ``SessionDB._execute_write``).
+_MIN_STATE_DB_BUSY_TIMEOUT_MS = 20_000
+
+
+def _apply_state_db_busy_timeout(conn: sqlite3.Connection) -> None:
+    """Set ``PRAGMA busy_timeout`` on a session-store connection (floor 20s).
+
+    ``sqlite3.connect(timeout=...)`` pre-arms SQLite's busy handler only up to
+    that short value; this PRAGMA makes a long, observable wait authoritative
+    so a legitimate lock holder (maintenance VACUUM / FTS pass / sibling
+    writer) does not surface as a spurious ``database is locked``.
+
+    * config ``database.busy_timeout_ms`` may raise the value,
+    * env ``HERMES_STATE_BUSY_TIMEOUT_MS`` overrides config,
+    * the floor is ``_MIN_STATE_DB_BUSY_TIMEOUT_MS`` (20s).
+
+    Best-effort: never raises, so a busy_timeout failure cannot block DB init.
+    """
+    busy_ms = _MIN_STATE_DB_BUSY_TIMEOUT_MS
+    raw = os.environ.get("HERMES_STATE_BUSY_TIMEOUT_MS", "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+
+            cfg = load_config_readonly()
+            raw_cfg = cfg_get(cfg, "database", "busy_timeout_ms", default=None)
+            if raw_cfg is not None:
+                raw = str(raw_cfg).strip()
+        except Exception:
+            raw = ""
+    if raw:
+        try:
+            busy_ms = max(int(raw), _MIN_STATE_DB_BUSY_TIMEOUT_MS)
+        except (TypeError, ValueError):
+            pass
+    try:
+        conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+    except sqlite3.Error:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Malformed-schema recovery
 # ---------------------------------------------------------------------------
@@ -3843,6 +3888,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # that follows would then repair WITHOUT its forensic backup.
                 try:
                     apply_database_pragmas(self._conn, db_label="state.db")
+                    _apply_state_db_busy_timeout(self._conn)
                     cursor = self._conn.cursor()
                     self._fts_enabled = (
                         self._fts_table_probe(cursor, "messages_fts") is True
@@ -3924,6 +3970,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                # Writable handle: raise the busy wait AFTER schema init — DB
+                # *open* keeps the short connect timeout + patience retry so a
+                # sibling lock holder doesn't stall startup, but runtime writes
+                # now wait on busy_timeout (>=20s) instead of surfacing
+                # "database is locked" on millisecond contention.
+                _apply_state_db_busy_timeout(self._conn)
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
