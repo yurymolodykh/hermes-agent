@@ -4735,6 +4735,7 @@ def _spawn_detached_gateway() -> bool:
     working.
     """
     from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+    from hermes_cli.kanban_gateway_env import sanitized_child_env
 
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -4751,6 +4752,10 @@ def _spawn_detached_gateway() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=subprocess.DEVNULL,
+                # KANBAN_ENV_SANITIZE (t_1b5b0e48): never pass a stale
+                # worker-session HERMES_KANBAN_TASK/RUN_ID into the spawned
+                # gateway (keep the gateway's own board pin).
+                env=sanitized_child_env(),
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -5801,8 +5806,17 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
                  This prevents systemd restart loops when the old process
                  hasn't fully exited yet.
         force: Skip the supervised-gateway conflict guard and start even when a
-               systemd/launchd service is already supervising this profile.
+              systemd/launchd service is already supervising this profile.
     """
+    # KANBAN_ENV_SANITIZE (t_1b5b0e48): the gateway is never a kanban worker.
+    # A stale HERMES_KANBAN_TASK / HERMES_KANBAN_RUN_ID inherited from a
+    # worker-session launch chain would make every gateway-hosted agent
+    # session try (and fail) a KANBAN_BIND in agent_init.  Strip + warn here
+    # at `gateway run` entry; the gateway's own dispatch pin (BOARD/HOME/DB/
+    # WORKSPACES_ROOT) is intentionally preserved.
+    from hermes_cli.kanban_gateway_env import strip_gateway_worker_env
+
+    strip_gateway_worker_env()
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
