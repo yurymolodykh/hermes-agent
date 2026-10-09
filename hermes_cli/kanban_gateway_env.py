@@ -76,12 +76,20 @@ def sanitized_child_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def strip_gateway_worker_env(log_warning: bool = True) -> dict[str, object]:
+def strip_gateway_worker_env(
+    log_warning: bool = True,
+    gateway_log_path: "os.PathLike[str] | str | None" = None,
+) -> dict[str, object]:
     """Remove stale kanban worker identity from this process's ``os.environ``.
 
     Idempotent: a clean env is untouched.  Returns
     ``{"dropped": {var: value, ...}, "source": {"parent_pid", "parent_cmdline"}}``
     so callers can record exactly what was cleared and from where.
+
+    ``gateway_log_path`` — optional path to the gateway log file the warning
+    line is ALSO appended to verbatim (best-effort, so the diagnostic is
+    physically present in ``logs/gateway.log`` even before the logger
+    handlers are fully configured at ``gateway run`` startup).
     """
     dropped: dict[str, str] = {}
     for var in WORKER_IDENTITY_ENV_VARS:
@@ -93,16 +101,20 @@ def strip_gateway_worker_env(log_warning: bool = True) -> dict[str, object]:
     source: dict[str, object] = {}
     if dropped:
         source = _env_source()
+        detail = ", ".join(f"{k}={v}" for k, v in dropped.items())
+        src = ""
+        if source.get("parent_cmdline"):
+            src = (
+                " (env-source: parent_pid="
+                f"{source.get('parent_pid')} "
+                f"cmdline={source.get('parent_cmdline')})"
+            )
+        argv = " ".join(sys.argv) or "(empty argv)"
+        message = (
+            "KANBAN_ENV_SANITIZE: gateway run inherited stale kanban "
+            f"worker env: {detail} — cleared.{src} argv={argv}"
+        )
         if log_warning:
-            detail = ", ".join(f"{k}={v}" for k, v in dropped.items())
-            src = ""
-            if source.get("parent_cmdline"):
-                src = (
-                    " (env-source: parent_pid="
-                    f"{source.get('parent_pid')} "
-                    f"cmdline={source.get('parent_cmdline')})"
-                )
-            argv = " ".join(sys.argv) or "(empty argv)"
             try:
                 logging.getLogger(_GATEWAY_LOGGER_NAME).warning(
                     "KANBAN_ENV_SANITIZE: gateway run inherited stale kanban "
@@ -113,4 +125,14 @@ def strip_gateway_worker_env(log_warning: bool = True) -> dict[str, object]:
                 )
             except Exception:
                 pass  # never let the diagnostic itself crash gateway startup
+        # Physical record in the gateway log file is independent of the
+        # logger toggle, so the diagnostic survives even when the logger
+        # handlers aren't configured yet at `gateway run` startup.
+        if gateway_log_path is not None:
+            try:
+                _path = os.fspath(gateway_log_path)
+                with open(_path, "a", encoding="utf-8") as fh:
+                    fh.write(message + "\n")
+            except OSError:
+                pass  # append is best-effort
     return {"dropped": dropped, "source": source}

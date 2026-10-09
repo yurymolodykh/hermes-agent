@@ -5816,7 +5816,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # WORKSPACES_ROOT) is intentionally preserved.
     from hermes_cli.kanban_gateway_env import strip_gateway_worker_env
 
-    strip_gateway_worker_env()
+    try:
+        _gw_log_path = get_hermes_home() / "logs" / "gateway.log"
+    except Exception:
+        _gw_log_path = None
+    strip_gateway_worker_env(gateway_log_path=_gw_log_path)
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)

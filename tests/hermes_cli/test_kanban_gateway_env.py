@@ -41,6 +41,28 @@ def test_strip_removes_worker_identity_and_keeps_gateway_pin(monkeypatch):
     }
 
 
+def test_strip_writes_diagnostic_to_gateway_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_gwlog")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "prod")
+    gwlog = tmp_path / "logs" / "gateway.log"
+    gwlog.parent.mkdir(parents=True)
+
+    result = strip_gateway_worker_env(log_warning=False, gateway_log_path=gwlog)
+
+    assert result["dropped"] == {"HERMES_KANBAN_TASK": "t_gwlog", "HERMES_KANBAN_RUN_ID": "7"}
+    assert "HERMES_KANBAN_TASK" not in os.environ
+    assert os.environ.get("HERMES_KANBAN_BOARD") == "prod"
+    text = gwlog.read_text(encoding="utf-8")
+    assert "KANBAN_ENV_SANITIZE" in text
+    assert "t_gwlog" in text and "HERMES_KANBAN_RUN_ID=7" in text
+    assert "parent_pid=" in text  # env-source present
+    # no-op on a clean env writes nothing
+    gwlog.write_text("", encoding="utf-8")
+    strip_gateway_worker_env(log_warning=False, gateway_log_path=gwlog)
+    assert gwlog.read_text(encoding="utf-8") == ""
+
+
 def test_strip_is_noop_when_env_clean(monkeypatch):
     for var in WORKER_IDENTITY_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
