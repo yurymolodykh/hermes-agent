@@ -5178,27 +5178,72 @@ def bind_worker_session(
 
     This is deliberately compare-and-set: a terminal, reclaimed, foreign, or
     already differently-bound run is rejected without changing board state.
+
+    With one exception (t_44017da2): when the only blocker is a STALE binding
+    left by a provably-dead worker — a previous gateway crashed and the
+    ``worker_session_id`` on the run still points at the dead session — the
+    stale binding is released and the fresh worker takes the slot, instead of
+    dying on ``KANBAN_BINDING: rejected active run/session binding``. A LIVE
+    worker's binding is never stolen (see :func:`_can_release_worker_binding`).
     """
     if not all(str(v).strip() for v in (task_id, run_id, assignee, session_id)):
         return False
     with write_txn(conn):
-        cur = conn.execute(
+        cur = _try_bind_worker_session(conn, task_id, run_id, assignee, session_id)
+        if cur.rowcount == 1:
+            return True
+        # Strict CAS refused. If the run is bound to a DIFFERENT session whose
+        # worker is provably dead (dead-gateway residue), release it and retry
+        # once so a fresh worker can re-bind instead of being hard-rejected.
+        dead_stale = conn.execute(
             """
-            UPDATE task_runs
-               SET worker_session_id = ?
-             WHERE id = ? AND task_id = ? AND profile = ?
-               AND status = 'running' AND ended_at IS NULL
-               AND (worker_session_id IS NULL OR worker_session_id = ?)
-               AND EXISTS (
-                   SELECT 1 FROM tasks
-                    WHERE id = ? AND assignee = ? AND status = 'running'
-                      AND current_run_id = ?
-               )
+            SELECT 1 FROM task_runs r
+             WHERE r.id = ? AND r.task_id = ? AND r.profile = ?
+               AND r.status = 'running' AND r.ended_at IS NULL
+               AND r.worker_session_id IS NOT NULL
+               AND r.worker_session_id != ?
             """,
-            (session_id, int(run_id), task_id, assignee, session_id,
-             task_id, assignee, int(run_id)),
-        )
+            (int(run_id), task_id, assignee, session_id),
+        ).fetchone()
+        if dead_stale and _can_release_worker_binding(conn, int(run_id), task_id):
+            _log.info(
+                "kanban: re-binding run %s for task %s — previous worker "
+                "session is provably dead (t_44017da2 dead-gateway residue)",
+                int(run_id), task_id,
+            )
+            conn.execute(
+                """
+                UPDATE task_runs SET worker_session_id = NULL
+                 WHERE id = ? AND status = 'running' AND ended_at IS NULL
+                   AND worker_session_id IS NOT NULL
+                   AND worker_session_id != ?
+                """,
+                (int(run_id), session_id),
+            )
+            cur = _try_bind_worker_session(conn, task_id, run_id, assignee, session_id)
         return cur.rowcount == 1
+
+
+def _try_bind_worker_session(
+    conn: sqlite3.Connection, task_id: str, run_id: int, assignee: str, session_id: str
+):
+    """Shared CAS UPDATE for :func:`bind_worker_session` (idempotent)."""
+    return conn.execute(
+        """
+        UPDATE task_runs
+          SET worker_session_id = ?
+        WHERE id = ? AND task_id = ? AND profile = ?
+          AND status = 'running' AND ended_at IS NULL
+          AND (worker_session_id IS NULL OR worker_session_id = ?)
+          AND EXISTS (
+              SELECT 1 FROM tasks
+               WHERE id = ? AND assignee = ? AND status = 'running'
+                 AND current_run_id = ?
+          )
+        """,
+        (session_id, int(run_id), task_id, assignee, session_id,
+         task_id, assignee, int(run_id)),
+    )
 
 
 def has_authenticated_worker_binding(
@@ -8939,6 +8984,14 @@ class DispatchResult:
     (t_ae461ad6). Requeued to ``ready`` on the dispatch tick instead of waiting
     out the ``release_stale_claims`` TTL (~4h). Live-worker cards are never
     included — see :func:`reclaim_dead_generation_running`."""
+    bindings_released: list[str] = field(default_factory=list)
+    """Task ids whose run/session binding was released this tick because the
+    bound worker session is provably dead (t_44017da2). A dead gateway leaves
+    ``task_runs.worker_session_id`` pointed at a gone session; without this
+    sweep a fresh worker for the same run is hard-rejected
+    (``KANBAN_BINDING: rejected active run/session binding``) and dies before
+    working. Live-worker bindings are never released — see
+    :func:`release_dead_worker_bindings`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -9906,6 +9959,125 @@ def _error_fingerprint(error_text: str) -> str:
     fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
     fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
     return fp.lower().strip()
+
+
+def _can_release_worker_binding(
+    conn: sqlite3.Connection, run_id: int, task_id: str,
+) -> bool:
+    """True when ``run_id``'s run/session binding may be released as stale.
+
+    Conservative gate shared by the boot-time binding sweep
+    (:func:`release_dead_worker_bindings`) and the attach-time takeover in
+    :func:`bind_worker_session`: a binding is ONLY released when we can
+    positively prove the bound worker is gone — never to disturb a
+    legitimately live worker.
+
+    Requires ALL of:
+
+      * the run records a worker pid (no pid → cannot prove death),
+      * the run/claim is host-local (foreign claims are judged by their own
+        host's dispatcher),
+      * the launch grace window has passed (a freshly-spawned worker's pid can
+        be transiently invisible on /proc, mirroring ``detect_crashed_workers``),
+      * ``_pid_alive`` confidently reports the pid as dead.
+
+    ``_pid_alive`` is itself deliberately conservative (returns True on any
+    probe error), so this combination can only fire when the worker is
+    provably gone.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    row = conn.execute(
+        """
+        SELECT COALESCE(r.worker_pid, t.worker_pid) AS worker_pid,
+               COALESCE(r.claim_lock, t.claim_lock) AS claim_lock,
+               COALESCE(r.started_at, t.started_at) AS started_at
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.id = ? AND r.task_id = ?
+        """,
+        (int(run_id), task_id),
+    ).fetchone()
+    if row is None:
+        return False
+    lock = row["claim_lock"] or ""
+    if not lock.startswith(host_prefix):
+        # Foreign claim — liveness can only be judged on the owning host.
+        return False
+    pid = row["worker_pid"]
+    if not pid:
+        return False
+    started_at = row["started_at"]
+    if started_at is not None:
+        grace = _resolve_crash_grace_seconds()
+        if time.time() - started_at < grace:
+            return False
+    return not _pid_alive(pid)
+
+
+def release_dead_worker_bindings(conn: sqlite3.Connection) -> list[str]:
+    """Boot-time sweep: release run/session bindings held by dead workers.
+
+    ``task_runs.worker_session_id`` is the active run-session binding set by
+    :func:`bind_worker_session`. When a gateway dies (crash, kill -9, host
+    reboot) its worker children die with it, but the runs they held stay
+    ``status='running'`` with ``worker_session_id`` pointed at the now-dead
+    session. A fresh worker spawned for that SAME run is then hard-rejected
+    by ``bind_worker_session``'s CAS (``KANBAN_BINDING: rejected active
+    run/session binding``) and dies before doing any work.
+
+    This pass finds those stale bindings and clears ``worker_session_id`` —
+    but ONLY when the bound worker is provably dead (host-local + pid dead +
+    launch grace elapsed, see :func:`_can_release_worker_binding`).
+    Legitimate live runs are never touched. It does NOT close the run or
+    requeue the card (the existing reclaim passes own task lifecycle); it
+    only resets the session pointer so the run can be rebound.
+
+    Idempotent: a cleared binding has ``worker_session_id = NULL`` and is
+    skipped on the next pass, so it is safe to call every dispatch tick —
+    the first tick after a gateway restart IS the boot-time reset.
+
+    Returns the task ids whose binding was released (for ``DispatchResult``
+    / telemetry).
+    """
+    released: list[str] = []
+    rows = conn.execute(
+        """
+        SELECT r.id AS run_id, r.task_id, r.worker_session_id
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.status = 'running' AND r.ended_at IS NULL
+           AND r.worker_session_id IS NOT NULL
+           AND t.status = 'running'
+        """
+    ).fetchall()
+    for row in rows:
+        run_id = int(row["run_id"])
+        task_id = row["task_id"]
+        if not _can_release_worker_binding(conn, run_id, task_id):
+            continue
+        stale_session = row["worker_session_id"]
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE task_runs SET worker_session_id = NULL
+                 WHERE id = ? AND status = 'running' AND ended_at IS NULL
+                   AND worker_session_id = ?
+                """,
+                (run_id, stale_session),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn, task_id, "binding_released",
+                    {"run_id": run_id, "old_session": stale_session,
+                     "reason": "dead_worker"},
+                    run_id=run_id,
+                )
+                released.append(task_id)
+        _log.info(
+            "kanban: released stale worker-session binding run=%s task=%s "
+            "(dead worker pid)", run_id, task_id,
+        )
+    return released
 
 
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
@@ -11925,6 +12097,13 @@ def _dispatch_once_locked(
     # tick after a restart, instead of waiting out the ~4h release_stale_claims
     # TTL. Live-worker cards are never touched (see the function docstring).
     result.generation_reclaimed = reclaim_dead_generation_running(conn)
+    # Dead-session binding sweep (t_44017da2): a gateway crash leaves
+    # task_runs.worker_session_id pointed at a dead session; a fresh worker
+    # for that same run would be hard-rejected by bind_worker_session's CAS.
+    # Release provably-dead bindings every tick — idempotent, and the first
+    # tick after a restart IS the boot-time reset. Live-worker bindings and
+    # foreign claims are never touched (see release_dead_worker_bindings).
+    result.bindings_released = release_dead_worker_bindings(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
