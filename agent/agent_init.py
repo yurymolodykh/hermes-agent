@@ -980,6 +980,50 @@ def init_agent(
             agent._use_native_cache_layout = False
             agent._cache_ttl = None
             agent._cache_disabled = True
+
+        # ── P1 measures (token-optimization rollout, W2 branch) ──────────
+        # Every flag below is DEFAULT OFF: the live system stays byte-identical
+        # until a later wave explicitly flips `true`. Read together with
+        # cache_ttl so all prompt-caching knobs live in one place
+        # (agent_init.py, next to :968-985). Diff-plan and rollback for each
+        # flag: research/p1-implementation.md (mission token-optimization-rollout).
+        # M1 — protective sha256 fingerprint of the stable prompt tier. When
+        # enabled, build_system_prompt compares the current stable prefix
+        # against the previous one and logs a warning + increments
+        # agent.stable_prefix_rebuilds on any drift (detects accidental
+        # dynamic bytes in the stable band).
+        agent._stable_prefix_guard = is_truthy_value(
+            _pc_cfg.get("stable_prefix"), default=False
+        )
+        # M2 — canonical tool-schema serialization: sorted-by-name JSON with
+        # compact separators, used by the prompt-size metric and (opt-in)
+        # wire ordering. Enables the tools_stable_checks counter.
+        agent._sort_tool_schemas = is_truthy_value(
+            _pc_cfg.get("sort_tool_schemas"), default=False
+        )
+        # M3 — freeze skills index + memory blocks for the lifetime of the
+        # AIAgent: a rebuild reuses the first-built blocks instead of
+        # re-deriving them, so the volatile band (and thus the cache prefix
+        # ahead of it) stays stable.
+        agent._freeze_volatile = is_truthy_value(
+            _pc_cfg.get("freeze_volatile"), default=False
+        )
+        # M10 — compact tool schemas: drop/genericize long descriptions while
+        # keeping name/parameters/required intact (smaller fixed payload).
+        agent._compact_tool_schemas = is_truthy_value(
+            _pc_cfg.get("compact_tool_schemas"), default=False
+        )
+        # M6/M7 — class-based reasoning routing (agent.reasoning_class_routing,
+        # DEFAULT OFF). Reads the master switch + optional per-class effort
+        # overrides so agent.reasoning_class_router can resolve per-class effort
+        # at A/B time without touching the live wire. While off, the router is
+        # inert (returns None) and reasoning_effort is byte-identical to base.
+        _acfg = _load_pc_cfg().get("agent", {}) or {}
+        agent._reasoning_class_routing = is_truthy_value(
+            _acfg.get("reasoning_class_routing"), default=False
+        )
+        _rce = _acfg.get("reasoning_class_efforts") or {}
+        agent._reasoning_class_efforts = _rce if isinstance(_rce, dict) else {}
     except Exception:
         pass
 

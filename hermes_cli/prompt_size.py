@@ -276,7 +276,19 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
 
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
-    tools_json = json.dumps(tools, ensure_ascii=False)
+    # M2 (token-optimization rollout, W2; gated by prompt_caching.sort_tool_schemas,
+    # DEFAULT OFF): canonical sorted-by-name JSON so the metric is deterministic
+    # and comparable across sessions. Default path keeps the historical
+    # serialization exactly (byte-identical output with the flag off).
+    if getattr(agent, "_sort_tool_schemas", False):
+        try:
+            from model_tools import stable_tools_json
+
+            tools_json = stable_tools_json(tools)
+        except Exception:
+            tools_json = json.dumps(tools, ensure_ascii=False)
+    else:
+        tools_json = json.dumps(tools, ensure_ascii=False)
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),

@@ -1826,6 +1826,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
+    # M10 (token-optimization rollout, W2; gated by
+    # prompt_caching.compact_tool_schemas, DEFAULT OFF): compact long tool
+    # descriptions before the schemas reach any transport wire. Default path
+    # passes tools through untouched (byte-identical to the base revision).
+    if getattr(agent, "_compact_tool_schemas", False) and tools_for_api:
+        try:
+            from model_tools import compact_tool_definitions
+
+            tools_for_api = compact_tool_definitions(tools_for_api)
+        except Exception:
+            pass
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

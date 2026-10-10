@@ -320,6 +320,71 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
+def stable_tools_json(tools: List[Dict[str, Any]]) -> str:
+    """Canonical, wire-agnostic JSON serialization of tool schemas (M2).
+
+    P1 measure M2 (token-optimization rollout, W2): the same schema list must
+    serialize to identical bytes on every call so (a) the prompt-size metric is
+    deterministic and (b) provider-side name-based canonicalization never
+    reorders them. Ordering: sorted by ``function.name``. Formatting: sorted
+    keys + compact separators — stable under Python dict insertion order.
+
+    The registry already builds tool definitions in sorted-name order
+    (tools/registry.py get_definitions), so for the live wire this is a
+    *verification* helper; it is what the prompt-size metric should use. The
+    wire ordering in chat_completions is intentionally left untouched (already
+    deterministic); M2 only adds the metric-side canonical form and the
+    stability counter. Gated by prompt_caching.sort_tool_schemas (DEFAULT OFF).
+    """
+    ordered = sorted(
+        tools or [],
+        key=lambda t: ((t.get("function") or {}).get("name") or ""),
+    )
+    return json.dumps(ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+#: M10 keeps this many characters of a tool ``description`` when compacting.
+#: Fine-tunable but intentionally a single constant — the measure is a fixed
+#: heuristics toggle, not a knob per tool.
+M10_DESCRIPTION_CHAR_CAP = 120
+#: When the original description is not longer than this, it is kept verbatim.
+#: Only descriptions above the cap are shortened. Keeps every short, precise
+#: tool description identical to its base form.
+M10_KEEP_VERBATIM_UNDER = 200
+
+
+def compact_tool_definitions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compact the given OpenAI-format tool schemas (P1 M10).
+
+    Drops pathologically long ``description`` text down to a leading excerpt
+    (kept under ``M10_DESCRIPTION_CHAR_CAP``) while preserving ``name``,
+    ``parameters``, ``required``, ``type`` and any other structural fields —
+    so the schema stays valid for every provider wire. Short descriptions are
+    kept verbatim. Returns a NEW list; the input is never mutated.
+
+    Gated by ``prompt_caching.compact_tool_schemas`` (DEFAULT OFF). With the
+    flag off this helper is not called and the wire is byte-identical to the
+    base revision.
+    """
+    if not tools:
+        return list(tools or [])
+    out: List[Dict[str, Any]] = []
+    for t in tools:
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            out.append(t)
+            continue
+        desc = fn.get("description")
+        if isinstance(desc, str) and len(desc) > M10_KEEP_VERBATIM_UNDER:
+            trimmed = desc.strip()
+            head = " ".join(trimmed.split())[:M10_DESCRIPTION_CHAR_CAP].rstrip()
+            if len(" ".join(trimmed.split())) > M10_DESCRIPTION_CHAR_CAP:
+                head = head + "…"
+            fn = {**fn, "description": head}
+        out.append({**t, "function": fn})
+    return out
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -772,7 +837,6 @@ _TOOL_ERROR_CDATA_RE = re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL)
 # (tool_error / _bound_json_error_result) trim to the same budget so text
 # never passes two different caps with two different markers.
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
-
 
 def _sanitize_tool_error(error_msg: str) -> str:
     """Strip structural framing tokens from a tool error before showing it to the model.

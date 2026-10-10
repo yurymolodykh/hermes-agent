@@ -357,6 +357,19 @@ DEFAULT_CONFIG = {
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
 
+        # P1 M6/M7 class-based reasoning routing (token-optimization rollout,
+        # W2 branch; DEFAULT OFF — see research/p1-implementation.md).
+        #   reasoning_class_routing: false    # master switch (default OFF)
+        #   reasoning_class_efforts: {}       # optional per-class override map
+        # When enabled, agent.reasoning_class_router routes each detected task
+        # class to a reasoning effort (complex classes -> max, routine -> low,
+        # ops/undef unrouted); the A/B harness (W3) consumes
+        # class_effort_table() to drive per-class after-arm effort. With the
+        # switch off the router returns None and reasoning is untouched —
+        # live behavior stays byte-identical to the base revision.
+        "reasoning_class_routing": False,
+        "reasoning_class_efforts": {},
+
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name
@@ -949,8 +962,26 @@ DEFAULT_CONFIG = {
     # cache_ttl: "5m" or "1h" (Anthropic-supported tiers). Other non-falsy
     # values are silently ignored. Falsy values (false, null, "off",
     # "disabled", "no", "none") disable prompt caching entirely.
+    #
+    # P1 measures (token-optimization rollout, W2 branch, all DEFAULT OFF):
+    # the live system stays byte-identical until a later wave flips a key.
+    # Each key gates one measure and one measure only; setting any to `true`
+    # changes the behavior described under `research/p1-implementation.md`.
+    #   stable_prefix        -> M1: protective sha256 fingerprint of the stable
+    #                           tier (log + rebuild counter on drift).
+    #   sort_tool_schemas    -> M2: canonical (sorted, compact-separator) JSON
+    #                           serialization of tool schemas for the metric.
+    #   freeze_volatile      -> M3: freeze skills index + memory blocks for the
+    #                           lifetime of the AIAgent (no re-derivation on
+    #                           rebuild).
+    #   compact_tool_schemas -> M10: drop/genericize long tool descriptions,
+    #                           keeping name/parameters/required intact.
     "prompt_caching": {
         "cache_ttl": "5m",
+        "stable_prefix": False,
+        "sort_tool_schemas": False,
+        "freeze_volatile": False,
+        "compact_tool_schemas": False,
     },
 
     # OpenRouter-specific settings.

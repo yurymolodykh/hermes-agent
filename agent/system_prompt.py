@@ -802,6 +802,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     volatile_parts: List[str] = []
+    # M3 (token-optimization rollout, W2; gated by prompt_caching.freeze_volatile,
+    # DEFAULT OFF): freeze the skills index + memory/USER blocks for the
+    # lifetime of the AIAgent — a rebuild reuses the first-built blocks instead
+    # of re-deriving them, keeping the volatile band (and the cache prefix
+    # ahead of it) byte-stable. With the flag off (the default), behavior is
+    # byte-identical to the base revision: blocks are re-derived on every build.
+    _freeze_vol = getattr(agent, "_freeze_volatile", False)
+    _frozen = getattr(agent, "_frozen_volatile_blocks", None) if _freeze_vol else None
+
     # Skills are runtime-mutable: the agent adds and patches them across a
     # session (SKILLS_GUIDANCE tells it to patch a skill the moment it goes
     # stale). The built prompt is cached per session and only rebuilt on
@@ -814,28 +823,46 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # inside the reused prefix, and a changed one only re-prefills from here on.
     # (No effect for single-block cache_control backends, where the whole
     # system message is one cache unit regardless of internal order.)
-    if skills_prompt:
-        volatile_parts.append(skills_prompt)
+    if _freeze_vol and _frozen is not None:
+        for _key in ("skills", "memory", "user", "external"):
+            _blk = _frozen.get(_key)
+            if _blk:
+                volatile_parts.append(_blk)
+    else:
+        _mapped = {} if _freeze_vol else None
+        if skills_prompt:
+            volatile_parts.append(skills_prompt)
+            if _mapped is not None:
+                _mapped["skills"] = skills_prompt
 
-    if agent._memory_store:
-        if agent._memory_enabled:
-            mem_block = agent._memory_store.format_for_system_prompt("memory")
-            if mem_block:
-                volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
-        if agent._user_profile_enabled:
-            user_block = agent._memory_store.format_for_system_prompt("user")
-            if user_block:
-                volatile_parts.append(user_block)
+        if agent._memory_store:
+            if agent._memory_enabled:
+                mem_block = agent._memory_store.format_for_system_prompt("memory")
+                if mem_block:
+                    volatile_parts.append(mem_block)
+                    if _mapped is not None:
+                        _mapped["memory"] = mem_block
+            # USER.md is always included when enabled.
+            if agent._user_profile_enabled:
+                user_block = agent._memory_store.format_for_system_prompt("user")
+                if user_block:
+                    volatile_parts.append(user_block)
+                    if _mapped is not None:
+                        _mapped["user"] = user_block
 
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
+        # External memory provider system prompt block (additive to built-in)
+        if agent._memory_manager:
+            try:
+                _ext_mem_block = agent._memory_manager.build_system_prompt()
+                if _ext_mem_block:
+                    volatile_parts.append(_ext_mem_block)
+                    if _mapped is not None:
+                        _mapped["external"] = _ext_mem_block
+            except Exception:
+                pass
+
+        if _mapped is not None:
+            agent._frozen_volatile_blocks = _mapped
 
     # Plugin sections are intentionally confined to one coarse anchor in the
     # volatile tail. This preserves deterministic ordering and lets a resumed
@@ -920,6 +947,30 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
+
+    # M1 (token-optimization rollout, W2; gated by prompt_caching.stable_prefix,
+    # DEFAULT OFF): protective fingerprint of the stable tier. When enabled,
+    # any drift of the byte-stable prefix between builds is logged and counted
+    # so accidental dynamic bytes in the stable band are caught early. With the
+    # flag off (the default) this block never runs and behavior is byte-identical.
+    if getattr(agent, "_stable_prefix_guard", False):
+        try:
+            import hashlib
+            _fp = hashlib.sha256(parts["stable"].encode("utf-8")).hexdigest()
+            _prev = getattr(agent, "_last_stable_fingerprint", None)
+            if _prev is not None and _prev != _fp:
+                agent.stable_prefix_rebuilds = (
+                    getattr(agent, "stable_prefix_rebuilds", 0) + 1
+                )
+                logger.warning(
+                    "P1/M1: stable-prefix fingerprint changed "
+                    "(%s... -> %s...); %d drift(s). Check for dynamic bytes "
+                    "in the stable tier.",
+                    _prev[:12], _fp[:12], agent.stable_prefix_rebuilds,
+                )
+            agent._last_stable_fingerprint = _fp
+        except Exception:
+            logger.debug("P1/M1 stable-prefix fingerprint skipped", exc_info=True)
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
