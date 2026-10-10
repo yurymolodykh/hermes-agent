@@ -2872,6 +2872,7 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
             classify,
             default_context,
             log_suppression,
+            owui_telegram_users,
             policy_enabled,
             verify_recipient,
         )
@@ -2899,8 +2900,16 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
         classify,
         default_context,
         log_suppression,
+        owui_telegram_users,
         verify_recipient,
     )
+
+    try:
+        # T2 (спека §8.1): серверная привязка OWUI⇄TG читается ТОЛЬКО
+        # серверной стороной (scheduler), никогда из client-запросов.
+        _owui_tg = owui_telegram_users() or {}
+    except Exception:
+        _owui_tg = {}
 
     return {
         "initiator": InitiatorRef.from_origin(_resolve_origin(job) or {}),
@@ -2909,6 +2918,7 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
         "has_media": bool(media_files),
         "media_files": media_files,
         "no_agent": bool(job.get("no_agent")),
+        "owui_to_tg": _owui_tg,
         "policy_disabled": False,
         "classify": classify,
         "default_context": default_context,
@@ -2956,6 +2966,7 @@ def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
         target=target_ref,
         home_channel=policy_ctx["home_channel"],
         allowed_users=policy_ctx["allowed_users"],
+        owui_to_tg=policy_ctx.get("owui_to_tg"),
         no_agent=policy_ctx.get("no_agent", False),
         completed_terminal=True,  # _deliver_result carries the final output
         has_media=policy_ctx["has_media"],
@@ -2967,6 +2978,7 @@ def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
             policy_ctx["initiator"], target_ref,
             home_channel=policy_ctx["home_channel"],
             allowed_users=policy_ctx["allowed_users"],
+            owui_to_tg=policy_ctx.get("owui_to_tg"),
         ):
             return True
         policy_ctx["log_suppression"](
@@ -3019,6 +3031,59 @@ def _journal_policy_unavailable(app: str, chat_id: str, delivery_content: str) -
         pass  # ERROR log above is the record
 
 
+def _augment_owui_telegram_lane(job: dict, origin: dict, targets: List[dict]) -> List[dict]:
+    """T2 dual-lane (спека §8.2.2): добавить TG-ленту для OWUI-джоба с api_server-лентой.
+
+    Условия добавления telegram-таргета ``telegram:<bound_chat>`` (если его
+    ещё нет в ``targets``):
+      * policy on (``policy_enabled()``);
+      * известный authoritative owner из серверного реестра OWUI
+        (``origin.owner_id``);
+      * серверная привязка ``openwebui_telegram_users[owner_id]`` ∈ ALLOWED/home.
+
+    Иначе возвращает ``targets`` без изменений (флаг-фейл: «нет привязки —
+    OWUI-only», поведение V8).  Добавленный target проходит тот же
+    пер-таргетный гейт ``_tg_gate_target`` (classify + verify), что и все
+    остальные: артефакты/финал → deliver, рутина/нет-дельты → suppress+журнал.
+    """
+    try:
+        from hermes_cli.delivery_policy import owui_telegram_users, policy_enabled
+
+        if not policy_enabled():
+            return targets
+        binding = owui_telegram_users() or {}
+    except Exception:
+        # Fail-closed: при ошибке конфига/модуля TG-ленту не добавляем.
+        return targets
+    owner_id = str(origin.get("owner_id") or origin.get("user_id") or "")
+    if not owner_id or owner_id not in binding:
+        # Нет привязки у инициатора / не в привязке → TG-ленты нет (OWUI-only).
+        return targets
+    bound_chat = str(binding.get(owner_id) or "").strip()
+    if not bound_chat:
+        return targets
+    # Привязка даёт право ТОЛЬКО если целевой TG-чат ∈ ALLOWED/home (§8.1).
+    try:
+        home_chat = _get_home_target_chat_id("telegram")
+    except Exception:
+        home_chat = None
+    allowed = {
+        p.strip() for p in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+        if p.strip()
+    }
+    if bound_chat != home_chat and bound_chat not in allowed:
+        return targets
+    # Не дублировать уже присутствующий telegram:<bound_chat>.
+    for t in targets:
+        if str(t.get("platform", "")).lower() == "telegram" and str(t.get("chat_id")) == bound_chat:
+            return targets
+    logger.info(
+        "Job '%s': T2 dual-lane — OWUI owner %s bound to telegram:%s, "
+        "adding TG lane for api_server job", job.get("id", "?"), owner_id, bound_chat,
+    )
+    return [*targets, {"platform": "telegram", "chat_id": bound_chat, "thread_id": None}]
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None,
                     source_id: Optional[str] = None) -> Optional[str]:
     """
@@ -3038,8 +3103,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
     # transcript mirror or a self-post into a user-visible ACK. Client receipt
     # is a separate transition; until then last_delivery_error stays visible.
     api_targets = [t for t in targets if t["platform"] == "api_server"]
+    _api_receipt = None
     if api_targets:
-        if len(api_targets) != len(targets):
+        # T2 (спека §8.2.1): api_server-лента может сочетаться ТОЛЬКО с
+        # telegram (dual-lane).  Прочие платформы в смеси — прежняя ошибка
+        # «mixed push/API targets» (не меняется).
+        _other_platforms = [
+            t for t in targets if t["platform"] not in ("api_server", "telegram")
+        ]
+        if _other_platforms:
             return "api_server origin delivery failed: mixed push/API targets require per-target receipts"
         from gateway.origin_outbox import enqueue, status as delivery_status
         from hermes_constants import get_hermes_home
@@ -3070,6 +3142,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
         origin = resolve_origin(registry, get_active_profile_name(), origin)
         if origin is None:
             return "api_server origin delivery failed: no server-owned Open WebUI chat binding"
+        # T2: stamp the authoritative OWUI owner into the LOCAL job origin so
+        # the delivery-policy gate (InitiatorRef.user_id) resolves the dual-lane
+        # telegram target's binding. Copy-on-write: never mutate the caller's
+        # job dict. user_id first (InitiatorRef reads user_id || owner_id).
+        _local_origin = dict(job.get("origin") or {})
+        _local_origin["user_id"] = origin.get("owner_id")
+        _local_origin["owner_id"] = origin.get("owner_id")
+        job = dict(job)
+        job["origin"] = _local_origin
+        # T2 (спека §8.2.2): для OWUI-джоба с api_server-лентой, policy on и
+        # известным инициатором (authoritative owner из серверного реестра)
+        # при наличии привязки openwebui_telegram_users[owner_id] ∈ ALLOWED/home
+        # к targets ДОБАВЛЯЕТСЯ telegram-таргет telegram:<bound_chat> (если
+        # его ещё нет) — тот же пер-таргетный гейт _tg_gate_target применяется
+        # к нему идентично.
+        targets = _augment_owui_telegram_lane(job, origin, targets)
         try:
             event = enqueue(
                 get_hermes_home() / "delivery-outbox.sqlite",
@@ -3079,12 +3167,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
             return f"api_server origin delivery failed: {exc}"
         _delivery_state = delivery_status(get_hermes_home() / "delivery-outbox.sqlite", event)
         if _delivery_state == "acknowledged":
-            return None
-        if _delivery_state == "failed":
-            return f"api_server origin delivery failed: exhausted retries (outbox={event})"
-        # No fallback into another chat; mixed-platform fanout still needs a
-        # distinct per-target receipt contract before we can return success.
-        return f"api_server delivery pending client ACK (outbox={event})"
+            _api_receipt = None
+        elif _delivery_state == "failed":
+            _api_receipt = f"api_server origin delivery failed: exhausted retries (outbox={event})"
+        else:
+            _api_receipt = f"api_server delivery pending client ACK (outbox={event})"
+        # Dual-lane: telegram-лента (если она есть) доставляется общим
+        # пер-таргетным циклом ниже; api-лента сохраняет собственный receipt
+        # (ack/pending/failed), который складывается в итоговый статус в конце
+        # (pending api не затирается успехом TG: authoritative-лента — OWUI).
+        targets = [t for t in targets if t["platform"] == "telegram"]
+        if not targets:
+            # Чисто api-лента: прежнее поведение V8 (возврат только api-receipt).
+            return _api_receipt
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -3904,7 +3999,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None,
         # Filter-time drops apply to every target; report them once.
         delivery_errors.extend(policy_drop_errors)
     if delivery_errors:
+        # Fold the api-lane receipt into the error surface: a dual-lane
+        # failure must surface BOTH lanes, while the api (authoritative) lane
+        # stays the status authority. TG-suppression is NOT a delivery error —
+        # it lands in the policy journal, not here.
+        if _api_receipt:
+            return f"{_api_receipt}; " + "; ".join(delivery_errors)
         return "; ".join(delivery_errors)
+    # Dual-lane (T2 §8.2.4): api-лента authoritative. Пока её receipt не
+    # ack/pending — окончательный статус держит её, даже если TG-лента
+    # успешно доставлена (pending api не затирается успехом TG).
+    if _api_receipt:
+        return _api_receipt
     return None
 
 

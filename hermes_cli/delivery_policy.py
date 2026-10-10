@@ -27,7 +27,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,63 @@ def policy_enabled(cfg: Optional[dict] = None) -> bool:
                     return False
                 return str(val).strip().lower() != "off"
     return True
+
+
+# --------------------------------------------------------------------------
+# Серверная привязка OWUI-пользователь ⇄ TG-чат (T2, спека §8.1)
+# --------------------------------------------------------------------------
+
+#: Конфиг-ключ и env-переменная с привязкой ``{owui_user_id: tg_chat_id}``.
+_BINDING_CFG_KEY = "openwebui_telegram_users"
+_BINDING_ENV = "HERMES_OPENWEBUI_TELEGRAM_USERS"
+
+
+def owui_telegram_users(cfg: Optional[dict] = None) -> Dict[str, str]:
+    """Серверная привязка «TG-чат принадлежит данному OWUI-пользователю» (T2 §8.1).
+
+    ЕДИНСТВЕННЫЙ источник прав перетекания OWUI→TG.  Отсутствие ключа /
+    отсутствие записи пользователя = OWUI-only (fail-closed, V8 до T2).
+    Ни client-заголовки, ни home-фолбэки прав НЕ дают.
+
+    Приоритет источников (первый решающий побеждает):
+      1. env ``HERMES_OPENWEBUI_TELEGRAM_USERS`` — JSON-объект
+         ``{owui_user_id: tg_chat_id}`` (устойчив к перезаписи config.yaml).
+      2. Per-call ``cfg`` dict (``openwebui_telegram_users``).
+      3. ``load_config()`` (тот же ключ).
+    Оба источника читаются только серверной стороной (scheduler), никогда
+    из client-запросов.
+
+    Возвращает mapping ``{str(owui_user_id): str(tg_chat_id)}``; при
+    не-JSON / не-объекте / отсутствии — ``{}`` (fail-closed, без исключений).
+    """
+    env_raw = os.environ.get(_BINDING_ENV, "").strip()
+    if env_raw:
+        try:
+            parsed = json.loads(env_raw)
+        except Exception:
+            logger.error(
+                "delivery-policy: %s is not valid JSON — binding ignored "
+                "(OWUI-only, fail-closed)", _BINDING_ENV,
+            )
+            return {}
+        if not isinstance(parsed, dict):
+            logger.error(
+                "delivery-policy: %s must be a JSON object — binding ignored "
+                "(OWUI-only, fail-closed)", _BINDING_ENV,
+            )
+            return {}
+        return {str(k): str(v) for k, v in parsed.items()}
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+    raw = (cfg or {}).get(_BINDING_CFG_KEY) if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()}
 
 
 # --------------------------------------------------------------------------
@@ -303,6 +360,7 @@ def verify_recipient(
     target: Optional[TargetRef],
     home_channel: Optional[str] = None,
     allowed_users: Optional[Sequence[str]] = None,
+    owui_to_tg: Optional[Mapping] = None,
 ) -> bool:
     """ИНВ1: получатель == инициатор (fail-closed).
 
@@ -317,6 +375,12 @@ def verify_recipient(
             allowed_users (владелец получает админ-доставки).
       * кросс-платформа (напр. api_server -> TG home): только если
             initiator.user_id входит в allowed_users владельца.
+      * T2 (спека §8.2.3): при заданной серверной привязке ``owui_to_tg``
+            (непустой mapping ``{owui_user_id: tg_chat_id}``) кросс-платформа
+            api_server→telegram проходит ТОЛЬКО если
+            ``target.chat_id == owui_to_tg[initiator.user_id]`` и этот чат
+            ∈ ALLOWED/home.  Пустая привязка (привязка не сконфигурирована)
+            сохраняет прежнее V1-поведение (F1/F3 не меняются).
     """
     if target is None or not target.platform:
         return False
@@ -350,6 +414,19 @@ def verify_recipient(
     # Только владелец (user_id in ALLOWED) проходит; чужой api_server-user
     # (OWUI) — fail-closed, в home владельца не льём.
     if initiator.platform != target.platform:
+        if initiator.platform == "api_server" and owui_to_tg:
+            # T2 (спека §8.2.3): кросс-платформа api_server→telegram
+            # адресуется ТОЛЬКО собственным чатом привязки инициатора.
+            binding: Mapping = {str(k): str(v) for k, v in dict(owui_to_tg).items()}
+            bound_chat = binding.get(str(initiator.user_id or ""))
+            if bound_chat is None:
+                # Не в привязке → verf=False → TG suppressed даже для
+                # ценного контента (спека §8.3).
+                return False
+            if str(target.chat_id) != bound_chat:
+                # Перекрёстная утечка в чужой TG-чат конструктивно невозможна.
+                return False
+            return bound_chat == home_channel or bound_chat in allowed
         if (
             target.chat_id == home_channel
             and initiator.user_id
@@ -496,6 +573,7 @@ def classify(content: Optional[str], context: Optional[dict] = None) -> PolicyDe
         ctx.get("target"),
         ctx.get("home_channel"),
         ctx.get("allowed_users"),
+        owui_to_tg=ctx.get("owui_to_tg"),
     ):
         return deliver("default")
     return suppress("recipient mismatch")
@@ -508,6 +586,7 @@ def default_context(
     target: Optional[TargetRef] = None,
     home_channel: Optional[str] = None,
     allowed_users: Optional[Sequence[str]] = None,
+    owui_to_tg: Optional[Mapping] = None,
     **extra: Any,
 ) -> dict:
     """Собрать базовый context с общими полями для классификатора."""
@@ -517,6 +596,7 @@ def default_context(
         "target": target,
         "home_channel": home_channel,
         "allowed_users": allowed_users,
+        "owui_to_tg": owui_to_tg,
     }
     ctx.update(extra)
     return ctx
