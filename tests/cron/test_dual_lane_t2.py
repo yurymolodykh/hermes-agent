@@ -375,3 +375,183 @@ def _ctx_owner_home(monkeypatch):
     monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+
+
+# ---------------------------------------------------------------------------
+# §8.4 — полный dual-lane: обе ленты одновременно + журнал подавлений без
+# лишних записей (acceptance t_812d58c2)
+# ---------------------------------------------------------------------------
+
+#: Второй OWUI-пользователь, также ПРИВЯЗАННЫЙ (в отличие от FOREIGN_OWUI).
+SECOND_OWUI = "aaaaa111-2222-3333-4444-555555555555"
+SECOND_TG = "999000111"
+
+
+def _read_suppression_journal():
+    """Jsonl-записи delivery-policy-suppressed.log в изолированном HERMES_HOME."""
+    import json as _json
+
+    from hermes_constants import get_hermes_home
+
+    log_path = get_hermes_home() / "logs" / "delivery-policy-suppressed.log"
+    if not log_path.exists():
+        return []
+    records = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(_json.loads(line))
+    return records
+
+
+def _run_all_targets_gate(job, content, *, no_agent=False):
+    """Применить гейт ко ВСЕМ таргетам (включая api_server/OWUI).
+
+    Возвращает список (platform, chat_id, allowed) — в отличие от
+    _run_dual_gate, который выкидывает не-telegram таргеты, здесь видна
+    полная картина dual-lane: OWUI-лента сохраняется, TG-лента добавляется.
+    """
+    from cron.scheduler import (
+        _augment_owui_telegram_lane,
+        _get_home_target_chat_id,
+        _resolve_delivery_targets,
+        _tg_delivery_policy_context,
+        _tg_gate_target,
+    )
+
+    job = dict(job)
+    job["no_agent"] = bool(job.get("no_agent")) or no_agent
+    targets = _resolve_delivery_targets(job)
+    origin = {
+        "platform": "api_server",
+        "chat_id": str((job.get("origin") or {}).get("chat_id") or "owui-chat-x"),
+        "owner_id": (job.get("origin") or {}).get("user_id") or OWNER_OWUI,
+        "user_id": (job.get("origin") or {}).get("user_id") or OWNER_OWUI,
+    }
+    targets = _augment_owui_telegram_lane(job, origin, targets)
+    home = _get_home_target_chat_id("telegram")
+    ctx = _tg_delivery_policy_context(
+        job, content, [], home_channel=home, allowed_users=ALLOWED,
+    )
+    return [
+        (str(t.get("platform")), str(t.get("chat_id") or t.get("chat") or ""),
+         _tg_gate_target(t, content, ctx))
+        for t in targets
+    ]
+
+
+def test_dual_lane_artifact_delivers_to_both_owui_and_telegram(monkeypatch):
+    # Приёмка 1: OWUI-origin джоб с артефактом доставляется И в OWUI-чат
+    # инициатора (api_server-лента), И в его Telegram (dual-lane) — обе
+    # ленты присутствуют и обе проходят гейт.
+    _ctx_owner_home_with_binding(monkeypatch)
+    job = {
+        "id": "t2-full-1",
+        "deliver": "origin",
+        "origin": {"platform": "api_server", "chat_id": "owui-chat-full-1",
+                   "user_id": OWNER_OWUI},
+    }
+    results = _run_all_targets_gate(job, ARTIFACT)
+    lanes = {p for p, _, _ in results}
+    assert "api_server" in lanes, "OWUI-лента (api_server) должна остаться"
+    assert "telegram" in lanes, "dual-lane должен добавить TG-ленту"
+    by_platform = {}
+    for p, c, allowed in results:
+        by_platform.setdefault(p, []).append((c, allowed))
+    # Telegram-лента ведёт в чат привязки инициатора и разрешена.
+    assert by_platform["telegram"] == [(OWNER_TG, True)]
+    # OWUI-лента (не-telegram) гейтом не подавляется.
+    assert all(allowed is True for _, allowed in by_platform["api_server"])
+
+
+def test_dual_lane_second_bound_user_receives_nothing(monkeypatch):
+    # Приёмка 2 (isolation): привязка есть у ДВУХ пользователей, но джоб
+    # принадлежит owner. Augmentation добавляет TG-ленту ТОЛЬКО для чата
+    # привязки owner — второй bound-пользователь ничего не получает.
+    _ctx_owner_home_with_binding(monkeypatch)
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        '{"' + OWNER_OWUI + '": "' + OWNER_TG + '", "'
+        + SECOND_OWUI + '": "' + SECOND_TG + '"}',
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_ALLOWED_USERS", ",".join([OWNER_TG, SECOND_TG]),
+    )
+    job = {
+        "id": "t2-full-2",
+        "deliver": "origin",
+        "origin": {"platform": "api_server", "chat_id": "owui-chat-full-2",
+                   "user_id": OWNER_OWUI},
+    }
+    results = _run_all_targets_gate(job, ARTIFACT)
+    tg_chats = [c for p, c, _ in results if p == "telegram"]
+    assert tg_chats == [OWNER_TG], (
+        "второй bound-пользователь не должен получить TG-ленту; "
+        f"фактически: {tg_chats}"
+    )
+    assert SECOND_TG not in tg_chats
+    # И на уровне verify_recipient: таргет=чужой bound-чат отвергается.
+    assert verify_recipient(
+        InitiatorRef("api_server", "owui-chat-full-2", OWNER_OWUI),
+        TargetRef("telegram", SECOND_TG),
+        home_channel=OWNER_TG,
+        allowed_users=[OWNER_TG, SECOND_TG],
+        owui_to_tg={OWNER_OWUI: OWNER_TG, SECOND_OWUI: SECOND_TG},
+    ) is False
+
+
+def test_dual_lane_routine_journal_exactly_one_entry(monkeypatch):
+    # Приёмка 3+4: рутина/no-delta подавляется в TG даже при привязке —
+    # и журнал подавлений получает РОВНО одну запись (без дублей/лишних
+    # строк от guest-лент).
+    _ctx_owner_home_with_binding(monkeypatch)
+    job = {
+        "id": "t2-full-3",
+        "deliver": "origin",
+        "origin": {"platform": "api_server", "chat_id": "owui-chat-full-3",
+                   "user_id": OWNER_OWUI},
+    }
+    results = _run_all_targets_gate(job, ROUTINE, no_agent=True)
+    tg_entries = [(c, allowed) for p, c, allowed in results if p == "telegram"]
+    assert tg_entries == [(OWNER_TG, False)], "рутина должна быть подавлена в TG"
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["target"] == f"telegram:{OWNER_TG}"
+    assert journal[0]["app"] == "cron"
+
+
+def test_dual_lane_artifact_delivered_journal_has_no_extra_entries(monkeypatch):
+    # Приёмка 4: ценный артефакт владельцу доставляется в ОБЕ ленты — журнал
+    # подавлений НЕ получает никаких записей (ничего не подавлено).
+    _ctx_owner_home_with_binding(monkeypatch)
+    job = {
+        "id": "t2-full-4",
+        "deliver": "origin",
+        "origin": {"platform": "api_server", "chat_id": "owui-chat-full-4",
+                   "user_id": OWNER_OWUI},
+    }
+    results = _run_all_targets_gate(job, ARTIFACT)
+    assert all(allowed is True for _, _, allowed in results), results
+    assert _read_suppression_journal() == [], (
+        "доставленный артефакт не должен оставлять записей в "
+        "delivery-policy-suppressed.log"
+    )
+
+
+def test_dual_lane_foreign_owui_no_lane_no_journal(monkeypatch):
+    # Приёмка 4 (negative): чужому OWUI-пользователю TG-лента не добавляется
+    # вовсе — журнал подавлений тоже пуст (нет лишних записей о «подавлении»
+    # контента, который и не целивался ни в какой TG-чат).
+    _ctx_owner_home_with_binding(monkeypatch)
+    job = {
+        "id": "t2-full-5",
+        "deliver": "origin",
+        "origin": {"platform": "api_server", "chat_id": "owui-chat-full-5",
+                   "user_id": FOREIGN_OWUI},
+    }
+    results = _run_all_targets_gate(job, ARTIFACT)
+    assert [p for p, _, _ in results if p == "telegram"] == []
+    assert _read_suppression_journal() == [], (
+        "чужому пользователю нечего подавлять — журнал должен остаться пустым"
+    )
+
