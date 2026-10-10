@@ -3248,6 +3248,53 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _claim_predates_current_dispatcher(row) -> bool:
+    """True when *row*'s running claim was written by a previous dispatcher.
+
+    Two independent signals, either suffices (t_d9451f51):
+
+    * ``gateway_generation`` — the claim-generation stamp written at claim
+      time. Non-NULL and different from THIS process's stamp ⇒ the claimer
+      process is gone (crash, kill, host reboot). NULL stamps (claims written
+      by pre-generation code) fall through to the claim_lock check.
+    * ``claim_lock`` — ``host:pid`` of the claimer. When the pid differs from
+      the current process AND that pid is not alive on this host, the claim
+      belongs to a dead dispatcher. This covers legacy NULL-generation claims
+      (the 2026-10-10 00:04 incident: the old gateway predated the stamp, so
+      cards carried NULL generations while still being restart victims).
+
+    Never returns True for a claim whose pid IS alive — that's either a live
+    dispatcher (not this one) or an unrelated process; the caller must leave
+    such cards untouched rather than double-freeing them.
+    """
+    current = current_gateway_generation()
+    stamp = None
+    try:
+        stamp = row["gateway_generation"]
+    except (KeyError, IndexError):
+        stamp = None
+    if stamp and stamp != current:
+        return True
+    lock = row["claim_lock"] or ""
+    if not lock.startswith(f"{socket_hostname()}:"):
+        return False
+    try:
+        claimer_pid = int(lock.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return False
+    return claimer_pid != os.getpid() and not _pid_alive(claimer_pid)
+
+
+def socket_hostname() -> str:
+    """Hostname for claim_lock prefix matching (isolated from _claimer_id so
+    tests can monkeypatch hostname resolution once for both call sites)."""
+    import socket
+    try:
+        return socket.gethostname() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Gateway generation (t_ae461ad6)
 #
@@ -10240,6 +10287,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crashed: list[str] = []
     rate_limited: list[str] = []
     api_unavailable: list[str] = []
+    restart_reclaimed: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -10254,7 +10302,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id, "
-            "model_override, provider_override, api_unavailable_streak "
+            "model_override, provider_override, api_unavailable_streak, "
+            "gateway_generation "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -10287,6 +10336,64 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     kind = "provider_unavailable"
                 elif code == KANBAN_RATE_LIMIT_EXIT_CODE:
                     kind = "rate_limited"
+                elif _claim_predates_current_dispatcher(row):
+                    # Restart-victim classification (t_d9451f51): the claim was
+                    # written by ANOTHER dispatcher process — the one that died
+                    # and took its worker children with it. "Exit status
+                    # unknown" is the wrong verdict here: the worker is a
+                    # descendant of the dead gateway, so it cannot have exited
+                    # for its own reasons while we lost the handle. Requeue to
+                    # the source phase immediately, mirroring the
+                    # provider_unavailable auto-release below: no failure
+                    # counter, no needs_input question, no duplicate worker
+                    # (the pid is confirmed dead). This closes the 2026-10-10
+                    # 00:04 class of incidents where 12 cards sat in
+                    # blocked/needs_input for 0-30 min waiting for the
+                    # kanban-auto-unblock cron.
+                    error_text = (
+                        f"Windows worker {pid} exited with the previous dispatcher "
+                        "generation (gateway restart victim) — automatically "
+                        "requeued without counting a failure"
+                    )
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "claim_generation": row["gateway_generation"],
+                        "current_generation": current_gateway_generation(),
+                    }
+                    retry_status = _retry_status_for_run(conn, row["id"])
+                    event_payload["retry_status"] = retry_status
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "gateway_generation = NULL "
+                        "WHERE id = ? AND status = 'running' "
+                        "  AND worker_pid = ? AND claim_lock IS ?",
+                        (retry_status, row["id"], pid, row["claim_lock"]),
+                    )
+                    if cur.rowcount == 1:
+                        run_id = _end_run(
+                            conn, row["id"],
+                            outcome="reclaimed", status="reclaimed",
+                            error=error_text,
+                            metadata=dict(event_payload),
+                        )
+                        _append_event(
+                            conn, row["id"], "restart_reclaimed",
+                            event_payload, run_id=run_id,
+                        )
+                        exited_hook_payloads.append({
+                            "task_id": row["id"],
+                            "assignee": row["assignee"],
+                            "run_id": run_id,
+                            "worker_pid": pid,
+                            "exit_kind": "restart_reclaimed",
+                            "exit_code": None,
+                            "outcome": "reclaimed",
+                            "retry_status": retry_status,
+                        })
+                        restart_reclaimed.append(row["id"])
+                    continue
                 else:
                     question = (f"Windows worker {pid} exited after dispatcher restart; "
                                 "exit status cannot be verified. Inspect the worker log and "
@@ -10669,6 +10776,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # retry once the provider is back (or, past the streak limit, were blocked
     # with the user question, which lands in ``_last_auto_blocked``).
     detect_crashed_workers._last_api_unavailable = api_unavailable  # type: ignore[attr-defined]
+    # Restart victims (t_d9451f51): running cards whose worker died with the
+    # previous dispatcher generation. Released to their source phase without
+    # failure accounting — surfaced for telemetry the same way as the other
+    # non-failure requeues.
+    detect_crashed_workers._last_restart_reclaimed = restart_reclaimed  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -12448,6 +12560,15 @@ def _dispatch_once_locked(
     )
     if _crash_api_unavailable:
         result.api_unavailable.extend(_crash_api_unavailable)
+    # Restart-victim requeues (t_d9451f51) — running cards whose worker died
+    # with the previous gateway generation; released to their source phase
+    # without failure accounting. Surfaces the auto-release so A4-style
+    # log/event greps can distinguish them from genuine crashes.
+    _crash_restart_reclaimed = getattr(
+        detect_crashed_workers, "_last_restart_reclaimed", []
+    )
+    if _crash_restart_reclaimed:
+        result.generation_reclaimed.extend(_crash_restart_reclaimed)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
