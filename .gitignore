@@ -213,5 +213,8 @@ native/fts5_cjk/*.so
 .lazy-refresh-incomplete
 
 # card/process artifacts + conflict-resolution backups (t_fc6a7477 A.5)
+# *.bak-* added by t_166cf543: utility backup snapshots (e.g. gateway/slash_commands.py.bak-flatswitch-*)
+# are historical rollback points, never working drift.
 artifacts/
 *.pre-*
+*.bak-*
