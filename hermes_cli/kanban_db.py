@@ -12300,6 +12300,105 @@ def _assignee_route_usable(assignee: str, provider: Optional[str], model: Option
         return False
 
 
+def _preflight_task_skills(
+    task: Task,
+    workspace: str,
+) -> Optional[str]:
+    """Return a block reason when *task*'s force-loaded skills cannot resolve.
+
+    Spawn-time preflight (t_d9451f51): ``_default_spawn`` passes each
+    ``task.skills`` entry via ``--skills``, and a worker whose skill does not
+    resolve in ITS profile context dies on startup
+    (``oneshot.py`` raises ``ValueError: Unknown skill(s)`` → exit 1) — a
+    doomed crash-loop that burns the retry budget while the real cause is
+    only visible in the worker log. This check resolves the exact skill set
+    the worker WOULD load, in the assignee profile's context (HERMES_HOME
+    swap) and from the workspace cwd (project-skill discovery mirrors the
+    worker's), so the card is blocked BEFORE a doomed spawn with the precise
+    reason on the board instead.
+
+    Returns ``None`` when every skill resolves (spawn may proceed). Returns
+    a human-readable block reason naming each unresolved skill and its
+    candidate paths (or the collision) otherwise. Never raises: any internal
+    resolution failure is treated as "cannot verify" and reported as a
+    reason, fail-closed toward blocking rather than spawning blind.
+    """
+    skills = [s for s in (task.skills or []) if s]
+    if not skills:
+        return None
+    assignee = task.assignee or ""
+    if not assignee:
+        return None
+    reasons: list[str] = []
+    try:
+        with _assignee_home(assignee):
+            # Project-skill discovery is cwd-based; the worker is spawned
+            # with cwd=workspace (TERMINAL_CWD takes precedence there too),
+            # so mirror that directory while resolving.
+            prev_cwd = os.getcwd()
+            try:
+                if workspace and os.path.isdir(workspace):
+                    os.chdir(workspace)
+                from agent.skill_commands import build_preloaded_skills_prompt
+                _prompt, loaded, missing = build_preloaded_skills_prompt(
+                    list(skills), task_id=task.id,
+                )
+            finally:
+                os.chdir(prev_cwd)
+            if missing:
+                details = []
+                for name in missing:
+                    detail = f"skill {name!r} does not resolve"
+                    cands = _skill_preflight_candidates(name)
+                    if cands:
+                        detail += f" (collision: {' vs '.join(cands)})"
+                    else:
+                        detail += " (no SKILL.md found in any skills dir)"
+                    details.append(detail)
+                reasons.append(
+                    "skill preflight failed for profile "
+                    f"{assignee!r}: " + "; ".join(details)
+                )
+    except Exception as exc:  # noqa: BLE001 — never crash the dispatch tick
+        reasons.append(
+            f"skill preflight could not verify skills {skills} in profile "
+            f"{assignee!r}: {exc}"
+        )
+    if not reasons:
+        return None
+    return " | ".join(reasons)
+
+
+def _skill_preflight_candidates(name: str) -> list[str]:
+    """Best-effort candidate SKILL.md paths for *name* across skill tiers.
+
+    Mirrors the scan the resolver itself performs (project → local →
+    external dirs) without the first-wins dedup, so a collision can be
+    reported with the exact competing paths. Returns [] when the name
+    matches nothing anywhere — the "missing" case.
+    """
+    try:
+        from agent.skill_utils import get_scan_ordered_skills_dirs
+    except Exception:
+        return []
+    normalized = name.strip()
+    if "/" in normalized or "\\" in normalized:
+        # Already a path-like identifier: report it verbatim.
+        return [normalized]
+    cands: list[str] = []
+    try:
+        for d in get_scan_ordered_skills_dirs():
+            try:
+                for hit in d.rglob("SKILL.md"):
+                    if hit.parent.name == normalized:
+                        cands.append(str(hit.parent))
+            except OSError:
+                continue
+    except Exception:
+        return cands
+    return cands
+
+
 def resolve_assignee_spawn_route(
     assignee: Optional[str],
     card_provider: Optional[str],
@@ -13003,6 +13102,27 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Skill pre-flight (t_d9451f51): resolve the exact --skills set in the
+        # assignee profile's context BEFORE spawning. A worker whose skill
+        # cannot resolve dies on startup (exit 1 "Unknown skill(s)") and
+        # crash-loops through the retry budget with the real cause visible
+        # only in the worker log. Blocking here surfaces the reason on the
+        # board (event + last_failure_error) without burning a spawn.
+        if not dry_run:
+            skill_block = _preflight_task_skills(claimed, str(workspace))
+            if skill_block is not None:
+                block_task(
+                    conn, claimed.id,
+                    reason=f"skill pre-flight blocked before spawn: {skill_block}",
+                    kind="capability",
+                )
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (skill_block[:500], claimed.id),
+                    )
+                result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -13190,6 +13310,25 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # Skill pre-flight (t_d9451f51): same check as the ready lane, but
+        # here it also covers the force-injected sdlc-review itself. The
+        # t_9b53a6bc incident showed a review worker crash-looping (8x exit
+        # 1) because sdlc-review collided across tiers in its profile while
+        # the board only showed "pid exited with code 1".
+        skill_block = _preflight_task_skills(claimed, str(workspace))
+        if skill_block is not None:
+            block_task(
+                conn, claimed.id,
+                reason=f"skill pre-flight blocked before review spawn: {skill_block}",
+                kind="capability",
+            )
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (skill_block[:500], claimed.id),
+                )
+            result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
