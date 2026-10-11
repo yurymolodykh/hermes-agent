@@ -398,6 +398,134 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
     return f"{msg}\n\n{art}"
 
 
+def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
+                       *, task_is_root: Optional[bool] = None,
+                       home_channel: str = "") -> Optional[tuple]:
+    """Complementary OWUI→Telegram delivery lane for a non-RGZ kanban mission.
+
+    Mirror of cron T2 (``cron/scheduler.py::_augment_owui_telegram_lane`` +
+    ``_tg_gate_target``, спека §8.2.2/§8.3): an ``api_server`` subscription's
+    PRIMARY lane is the exact-owner OWUI chat staged in the server-owned
+    outbox.  When the OWUI owner (``sub.user_id``) is server-bound to a
+    Telegram chat via ``openwebui_telegram_users`` AND that chat is in
+    ``TELEGRAM_ALLOWED_USERS``/home, the SAME event is also evaluated for a
+    Telegram delivery to that bound chat through the SAME RGZ classifier
+    (classify + verify_recipient + log_suppression).
+
+    Returns:
+      * ``None`` — no Telegram lane: not an api_server subscription, policy
+        disabled, policy module unavailable (fail-closed), no binding for the
+        owner, or bound chat not in ALLOWED/home.  Nothing is sent, nothing
+        journaled — the mission stays OWUI-only (V8 behavior).
+      * ``(decision, bound_chat)`` — ``decision.delivered`` → send ``msg`` to
+        Telegram ``bound_chat``; ``decision.suppressed`` → already journaled,
+        do NOT send.  ``verify_recipient`` enforces recipient == initiator
+        (ИНВ1); a foreign recipient is never delivered.  Bound chat matching
+        (owner → chat) is exclusive to the server registry: the chat of one
+        owner can never receive another owner's mission.
+    """
+    if str(sub.get("platform") or "").lower() != "api_server":
+        return None
+    try:
+        from hermes_cli.delivery_policy import (
+            InitiatorRef,
+            TargetRef,
+            classify,
+            default_context,
+            log_suppression,
+            owui_telegram_users,
+            policy_enabled,
+            verify_recipient,
+        )
+    except Exception as exc:
+        # Fail-closed: a broken policy module must not open a new lane.
+        logger.error(
+            "delivery-policy: module import failed (%s) — kanban OWUI→TG "
+            "lane FAIL-CLOSED (no lane)", exc,
+        )
+        return None
+    try:
+        if not policy_enabled():
+            return None
+        binding = owui_telegram_users() or {}
+    except Exception as exc:
+        # Fail-closed: конфиг/модуль недоступен — TG-ленту не добавляем.
+        logger.error(
+            "delivery-policy: policy_enabled()/owui_telegram_users() raised "
+            "(%s) — kanban OWUI→TG lane FAIL-CLOSED (no lane)", exc,
+        )
+        return None
+    owner_id = str(sub.get("user_id") or "").strip()
+    if not owner_id:
+        return None
+    bound_chat = str(binding.get(owner_id) or "").strip()
+    if not bound_chat:
+        # Нет серверной привязки у владельца → OWUI-only (§8.3/V8).
+        return None
+    if not home_channel:
+        home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
+    allowed: set = {
+        str(p).strip() for p in (allowed_users or ()) if str(p).strip()
+    }
+    if bound_chat != home_channel and bound_chat not in allowed:
+        return None
+    initiator = InitiatorRef.from_origin({
+        "platform": "api_server",
+        "chat_id": sub.get("chat_id") or "",
+        "user_id": owner_id,
+        "thread_id": sub.get("thread_id") or "",
+    })
+    target = TargetRef.from_dict({
+        "platform": "telegram",
+        "chat_id": bound_chat,
+        "thread_id": None,
+    })
+    payload = getattr(ev, "payload", None) or {}
+    artifacts = list(payload.get("artifacts") or ()) if isinstance(payload, dict) else []
+    task_terminal = bool(task and getattr(task, "status", None) == "archived")
+    root_closing = bool(task_is_root and kind == "completed")
+    ctx = default_context(
+        kind="kanban",
+        initiator=initiator,
+        target=target,
+        home_channel=home_channel,
+        allowed_users=allowed_users,
+        owui_to_tg=binding,
+        event_kind=kind,
+        artifacts=artifacts,
+        has_media=bool(artifacts),
+        completed_terminal=bool(task_terminal or root_closing),
+        no_agent=False,
+    )
+    decision = classify(msg, ctx)
+    if not decision.suppressed:
+        if verify_recipient(
+            initiator, target,
+            home_channel=home_channel,
+            allowed_users=allowed_users,
+            owui_to_tg=binding,
+        ):
+            return (decision, bound_chat)
+        decision = _suppress_decision(
+            "recipient mismatch",
+            detail=f"cross-platform api_server→telegram target={bound_chat}",
+        )
+    log_suppression(
+        app="kanban",
+        who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+        target=f"telegram:{bound_chat}",
+        decision=decision,
+        snippet=(msg or "")[:200],
+        extra={
+            "task_id": sub.get("task_id"),
+            "event_kind": kind,
+            "event_id": getattr(ev, "id", None),
+            "owui_to_tg": True,
+        },
+    )
+    return (decision, bound_chat)
+
+
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
@@ -833,7 +961,13 @@ class GatewayKanbanWatchersMixin:
                                     # identifies that creation user.
                                     task_is_root = False
                                     task_tg_owner = ""
-                                    if platform == "telegram":
+                                    # Branch-root detection is shared by both
+                                    # delivery lanes. The telegram gate needs
+                                    # it for K1 RF2 terminality; the OWUI→TG
+                                    # dual lane (non-RGZ missions, T2 parity,
+                                    # §8.2.2) treats a root-closing completed
+                                    # as terminal exactly the same way.
+                                    if platform in ("telegram", "api_server"):
                                         _top = sub["task_id"]
                                         _depth = 0
                                         while True:
@@ -843,9 +977,17 @@ class GatewayKanbanWatchersMixin:
                                             _top = _parents[0]
                                             _depth += 1
                                         task_is_root = _top == sub["task_id"]
-                                        task_tg_owner = _kanban_branch_tg_owner(
-                                            conn, _kb, _top,
-                                        )
+                                        if platform == "telegram":
+                                            # The branch OWNER is the creator
+                                            # of the topmost root — resolved
+                                            # by walking the parent chain to
+                                            # the top (RF3). For api_server the
+                                            # owner identity comes from the
+                                            # server-owned binding instead, so
+                                            # no telegram lookup applies.
+                                            task_tg_owner = _kanban_branch_tg_owner(
+                                                conn, _kb, _top,
+                                            )
                                     # branch_summary_replace mode: tasks that
                                     # are a strict descendant of a subscribed
                                     # branch root have their individual pings
@@ -1160,6 +1302,78 @@ class GatewayKanbanWatchersMixin:
                                     )
                                 break
                             api_stage_counts.pop((sub["task_id"], ev.id), None)
+                            # Non-RGZ/OWUI mission (T2 parity, спека §8.2.2/
+                            # §8.3): the exact-owner api_server staging above
+                            # is the PRIMARY lane.  When the OWUI owner is
+                            # server-bound to a Telegram chat in ALLOWED/HOME,
+                            # ALSO evaluate a Telegram delivery of the SAME
+                            # text to the bound chat through the SAME RGZ
+                            # classifier.  Routine/status-flip events are
+                            # suppressed with a journal entry; the lane is
+                            # fail-closed and never delivers to a foreign
+                            # recipient (verify_recipient ИНВ1).
+                            try:
+                                _tg_lane = _tg_owui_dual_lane(
+                                    sub, ev, kind, msg, task, _tg_allowed,
+                                    task_is_root=d.get("task_is_root"),
+                                )
+                            except Exception as _lane_exc:
+                                logger.warning(
+                                    "kanban notifier: OWUI→TG lane for %s/%s failed: %s",
+                                    sub["task_id"], ev.id, _lane_exc,
+                                )
+                                _tg_lane = None
+                            if _tg_lane is not None:
+                                _tg_decision, _tg_bound_chat = _tg_lane
+                                if not _tg_decision.suppressed:
+                                    _tg_adapter = self._authorization_adapter(
+                                        _Platform.TELEGRAM, sub_profile or None,
+                                    )
+                                    if _tg_adapter is not None:
+                                        try:
+                                            _tg_send_res = await _tg_adapter.send(
+                                                _tg_bound_chat, msg, metadata={},
+                                            )
+                                            if getattr(_tg_send_res, "success", True) is False:
+                                                # Complementary best-effort lane:
+                                                # a TG transport failure must NOT
+                                                # rewind the OWUI cursor (the
+                                                # primary lane already staged and
+                                                # ACKed) — log for observability.
+                                                logger.warning(
+                                                    "kanban notifier: OWUI→TG lane send to telegram:%s reported failure: %s",
+                                                    _tg_bound_chat,
+                                                    getattr(_tg_send_res, "error", None) or "unknown error",
+                                                )
+                                            else:
+                                                logger.debug(
+                                                    "kanban notifier: OWUI→TG lane delivered %s event for %s to telegram:%s on board %s",
+                                                    kind, sub["task_id"],
+                                                    _tg_bound_chat, board_slug,
+                                                )
+                                            if kind == "completed":
+                                                # Native artifact upload for the
+                                                # TG lane, mirroring the telegram
+                                                # branch below. Best-effort: a
+                                                # failure must not fail the send.
+                                                try:
+                                                    await self._deliver_kanban_artifacts(
+                                                        adapter=_tg_adapter,
+                                                        chat_id=_tg_bound_chat,
+                                                        metadata={},
+                                                        event_payload=getattr(ev, "payload", None),
+                                                        task=task,
+                                                    )
+                                                except Exception as _art_exc:
+                                                    logger.debug(
+                                                        "kanban notifier: OWUI→TG artifact delivery for %s failed: %s",
+                                                        sub["task_id"], _art_exc,
+                                                    )
+                                        except Exception as _tg_exc:
+                                            logger.warning(
+                                                "kanban notifier: OWUI→TG send failed for %s to telegram:%s: %s",
+                                                sub["task_id"], _tg_bound_chat, _tg_exc,
+                                            )
                             continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER

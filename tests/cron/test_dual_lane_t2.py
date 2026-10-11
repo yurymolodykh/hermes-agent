@@ -27,6 +27,7 @@ T2 (РГЗ/tghyg): dual-lane OWUI→TG доставка по серверной 
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -554,4 +555,136 @@ def test_dual_lane_foreign_owui_no_lane_no_journal(monkeypatch):
     assert _read_suppression_journal() == [], (
         "чужому пользователю нечего подавлять — журнал должен остаться пустым"
     )
+
+
+# ---------------------------------------------------------------------------
+# §8.5 (kanban) — ОWUI→TG dual-lane в канбан-нотификаторе
+# (gateway.kanban_watchers._tg_owui_dual_lane, сплит t_9abe0eb6, родитель
+# t_e7a60f78).  Тот же RGZ-классификатор (classify + verify_recipient +
+# log_suppression), что и §8.2.2 для cron, но на КАНБАН-событиях не-РГЗ
+# миссии (api_server-подписка инициатора): B/C/D-артефакт инициатору →
+# доставка и в OWUI, и в TG-чат привязки; рутина/статус → suppress + журнал;
+# чужой OWUI / чужой initiator → TG-ленты нет вовсе.
+# ---------------------------------------------------------------------------
+
+def _owui_sub(owner=OWNER_OWUI, chat="owui-chat-k", task_id="t-k"):
+    return {
+        "platform": "api_server", "user_id": owner,
+        "chat_id": chat, "task_id": task_id,
+    }
+
+
+def _owui_ev(kind="completed", artifacts=None, eid=1, summary="Результат"):
+    payload = {"summary": summary}
+    if artifacts is not None:
+        payload["artifacts"] = artifacts
+    return SimpleNamespace(id=eid, kind=kind, payload=payload)
+
+
+def _owui_task(status="done"):
+    return SimpleNamespace(status=status, title="root", result="res")
+
+
+def _run_owui_lane(sub, ev, msg="Kanban T1 done — Результат", *, task=None,
+                   task_is_root=None, home_channel=None, allowed=None):
+    from gateway.kanban_watchers import _tg_owui_dual_lane
+
+    return _tg_owui_dual_lane(
+        sub, ev, ev.kind, msg, task or _owui_task(),
+        list(allowed or ALLOWED),
+        task_is_root=task_is_root, home_channel=home_channel or "",
+    )
+
+
+def test_owui_lane_artifact_delivers_to_initiator_tg(monkeypatch):
+    # B/C/D-артефакт владельцу: OWUI-лента (api_server) дополняется TG-лентой
+    # до привязанного чата инициатора; журнал подавлений пуст (нечего
+    # подавлять).
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed", artifacts=["rpt.md"]),
+    )
+    assert decision.delivered is True, f"артефакт должен доставляться: {decision}"
+    assert bound_chat == OWNER_TG, f"TG-чат = привязка инициатора: {bound_chat}"
+    assert _read_suppression_journal() == [], (
+        "доставленный артефакт не должен писать в журнал подавлений"
+    )
+
+
+def test_owui_lane_human_action_delivers_to_initiator_tg(monkeypatch):
+    # human_action (blocked/needs_input) — доставляется в TG-чат привязки.
+    _ctx_owner_home_with_binding(monkeypatch)
+    for kind in ("blocked", "needs_input"):
+        decision, bound_chat = _run_owui_lane(
+            _owui_sub(), _owui_ev(kind=kind),
+        )
+        assert decision.delivered is True, f"{kind} должен доставляться"
+        assert bound_chat == OWNER_TG
+
+
+def test_owui_lane_root_closing_completed_delivers_to_tg(monkeypatch):
+    # Закрытие КОРНЯ ветки (task_is_root=True, completed, без артефакта) —
+    # терминально (RF2-паритет) → доставка в TG-чат привязки.
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed", artifacts=None),
+        task=_owui_task(status="done"), task_is_root=True,
+    )
+    assert decision.delivered is True, f"root-closing должен доставляться: {decision}"
+    assert bound_chat == OWNER_TG
+
+
+def test_owui_lane_routine_status_suppressed_with_journal(monkeypatch):
+    # Рутина/статус-флип: даже при валидной привязке → suppress + РОВНО одна
+    # запись в журнале с owui_to_tg=True (как в cron-T2 §8.2.2).
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="status"),
+    )
+    assert decision.suppressed is True, f"статус должен подавляться: {decision}"
+    assert bound_chat == OWNER_TG
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["target"] == f"telegram:{OWNER_TG}"
+    assert journal[0]["app"] == "kanban"
+    assert journal[0]["owui_to_tg"] is True
+
+
+def test_owui_lane_foreign_owui_never_gets_tg_lane(monkeypatch):
+    # Чужой OWUI-пользователь (не в привязке): TG-лента не добавляется вовсе,
+    # журнал пуст — ценный артефакт чужаку отправлять некуда (fail-closed).
+    _ctx_owner_home_with_binding(monkeypatch)
+    out = _run_owui_lane(
+        _owui_sub(owner=FOREIGN_OWUI),
+        _owui_ev(kind="completed", artifacts=["rpt.md"]),
+    )
+    assert out is None, f"чужой OWUI не должен получить TG-ленту: {out}"
+    assert _read_suppression_journal() == []
+
+
+def test_owui_lane_structural_isolation_and_fail_closed(monkeypatch):
+    # (1) Структурная изоляция: миссия владельца A никогда не уходит в чат
+    # привязки другого bound-пользователя (owner→chat — эксклюзивно).
+    _ctx_owner_home_with_binding(monkeypatch)
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        '{"' + OWNER_OWUI + '": "' + OWNER_TG + '", "'
+        + SECOND_OWUI + '": "' + SECOND_TG + '"}',
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_ALLOWED_USERS", ",".join([OWNER_TG, SECOND_TG]),
+    )
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(owner=OWNER_OWUI),
+        _owui_ev(kind="completed", artifacts=["rpt.md"]),
+    )
+    assert decision.delivered is True
+    assert bound_chat == OWNER_TG
+    assert bound_chat != SECOND_TG
+    # (2) Fail-closed: без привязки у владельца — TG-ленты нет вообще (OWUI-only).
+    monkeypatch.delenv("HERMES_OPENWEBUI_TELEGRAM_USERS", raising=False)
+    assert _run_owui_lane(
+        _owui_sub(owner=OWNER_OWUI),
+        _owui_ev(kind="completed", artifacts=["rpt.md"]),
+    ) is None
 
