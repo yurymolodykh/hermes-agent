@@ -398,6 +398,31 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
     return f"{msg}\n\n{art}"
 
 
+def _branch_summary_terminal(conn, kb, root_id: str) -> bool:
+    """True when the branch итог for ``root_id`` is the TERMINAL итог of the
+    whole mission/root tree — i.e. no open/running card remains ABOVE it.
+
+    A branch root is the topmost *subscribed* task of a subtree (see
+    ``subscribed_branch_roots``), but it can be a mid-tree node: a
+    ``[split N/M]`` card, a one-off daughter card, or any sub-branch whose
+    ancestor mission is still in flight.  Those intermediate closes must NOT
+    reach the Telegram mirror (F6-style hygiene); OWUI api_server is
+    unaffected.  The итог is terminal only when the branch's OWN tree is
+    closed (guaranteed by the caller — a summary is only planned for a
+    terminal ``branch_state``) AND every ancestor via ``task_links`` has its
+    whole subtree terminal-closed (``branch_state(aid) is not None``).
+    """
+    ancestors = kb.get_ancestor_ids(conn, root_id)
+    if not ancestors:
+        # Top of the whole tree — this close IS the terminal итог.
+        return True
+    for aid in sorted(ancestors):
+        if kb.branch_state(conn, aid) is None:
+            # An ancestor mission tree is still open/running → intermediate.
+            return False
+    return True
+
+
 def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
                        *, task_is_root: Optional[bool] = None,
                        home_channel: str = "") -> Optional[tuple]:
@@ -2097,6 +2122,14 @@ class GatewayKanbanWatchersMixin:
             return None
         outcome = st["outcome"]
         msg = _kb.branch_summary_message(outcome, st["failed"])
+        # F6-style terminal gate for the TG mirror of the branch итог: the
+        # итог is TERMINAL only when the whole mission/root tree above the
+        # branch root is closed too (no open/running ancestor remains).  A
+        # mid-tree close ([split N/M], one-off daughter card, sub-branch of a
+        # still-running mission) is intermediate → delivered to OWUI but NOT
+        # mirrored to Telegram (computed once per root, consumed by
+        # _deliver_branch_summary).
+        terminal = _branch_summary_terminal(conn, _kb, root_id)
         marker = _kb.has_branch_summary(conn, root_id)
         if marker is not None and marker.get("fingerprint") == st["fingerprint"]:
             # Already claimed for this exact close-state: only channels not
@@ -2114,6 +2147,7 @@ class GatewayKanbanWatchersMixin:
                 "msg": msg,
                 "marker_id": marker.get("_event_id"),
                 "fingerprint": st["fingerprint"],
+                "terminal": terminal,
             }
         if marker is not None:
             # Close-state changed without passing through open (e.g. a blocked
@@ -2138,6 +2172,7 @@ class GatewayKanbanWatchersMixin:
             "msg": msg,
             "marker_id": marker_id,
             "fingerprint": st["fingerprint"],
+            "terminal": terminal,
         }
 
     async def _deliver_branch_summary(
@@ -2209,6 +2244,53 @@ class GatewayKanbanWatchersMixin:
                     root_id, _state,
                 )
                 return False
+            await _to_thread_process_service(
+                self._ack_branch_summary, board, root_id,
+                platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
+            )
+            return True
+        # F6-style terminal gate (t_f285cb14): the branch итог reaches the
+        # Telegram mirror ONLY when it is the TERMINAL close of the whole
+        # mission/root tree (plan["terminal"]).  Intermediate closes —
+        # [split N/M], one-off daughter cards, any sub-branch with a still-
+        # open ancestor mission — are suppressed for telegram while OWUI
+        # api_server (above) is unaffected.  The channel is acked so the
+        # marker completes and the tick stops retrying; only the terminal
+        # root close ever mirrors to TG.
+        if platform_str == "telegram" and not plan.get("terminal", True):
+            _suppr = _suppress_decision(
+                "routine status close",
+                detail=(
+                    "intermediate branch summary — non-terminal mission tree "
+                    "suppressed in TG mirror"
+                ),
+            )
+            try:
+                from hermes_cli.delivery_policy import log_suppression
+
+                log_suppression(
+                    app="kanban",
+                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+                    target=f"telegram:{sub.get('chat_id')}",
+                    decision=_suppr,
+                    snippet=(msg or "")[:200],
+                    extra={
+                        "task_id": root_id,
+                        "event_kind": "branch_summary",
+                        "event_id": plan.get("marker_id") or 0,
+                        "owui_to_tg": True,
+                    },
+                )
+            except Exception as exc:  # journal must never break delivery
+                logger.debug(
+                    "delivery-policy: branch summary suppression journal failed: %s",
+                    exc,
+                )
+            logger.info(
+                "delivery-policy: intermediate branch summary suppressed for "
+                "%s to telegram:%s (non-terminal mission tree)",
+                root_id, sub.get("chat_id"),
+            )
             await _to_thread_process_service(
                 self._ack_branch_summary, board, root_id,
                 platform_str, sub.get("chat_id"), sub.get("thread_id") or "",

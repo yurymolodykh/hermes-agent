@@ -303,3 +303,229 @@ async def test_replace_flag_suppresses_descendant_notifier_pings(board_env, monk
     adapter.sent.clear()
     await _run_one_branch_tick(monkeypatch, runner, interval=1)
     assert adapter.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Terminal gate (t_f285cb14): only the TERMINAL close of the whole
+# mission/root tree reaches the TG mirror; intermediate branch итоги
+# ([split N/M], daughter cards, sub-branches with an open ancestor mission)
+# are suppressed for telegram WITH a journal record, while OWUI api_server
+# keeps receiving both.
+# ---------------------------------------------------------------------------
+
+def _read_suppression_journal():
+    """Jsonl-записи delivery-policy-suppressed.log в изолированном HERMES_HOME."""
+    import json as _json
+
+    from hermes_constants import get_hermes_home
+
+    log_path = get_hermes_home() / "logs" / "delivery-policy-suppressed.log"
+    if not log_path.exists():
+        return []
+    records = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(_json.loads(line))
+    return records
+
+
+def _mk_bg(conn, title, parent=None, status="running", assignee="worker"):
+    """Create a card (optionally linked under parent) and return its id."""
+    tid = kb.create_task(
+        conn, title=title, assignee=assignee, initial_status=status,
+    )
+    if parent:
+        kb.link_tasks(conn, parent, tid)
+    return tid
+
+
+@pytest.mark.asyncio
+async def test_intermediate_branch_suppressed_for_telegram_with_journal(
+    board_env, monkeypatch,
+):
+    """Split/разовая дочерняя карточка закрыта, а миссия выше ещё running:
+    итог ветки — ПРОМЕЖУТОЧНЫЙ → для telegram подавлен, в журнале ровно одна
+    запись (reason=routine status close, owui_to_tg=True); OWUI не потерян.
+    """
+    mission = _mk_bg(board_env, "mission")
+    split = _mk_bg(board_env, "split-1", parent=mission)
+    child = _mk_bg(board_env, "sub-task", parent=split)
+    # Root with a subscription but NO subscribed ancestor: `split` is the
+    # branch root (mission above stays unsubscribed and still-running).
+    kb.add_notify_sub(
+        board_env, task_id=split, platform="telegram", chat_id="tg-chat-1",
+    )
+    # OWUI subscription on the same branch root (api_server) must NOT be lost.
+    kb.add_notify_sub(
+        board_env,
+        task_id=split,
+        platform="api_server",
+        chat_id="owui-abc",
+        user_id="sess-1",
+        delivery_mode="notify+wake",
+    )
+    # Close the split branch fully; keep the mission running. `complete_task`
+    # is parent-gated (split's parent mission is still open), so simulate the
+    # terminal close directly — exactly the state the bug report describes: a
+    # mid-tree split branch HAS closed while the ancestor mission is still
+    # running ([split N/M] / one-off child close).
+    with kb.write_txn(board_env):
+        board_env.execute(
+            "UPDATE tasks SET status='done' WHERE id IN (?, ?)", (child, split),
+        )
+
+    staged = []
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+    from gateway import kanban_origin_delivery as _kod
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    # api_server adapter must be live too (OWUI lane is primary).
+    runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # TG mirror: SUPPRESSED (не терминальный итог).
+    assert adapter.sent == [], (
+        "промежуточный итог ветки не должен уходить в TG"
+    )
+    # OWUI (api_server): delivered as before.
+    assert len(staged) == 1
+    assert staged[0][0] == "owui-abc"
+    assert staged[0][1] == "✅ Задача выполнена"
+
+    # Journal: exactly one record for the suppressed TG channel.
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["reason"] == "routine status close"
+    assert journal[0]["app"] == "kanban"
+    assert journal[0]["target"] == "telegram:tg-chat-1"
+    assert journal[0]["task_id"] == split
+    assert journal[0]["event_kind"] == "branch_summary"
+    assert journal[0]["owui_to_tg"] is True
+
+    # The TG channel is acked so the marker completes and the tick stops
+    # retrying (no duplicate journal records on a repeated tick).
+    conn2 = kb.connect(board="default")
+    try:
+        marker = kb.has_branch_summary(conn2, split)
+        assert kb.branch_summary_pending_subs(
+            marker, [
+                {"platform": "telegram", "chat_id": "tg-chat-1", "thread_id": ""},
+            ]
+        ) == []
+    finally:
+        conn2.close()
+    adapter.sent.clear()
+    staged.clear()
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert adapter.sent == [] and staged == []
+    assert len(_read_suppression_journal()) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_root_delivers_telegram_no_journal(board_env, monkeypatch):
+    """Полное закрытие корня дерева миссии (без открытого предка) ->
+    ТЕРМИНАЛЬНЫЙ итог -> TG-доставка происходит, журнал подавлений пуст.
+    """
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env, task_id=root, platform="telegram", chat_id="tg-chat-9",
+    )
+    _complete_branch(board_env, root, [a])
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    assert adapter.sent[0]["chat_id"] == "tg-chat-9"
+    assert _read_suppression_journal() == [], (
+        "терминальный итог не должен писать в журнал подавлений"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_root_owui_api_server_still_delivered(board_env, monkeypatch):
+    """Корень дерева закрыт полностью: OWUI (api_server) доставка НЕ теряется
+    даже при терминальном итоге (primary лента остаётся без изменений).
+    """
+    from gateway import kanban_origin_delivery as _kod
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc123",
+        user_id="sess-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    staged = []
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert len(staged) == 1
+    assert staged[0][0] == "owui-abc123"
+    assert staged[0][1] == "✅ Задача выполнена"
+
+
+@pytest.mark.asyncio
+async def test_intermediate_branch_owui_api_server_still_delivered(
+    board_env, monkeypatch,
+):
+    """Промежуточный итог (миссия выше открыта): OWUI api_server доставка
+    сохраняется — гейт действует ТОЛЬКО на TG-зеркало, primary лента жива.
+    """
+    from gateway import kanban_origin_delivery as _kod
+    mission = _mk_bg(board_env, "mission")
+    split = _mk_bg(board_env, "split-1", parent=mission)
+    child = _mk_bg(board_env, "sub-task", parent=split)
+    kb.add_notify_sub(
+        board_env,
+        task_id=split,
+        platform="api_server",
+        chat_id="owui-abc",
+        user_id="sess-1",
+        delivery_mode="notify+wake",
+    )
+    # Parent-gated `complete_task` can't close the split while the mission is
+    # open; simulate the mid-tree terminal close directly (see the journal
+    # test above — real [split N/M] close with a still-running mission).
+    with kb.write_txn(board_env):
+        board_env.execute(
+            "UPDATE tasks SET status='done' WHERE id IN (?, ?)", (child, split),
+        )
+
+    staged = []
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert len(staged) == 1, f"OWUI api_server не должен терять доставку: {staged}"
+    assert staged[0][0] == "owui-abc"
+    assert staged[0][1] == "✅ Задача выполнена"
+    assert _read_suppression_journal() == []
+
