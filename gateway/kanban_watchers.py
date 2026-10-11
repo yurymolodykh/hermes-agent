@@ -484,6 +484,43 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     artifacts = list(payload.get("artifacts") or ()) if isinstance(payload, dict) else []
     task_terminal = bool(task and getattr(task, "status", None) == "archived")
     root_closing = bool(task_is_root and kind == "completed")
+    completed_terminal = bool(task_terminal or root_closing)
+    # F6 (tg-delivery-hygiene, применяется ко ВСЕМ binding
+    # openwebui_telegram_users): в TG-ленте (dual-lane) доставляется ТОЛЬКО
+    # терминальный итог миссии / корневой карточки.  Промежуточный completed
+    # дочерней карточки — даже с артефактами сплита (отчёты/диффы/тестлоги) —
+    # в TG подавляется (ИНВ2, reason=routine status close — прецедент в
+    # classify); OWUI-лента (primary) при этом НЕ затрагивается.
+    # Гейт стоит ДО classify, чтобы не срабатывала артефактная ветка:
+    # completed терминален только когда закрывается корень ветки
+    # (task_is_root) либо карточка архивирована (task.status==archived).
+    if kind == "completed" and not completed_terminal:
+        _suppr = _suppress_decision(
+            "routine status close",
+            detail=(
+                "intermediate completed child — non-terminal mission card "
+                "suppressed in OWUI→TG lane"
+            ),
+        )
+        log_suppression(
+            app="kanban",
+            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+            target=f"telegram:{bound_chat}",
+            decision=_suppr,
+            snippet=(msg or "")[:200],
+            extra={
+                "task_id": sub.get("task_id"),
+                "event_kind": kind,
+                "event_id": getattr(ev, "id", None),
+                "owui_to_tg": True,
+            },
+        )
+        logger.info(
+            "delivery-policy: OWUI→TG lane suppressed intermediate completed "
+            "for %s to telegram:%s (not terminal mission card)",
+            sub.get("task_id"), bound_chat,
+        )
+        return (_suppr, bound_chat)
     ctx = default_context(
         kind="kanban",
         initiator=initiator,
@@ -494,7 +531,7 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
         event_kind=kind,
         artifacts=artifacts,
         has_media=bool(artifacts),
-        completed_terminal=bool(task_terminal or root_closing),
+        completed_terminal=completed_terminal,
         no_agent=False,
     )
     decision = classify(msg, ctx)

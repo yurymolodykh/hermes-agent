@@ -596,19 +596,29 @@ def _run_owui_lane(sub, ev, msg="Kanban T1 done — Результат", *, task
     )
 
 
-def test_owui_lane_artifact_delivers_to_initiator_tg(monkeypatch):
-    # B/C/D-артефакт владельцу: OWUI-лента (api_server) дополняется TG-лентой
-    # до привязанного чата инициатора; журнал подавлений пуст (нечего
-    # подавлять).
+def test_owui_lane_intermediate_completed_child_suppressed_with_journal(monkeypatch):
+    # F6: промежуточный completed ДОЧЕРНЕЙ карточки (task_is_root не задан /
+    # не корень) с артефактами сплита — НЕ терминальный итог миссии (ИНВ2)
+    # → TG-лента SUPPRESS + РОВНО одна запись журнала подавлений
+    # (reason=routine status close — прецедент classify, owui_to_tg=True).
+    # OWUI-лента (primary) этим не затронута: гейт действует только на TG-зеркало.
     _ctx_owner_home_with_binding(monkeypatch)
     decision, bound_chat = _run_owui_lane(
         _owui_sub(), _owui_ev(kind="completed", artifacts=["rpt.md"]),
+        task=_owui_task(status="done"),
     )
-    assert decision.delivered is True, f"артефакт должен доставляться: {decision}"
+    assert decision.suppressed is True, (
+        f"промежуточный completed ребёнка должен подавляться: {decision}"
+    )
     assert bound_chat == OWNER_TG, f"TG-чат = привязка инициатора: {bound_chat}"
-    assert _read_suppression_journal() == [], (
-        "доставленный артефакт не должен писать в журнал подавлений"
-    )
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["reason"] == "routine status close"
+    assert journal[0]["app"] == "kanban"
+    assert journal[0]["target"] == f"telegram:{OWNER_TG}"
+    assert journal[0]["owui_to_tg"] is True
+    assert journal[0]["event_kind"] == "completed"
+    assert journal[0]["task_id"] == "t-k"
 
 
 def test_owui_lane_human_action_delivers_to_initiator_tg(monkeypatch):
@@ -632,6 +642,58 @@ def test_owui_lane_root_closing_completed_delivers_to_tg(monkeypatch):
     )
     assert decision.delivered is True, f"root-closing должен доставляться: {decision}"
     assert bound_chat == OWNER_TG
+
+
+def test_owui_lane_root_completed_with_final_artifact_delivers(monkeypatch):
+    # F6: завершение КОРНЯ миссии (task_is_root=True) с финальным итоговым
+    # артефактом — терминальный итог миссии → DELIVER (OWUI+TG), журнал пуст.
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed", artifacts=["final-report.pdf"]),
+        task=_owui_task(status="done"), task_is_root=True,
+    )
+    assert decision.delivered is True, (
+        f"итог корня с финальным артефактом должен доставляться: {decision}"
+    )
+    assert bound_chat == OWNER_TG
+    assert _read_suppression_journal() == [], (
+        "доставленный терминальный итог не должен писать в журнал подавлений"
+    )
+
+
+def test_owui_lane_archived_completed_terminal_delivers(monkeypatch):
+    # F6: completed дочерней карточки с task.status==archived (task_terminal) —
+    # терминален и в TG проходит (опора completed_terminal), журнал пуст.
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed", artifacts=["arch.yml"]),
+        task=_owui_task(status="archived"),
+    )
+    assert decision.delivered is True, (
+        f"archived-completed терминален и должен доставляться: {decision}"
+    )
+    assert bound_chat == OWNER_TG
+    assert _read_suppression_journal() == []
+
+
+def test_owui_lane_policy_off_passthrough(monkeypatch):
+    # F6: policy off → TG-лента не добавляется вовсе (passthrough/OWUI-only),
+    # журнал пуст — даже для completed, который при policy on доставлялся бы.
+    _ctx_owner_home_with_binding(monkeypatch)
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
+    for kwargs in (
+        {"ev_kind": "completed", "artifacts": ["rpt.md"], "task_is_root": None},
+        {"ev_kind": "completed", "artifacts": ["final-report.pdf"],
+         "task_is_root": True},
+    ):
+        out = _run_owui_lane(
+            _owui_sub(),
+            _owui_ev(kind=kwargs["ev_kind"], artifacts=kwargs["artifacts"]),
+            task=_owui_task(status="done"),
+            task_is_root=kwargs["task_is_root"],
+        )
+        assert out is None, f"policy off → OWUI-only (no TG lane): {out}"
+    assert _read_suppression_journal() == []
 
 
 def test_owui_lane_routine_status_suppressed_with_journal(monkeypatch):
@@ -677,6 +739,7 @@ def test_owui_lane_structural_isolation_and_fail_closed(monkeypatch):
     decision, bound_chat = _run_owui_lane(
         _owui_sub(owner=OWNER_OWUI),
         _owui_ev(kind="completed", artifacts=["rpt.md"]),
+        task=_owui_task(status="done"), task_is_root=True,
     )
     assert decision.delivered is True
     assert bound_chat == OWNER_TG
