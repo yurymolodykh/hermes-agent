@@ -350,8 +350,13 @@ async def test_branch_summary_full_mission_tg_delivered_with_owui_binding(
     runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
     await _run_one_branch_tick(monkeypatch, runner)
 
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
-    assert adapter.sent[0]["chat_id"] == "tg-chat-bind"
+    # F7 (t_ebc0a351): терминальный итог миссии доставляется в BOTH native
+    # telegram-подписку И в OWUI→TG зеркало (чат привязки владельца) —
+    # обе ленты получают «✅ Задача выполнена».
+    assert [s["text"] for s in adapter.sent] == [
+        "✅ Задача выполнена", "✅ Задача выполнена",
+    ]
+    assert {s["chat_id"] for s in adapter.sent} == {"tg-chat-bind", OWNER_TG}
     assert len(staged) == 1  # OWUI-лента сохранена
     assert _read_suppression_journal() == []
 
@@ -458,4 +463,273 @@ async def test_branch_summary_policy_off_no_tg_lane_no_delivery(
 
     assert adapter.sent == []
     assert len(staged) == 1
+    assert _read_suppression_journal() == []
+
+
+# ---------------------------------------------------------------------------
+# F7 do-implementation (t_ebc0a351): OWUI→TG mirror in the branch_summary
+# watcher driven by the plan's ``terminal`` flag.
+#
+# The branch итог for an OWUI mission is delivered to the api_server PRIMARY
+# lane.  F7 wires the server binding ``openwebui_telegram_users`` into the
+# branch_summary watcher: the TERMINAL итог of a fully closed mission/root
+# tree is ALSO sent to the owner's bound Telegram chat; an INTERMEDIATE branch
+# close ([split N/M], one-off daughter card, sub-branch of a still-running
+# mission) has its Telegram mirror SUPPRESSED with a journal entry
+# (reason=routine status close, owui_to_tg=True); policy-off / foreign OWUI /
+# no binding → no lane, journal empty (fail-closed, OWUI-only preserved).
+# Direct unit tests on ``_branch_summary_owui_tg_lane`` (fast) mirror the live
+# gate; watcher-level tests prove the observable branch_summary behavior.
+# ---------------------------------------------------------------------------
+
+
+def _branch_summary_plan(root_id, *, terminal=True, marker_id=7):
+    return {
+        "root_id": root_id,
+        "board": "default",
+        "marker_id": marker_id,
+        "terminal": terminal,
+        "msg": "✅ Задача выполнена",
+    }
+
+
+def _ctx_owner_home_with_binding(monkeypatch, binding_target=OWNER_TG):
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        '{"' + OWNER_OWUI + '": "' + binding_target + '"}',
+    )
+
+
+def _run_branch_lane(sub, plan, msg="✅ Задача выполнена", *, home_channel="",
+                     allowed=None):
+    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
+
+    return _branch_summary_owui_tg_lane(
+        sub, plan, msg, list(allowed or ALLOWED), home_channel=home_channel,
+    )
+
+
+def test_branch_lane_owui_intermediate_branch_suppressed_with_journal(
+    monkeypatch,
+):
+    # F7: промежуточный итог ветки (план с terminal=False — миссия выше ещё
+    # running) с валидной OWUI-привязкой → OWUI→TG зеркало SUPPRESS + РОВНО
+    # одна запись журнала (reason=routine status close, owui_to_tg=True).
+    # OWUI-лента (primary) этим не затронута: гейт действует только на зеркало.
+    _ctx_owner_home_with_binding(monkeypatch)
+    sub = {
+        "platform": "api_server", "user_id": OWNER_OWUI,
+        "chat_id": "owui-chat", "task_id": "t-branch",
+    }
+    decision, bound_chat = _run_branch_lane(
+        sub, _branch_summary_plan("t-branch", terminal=False),
+    )
+    assert decision.suppressed is True, (
+        f"промежуточный branch summary должен подавляться: {decision}"
+    )
+    assert bound_chat == OWNER_TG
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["reason"] == "routine status close"
+    assert journal[0]["app"] == "kanban"
+    assert journal[0]["target"] == f"telegram:{OWNER_TG}"
+    assert journal[0]["owui_to_tg"] is True
+    assert journal[0]["event_kind"] == "branch_summary"
+    assert journal[0]["task_id"] == "t-branch"
+
+
+def test_branch_lane_owui_terminal_full_mission_delivers_to_tg(monkeypatch):
+    # F7: терминальный итог ПОЛНОЙ миссии (план с terminal=True) при валидной
+    # OWUI-привязке → OWUI→TG зеркало ДОСТАВЛЯЕТ итог в чат привязки
+    # владельца, журнал пуст.
+    _ctx_owner_home_with_binding(monkeypatch)
+    sub = {
+        "platform": "api_server", "user_id": OWNER_OWUI,
+        "chat_id": "owui-chat", "task_id": "t-root",
+    }
+    decision, bound_chat = _run_branch_lane(
+        sub, _branch_summary_plan("t-root", terminal=True),
+    )
+    assert decision.delivered is True, f"терминальный итог должен доставляться: {decision}"
+    assert bound_chat == OWNER_TG
+    assert _read_suppression_journal() == []
+
+
+def test_branch_lane_policy_off_no_tg_lane(monkeypatch):
+    # policy off → OWUI-миссия остаётся OWUI-only: ленты нет, журнал пуст.
+    _ctx_owner_home_with_binding(monkeypatch)
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
+    sub = {
+        "platform": "api_server", "user_id": OWNER_OWUI,
+        "chat_id": "owui-chat", "task_id": "t-root",
+    }
+    out = _run_branch_lane(sub, _branch_summary_plan("t-root", terminal=True))
+    assert out is None, f"policy off → OWUI-only (no lane): {out}"
+    assert _read_suppression_journal() == []
+
+
+def test_branch_lane_foreign_owui_no_binding_no_lane(monkeypatch):
+    # Чужой/непривязанный OWUI (нет записи в openwebui_telegram_users) →
+    # TG-ленты нет, журнал пуст (fail-closed).
+    _ctx_owner_home_with_binding(monkeypatch)
+    sub = {
+        "platform": "api_server", "user_id": FOREIGN_OWUI,
+        "chat_id": "owui-foreign", "task_id": "t-root",
+    }
+    out = _run_branch_lane(sub, _branch_summary_plan("t-root", terminal=True))
+    assert out is None, f"чужой OWUI → no lane: {out}"
+    assert _read_suppression_journal() == []
+
+
+def test_branch_lane_not_api_server_sub_no_lane(monkeypatch):
+    # Не-api_server подписка (нативная telegram) — mirror к ней не применяется.
+    _ctx_owner_home_with_binding(monkeypatch)
+    sub = {
+        "platform": "telegram", "user_id": "", "chat_id": "tg-native",
+        "task_id": "t-root",
+    }
+    out = _run_branch_lane(sub, _branch_summary_plan("t-root", terminal=True))
+    assert out is None, f"native telegram sub → no OWUI mirror: {out}"
+    assert _read_suppression_journal() == []
+
+
+# ---------------------------------------------------------------------------
+# F7 watcher-level: OWUI mission root (api_server sub only, no native telegram
+# row) — the terminal итог must now reach the owner's bound TG chat, and an
+# intermediate branch close must be journaled (never sent), with the OWUI
+# api_server PRIMARY lane always intact.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_branch_summary_owui_only_root_terminal_mirrors_to_tg(
+    board_env, monkeypatch,
+):
+    # OWUI-миссия с ЕДИНСТВЕННОЙ api_server-подпиской (0 native telegram rows
+    # — ровно тот случай из t_2a586264): терминальное закрытие корня миссии
+    # → итог доставляется в OWUI (staged) И зеркалируется в TG-чат привязки
+    # владельца; журнал пуст.
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-owner",
+        user_id=OWNER_OWUI,
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    staged = []
+    _kod, fake_stage = _fake_stage(staged)
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert [s["chat_id"] for s in adapter.sent] == [OWNER_TG]
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    assert len(staged) == 1, "OWUI primary lane не теряется"
+    assert staged[0][0] == "owui-owner"
+    assert _read_suppression_journal() == []
+
+
+@pytest.mark.asyncio
+async def test_branch_summary_owui_only_root_intermediate_journaled_not_sent(
+    board_env, monkeypatch,
+):
+    # OWUI-миссия с промежуточным закрытием ветки: [split N/M] закрыт, миссия
+    # выше ещё running → OWUI-итог ветки стаджен (primary intact), а OWUI→TG
+    # зеркало ПОДАВЛЕНО с РОВНО одной записью журнала; в TG ничего не ушло.
+    mission = _mk_bg(board_env, "mission")
+    split = _mk_bg(board_env, "split-1", parent=mission)
+    child = _mk_bg(board_env, "sub-task", parent=split)
+    kb.add_notify_sub(
+        board_env,
+        task_id=split,
+        platform="api_server",
+        chat_id="owui-split",
+        user_id=OWNER_OWUI,
+        delivery_mode="notify+wake",
+    )
+    _close_mid_tree(board_env, child, split)
+
+    staged = []
+    _kod, fake_stage = _fake_stage(staged)
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert adapter.sent == [], "промежуточный итог ветки не должен идти в TG"
+    assert len(staged) == 1, "OWUI primary lane не теряется"
+    assert staged[0][0] == "owui-split"
+    journal = _read_suppression_journal()
+    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
+    assert journal[0]["reason"] == "routine status close"
+    assert journal[0]["owui_to_tg"] is True
+    assert journal[0]["event_kind"] == "branch_summary"
+
+
+@pytest.mark.asyncio
+async def test_branch_summary_owui_only_foreign_no_tg_lane(
+    board_env, monkeypatch,
+):
+    # OWUI-миссия чужого (непривязанного) пользователя: api_server-подписка
+    # есть, но в openwebui_telegram_users его нет → TG-зеркала нет вовсе
+    # (fail-closed), OWUI primary доставлен, журнал пуст.
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-foreign",
+        user_id=FOREIGN_OWUI,
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    staged = []
+    _kod, fake_stage = _fake_stage(staged)
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert adapter.sent == [], "чужой OWUI не должен получать TG-доставку"
+    assert len(staged) == 1, "OWUI-лента (api_server) для чужого не теряется"
     assert _read_suppression_journal() == []
