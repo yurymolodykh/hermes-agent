@@ -349,6 +349,91 @@ class TestMidRunKillResume:
             assert final.get("last_status") == "ok"
 
 
+class TestUpdateJobPreservesToken:
+    """update_job must never silently drop an active durable resume_token.
+
+    The resume_token / resume_session pair is the durable "owner interrupted,
+    resume from here" signal for an interrupted long LLM cron run. A blind
+    field-merge rewrite of a job (update_job) touching unrelated fields
+    (name, prompt, schedule, no_agent, ...) must preserve the pair — losing it
+    would strand the interrupted run with nothing to resume (F1 follow-up on
+    the fast-gateway-restart mission).
+    """
+
+    def test_partial_rewrite_preserves_active_token(self, tmp_path):
+        with use_cron_store(tmp_path), jobs._jobs_lock():
+            created = jobs.create_job(
+                prompt="hello", schedule="0 0 * * *", name="update-resume"
+            )
+            job_id = created["id"]
+            assert set_resume_token(
+                job_id,
+                {"session_id": "session-a", "fire_owner": "owner-a", "started_at": "2026-01-01"},
+            )
+            # Plant the per-run resume_session marker the re-arm path would have
+            # stamped before the next tick (real restart state).
+            with use_cron_store(tmp_path), jobs._jobs_lock():
+                all_jobs = jobs.load_jobs()
+                for i, rec in enumerate(all_jobs):
+                    if rec["id"] == job_id:
+                        all_jobs[i] = {**rec, "resume_session": "session-a"}
+                        break
+                jobs.save_jobs(all_jobs)
+
+            # Rewrite with unrelated fields only — must not clobber the pair.
+            updated = jobs.update_job(job_id, {"name": "renamed"})
+            assert updated["resume_token"]["session_id"] == "session-a"
+            assert updated["resume_token"]["fire_owner"] == "owner-a"
+            assert updated["resume_session"] == "session-a"
+
+            persisted = jobs.get_job(job_id)
+            assert persisted["resume_token"]["session_id"] == "session-a"
+            assert persisted["resume_session"] == "session-a"
+            assert persisted["name"] == "renamed"
+
+    def test_schedule_rewrite_preserves_token(self, tmp_path):
+        with use_cron_store(tmp_path), jobs._jobs_lock():
+            created = jobs.create_job(
+                prompt="hello", schedule="0 0 * * *", name="schedule-rewrite"
+            )
+            job_id = created["id"]
+            set_resume_token(job_id, {"session_id": "session-b", "fire_owner": ""})
+
+            # Schedule change recomputes next_run_at and rewrites the record.
+            updated = jobs.update_job(job_id, {"schedule": "*/5 * * * *"})
+            assert updated["resume_token"]["session_id"] == "session-b"
+            persisted = jobs.get_job(job_id)
+            assert persisted["resume_token"]["session_id"] == "session-b"
+            assert persisted["schedule_display"] in {"*/5 * * * *", "every 5 minutes"}
+
+    def test_job_without_token_stays_without_token(self, tmp_path):
+        with use_cron_store(tmp_path), jobs._jobs_lock():
+            created = jobs.create_job(
+                prompt="hi", schedule="0 0 * * *", name="no-token-update"
+            )
+            job_id = created["id"]
+            updated = jobs.update_job(job_id, {"name": "still-no-token"})
+            assert "resume_token" not in updated
+            assert "resume_session" not in updated
+
+    def test_explicit_resume_token_update_is_honored(self, tmp_path):
+        """An explicit resume_token/resume_session in `updates` wins, so a
+        caller that deliberately resets resume state keeps full control
+        (otherwise there would be no way to re-point the pair though
+        update_job)."""
+        with use_cron_store(tmp_path), jobs._jobs_lock():
+            created = jobs.create_job(
+                prompt="hi", schedule="0 0 * * *", name="explicit-token"
+            )
+            job_id = created["id"]
+            set_resume_token(job_id, {"session_id": "old", "fire_owner": "w1"})
+            updated = jobs.update_job(
+                job_id,
+                {"resume_token": {"session_id": "new", "fire_owner": "w2"}},
+            )
+            assert updated["resume_token"]["session_id"] == "new"
+
+
 class TestClearAndHelpers:
     def test_clear_resume_token(self, tmp_path):
         with use_cron_store(tmp_path), jobs._jobs_lock():

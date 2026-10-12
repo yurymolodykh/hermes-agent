@@ -2164,6 +2164,30 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
+            # Resume pair lineage preservation (F1 follow-up on the
+            # fast-gateway-restart mission). The ``resume_token`` /
+            # ``resume_session`` pair is the durable "owner interrupted, resume
+            # from here" signal for a long LLM cron run that was cut short by a
+            # gateway kill/restart.  A rewrite of unrelated fields (name,
+            # prompt, schedule, no_agent, ...) must never drop it — losing the
+            # token strands the interrupted run with nothing to resume.  The
+            # merge above already keeps it for partial updates, but that is an
+            # accident of dict-merge order; make it an explicit, layer-enforced
+            # contract so a future wholesale-replace path (or an update that
+            # rebuilds the record from a sub-schema) cannot silently clobber it.
+            # Lineage key = the job id: only updates that EXPLICITLY carry a
+            # new resume_token/resume_session replace the stored pair — a
+            # caller deliberately resetting resume state keeps full control.
+            if "resume_token" not in updates and "resume_session" not in updates:
+                if _coerce_job_text(job.get("id")) == _coerce_job_text(updated.get("id")):
+                    # Copy the stored pair ONLY when the source record actually
+                    # carries it — never synthesise empty keys on jobs that had
+                    # none (a fresh job must stay free of the resume machinery).
+                    if "resume_token" in job:
+                        updated.setdefault("resume_token", job["resume_token"])
+                    if "resume_session" in job:
+                        updated.setdefault("resume_session", job["resume_session"])
+
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants
             # can't be violated through the update door (e.g. flipping
