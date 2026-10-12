@@ -588,6 +588,167 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     return (decision, bound_chat)
 
 
+def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
+                                 *, home_channel: str = "") -> Optional[tuple]:
+    """Complementary OWUI→Telegram mirror for a kanban branch итог.
+
+    F7 do-implementation (t_ebc0a351): the branch-summary watcher delivers the
+    итог to every subscribed channel of a branch root.  For an OWUI mission the
+    root is subscribed ONLY via ``api_server`` (0 native telegram rows, verified
+    live in t_2a586264) — so the terminal итог never reached Telegram even when
+    the OWUI owner was server-bound via ``openwebui_telegram_users``.  This
+    lane mirrors F6 semantics: when the branch итог is TERMINAL (the whole
+    mission/root tree is closed, ``plan["terminal"]``), the SAME итог is also
+    sent to the owner's bound Telegram chat; when it is INTERMEDIATE (a
+    [split N/M] or one-off daughter branch whose ancestor mission is still
+    running), the Telegram mirror is suppressed with a journal entry
+    (reason=..., owui_to_tg=True).  The OWUI api_server PRIMARY lane is never
+    touched.
+
+    Returns:
+      * ``None`` — no Telegram lane: not an api_server subscription, policy
+        disabled, policy module unavailable (fail-closed), no binding for the
+        owner, or bound chat not in ALLOWED/home.  Mission stays OWUI-only.
+      * ``(decision, bound_chat)`` — ``decision.delivered`` → send ``msg`` to
+        Telegram ``bound_chat``; ``decision.suppressed`` → already journaled,
+        do NOT send.  ``verify_recipient`` enforces recipient == initiator
+        (ИНВ1); a foreign recipient is never delivered.
+    """
+    if str(sub.get("platform") or "").lower() != "api_server":
+        return None
+    try:
+        from hermes_cli.delivery_policy import (
+            InitiatorRef,
+            TargetRef,
+            classify,
+            default_context,
+            log_suppression,
+            owui_telegram_users,
+            policy_enabled,
+            verify_recipient,
+        )
+    except Exception as exc:
+        # Fail-closed: a broken policy module must not open a new lane.
+        logger.error(
+            "delivery-policy: module import failed (%s) — kanban branch summary "
+            "OWUI→TG lane FAIL-CLOSED (no lane)", exc,
+        )
+        return None
+    try:
+        if not policy_enabled():
+            return None
+        binding = owui_telegram_users() or {}
+    except Exception as exc:
+        # Fail-closed: конфиг/модуль недоступен — TG-ленту не добавляем.
+        logger.error(
+            "delivery-policy: policy_enabled()/owui_telegram_users() raised "
+            "(%s) — kanban branch summary OWUI→TG lane FAIL-CLOSED (no lane)",
+            exc,
+        )
+        return None
+    owner_id = str(sub.get("user_id") or "").strip()
+    if not owner_id:
+        return None
+    bound_chat = str(binding.get(owner_id) or "").strip()
+    if not bound_chat:
+        # Нет серверной привязки у владельца → OWUI-only (§8.3/V8).
+        return None
+    if not home_channel:
+        home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
+    allowed: set = {
+        str(p).strip() for p in (allowed_users or ()) if str(p).strip()
+    }
+    if bound_chat != home_channel and bound_chat not in allowed:
+        return None
+    initiator = InitiatorRef.from_origin({
+        "platform": "api_server",
+        "chat_id": sub.get("chat_id") or "",
+        "user_id": owner_id,
+        "thread_id": sub.get("thread_id") or "",
+    })
+    target = TargetRef.from_dict({
+        "platform": "telegram",
+        "chat_id": bound_chat,
+        "thread_id": None,
+    })
+    root_id = plan.get("root_id")
+    terminal = bool(plan.get("terminal"))
+    # F6-style terminal gate applied to the branch итог (t_ebc0a351): the
+    # OWUI→TG mirror carries ONLY the terminal итог of the whole mission/root
+    # tree.  An intermediate branch close ([split N/M], one-off daughter card,
+    # sub-branch of a still-running mission) is suppressed — journaled, never
+    # sent to the owner's Telegram — while the OWUI api_server PRIMARY lane is
+    # unaffected.  Same reason/detail as F6 (routine status close) so the
+    # suppression journal stays a single consistent audit stream.
+    if not terminal:
+        _suppr = _suppress_decision(
+            "routine status close",
+            detail=(
+                "intermediate branch summary — non-terminal mission tree "
+                "suppressed in OWUI→TG lane"
+            ),
+        )
+        log_suppression(
+            app="kanban",
+            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+            target=f"telegram:{bound_chat}",
+            decision=_suppr,
+            snippet=(msg or "")[:200],
+            extra={
+                "task_id": root_id,
+                "event_kind": "branch_summary",
+                "event_id": plan.get("marker_id") or 0,
+                "owui_to_tg": True,
+            },
+        )
+        logger.info(
+            "delivery-policy: OWUI→TG lane suppressed intermediate branch "
+            "summary for %s to telegram:%s (non-terminal mission tree)",
+            root_id, bound_chat,
+        )
+        return (_suppr, bound_chat)
+    ctx = default_context(
+        kind="kanban",
+        initiator=initiator,
+        target=target,
+        home_channel=home_channel,
+        allowed_users=allowed_users,
+        owui_to_tg=binding,
+        event_kind="branch_summary",
+        artifacts=[],
+        has_media=False,
+        completed_terminal=True,
+        no_agent=False,
+    )
+    decision = classify(msg, ctx)
+    if not decision.suppressed:
+        if verify_recipient(
+            initiator, target,
+            home_channel=home_channel,
+            allowed_users=allowed_users,
+            owui_to_tg=binding,
+        ):
+            return (decision, bound_chat)
+        decision = _suppress_decision(
+            "recipient mismatch",
+            detail=f"cross-platform api_server→telegram target={bound_chat}",
+        )
+    log_suppression(
+        app="kanban",
+        who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+        target=f"telegram:{bound_chat}",
+        decision=decision,
+        snippet=(msg or "")[:200],
+        extra={
+            "task_id": root_id,
+            "event_kind": "branch_summary",
+            "event_id": plan.get("marker_id") or 0,
+            "owui_to_tg": True,
+        },
+    )
+    return (decision, bound_chat)
+
+
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
@@ -2244,6 +2405,62 @@ class GatewayKanbanWatchersMixin:
                     root_id, _state,
                 )
                 return False
+            # F7 do-implementation (t_ebc0a351): complement the OWUI api_server
+            # PRIMARY lane with the OWUI→Telegram mirror.  An OWUI mission root
+            # is subscribed ONLY via api_server (0 native telegram rows), so the
+            # terminal branch итог previously never reached Telegram even when
+            # the owner was server-bound via openwebui_telegram_users.  The
+            # mirror sends the SAME terminal итог to the owner's bound TG chat
+            # (F6 gate: only a fully-closed mission/root tree; intermediate
+            # splits are journaled, never sent).  Best-effort: a TG send /
+            # mirror failure is logged but NEVER blocks or re-queues the OWUI
+            # channel (the api_server primary lane is acked below regardless),
+            # and the mirror never touches the marker's delivered list, so a
+            # later delivery of the OWUI итог can't be suppressed by it.
+            try:
+                _tg_lane = _branch_summary_owui_tg_lane(
+                    sub, plan, msg, _tg_delivery_policy_allowed_users(),
+                )
+            except Exception as _lane_exc:
+                logger.warning(
+                    "kanban branch summary: OWUI→TG mirror for %s/%s failed: %s",
+                    platform_str, root_id, _lane_exc,
+                )
+                _tg_lane = None
+            if _tg_lane is not None:
+                _tg_decision, _tg_bound_chat = _tg_lane
+                if not _tg_decision.suppressed:
+                    _tg_adapter = self._authorization_adapter(
+                        _Platform.TELEGRAM, sub_profile or None,
+                    )
+                    if _tg_adapter is not None:
+                        try:
+                            _tg_send_res = await _tg_adapter.send(
+                                _tg_bound_chat, msg, metadata={},
+                            )
+                            if getattr(_tg_send_res, "success", True) is False:
+                                raise RuntimeError(
+                                    "branch summary OWUI→TG mirror send() "
+                                    f"reported failure: "
+                                    f"{getattr(_tg_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            logger.info(
+                                "kanban branch summary: OWUI→TG mirror terminal "
+                                "итог for %s delivered to telegram:%s",
+                                root_id, _tg_bound_chat,
+                            )
+                        except Exception as _tg_send_exc:
+                            logger.warning(
+                                "kanban branch summary: OWUI→TG mirror send "
+                                "failed for %s to telegram:%s: %s",
+                                root_id, _tg_bound_chat, _tg_send_exc,
+                            )
+                    else:
+                        logger.debug(
+                            "kanban branch summary: OWUI→TG mirror telegram "
+                            "adapter disconnected for %s; deferred",
+                            root_id,
+                        )
             await _to_thread_process_service(
                 self._ack_branch_summary, board, root_id,
                 platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
