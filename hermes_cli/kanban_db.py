@@ -1415,6 +1415,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion / operator reclaim / unblock.
     api_unavailable_streak INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Worker process create-time (epoch seconds, ms-quantized) recorded at
+    -- spawn alongside ``worker_pid`` (F3). Together they are a positive
+    -- process identity: if the OS reuses a dead worker's pid for a NEW
+    -- process (fast shim restart), the create times differ, so the
+    -- generation-reclaim pass can requeue the stale card instead of leaving
+    -- it ``running`` forever because ``_pid_alive`` sees a live pid. NULL on
+    -- legacy rows / when create-time was unreadable at spawn — the reclaim
+    -- treats NULL conservatively (leave running, never risk a duplicate).
+    worker_start         REAL,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2660,6 +2669,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_start" not in cols:
+        # Worker process create-time (epoch seconds, ms-quantized) for the
+        # PID-reuse guard (F3, fast-gateway-restart follow-up). NULL on
+        # legacy rows — the generation reclaim treats NULL conservatively.
+        _add_column_if_missing(conn, "tasks", "worker_start", "worker_start REAL")
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -3451,19 +3465,33 @@ def reclaim_dead_generation_running(conn: sqlite3.Connection) -> list[str]:
     their heartbeat simply stops and nothing notices. This sweep breaks that
     long stall by reclaiming them to ``ready`` immediately.
 
-    Safety: a card whose recorded ``worker_pid`` is still alive on this host is
-    NEVER touched — the old gateway may be gone but its worker is doing real
-    work, so spawning a duplicate beside it would be wrong. Cards with no stamp
-    (legacy / non-gateway claims) are also left alone: they are handled by the
-    existing TTL / crash / heartbeat paths.
+    Notes on the ``worker_pid`` liveness guard and **PID-reuse** (F3):
 
-    Returns the list of reclaimed task ids. Idempotent — safe to run every
-    tick (reclaimed cards are no longer ``running`` on the next pass).
+    A card whose recorded ``worker_pid`` is still alive on this host is NEVER
+    touched when that pid still describes the SAME process the card's spawn
+    recorded: the old gateway may be gone but its worker is doing real work, so
+    spawning a duplicate beside it would be wrong.  However, the OS can REUSE a
+    dead worker's pid for a brand-new process (a fresh shim or an unrelated
+    process).  Then ``_pid_alive(pid)`` alone would see "alive" and the stale
+    card would stay ``running`` forever despite its generation being dead.  So
+    when the pid IS alive we additionally compare the live process create-time
+    against the worker's OWN recorded create-time (``worker_start``, persisted
+    at spawn) via ``pid_looks_reused``: a mismatch means the pid was reused by
+    a new process and the old worker is definitively gone → requeue.  When the
+    recorded start is unknown (legacy / unreadable) we stay conservative and
+    leave the card running — false-keeping is always safer than a duplicate.
+
+    NOTE: ``worker_start`` is the WORKER's identity, recorded separately from
+    the claim-time ``gateway_generation`` stamp (which identifies the
+    DISPATCHER process, not the worker).  Comparing a worker's create time
+    against the stamp's ``start:`` segment would be meaningless — those are two
+    different processes.
     """
     current = read_gateway_generation() or current_gateway_generation()
     reclaimed: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid, gateway_generation "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_start, "
+        "gateway_generation "
         "FROM tasks "
         "WHERE status = 'running' "
         "  AND gateway_generation IS NOT NULL "
@@ -3473,17 +3501,36 @@ def reclaim_dead_generation_running(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
+        gen_stamp = row["gateway_generation"]
+        worker_start = row["worker_start"]
         if _pid_alive(pid):
-            _log.debug(
+            # The pid is alive — but is it the SAME worker process the card's
+            # spawn recorded, or did the OS reuse the dead worker's pid for a
+            # NEW process (PID-reuse under a fast shim restart)?  Only a
+            # definitively-same (pid, create_time) pair lets us leave the card
+            # running; a reused pid means the old worker is dead and the card
+            # must be requeued.  ``worker_start`` is the worker's OWN
+            # create-time recorded at spawn (NOT the dispatcher generation
+            # stamp, which describes a different process).
+            if not pid_looks_reused(pid, worker_start):
+                _log.debug(
+                    "kanban generation reclaim: task %s stamped by %s (foreign to "
+                    "current %s) with pid %s alive and matching the recorded "
+                    "worker start (or unknown) — leaving untouched",
+                    tid, gen_stamp, current, pid,
+                )
+                continue
+            _log.info(
                 "kanban generation reclaim: task %s stamped by %s (foreign to "
-                "current %s) but pid %s is alive — leaving untouched",
-                tid, row["gateway_generation"], current, pid,
+                "current %s) with pid %s ALIVE but create-time mismatch "
+                "(recorded=%s) — pid was reused by a new process; requeueing "
+                "(F3 PID-reuse)",
+                tid, gen_stamp, current, pid, worker_start,
             )
-            continue
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_start = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND gateway_generation IS ?",
@@ -9350,6 +9397,58 @@ def reap_worker_zombies() -> "list[int]":
     return reaped
 
 
+def _pid_create_time_value(pid: int) -> Optional[float]:
+    """Return the process create time (epoch seconds) for a local pid, or None.
+
+    Used by the PID-reuse guard.  A (pid, create_time) pair uniquely identifies
+    a process; if the OS has reused a dead worker's pid for a NEW process (a
+    fresh shim or an unrelated process), the create times differ and the guard
+    knows the old generation is definitively gone even though ``_pid_alive``
+    sees a live pid.
+
+    Quantized to 3 decimal places (milliseconds) to stay comparable with the
+    ``start:`` segment of ``current_gateway_generation()`` (``{create:.3f}``).
+    """
+    try:
+        import psutil  # type: ignore
+
+        value = float(psutil.Process(int(pid)).create_time())
+        return round(value, 3) if value == value else None
+    except Exception:
+        return None
+
+
+def pid_looks_reused(pid: Optional[int], recorded_start: Optional[float]) -> bool:
+    """True when the live process at ``pid`` is NOT the worker that was
+    spawned — i.e. the OS reused the dead worker's pid for a NEW process.
+
+    This is the **F3 PID-reuse guard** (fast-gateway-restart follow-up).  The
+    dispatcher persists the worker's own create-time (``worker_start``) at
+    spawn.  A (pid, create_time) pair is a positive process identity: if the
+    dead worker's pid was reused by a fresh shim (or any unrelated process),
+    the live create-time differs from the recorded one, so the stale card can
+    be safely requeued even though ``_pid_alive(pid)`` reports the pid as
+    alive.
+
+    Conservative by default — returns False (NOT reused) whenever we cannot
+    PROVE a mismatch:
+
+    * ``pid`` is None → False.
+    * ``recorded_start`` is None (legacy row / create-time unreadable at
+      spawn) → False: never reclaim on a guess.
+    * The live create-time cannot be read → False.
+    * Otherwise: mismatch beyond a small tolerance (10 ms; psutil is
+      float-epoch while the stored value is ms-quantized, and a reused pid
+      differs by seconds-to-hours) → True.
+    """
+    if pid is None or recorded_start is None:
+        return False
+    live = _pid_create_time_value(int(pid))
+    if live is None:
+        return False
+    return abs(live - recorded_start) >= 0.01
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -11046,14 +11145,21 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     and back-stamps the generation onto the task (defensive: the claim-time
     stamp in :func:`claim_task` is the primary path; this covers any spawn
     whose claim predates it, e.g. a mid-migration race).
+
+    Also persists the worker's process create-time (``worker_start``) so the
+    generation reclaim can tell a genuinely-live worker from a REUSED pid
+    after a fast shim restart (F3): a (pid, create_time) pair is a positive
+    process identity, pid alone is forgeable by OS reuse. Best-effort —
+    when create-time is unreadable the column stays NULL and the reclaim
+    falls back to conservative (never reclaim a live-looking pid).
     """
     write_gateway_generation()
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ?, "
+            "UPDATE tasks SET worker_pid = ?, worker_start = ?, "
             "gateway_generation = COALESCE(gateway_generation, ?) "
             "WHERE id = ?",
-            (int(pid), current_gateway_generation(), task_id),
+            (int(pid), _pid_create_time_value(int(pid)), current_gateway_generation(), task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:

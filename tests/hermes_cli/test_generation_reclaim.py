@@ -45,15 +45,19 @@ def _running_card(
     conn,
     generation,
     pid,
+    worker_start=None,
 ):
     """Create+claim a task, then force its claim to look like it belongs to
-    ``generation`` with worker pid ``pid`` (as a previous gateway would have
-    left it)."""
+    ``generation`` (the DISPATCHER stamp) with worker pid ``pid`` and (F3)
+    the worker's own recorded create-time ``worker_start`` — as a previous
+    gateway would have left it.
+    """
     tid = kb.create_task(conn, title="x", assignee="alice")
     kb.claim_task(conn, tid)
     conn.execute(
-        "UPDATE tasks SET gateway_generation = ?, worker_pid = ? WHERE id = ?",
-        (generation, pid, tid),
+        "UPDATE tasks SET gateway_generation = ?, worker_pid = ?, "
+        "worker_start = ? WHERE id = ?",
+        (generation, pid, worker_start, tid),
     )
     return tid
 
@@ -238,3 +242,95 @@ def test_dead_generation_reclaim_does_not_touch_cards_after_reclaim(
         res2 = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
         assert tid not in res2.generation_reclaimed
         assert _status(conn, tid) == "ready"
+
+
+# ---------------------------------------------------------------------------
+# PID-reuse scenario (F3 follow-up on fast-gateway-restart)
+# ---------------------------------------------------------------------------
+
+
+def test_pid_reuse_foreign_generation_reclaimed(kanban_home, monkeypatch):
+    """When the OS reuses the dead worker's PID for a NEW process (a fresh shim
+    or any unrelated process), ``_pid_alive(pid)`` alone would keep the stale
+    card ``running`` forever despite its generation being dead.  The reclaim
+    must compare the LIVE create-time of that PID against the worker's OWN
+    recorded create-time (``worker_start``): mismatch ⇒ the pid was reused by a
+    new process ⇒ requeue.
+
+    Note the semantic split that the original draft got wrong: ``worker_start``
+    is recorded per-spawn from the WORKER process, while ``gateway_generation``
+    identifies the DISPATCHER (a different process).  A worker's create time
+    must never be compared against the stamp's ``start:`` segment.
+    """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)  # PID exists (reused)
+    monkeypatch.setattr(kb, "_pid_create_time_value", lambda pid: 999_000.0)
+    with kb.connect() as conn:
+        tid = _running_card(
+            conn,
+            "pid:4242:start:111_000:boot:old-boot",  # dispatcher stamp (foreign)
+            pid=4242,
+            worker_start=111_000.0,  # worker's own start; live 999000 differs
+        )
+        kb.write_gateway_generation()
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
+
+        assert tid in res.generation_reclaimed
+        assert _status(conn, tid) == "ready"
+
+
+def test_pid_reuse_same_worker_start_untouched(kanban_home, monkeypatch):
+    """A foreign-generation card whose worker's recorded create-time STILL
+    matches the live PID (the old worker really is still running) must NOT be
+    reclaimed — the generation-number difference is purely a marker refresh
+    artifact and the worker is doing real work."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_pid_create_time_value", lambda pid: 111_000.0, raising=False
+    )
+    with kb.connect() as conn:
+        tid = _running_card(
+            conn,
+            "pid:4242:start:111_000:boot:old-boot",
+            pid=4242,
+            worker_start=111_000.0,
+        )
+        kb.write_gateway_generation()
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
+
+        assert tid not in res.generation_reclaimed
+        assert _status(conn, tid) == "running"
+
+
+def test_pid_reuse_unknown_worker_start_untouched(kanban_home, monkeypatch):
+    """Legacy / unreadable ``worker_start`` (NULL) is CONSERVATIVE: a live pid
+    with no recorded start is never reclaimed — false-keeping is always safer
+    than spawning a duplicate beside real work."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        kb, "_pid_create_time_value", lambda pid: 999_000.0, raising=False
+    )
+    with kb.connect() as conn:
+        tid = _running_card(
+            conn,
+            "pid:4242:start:111_000:boot:old-boot",
+            pid=4242,
+            worker_start=None,
+        )
+        kb.write_gateway_generation()
+        res = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
+
+        assert tid not in res.generation_reclaimed
+        assert _status(conn, tid) == "running"
+
+
+def test_pid_reuse_guard_helper(kanban_home, monkeypatch):
+    """The F3 guard ``pid_looks_reused``: a ((pid, recorded_start), live_start)
+    mismatch means reuse; anything unprovable returns False (not reused)."""
+    monkeypatch.setattr(kb, "_pid_create_time_value", lambda pid: 200.0)
+    assert kb.pid_looks_reused(9, 200.0) is False   # same process
+    assert kb.pid_looks_reused(9, 200.01) is False  # within 10 ms tolerance
+    assert kb.pid_looks_reused(9, 999.0) is True    # reused (seconds apart)
+    assert kb.pid_looks_reused(None, 200.0) is False
+    assert kb.pid_looks_reused(9, None) is False    # legacy: not provable
+    monkeypatch.setattr(kb, "_pid_create_time_value", lambda pid: None)
+    assert kb.pid_looks_reused(9, 200.0) is False   # live unreadable: not provable
