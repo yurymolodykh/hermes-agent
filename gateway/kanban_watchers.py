@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import sqlite3
@@ -103,6 +104,7 @@ def _tg_delivery_policy_allowed_users() -> list:
 
 def _tg_notify_policy_decision(sub, ev, kind: str, msg: str, task, allowed_users: list,
                                 *, task_is_root: Optional[bool] = None,
+                                mission_live: bool = False,
                                 task_tg_owner: str = ""):
     """Apply the TG delivery-policy gate to ONE kanban notifier event.
 
@@ -179,6 +181,10 @@ def _tg_notify_policy_decision(sub, ev, kind: str, msg: str, task, allowed_users
     # human-action события доставляются независимо от этого флага.
     task_terminal = bool(task and task.status == "archived")
     root_closing = bool(task_is_root and kind == "completed")
+    # F9 (t_85a095e0): a root card whose mission controller is still live is
+    # NOT a terminal close — the mission is in flight, so de-terminalize.
+    if root_closing and mission_live:
+        root_closing = False
     ctx = default_context(
         kind="kanban",
         initiator=InitiatorRef.from_origin({
@@ -398,6 +404,61 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
     return f"{msg}\n\n{art}"
 
 
+#: Live statuses for a goal_mode mission controller: while ANY of these hold
+#: the mission is still in flight, so a leaf/daughter close must NOT be treated
+#: as the terminal итог of the whole tree.
+_MISSION_CONTROLLER_LIVE_STATUSES = frozenset({
+    "todo", "ready", "running", "review", "blocked", "triage", "scheduled",
+})
+
+
+def _has_live_mission_controller(conn, kb, task_id: str) -> bool:
+    """True when a LIVE goal_mode mission controller shares task_id's OWUI
+    session.
+
+    A kanban "mission" is driven by an orchestrator controller card created
+    with ``goal_mode=True`` (a Ralph-style goal loop worker).  The controller
+    keeps the mission open until IT closes — so any leaf/daughter close while
+    the controller is live is an INTERMEDIATE close of the whole mission, not
+    its terminal итог (F9, t_85a095e0).
+
+    The controller is deliberately NOT located via ``task_links``: orchestrator
+    controllers on this board are routinely created detached from the worker
+    subtree (the R4 sno-economics case: t_2cfdc4e4 goal_mode=1 running, no
+    ``task_links`` edge to the t_7d11fc80 R1 subtree).  The robust mission
+    identity is the shared **OWUI session**: every card of a mission carries an
+    ``api_server`` notification subscription on the same ``chat_id`` (the
+    originating Open WebUI thread).  So the predicate is: is there any task
+    with ``goal_mode=1``, a live status, and an ``api_server`` subscription on
+    the same chat_id as ``task_id``'s own ``api_server`` subscription?
+
+    Returns ``False`` when ``task_id`` has no api_server subscription of its
+    own (the signal is meaningless outside an OWUI mission) and when no live
+    controller shares its session.  Fail-closed: a controller that cannot be
+    located (no shared sub) simply does not change the terminal decision.
+    """
+    row = conn.execute(
+        "SELECT chat_id FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = 'api_server' ORDER BY chat_id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["chat_id"]:
+        return False
+    session = str(row["chat_id"])
+    rows = conn.execute(
+        "SELECT t.id FROM tasks t "
+        "WHERE t.goal_mode = 1 AND t.status IN (%s) "
+        "AND EXISTS ("
+        "  SELECT 1 FROM kanban_notify_subs n "
+        "  WHERE n.task_id = t.id AND n.platform = 'api_server' "
+        "  AND n.chat_id = ?"
+        ") LIMIT 1"
+        % (", ".join("?" * len(_MISSION_CONTROLLER_LIVE_STATUSES))),
+        (*sorted(_MISSION_CONTROLLER_LIVE_STATUSES), session),
+    ).fetchone()
+    return rows is not None
+
+
 def _branch_summary_terminal(conn, kb, root_id: str) -> bool:
     """True when the branch итог for ``root_id`` is the TERMINAL итог of the
     whole mission/root tree — i.e. no open/running card remains ABOVE it.
@@ -411,20 +472,180 @@ def _branch_summary_terminal(conn, kb, root_id: str) -> bool:
     closed (guaranteed by the caller — a summary is only planned for a
     terminal ``branch_state``) AND every ancestor via ``task_links`` has its
     whole subtree terminal-closed (``branch_state(aid) is not None``).
+
+    F9 (t_85a095e0): terminality ALSO fails when a live goal_mode mission
+    controller shares the root's OWUI session — even with zero ancestors via
+    ``task_links`` (a ``[split N/M]`` / daughter card whose controller is
+    detached, exactly the sno-economics-v2 R4 case).  The mission is still in
+    flight while its goal_mode controller is alive, regardless of the broken
+    link structure.
     """
     ancestors = kb.get_ancestor_ids(conn, root_id)
-    if not ancestors:
-        # Top of the whole tree — this close IS the terminal итог.
-        return True
-    for aid in sorted(ancestors):
-        if kb.branch_state(conn, aid) is None:
-            # An ancestor mission tree is still open/running → intermediate.
-            return False
+    if ancestors:
+        for aid in sorted(ancestors):
+            if kb.branch_state(conn, aid) is None:
+                # An ancestor mission tree is still open/running → intermediate.
+                return False
+    if _has_live_mission_controller(conn, kb, root_id):
+        # A live goal_mode controller owns the same OWUI session → intermediate.
+        return False
+    # Top of the whole tree (no ancestors) AND no live mission controller —
+    # this close IS the terminal итог.
+    return True
+
+
+def _branch_summary_owned_subs(
+    conn, kb, root_id: str, node_ids: set, subs_by_task: dict,
+    branch_roots: set,
+) -> list[dict]:
+    """Collect the subscriptions whose channel the branch root ``root_id`` OWNS.
+
+    ``subscribed_branch_roots`` returns the topmost subscribed task of every
+    subtree, but a shared descendant inherits notifications from EVERY parent
+    (``_inherit_notify_subs`` copies each parent's routing row onto the child).
+    A readback/synthetic card linked under two already-closed roots therefore
+    carries BOTH roots' channels — an F8 wave regression the naïve dedupe-by-
+    channel in the caller turned into **cross-contaminated** per-root packets:
+    root A planned delivery to root B's channel (and vice versa) each time the
+    shared descendant closed in a wave, replaying already-delivered old roots
+    to Telegram as a duplicated "OWUI→TG mirror terminal итог".
+
+    Ownership rule (extends ``subscribed_branch_roots`` to the channel level):
+    a channel K (platform/chat/thread) subscribed on task T belongs to the
+    BRANCH ROOT that owns K.  That is:
+
+      1. find ``candidate`` = the TOPMOST ancestor-or-self of T that subscribes
+         to K (a mid-tree node inheriting K from two parents never counts as
+         the owner of K by itself);
+      2. resolve ``candidate`` to its branch root = the highest ancestor-or-self
+         of ``candidate`` that is in ``branch_roots`` (usually ``candidate``
+         itself when it IS a branch root, e.g. root_b for the chat it owns);
+      3. the root owns K iff that branch root == ``root_id``.
+
+    Rule 2 keeps the legitimate case working: a child card carrying its OWN
+    distinct channel (not shared with a sibling root) still resolves to the
+    governing branch root and is delivered by it.
+
+    Returns the deduped list of subs owned by ``root_id`` (order: deterministic
+    by subtree node id for stable deliver/ack ordering).
+    """
+    owned: list[dict] = []
+    seen_channels: set[tuple] = set()
+    for tid in sorted(node_ids):
+        for sub in subs_by_task.get(tid, []):
+            key = kb.branch_summary_channel_key(
+                sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"),
+            )
+            if key in seen_channels:
+                continue
+            # (1) TOPMOST subscribed-to-`key` ancestor-or-self of `tid`.
+            # `get_ancestor_ids` excludes the task itself; walk deepest→topmost
+            # so a later (higher) subscribed match wins.
+            candidate = None
+            ancestry = [tid] + sorted(kb.get_ancestor_ids(conn, tid))
+            for anc in ancestry:
+                for anc_sub in subs_by_task.get(anc, []):
+                    akey = kb.branch_summary_channel_key(
+                        anc_sub.get("platform"), anc_sub.get("chat_id"),
+                        anc_sub.get("thread_id"),
+                    )
+                    if akey == key:
+                        candidate = anc
+            if candidate is None:
+                continue
+            # (2) resolve `candidate` to the governing branch root (topmost
+            # ancestor-or-self in branch_roots).
+            owner = candidate
+            for anc in [candidate] + sorted(kb.get_ancestor_ids(conn, candidate)):
+                if anc in branch_roots:
+                    owner = anc
+            if owner == root_id:
+                seen_channels.add(key)
+                owned.append(sub)
+    return owned
+
+
+#: Terminal close kinds whose presence in a wave marks a branch root as
+#: "touched" — a completed descendant, an archived node, or a needs-a-fix
+#: block/gave-up that makes ``branch_state`` terminal. Any of these on a node
+#: of the root's subtree means the wave can legitimately change the branch
+#: close-state / итог.
+_BRANCH_SUMMARY_WAVE_TOUCH_KINDS = frozenset({
+    "completed", "archived", "gave_up", "blocked", "status",
+})
+
+
+def _branch_summary_subtree_event_since(
+    conn, kb, node_ids: set, since_event_id: int,
+) -> bool:
+    """True when an event for any node of ``node_ids`` arrived after ``since``.
+
+    The wave filter (t_09f66666): a branch root is replanned only when the
+    current wave actually touches its subtree.  "Touched" = any close-state
+    relevant event (completed / archived / gave_up / blocked / status) on the
+    root itself or a descendant, with an event id strictly after ``since``.
+    ``since`` is the root's own branch_summary marker event id for an
+    already-delivered root, so a NEW descendant close, an archive, or a reopen
+    status move all re-trigger evaluation — while a batch INSERT closing 12
+    unrelated F7 readback cards does NOT touch the old root's subtree and the
+    old root is skipped (the F8/F7 incident shape).
+    """
+    if not node_ids:
+        return False
+    ordered = sorted(node_ids)
+    placeholders = ", ".join("?" * len(ordered))
+    kinds = _BRANCH_SUMMARY_WAVE_TOUCH_KINDS
+    kind_csv = ", ".join("?" * len(kinds))
+    row = conn.execute(
+        "SELECT 1 FROM task_events "
+        f"WHERE task_id IN ({placeholders}) AND id > ? "
+        f"AND kind IN ({kind_csv}) LIMIT 1",
+        [*ordered, int(since_event_id), *sorted(kinds)],
+    ).fetchone()
+    return row is not None
+
+
+def _branch_summary_skip_untouched_delivered_root(
+    conn, kb, root_id: str, root_subs, marker, node_ids: set,
+) -> bool:
+    """Skip an already-delivered, still-closed root the wave did not touch.
+
+    Returns ``True`` when the caller should return ``None`` (no plan/delivery)
+    WITHOUT clearing/rewriting the marker.  Conditions, ALL required:
+
+      1. a marker already exists (branch delivered at least once);
+      2. every channel is already acked (nothing pending → the only reason to
+         re-plan would be a fresh close, which the wave filter below decides);
+      3. the branch is STILL terminal (``branch_state`` not None) — a reopen
+         (even one emitted without an event row, e.g. direct SQL) must keep
+         flowing into the normal reactivation path;
+      4. NO close-state event for the root's subtree arrived after the marker
+         was written — i.e. the current wave does not touch this root.
+
+    This is the loop-level short-circuit for the F8/F7 incident: a batch wave
+    of unrelated readback closes must not re-plan old already-delivered roots.
+    """
+    if marker is None:
+        return False
+    if kb.branch_summary_pending_subs(marker, root_subs):
+        # Still pending channels → a real retry/resume; never skip.
+        return False
+    st = kb.branch_state(conn, root_id)
+    if st is None:
+        # Branch reopened → normal reactivation path must run (clears marker).
+        return False
+    if _branch_summary_subtree_event_since(
+        conn, kb, node_ids, since_event_id=int(marker.get("_event_id") or 0),
+    ):
+        # The wave touched the subtree (new descendant close / archive / etc.)
+        # → let the normal marker logic decide.
+        return False
     return True
 
 
 def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
                        *, task_is_root: Optional[bool] = None,
+                       mission_live: bool = False,
                        home_channel: str = "") -> Optional[tuple]:
     """Complementary OWUI→Telegram delivery lane for a non-RGZ kanban mission.
 
@@ -509,6 +730,13 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     artifacts = list(payload.get("artifacts") or ()) if isinstance(payload, dict) else []
     task_terminal = bool(task and getattr(task, "status", None) == "archived")
     root_closing = bool(task_is_root and kind == "completed")
+    # F9 (t_85a095e0): a live goal_mode controller in the same OWUI session
+    # keeps the mission in flight — a root card's completed must not be the
+    # terminal итог to Telegram while the controller is alive (the R4
+    # sno-economics case: parent-less leaf, controller detached from
+    # task_links, yet the mission was running).
+    if root_closing and mission_live:
+        root_closing = False
     completed_terminal = bool(task_terminal or root_closing)
     # F6 (tg-delivery-hygiene, применяется ко ВСЕМ binding
     # openwebui_telegram_users): в TG-ленте (dual-lane) доставляется ТОЛЬКО
@@ -1184,6 +1412,18 @@ class GatewayKanbanWatchersMixin:
                                     # identifies that creation user.
                                     task_is_root = False
                                     task_tg_owner = ""
+                                    # F9 (t_85a095e0): a LIVE goal_mode
+                                    # mission controller sharing the task's
+                                    # OWUI session keeps the mission in flight
+                                    # even without a task_links ancestor — so a
+                                    # parent-less root card's completed event
+                                    # must NOT be treated as the terminal итог
+                                    # (the R4 sno-economics case). Computed here
+                                    # where conn is available, threaded through
+                                    # to both terminality gates below.
+                                    mission_live = _has_live_mission_controller(
+                                        conn, _kb, sub["task_id"],
+                                    )
                                     # Branch-root detection is shared by both
                                     # delivery lanes. The telegram gate needs
                                     # it for K1 RF2 terminality; the OWUI→TG
@@ -1239,6 +1479,7 @@ class GatewayKanbanWatchersMixin:
                                         "board": slug,
                                         "silent": silent,
                                         "task_is_root": task_is_root,
+                                        "mission_live": mission_live,
                                         "task_tg_owner": task_tg_owner,
                                     })
                                 except Exception as sub_exc:
@@ -1445,6 +1686,7 @@ class GatewayKanbanWatchersMixin:
                         _tg_policy = _tg_notify_policy_decision(
                             sub, ev, kind, msg, task, _tg_allowed,
                             task_is_root=d.get("task_is_root"),
+                            mission_live=bool(d.get("mission_live")),
                             task_tg_owner=d.get("task_tg_owner") or "",
                         )
                         if _tg_policy is not None and _tg_policy.suppressed:
@@ -1539,6 +1781,7 @@ class GatewayKanbanWatchersMixin:
                                 _tg_lane = _tg_owui_dual_lane(
                                     sub, ev, kind, msg, task, _tg_allowed,
                                     task_is_root=d.get("task_is_root"),
+                                    mission_live=bool(d.get("mission_live")),
                                 )
                             except Exception as _lane_exc:
                                 logger.warning(
@@ -2138,6 +2381,7 @@ class GatewayKanbanWatchersMixin:
                             # topmost subscribed task of a subtree (see
                             # kanban_db.subscribed_branch_roots).
                             roots = _kb.subscribed_branch_roots(conn)
+                            branch_roots = set(roots)
                             subs_by_task: dict[str, list[dict]] = {}
                             for sub in subs:
                                 subs_by_task.setdefault(
@@ -2149,27 +2393,24 @@ class GatewayKanbanWatchersMixin:
                                 # ``kanban.branch_summary_replace`` mode its
                                 # individual per-node pings are suppressed, so
                                 # the whole-branch message is its only
-                                # notification. Collect every sub whose task
-                                # lies in the root's subtree, deduped by
-                                # (platform, chat_id, thread_id) so a channel
-                                # subscribed to both a node and its ancestor
-                                # still receives exactly ONE message.
+                                # notification. Collect the subs of the root's
+                                # subtree whose channel the root OWNS, deduped
+                                # by (platform, chat_id, thread_id) so a
+                                # channel subscribed to both a node and its
+                                # ancestor still receives exactly ONE message
+                                # — and a channel a shared descendant merely
+                                # inherited from a SIBLING root is claimed by
+                                # that sibling, not by this root (F8 wave:
+                                # otherwise an old already-delivered root is
+                                # re-planned/re-delivered on a wave of
+                                # descendant closes).
                                 node_ids = {root_id} | _kb.get_descendant_ids(
                                     conn, root_id
                                 )
-                                root_subs: list[dict] = []
-                                seen_channels: set[tuple] = set()
-                                for tid in node_ids:
-                                    for sub in subs_by_task.get(tid, []):
-                                        chan_key = _kb.branch_summary_channel_key(
-                                            sub.get("platform"),
-                                            sub.get("chat_id"),
-                                            sub.get("thread_id"),
-                                        )
-                                        if chan_key in seen_channels:
-                                            continue
-                                        seen_channels.add(chan_key)
-                                        root_subs.append(sub)
+                                root_subs = _branch_summary_owned_subs(
+                                    conn, _kb, root_id, node_ids, subs_by_task,
+                                    branch_roots,
+                                )
                                 if not root_subs:
                                     continue
                                 # Only roots with ≥1 locally-deliverable sub
@@ -2177,6 +2418,24 @@ class GatewayKanbanWatchersMixin:
                                 if not any(
                                     (str(sub.get("platform") or "").lower() in active_platforms)
                                     for sub in root_subs
+                                ):
+                                    continue
+                                # Wave root-event filter (t_09f66666): before
+                                # planning a root, skip an ALREADY-DELIVERED,
+                                # still-closed root whose subtree has NO close
+                                # event in the current wave.  This is the F8/F7
+                                # incident shape — a batch INSERT closing 12
+                                # unrelated F7 readback cards re-planned +
+                                # re-delivered OLD done roots (t_0f0e834d,
+                                # t_0db5f307): they carry a delivered marker,
+                                # no pending channels, a still-terminal branch,
+                                # and no subtree event since their marker → the
+                                # plan must be skipped here, before
+                                # ``branch_state``.
+                                marker = _kb.has_branch_summary(conn, root_id)
+                                if _branch_summary_skip_untouched_delivered_root(
+                                    conn, _kb, root_id, root_subs, marker,
+                                    node_ids,
                                 ):
                                     continue
                                 try:
@@ -2292,10 +2551,40 @@ class GatewayKanbanWatchersMixin:
         # _deliver_branch_summary).
         terminal = _branch_summary_terminal(conn, _kb, root_id)
         marker = _kb.has_branch_summary(conn, root_id)
-        if marker is not None and marker.get("fingerprint") == st["fingerprint"]:
-            # Already claimed for this exact close-state: only channels not
-            # yet acked (partial delivery, or a newly added subscription) need
-            # the итог this tick.
+        if marker is not None:
+            # The marker is the branch's ONCE-ONLY claim: every channel that
+            # already received the итог is acked inside it. A fingerprint
+            # difference without the branch passing through open MUST NOT
+            # clear+re-mark — that would replay the OLD итог to every acked
+            # channel. Closing a NEW descendant (batch synthetic-card wave,
+            # direct block->archived mutation, added child of an already
+            # closed root) changes the close-state fingerprint but the branch
+            # never re-opened, so the previously delivered итог stands.
+            #
+            # Only channels not yet acked (partial delivery, or a newly added
+            # subscription) need the итог this tick. A reopen (branch open)
+            # above already clears the marker via the reactivation path, so a
+            # full re-close still re-sends a fresh итог.
+            #
+            # F8 (РГЗ/tghyg): already-delivered old roots must NOT be
+            # re-marked/re-delivered on a wave of descendant closes.
+            #
+            # Duplicate-marker guard (t_46cdd83e): an existing marker whose
+            # fingerprint EQUALS the branch's current close-state fingerprint
+            # proves the branch has not changed since it was delivered. If
+            # nothing is pending (every channel already acked) there is
+            # nothing to do this tick — return None immediately instead of
+            # ever planning/enqueueing a duplicate delivery.  This is the
+            # in-function short-circuit: even when a wave reaches planning
+            # (e.g. a synthetic-card close that task-0's loop-level filter
+            # cannot prove "untouched" without event rows), a same-fingerprint
+            # already-acked root is never re-marked or re-delivered.
+            if (
+                marker.get("fingerprint") is not None
+                and marker.get("fingerprint") == st["fingerprint"]
+                and not _kb.branch_summary_pending_subs(marker, root_subs)
+            ):
+                return None
             pending = _kb.branch_summary_pending_subs(marker, root_subs)
             if not pending:
                 return None
@@ -2310,10 +2599,6 @@ class GatewayKanbanWatchersMixin:
                 "fingerprint": st["fingerprint"],
                 "terminal": terminal,
             }
-        if marker is not None:
-            # Close-state changed without passing through open (e.g. a blocked
-            # node was archived directly). Discard the stale claim and re-mark.
-            _kb.clear_branch_summary(conn, root_id)
         payload = {
             "fingerprint": st["fingerprint"],
             "outcome": outcome,
@@ -2605,17 +2890,48 @@ class GatewayKanbanWatchersMixin:
         from pathlib import Path as _Path
 
         candidates: list[str] = []
-        seen: set[str] = set()
+        seen_paths: set[str] = set()
+        # Content-addressed dedup (F9, t_85a095e0): workers frequently ship
+        # the same deliverable twice — once from the scratch/attachments copy
+        # and once from the durable copy (the sno-economics R4 case:
+        # `kanban/attachments/<task>/ref_midels.md` + `profiles/.../durable/
+        # .../ref_midels.md`, same file bytes).  Sending the same file to a
+        # channel twice is noise: dedupe by (filename, sha256) keeping the
+        # first occurrence, exactly as `_persist_scratch_completion_artifacts`
+        # stages one copy.  NOTE: only identical NAME+CONTENT collapses;
+        # distinct files that happen to share a name or bytes are unaffected.
+        _seen_fingerprints: dict[tuple[str, str], str] = {}
 
         def _add(path: str) -> None:
             if not path:
                 return
             expanded = os.path.expanduser(path)
-            if expanded in seen:
+            if expanded in seen_paths:
                 return
             if not os.path.isfile(expanded):
                 return
-            seen.add(expanded)
+            seen_paths.add(expanded)
+            try:
+                name = os.path.basename(expanded)
+                with open(expanded, "rb") as _fh:
+                    digest = hashlib.sha256()
+                    while chunk := _fh.read(1024 * 1024):
+                        digest.update(chunk)
+                    content_hash = digest.hexdigest()
+                key = (name, content_hash)
+                if key in _seen_fingerprints:
+                    logger.info(
+                        "kanban notifier: skipping duplicate artifact %s (same "
+                        "content as already-uploaded %s)",
+                        expanded, _seen_fingerprints[key],
+                    )
+                    return
+                _seen_fingerprints[key] = expanded
+            except OSError as _exc:
+                logger.debug(
+                    "kanban notifier: could not hash artifact %s (%s); shipping it",
+                    expanded, _exc,
+                )
             candidates.append(expanded)
 
         # 1. Explicit artifacts list in payload.

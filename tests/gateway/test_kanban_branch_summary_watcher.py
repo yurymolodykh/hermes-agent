@@ -124,6 +124,104 @@ async def test_summary_open_branch_no_delivery(board_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_summary_already_delivered_root_not_redelivered_when_descendant_closes(
+    board_env, monkeypatch,
+):
+    """F8 wave-suppression: an already-delivered old root must NOT be
+    re-marked/re-delivered when a NEW descendant closes in the same branch
+    (batch [F7 readback]-style synthetic cards closing together change the
+    branch fingerprint without the branch ever reopening).
+
+    Regression for РГЗ/tghyg F8: 10 old done / synthetic roots were re-sent as
+    "OWUI→TG mirror terminal итог" (18:17:37-39) after a mass close wave.
+    The close-state fingerprint changed (new descendant), so the marker's
+    fingerprint no longer matched, and _plan_branch_summary's stale-claim
+    branch (marker exists + fingerprint differs) cleared the marker and
+    re-marked + re-delivered the OLD итог to every channel again.
+    """
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(board_env, task_id=root, platform="telegram", chat_id="chat-1")
+    _complete_branch(board_env, root, [a])
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+
+    # Branch is delivered. Now a NEW descendant (synthetic readback card) is
+    # linked under the root and closed — the branch fingerprint changes, but
+    # the branch NEVER passed through open. The old итог must not replay.
+    b = _mk(board_env, "readback-card")
+    kb.link_tasks(board_env, root, b)
+    kb.complete_task(board_env, b, summary="done")
+
+    adapter.sent.clear()
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert adapter.sent == [], (
+        "already-delivered old root must not be re-delivered when a "
+        f"descendant closes; sent={adapter.sent}"
+    )
+    # The marker must still exist (not cleared/rewritten).
+    conn2 = kb.connect(board="default")
+    try:
+        marker = kb.has_branch_summary(conn2, root)
+        assert marker is not None, "marker must be preserved, not cleared"
+    finally:
+        conn2.close()
+
+
+@pytest.mark.asyncio
+async def test_summary_shared_descendant_wave_no_redelivery_for_all_ancestor_roots(
+    board_env, monkeypatch,
+):
+    """F8 decision-support: EXACT incident shape — one shared [F7 readback]
+    descendant is linked under MULTIPLE already-delivered ancestor roots, then
+    batch-closed in a wave. NO ancestor root that already received its итог
+    may be re-delivered (the close-state fingerprint of every ancestor changes
+    identically, which previously replayed every one of them).
+    """
+    root_a = _mk(board_env, "mission-A")
+    a1 = _mk(board_env, "a1")
+    kb.link_tasks(board_env, root_a, a1)
+    kb.add_notify_sub(board_env, task_id=root_a, platform="telegram", chat_id="chat-A")
+
+    root_b = _mk(board_env, "mission-B")
+    b1 = _mk(board_env, "b1")
+    kb.link_tasks(board_env, root_b, b1)
+    kb.add_notify_sub(board_env, task_id=root_b, platform="telegram", chat_id="chat-B")
+
+    _complete_branch(board_env, root_a, [a1])
+    _complete_branch(board_env, root_b, [b1])
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert sorted(s["chat_id"] for s in adapter.sent) == ["chat-A", "chat-B"]
+
+    # Shared synthetic readback card linked under BOTH roots, then closed in
+    # one wave — the fingerprint of both branches changes.
+    shared = _mk(board_env, "shared-readback")
+    kb.link_tasks(board_env, root_a, shared)
+    kb.link_tasks(board_env, root_b, shared)
+    kb.complete_task(board_env, shared, summary="done")
+
+    adapter.sent.clear()
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert adapter.sent == [], (
+        "shared-descendant close must not re-deliver already-sent ancestor "
+        f"roots; sent={adapter.sent}"
+    )
+    conn2 = kb.connect(board="default")
+    try:
+        assert kb.has_branch_summary(conn2, root_a) is not None
+        assert kb.has_branch_summary(conn2, root_b) is not None
+    finally:
+        conn2.close()
+
+
+@pytest.mark.asyncio
 async def test_summary_open_no_delivery_after_this_test_spawns_no_marker(board_env, monkeypatch):
     # dependency-blocked descendant keeps the branch open -> no summary
     root = _mk(board_env, "root")
@@ -529,3 +627,130 @@ async def test_intermediate_branch_owui_api_server_still_delivered(
     assert staged[0][1] == "✅ Задача выполнена"
     assert _read_suppression_journal() == []
 
+
+# ---------------------------------------------------------------------------
+# Wave root-event filter (t_09f66666): replan a root only when the current
+# wave carries a terminal close event for the root's own subtree.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_old_delivered_root_not_replanned_on_unrelated_wave(
+    board_env, monkeypatch,
+):
+    """F8/F7 incident shape (event#91420-91431): an old, already-delivered
+    branch root must NOT be re-planned/re-delivered when a wave of unrelated
+    synthetic [F7 readback] cards closes in the same board.
+
+    The wave filter skips roots whose subtree had NO terminal close event in
+    the current wave — old roots t_0f0e834d / t_0db5f307 style (their branches
+    closed long ago, marker already delivered) stay untouched when 12 unrelated
+    readback cards land a batch INSERT completed.
+    """
+    # Old root: closed + delivered on the first tick.
+    old_root = _mk(board_env, "old-root")
+    old_child = _mk(board_env, "old-child")
+    kb.link_tasks(board_env, old_root, old_child)
+    kb.add_notify_sub(
+        board_env, task_id=old_root, platform="telegram", chat_id="tg-old",
+    )
+    _complete_branch(board_env, old_root, [old_child])
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert [s["chat_id"] for s in adapter.sent] == ["tg-old"]
+    old_marker = kb.has_branch_summary(kb.connect(board="default"), old_root)
+    assert old_marker is not None
+
+    # Wave: 12 F7 readback cards, each with its own subscription, batch-closed.
+    wave_roots = []
+    for i in range(12):
+        r = _mk(board_env, f"readback-{i}")
+        c = _mk(board_env, f"readback-child-{i}")
+        kb.link_tasks(board_env, r, c)
+        kb.add_notify_sub(
+            board_env, task_id=r, platform="telegram", chat_id=f"tg-wave-{i}",
+        )
+        wave_roots.append(r)
+    for r in wave_roots:
+        _complete_branch(board_env, r, list(kb.get_descendant_ids(board_env, r)))
+
+    adapter.sent.clear()
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # The wave roots ARE delivered (their own completed events are in the wave).
+    wave_chats = sorted({s["chat_id"] for s in adapter.sent})
+    assert wave_chats == sorted(f"tg-wave-{i}" for i in range(12)), (
+        f"expected exactly the 12 wave deliveries, got {wave_chats}"
+    )
+    # The old root must NOT be re-delivered.
+    assert "tg-old" not in {s["chat_id"] for s in adapter.sent}, (
+        "old delivered root must not be re-delivered on an unrelated wave; "
+        f"sent={adapter.sent}"
+    )
+    conn2 = kb.connect(board="default")
+    try:
+        new_marker = kb.has_branch_summary(conn2, old_root)
+        assert new_marker is not None, "old root marker must be preserved"
+        assert new_marker.get("_event_id") == old_marker.get("_event_id"), (
+            "old root marker must not be rewritten by an unrelated wave"
+        )
+    finally:
+        conn2.close()
+
+@pytest.mark.asyncio
+async def test_wave_filter_skips_old_root_before_planning(
+    board_env, monkeypatch,
+):
+    """Loop-level wave filter (t_09f66666): during a wave that does NOT touch
+    an already-delivered root's subtree, `_plan_branch_summary` must not even
+    be consulted for that root (short-circuit before branch_state/branch scan).
+    """
+    old_root = _mk(board_env, "old-root")
+    old_child = _mk(board_env, "old-child")
+    kb.link_tasks(board_env, old_root, old_child)
+    kb.add_notify_sub(
+        board_env, task_id=old_root, platform="telegram", chat_id="tg-old",
+    )
+    _complete_branch(board_env, old_root, [old_child])
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    called_roots: list[str] = []
+    real_plan = runner._plan_branch_summary
+
+    def spy_plan(conn, root_id, root_subs, board_slug):
+        called_roots.append(root_id)
+        return real_plan(conn, root_id, root_subs, board_slug)
+
+    runner._plan_branch_summary = spy_plan
+
+    # First tick: old root delivered.
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert "tg-old" in {s["chat_id"] for s in adapter.sent}
+    assert old_root in called_roots
+
+    # Unrelated wave: 12 F7 readback cards batch-closed.
+    called_roots.clear()
+    adapter.sent.clear()
+    wave_roots = []
+    for i in range(12):
+        r = _mk(board_env, f"readback-{i}")
+        c = _mk(board_env, f"readback-child-{i}")
+        kb.link_tasks(board_env, r, c)
+        kb.add_notify_sub(
+            board_env, task_id=r, platform="telegram", chat_id=f"tg-wave-{i}",
+        )
+        wave_roots.append(r)
+    for r in wave_roots:
+        _complete_branch(board_env, r, list(kb.get_descendant_ids(board_env, r)))
+
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert old_root not in called_roots, (
+        "wave filter must skip an already-delivered old root whose subtree "
+        f"has no terminal event in the wave; planned_roots={called_roots}"
+    )
+    # Wave roots were still planned+delivered.
+    assert "tg-old" not in {s["chat_id"] for s in adapter.sent}
