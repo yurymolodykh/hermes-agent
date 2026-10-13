@@ -5150,6 +5150,18 @@ class AIAgent:
         without modifying socket options.  The default httpx transport
         preserves OS TCP defaults (including ``TCP_NODELAY``).
 
+        Every transport built here also carries ``retries=2`` — httpcore
+        connect-phase retries with exponential backoff (0 s, 0.5 s), so a
+        transient TCP/TLS connect drop to a direct-egress provider
+        (llm.letovo.site flapping under provider-side network issues) is
+        retried inside the pool instead of surfacing as an instant
+        ``APIConnectionError`` to the conversation loop.  Retries apply
+        only to ``ConnectError`` / ``ConnectTimeout`` — a request that was
+        already sent is never re-sent.  Known upstream limitation: httpx
+        0.28.1 drops ``retries`` for proxied pools (``httpcore.HTTPProxy``),
+        so retries land on direct pools, which is the llm.letovo.site path
+        (NO_PROXY direct egress).
+
         ``verify`` carries per-provider ``ssl_ca_cert`` / ``ssl_verify`` and
         ``HERMES_CA_BUNDLE`` settings.  It is passed on the client AND on
         the plain no-proxy mounts (a mounted transport owns the SSL context
@@ -5185,16 +5197,38 @@ class AIAgent:
             # NO_PROXY resolution.
             _mounts = {}
             if _proxy is None:
+                # retries=2 → httpcore connect-phase retries (ConnectError /
+                # ConnectTimeout only) with 0 s / 0.5 s backoff, so a flaky
+                # direct TCP/TLS handshake to llm.letovo.site no longer
+                # surfaces as an instant APIConnectionError.  limits=_limits
+                # makes the serving pool honor the documented 20 s idle
+                # reap (custom mounts do NOT inherit Client.limits — the
+                # httpx default is keepalive_expiry=5.0).
                 _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
+                    "http://": _httpx.HTTPTransport(
+                        verify=verify, retries=2, limits=_limits,
+                    ),
+                    "https://": _httpx.HTTPTransport(
+                        verify=verify, retries=2, limits=_limits,
+                    ),
                 }
+            else:
+                # Explicit base transport for the proxied branch, so the
+                # retries literal is present on every transport we build
+                # (the auto-created "all://" proxy mount keeps the Client's
+                # limits/verify; httpx 0.28.1 drops `retries` for
+                # httpcore.HTTPProxy pools — retries are effective on the
+                # direct path above, which is the llm.letovo.site path).
+                _transport = _httpx.HTTPTransport(
+                    verify=verify, retries=2, limits=_limits,
+                )
             return _httpx.Client(
                 limits=_limits,
                 timeout=_timeout,
                 proxy=_proxy,
                 mounts=_mounts or None,
                 verify=verify,
+                transport=None if _proxy is None else _transport,
             )
         except Exception:
             return None
