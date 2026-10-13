@@ -126,9 +126,11 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    MEDIA_DELIVERY_EXTS,
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
     SendResult,
+    _strip_media_tag_directives,
     is_network_accessible,
     validate_media_delivery_path,
 )
@@ -1406,6 +1408,71 @@ def _extract_openwebui_file_deltas(text: str) -> list[dict[str, Any]]:
             "data": f"data:{content_type};base64,{encoded}",
         })
     return items
+
+
+def _strip_existing_local_paths(text: str) -> str:
+    """Remove absolute paths of existing local files from display text.
+
+    Only absolute filesystem paths that *exist* on this machine are removed;
+    a path the model merely invented (no file on disk) stays visible, and
+    paths inside code examples (inline backticks / fenced code blocks) are
+    preserved verbatim (``extract_local_files`` skips those spans).
+
+    Mirrors the cleaning done by ``BasePlatformAdapter.extract_local_files``
+    for native delivery, so the visible SSE/non-stream content agrees with
+    what is shipped as file attachments.
+    """
+    if not text:
+        return text
+    try:
+        _, cleaned = BasePlatformAdapter.extract_local_files(text)
+    except Exception:
+        # A display convenience must never make a completed agent response
+        # fail.  Return the input text as a degraded best effort.
+        return text
+    return cleaned if cleaned is not None else text
+
+
+def _strip_local_file_paths(text: str) -> str:
+    """Remove local file paths (and MEDIA: directives) from display text.
+
+    Same core cleaning as :func:`_strip_existing_local_paths` (existing
+    absolute paths removed; non-existing paths and backtick/fence code
+    examples preserved verbatim), plus bare ``MEDIA:`` delivery directives
+    are stripped so the internal tag syntax never reaches user-visible text,
+    exactly as every other platform adapter does for display.
+    """
+    if not text:
+        return text
+    stripped = _strip_media_tag_directives(text) or text
+    return _strip_existing_local_paths(stripped)
+
+
+def _may_contain_local_path(text: str) -> bool:
+    """Cheap existence hint for whether ``text`` needs path cleaning.
+
+    Avoids running the full ``extract_local_files`` pass (which performs
+    per-candidate ``os.path.isfile`` checks) on every streamed token.  Only
+    text that mentions a ``MEDIA:`` directive or any of the deliverable
+    extensions at a plausible path boundary is considered a candidate; a
+    false positive only wastes a few microseconds of regex time, never
+    changes output.
+    """
+    if not text:
+        return False
+    if "MEDIA:" in text:
+        return True
+    return _PATH_EXT_HINT_RE.search(text) is not None
+
+
+#: Extension hint used by :func:`_may_contain_local_path`.  Shared with the
+#: delivery extension set so the fast-path guard and the real extractor agree.
+_PATH_EXT_HINT_RE = re.compile(
+    r"(?<![/:\w.])(?:~/|/|[A-Za-z]:[\\/])(?:[\w.\-]+[\\/])*[\w.\-]+\.(?:"
+    + "|".join(sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -5002,7 +5069,9 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _strip_local_file_paths(
+            _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -5140,7 +5209,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _delta(delta: str) -> None:
             if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+                # Hide local file paths (and MEDIA: directives) from
+                # streamed content — the file is delivered as an attachment,
+                # never a host path the user can't open.
+                cleaned = _strip_local_file_paths(delta) if _may_contain_local_path(delta) else delta
+                _enqueue("assistant.delta", {"message_id": message_id, "delta": cleaned})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -5174,7 +5247,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _strip_local_file_paths(
+                    _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                )
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -5817,7 +5892,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _strip_local_file_paths(
+            _resolve_media_to_data_urls(result.get("final_response") or "")
+        )
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5982,10 +6059,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         else:
                             current_status_description = "Обдумываю следующий шаг"
                 else:
+                    # Hide absolute local file paths from streamed content.
+                    # The file is delivered as an attachment via the ``files``
+                    # delta (see _extract_openwebui_file_deltas); the raw path
+                    # must not leak to a user with no host access.  Media
+                    # delivery directives are stripped too so they never
+                    # render, mirroring extract_media's display cleanup.
+                    # Cheap guard: only run the cleaning when the chunk
+                    # plausibly contains a local path or a MEDIA: directive;
+                    # clean text passes through unchanged either way.
+                    visible_content = item
+                    if isinstance(item, str) and _may_contain_local_path(item):
+                        visible_content = _strip_local_file_paths(item)
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": visible_content}, "finish_reason": None}],
                     }
                     await response.write(_sse_frame(content_chunk))
                 return time.monotonic()
@@ -6351,6 +6440,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                # Hide local file paths (and MEDIA: directives) from
+                # streamed content — the file is delivered as an attachment,
+                # never a host path the user can't open.
+                if _may_contain_local_path(delta_text):
+                    delta_text = _strip_local_file_paths(delta_text)
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -7023,7 +7117,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = _strip_local_file_paths(
+            _resolve_media_to_data_urls(result.get("final_response", ""))
+        )
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
