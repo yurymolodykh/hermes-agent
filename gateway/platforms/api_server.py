@@ -130,6 +130,7 @@ from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
     SendResult,
+    _merge_spans,
     _strip_media_tag_directives,
     is_network_accessible,
     validate_media_delivery_path,
@@ -1433,6 +1434,62 @@ def _strip_existing_local_paths(text: str) -> str:
     return cleaned if cleaned is not None else text
 
 
+def _scrub_existing_local_path_spans(text: str) -> str:
+    """Surgically delete only existing absolute-path spans, byte-preserving.
+
+    Same path detection as :func:`_strip_existing_local_paths` (only absolute
+    paths of files that EXIST are removed; non-existing paths and paths inside
+    backticks/fenced code blocks survive verbatim), but deletion is span-only:
+    the surrounding whitespace/newlines are left EXACTLY as-is, no
+    ``.strip()`` and no newline-collapsing.
+
+    ``extract_local_files``'s whole-text cleaning (``replace`` + ``.strip()``
+    + ``\\n{3,}`` collapse) is correct for a complete response, but a stream
+    fragment that ends right after a path would lose its trailing newlines and
+    the first whitespace of the following fragment — visibly mangling prose
+    (e.g. ``(5 bytes).`` -> ``(5bytes).``).  The streaming sanitizer therefore
+    uses this form so every byte outside the path span is preserved verbatim.
+    """
+    if not text:
+        return text
+    try:
+        _LOCAL_MEDIA_EXTS = MEDIA_DELIVERY_EXTS
+        ext_part = "|".join(e.lstrip(".") for e in _LOCAL_MEDIA_EXTS)
+        path_re = re.compile(
+            r"(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:"
+            + ext_part
+            + r")\b",
+            re.IGNORECASE,
+        )
+        code_spans: list = []
+        for m in re.finditer(r"```[^\n]*\n.*?```", text, re.DOTALL):
+            code_spans.append((m.start(), m.end()))
+        for m in re.finditer(r"`[^`\n]+`", text):
+            code_spans.append((m.start(), m.end()))
+
+        def _in_code(pos: int) -> bool:
+            return any(s <= pos < e for s, e in code_spans)
+
+        spans: list = []
+        for match in path_re.finditer(text):
+            if _in_code(match.start()):
+                continue
+            raw = match.group(0)
+            expanded = os.path.expanduser(raw)
+            if os.path.isfile(expanded):
+                spans.append(match.span())
+        if not spans:
+            return text
+        chars = list(text)
+        for start, end in reversed(_merge_spans(sorted(spans))):
+            del chars[start:end]
+        return "".join(chars)
+    except Exception:
+        # A display convenience must never make a completed agent response
+        # fail.  Return the input text as a degraded best effort.
+        return text
+
+
 def _strip_local_file_paths(text: str) -> str:
     """Remove local file paths (and MEDIA: directives) from display text.
 
@@ -1463,6 +1520,108 @@ def _may_contain_local_path(text: str) -> bool:
     if "MEDIA:" in text:
         return True
     return _PATH_EXT_HINT_RE.search(text) is not None
+
+
+#: Maximum tail characters buffered by :class:`_StreamingPathSanitizer` while
+#: a candidate path is still being assembled across stream tokens.  A full
+#: absolute path (e.g. ``C:/Users/…/<deep>/file.txt``) is small; this cap is a
+#: safety net so a pathological no-whitespace run can never grow the buffer
+#: without bound.  When the tail exceeds it the sanitizer force-flushes the
+#: oldest bytes anyway (worst case: a path split at exactly the force-slice
+#: boundary escapes one chunk — bounded and vanishingly rare).
+_STREAM_PATH_HOLDBACK_MAX = 16 * 1024
+
+
+def _scrub_stream_fragment(text: str) -> str:
+    """Byte-preserving cleaning for a bounded stream fragment.
+
+    Deletes exactly the ``MEDIA:``/marker spans (span-deletion, no
+    whitespace moved) and exactly the existing absolute-path spans
+    (:func:`_scrub_existing_local_path_spans`), leaving every other byte —
+    including whitespace and newlines around a path — untouched.
+
+    This must NOT be ``_strip_local_file_paths``: the whole-text cleaning
+    ends with ``.strip()`` and ``\\n{3,}`` collapsing, which is correct for a
+    complete response but would mangle a stream fragment that ends right
+    after a path (dropping its trailing newlines and the next fragment's
+    leading whitespace).
+    """
+    if not text:
+        return text
+    # Media/marker directives are already span-deletion and byte-preserving.
+    cleaned = _strip_media_tag_directives(text)
+    if cleaned != text:
+        text = cleaned
+    return _scrub_existing_local_path_spans(text)
+
+
+class _StreamingPathSanitizer:
+    """Hold-back tail sanitizer for LLM-token streams that fragment paths.
+
+    A final answer that names an existing local artifact is delivered as an
+    attachment (SSE ``files`` delta); the absolute host path must never reach
+    user-visible ``delta.content``.  ``BasePlatformAdapter.extract_local_files``
+    strips those paths correctly on a *complete* string, but a live LLM stream
+    splits one path across many small tokens (``"C"``, ``":/"``, ``"Users"``,
+    ``…``, ``".txt"``), so a per-chunk strip never sees the whole path and the
+    path leaks.
+
+    This sanitizer keeps back the tail of the stream, from the last
+    whitespace/newline on, so a path that is being assembled token-by-token is
+    fully retained until a boundary arrives that proves it complete; then the
+    now-complete prefix is run through :func:`_strip_local_file_paths` and
+    emitted.  Code samples (backticks/fences) and non-existing paths survive
+    untouched — the same contract as the whole-text strip.
+    """
+
+    __slots__ = ("_buf", "_max_holdback")
+
+    def __init__(self, max_holdback: int = _STREAM_PATH_HOLDBACK_MAX) -> None:
+        self._buf = ""
+        self._max_holdback = int(max_holdback)
+
+    def _safe_cut(self, buf: str) -> int:
+        """Largest index that may be hard-flushed without splitting a path.
+
+        The unstable tail is everything from the last whitespace/newline
+        (token boundary) so an in-progress path is never cut in half.  When a
+        pathological no-whitespace run exceeds ``max_holdback``, return the
+        forced overflow cut anyway to bound memory.
+        """
+        if len(buf) > self._max_holdback:
+            return len(buf) - self._max_holdback
+        # Last run of non-whitespace is the fragile tail: find the last
+        # separator (whitespace / newline).  Only whitespace separates here —
+        # backticks are punctuation a path could legitimately abut, so do NOT
+        # treat them as safe cut points (a path in a code sample must stay put
+        # next to its backtick).  No separator -> hold everything.
+        cut = max(buf.rfind(ch) for ch in (" ", "\t", "\r", "\n")) + 1
+        return cut
+
+    def feed(self, text: str) -> str:
+        """Append ``text`` and return the safely-strippable prefix (may be '').
+
+        The returned string has already had existing local paths removed; the
+        internally held-back tail will be released by a later ``feed`` /
+        ``flush`` once a boundary proves it complete.
+        """
+        if not text:
+            return ""
+        self._buf += text
+        cut = self._safe_cut(self._buf)
+        if cut <= 0:
+            return ""
+        head, tail = self._buf[:cut], self._buf[cut:]
+        self._buf = tail
+        return _scrub_stream_fragment(head)
+
+    def flush(self) -> str:
+        """Release everything left in the hold-back buffer, sanitized."""
+        if not self._buf:
+            return ""
+        out = _scrub_stream_fragment(self._buf)
+        self._buf = ""
+        return out
 
 
 #: Extension hint used by :func:`_may_contain_local_path`.  Shared with the
@@ -6009,6 +6168,12 @@ class APIServerAdapter(BasePlatformAdapter):
             is_openwebui = bool(session_id and session_id.startswith("owui-"))
             current_status_description = "Обдумываю следующий шаг"
 
+            # Hold-back sanitizer: LLMs stream one absolute path across many
+            # tiny tokens ("C", ":/", "Users", ...), so per-chunk stripping
+            # never sees the whole path.  This accumulates the tail and strips
+            # once a boundary proves the path complete (see class docstring).
+            stream_sanitizer = _StreamingPathSanitizer()
+
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -6065,18 +6230,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     # must not leak to a user with no host access.  Media
                     # delivery directives are stripped too so they never
                     # render, mirroring extract_media's display cleanup.
-                    # Cheap guard: only run the cleaning when the chunk
-                    # plausibly contains a local path or a MEDIA: directive;
-                    # clean text passes through unchanged either way.
-                    visible_content = item
-                    if isinstance(item, str) and _may_contain_local_path(item):
-                        visible_content = _strip_local_file_paths(item)
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": visible_content}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    # The hold-back sanitizer reconstructs paths that arrive
+                    # split across many tiny LLM tokens before stripping.
+                    visible_content = stream_sanitizer.feed(item) if isinstance(item, str) else item
+                    if visible_content:
+                        content_chunk = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": visible_content}, "finish_reason": None}],
+                        }
+                        await response.write(_sse_frame(content_chunk))
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -6125,6 +6288,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
 
                 last_activity = await _emit(delta)
+
+            # Release any content still held in the hold-back sanitizer
+            # (e.g. a trailing path whose terminating boundary arrived in the
+            # final chunk, or content emitted in one shot without separation).
+            held_back = stream_sanitizer.flush()
+            if held_back:
+                held_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": held_back}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(held_chunk))
 
             # Get usage from completed agent. The agent can fail two ways
             # after the content queue terminates cleanly: (1) ``agent_task``
