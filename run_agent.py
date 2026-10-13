@@ -5180,7 +5180,7 @@ class AIAgent:
             _limits = _httpx.Limits(
                 max_keepalive_connections=20,
                 max_connections=100,
-                keepalive_expiry=20.0,
+                keepalive_expiry=90.0,
             )
 
             # Timeouts: generous read=None for SSE streaming endpoints.
@@ -5206,10 +5206,10 @@ class AIAgent:
                 # httpx default is keepalive_expiry=5.0).
                 _mounts = {
                     "http://": _httpx.HTTPTransport(
-                        verify=verify, retries=2, limits=_limits,
+                        verify=verify, retries=2, limits=_limits, http2=True,
                     ),
                     "https://": _httpx.HTTPTransport(
-                        verify=verify, retries=2, limits=_limits,
+                        verify=verify, retries=2, limits=_limits, http2=True,
                     ),
                 }
             else:
@@ -5220,7 +5220,7 @@ class AIAgent:
                 # httpcore.HTTPProxy pools — retries are effective on the
                 # direct path above, which is the llm.letovo.site path).
                 _transport = _httpx.HTTPTransport(
-                    verify=verify, retries=2, limits=_limits,
+                    verify=verify, retries=2, limits=_limits, http2=True,
                 )
             return _httpx.Client(
                 limits=_limits,
@@ -5228,6 +5228,7 @@ class AIAgent:
                 proxy=_proxy,
                 mounts=_mounts or None,
                 verify=verify,
+                http2=True,
                 transport=None if _proxy is None else _transport,
             )
         except Exception:
