@@ -236,6 +236,59 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+# ---------------------------------------------------------------------------
+# do_not_deliver regression (t_1e52d756): the CLI --do-not-deliver flag marks
+# a synthetic card; ordinary creates never set it.
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_cli_do_not_deliver_flag_marks_synthetic_card(kanban_home):
+    """``--do-not-deliver`` on the create subcommand flags the new card.
+
+    Synthetic readback cards created through the CLI carry the flag so
+    terminal/branch-summary routing can skip them.
+    """
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out = kc.run_slash(
+        "create '[F7 readback] mission A (host stays open)' "
+        "--assignee alice --do-not-deliver"
+    )
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m, f"create must print a task id; got {out!r}"
+    tid = m.group(1)
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.do_not_deliver is True, task.do_not_deliver
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["do_not_deliver"] == 1
+
+
+def test_kanban_cli_create_without_flag_leaves_do_not_deliver_zero(kanban_home):
+    """Ordinary ``/kanban create`` never sets do_not_deliver (default 0)."""
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out = kc.run_slash("create 'ordinary card' --assignee alice")
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m, f"create must print a task id; got {out!r}"
+    tid = m.group(1)
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.do_not_deliver is False, task.do_not_deliver
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["do_not_deliver"] == 0
+
+
 
 
 # ---------------------------------------------------------------------------

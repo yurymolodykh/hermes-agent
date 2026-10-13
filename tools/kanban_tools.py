@@ -601,6 +601,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "provider_override": task.provider_override,
         "root_model_override": task.root_model_override,
         "root_provider_override": task.root_provider_override,
+        "do_not_deliver": task.do_not_deliver,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -1563,6 +1564,13 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    # ``do_not_deliver`` marks a SYNTHETIC card (F7 readback verification
+    # fixtures, watcher-created bookkeeping cards) as never being a delivery
+    # subject for terminal/branch-summary routing. Ordinary orchestrator
+    # children must NOT set it — this is an internal/operator-only surface.
+    do_not_deliver, do_not_deliver_err = _parse_bool_arg(args, "do_not_deliver")
+    if do_not_deliver_err:
+        return tool_error(do_not_deliver_err)
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1662,6 +1670,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                do_not_deliver=do_not_deliver,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2562,6 +2571,19 @@ KANBAN_CREATE_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "do_not_deliver": {
+                "type": "boolean",
+                "description": (
+                    "INTERNAL/OPERATOR-ONLY: mark the card as a synthetic "
+                    "bookkeeping card that must never be a terminal/branch-"
+                    "summary delivery subject (e.g. an [F7 readback] "
+                    "verification fixture). When true, the card is created "
+                    "WITHOUT a delivery route and terminal/branch-summary "
+                    "routing skips it. Ordinary orchestrator children must "
+                    "NOT set this; it defaults to false, which preserves "
+                    "normal card creation."
+                ),
+            },
         },
         "required": ["title", "assignee"],
     },

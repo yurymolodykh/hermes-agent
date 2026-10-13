@@ -1175,6 +1175,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Delivery-suppression flag for synthetic cards (F7 readback fixtures,
+    # watcher-created bookkeeping cards). When True the card is never a
+    # delivery subject for terminal/branch-summary routing. Default False
+    # for ordinary user-created cards. See the column comment in SCHEMA_SQL.
+    do_not_deliver: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1282,6 +1287,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            do_not_deliver=(
+                bool(row["do_not_deliver"])
+                if "do_not_deliver" in keys and row["do_not_deliver"] is not None
+                else False
             ),
         )
 
@@ -1499,7 +1509,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- no longer matches the CURRENT gateway generation AND whose worker PID is
     -- not alive is reclaimed to ``ready`` on the next dispatch tick instead of
     -- waiting out the ``release_stale_claims`` TTL.
-    gateway_generation   TEXT
+    gateway_generation   TEXT,
+    -- Delivery-suppression flag for SYNTHETIC cards (e.g. [F7 readback]
+    -- verification cards, automated fixtures, internal/watcher-created cards).
+    -- When 1, the card is a bookkeeping-only synthetic card: terminal/branch
+    -- summary delivery (Telegram mirrors, notifier wakes) must skip it, and
+    -- it never inherits a subscription's routing. 0 (the default) = normal
+    -- card, delivery as usual. Do NOT set on ordinary user-created cards.
+    do_not_deliver       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2790,6 +2807,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "gateway_generation", "gateway_generation TEXT"
         )
 
+    if "do_not_deliver" not in cols:
+        # Delivery-suppression flag for synthetic cards (F7 readback fixtures,
+        # watcher-created bookkeeping cards). Legacy rows get 0 (normal card),
+        # preserving pre-existing delivery behaviour on upgrade.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "do_not_deliver",
+            "do_not_deliver INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3776,6 +3804,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    do_not_deliver: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3815,6 +3844,12 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``do_not_deliver`` marks a SYNTHETIC card (e.g. an [F7 readback]
+    verification fixture, a watcher-created bookkeeping card) as never being a
+    delivery subject for terminal/branch-summary routing (Telegram mirrors,
+    notifier wakes). Ordinary cards must leave it as the default ``False``;
+    only the synthetic readback creation path passes ``True``.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -4162,8 +4197,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         root_model_override, root_provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, do_not_deliver
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4191,6 +4226,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if do_not_deliver else 0,
                     ),
                 )
                 for pid in parents:
@@ -4221,6 +4257,7 @@ def create_task(
                         "provider_override": provider_override,
                         "root_model_override": root_model_override,
                         "root_provider_override": root_provider_override,
+                        "do_not_deliver": bool(do_not_deliver) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)

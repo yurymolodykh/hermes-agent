@@ -2338,3 +2338,99 @@ def test_dispatch_once_reports_api_unavailable_in_result(
         t = kb.get_task(conn, tid)
         assert t.consecutive_failures == 0
 
+
+
+# ---------------------------------------------------------------------------
+# do_not_deliver (t_82d6df66): delivery-suppression flag for synthetic cards.
+# Synthetic readback cards (F7 fixtures, watcher-created bookkeeping cards)
+# must be created with the flag set; ordinary cards must never carry it.
+# ---------------------------------------------------------------------------
+
+
+def test_create_task_do_not_deliver_flag_defaults_false(kanban_home):
+    """An ordinary card created without the flag must NOT carry it.
+
+    ``do_not_deliver`` defaults to False so normal card creation semantics
+    (delivery as usual) are preserved exactly.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ordinary card", assignee="worker")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.do_not_deliver is False
+
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row is not None
+        assert row["do_not_deliver"] == 0
+
+
+def test_create_task_do_not_deliver_flag_set_for_synthetic(kanban_home):
+    """A synthetic readback card created with the flag carries it.
+
+    The synthetic readback creation path passes ``do_not_deliver=True`` so
+    terminal/branch-summary delivery routing can skip the card.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="[F7 readback] mission A (host stays open)",
+            assignee="01-orchestrator",
+            initial_status="blocked",
+            do_not_deliver=True,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.do_not_deliver is True
+
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row is not None
+        assert row["do_not_deliver"] == 1
+
+
+def test_create_task_do_not_deliver_false_explicit(kanban_home):
+    """Explicit ``do_not_deliver=False`` is stored as 0 (normal card).
+
+    Even when the flag is explicitly set false, the card remains a normal
+    delivery subject — same as legacy behaviour.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="explicit normal", assignee="worker",
+            do_not_deliver=False,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.do_not_deliver is False
+
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["do_not_deliver"] == 0
+
+
+def test_schema_has_do_not_deliver_with_default(kanban_home):
+    """The tasks table exposes ``do_not_deliver`` (default 0).
+
+    Fresh DBs get the column from SCHEMA_SQL; the additive migration must
+    idempotently add it for legacy DBs as well.
+    """
+    with kb.connect() as conn:
+        cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        assert "do_not_deliver" in cols
+
+        # The column has a NOT NULL DEFAULT 0 declaration.
+        col = conn.execute(
+            "PRAGMA table_info(tasks)"
+        ).fetchall()
+        do_not_deliver_col = next(
+            (row for row in col if row["name"] == "do_not_deliver"), None
+        )
+        assert do_not_deliver_col is not None
+        assert "0" in (do_not_deliver_col["dflt_value"] or "")
+        assert do_not_deliver_col["notnull"] == 1

@@ -1410,11 +1410,15 @@ def _insert_f7_readback_wave(conn, *, event_start=_F7_WAVE_FIRST_EVENT_ID,
     ids = [f"t_f7rb_{i:02d}" for i in range(count)]
     # Batch 1: the tasks themselves (created AND closed in the same INSERT —
     # status 'done' is what branch_state sees; the completed events come next).
+    # Synthetic [F7 readback] cards MUST carry do_not_deliver=1 (t_14a2df91):
+    # they are bookkeeping-only verification fixtures, never a terminal /
+    # branch-summary delivery subject. SQLite fills the column for older DBs
+    # via the additive migration default 0, so fresh boards get the same 1.
     with kb.write_txn(conn):
         for tid, title in zip(ids, titles):
             conn.execute(
-                "INSERT INTO tasks (id, title, status, created_at) "
-                "VALUES (?, ?, 'done', ?)",
+                "INSERT INTO tasks (id, title, status, created_at, do_not_deliver) "
+                "VALUES (?, ?, 'done', ?, 1)",
                 (tid, title, ts),
             )
     # Batch 2: the wave itself — 12 completed events, contiguous ids, one ts.
@@ -1555,3 +1559,60 @@ def test_incident_plan_no_duplicate_for_named_roots(board_env):
         assert _kb_inc.branch_summary_pending_subs(marker_after, subs) == [], (
             f"{root_id}: nothing may become pending after a no-op plan"
         )
+
+
+# ---------------------------------------------------------------------------
+# do_not_deliver regression (t_1e52d756): every synthetic [F7 readback] card
+# created by the 91420-91431 wave fixture must carry do_not_deliver=1 so
+# terminal/branch-summary routing can skip it; ordinary cards created through
+# the standard create_task path must stay at 0 (default) — the flag must never
+# leak into normal card creation.
+# ---------------------------------------------------------------------------
+
+
+def test_f7_readback_wave_cards_all_carry_do_not_deliver(board_env):
+    """The incident wave fixture must flag EVERY synthetic readback card.
+
+    The 91420-91431 wave is inserted as raw SQL (created AND closed in the
+    same INSERT). The fixture asserts do_not_deliver=1 per card so the
+    delivery-suppression rung has a real, test-pinned signal to consume.
+    """
+    wave_ids = _insert_f7_readback_wave(board_env)
+    assert len(wave_ids) == _F7_WAVE_CARD_COUNT == 12
+
+    rows = board_env.execute(
+        "SELECT id, do_not_deliver FROM tasks WHERE id IN ("
+        + ",".join("?" * len(wave_ids))
+        + ") ORDER BY id",
+        tuple(wave_ids),
+    ).fetchall()
+    assert len(rows) == _F7_WAVE_CARD_COUNT, (
+        f"all wave cards must exist; got {len(rows)} rows for {len(wave_ids)} ids"
+    )
+    flagged = [(r["id"], r["do_not_deliver"]) for r in rows]
+    assert all(dnd == 1 for _, dnd in flagged), (
+        f"every synthetic wave card must carry do_not_deliver=1; got {flagged}"
+    )
+
+
+def test_f7_readback_wave_default_do_not_deliver_zero_for_normal_cards(board_env):
+    """Ordinary cards go through create_task with do_not_deliver left at 0.
+
+    The synthetic-readback change must not leak into normal card creation:
+    a root + child created via the standard helpers (_mk / _mk_bg) are normal
+    delivery subjects and must stay flagged 0 even with a wave in the DB.
+    """
+    root = _mk(board_env, "ordinary root")
+    child = _mk_bg(board_env, "ordinary child", parent=root)
+    # A wave present does not change normal-card flags.
+    _insert_f7_readback_wave(board_env)
+
+    rows = board_env.execute(
+        "SELECT id, do_not_deliver FROM tasks WHERE id IN (?, ?)",
+        (root, child),
+    ).fetchall()
+    assert len(rows) == 2
+    by_id = {r["id"]: r["do_not_deliver"] for r in rows}
+    assert by_id[root] == 0 and by_id[child] == 0, (
+        f"ordinary cards must NOT carry do_not_deliver; got {by_id}"
+    )

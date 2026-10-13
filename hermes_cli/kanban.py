@@ -428,6 +428,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--do-not-deliver", action="store_true",
+                          default=False,
+                          help="INTERNAL/OPERATOR-ONLY: mark the card as a "
+                               "synthetic bookkeeping card (e.g. an [F7 "
+                               "readback] verification fixture) that must "
+                               "never be a terminal/branch-summary delivery "
+                               "subject. Ordinary cards must NOT set this.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1620,6 +1627,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            do_not_deliver=bool(getattr(args, "do_not_deliver", False)),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
