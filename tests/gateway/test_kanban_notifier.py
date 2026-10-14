@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -10,6 +11,29 @@ from gateway.kanban_watchers import (
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+
+
+# Hermetic board isolation: synthetic assignee registry + no host route
+# preflight.  Same opt-in fixtures the cron/kanban suites use
+# (see tests/tools/test_kanban_tools.py).
+pytestmark = pytest.mark.usefixtures(
+    "isolated_kanban_assignee_registry", "isolated_kanban_route_resolver"
+)
+
+
+@pytest.fixture(autouse=True)
+def _tg_delivery_policy_default_off(monkeypatch):
+    """Keep the TG delivery-policy gate OFF for these legacy notifier tests.
+
+    D0 ``tg-delivery-hygiene`` (7ea1a5ff943) made ``telegram_delivery_policy``
+    default ON and fail-closed: with an empty TELEGRAM_ALLOWED_USERS allowlist
+    the gate suppresses every telegram notifier delivery as "recipient
+    mismatch", which masks the delivery behaviour these tests assert on.  Same
+    env-override convention as tests/cron/conftest.py
+    (_cron_tg_delivery_policy_default_off) and d58bd9d2177: legacy delivery
+    tests keep the gate OFF; dedicated policy tests opt back in explicitly.
+    """
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
 
 
 class RecordingAdapter:
@@ -144,7 +168,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="approval", assignee="publisher")
+        tid = kb.create_task(conn, title="approval", assignee="worker")
         kb.add_notify_sub(
             conn,
             task_id=tid,
