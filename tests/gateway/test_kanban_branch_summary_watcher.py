@@ -357,6 +357,15 @@ async def test_replace_flag_suppresses_descendant_notifier_pings(board_env, monk
     monkeypatch.setattr(
         "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
     )
+    # The TG delivery-policy gate (7ea1a5ff943, default ON, fail-closed) is
+    # ORTHOGONAL to what this test asserts (branch_summary_replace suppression
+    # of descendant pings): with an empty TELEGRAM_ALLOWED_USERS allowlist the
+    # gate suppresses even the root's own completion ping as "recipient
+    # mismatch", which predates and masks the replace-mode behaviour under
+    # test. Same env-override convention as tests/cron/conftest.py
+    # (_cron_tg_delivery_policy_default_off): legacy delivery tests keep the
+    # gate OFF; dedicated policy tests opt back in explicitly.
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
 
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
