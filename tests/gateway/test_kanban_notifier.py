@@ -599,6 +599,175 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
+# ---------------------------------------------------------------------------
+# do_not_deliver delivery skip (t_01d91fbf / t_896ff347): a synthetic
+# [F7 readback] card flagged do_not_deliver=1 is NEVER a telegram delivery
+# subject (no text ping, no wake, no artifact upload), while an ordinary
+# card — flag False or absent — is still delivered exactly as before.
+# ---------------------------------------------------------------------------
+
+
+def _make_completed_with_flag(tmp_path, monkeypatch, *, do_not_deliver=None):
+    db_path = tmp_path / "dnd-notifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    kwargs = {}
+    if do_not_deliver is not None:
+        kwargs["do_not_deliver"] = do_not_deliver
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dnd card", assignee="worker", **kwargs,
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="synthetic done")
+        return tid
+    finally:
+        conn.close()
+
+
+def test_notifier_flagged_readback_card_do_not_deliver_is_not_sent(tmp_path, monkeypatch):
+    """A synthetic readback card with do_not_deliver=True is never delivered.
+
+    No text ping to the subscribed telegram chat, no wake turn injected on
+    the adapter, and no artifact upload — the flagged card is a
+    bookkeeping-only fixture. The cursor still advances so the claimed event
+    can never replay/wedge the subscription on a later tick.
+    """
+    tid = _make_completed_with_flag(
+        tmp_path, monkeypatch, do_not_deliver=True,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        f"flagged readback card must not be sent to telegram; got {adapter.sent}"
+    )
+    assert adapter.handled == [], (
+        "flagged readback card must not wake the creator session "
+        f"(no synthetic handle_message); got {len(adapter.handled)} wakes"
+    )
+    # Cursor advanced: the completed event is claimed, so the next tick has
+    # nothing left to deliver (no replay / no wedge even after a second tick).
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent == [], (
+        f"second tick must not replay a flagged readback delivery; got {adapter.sent}"
+    )
+    assert tid is not None
+
+
+def test_notifier_readback_card_without_flag_is_sent(tmp_path, monkeypatch):
+    """A synthetic-readback-shaped card WITHOUT the flag is still delivered.
+
+    The delivery skip must key strictly off the do_not_deliver flag, not off
+    the [F7 readback] title shape: a card titled like a readback but without
+    the flag is an ordinary delivery subject and reaches its telegram chat.
+    """
+    db_path = tmp_path / "dnd-noflag.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="[F7 readback] unflagged", assignee="worker",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        f"unflagged readback-shaped card IS a delivery subject; got {adapter.sent}"
+    )
+    assert adapter.sent[0]["chat_id"] == "chat-1"
+    assert tid in adapter.sent[0]["text"]
+
+
+def test_notifier_ordinary_card_still_sent_even_with_flagged_card_on_board(tmp_path, monkeypatch):
+    """An ordinary card is still delivered alongside a flagged readback card.
+
+    Regression guard for the delivery-skip filter: processing a board that
+    contains BOTH a synthetic do_not_deliver card and an ordinary card must
+    deliver exactly the ordinary one and nothing else — the filter must not
+    bleed out of its own subscription onto an unrelated pending delivery.
+    """
+    db_path = tmp_path / "dnd-mixed.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        flagged = kb.create_task(
+            conn, title="[F7 readback] wave", assignee="worker",
+            do_not_deliver=True,
+        )
+        kb.add_notify_sub(
+            conn, task_id=flagged, platform="telegram", chat_id="chat-flagged",
+        )
+        kb.complete_task(conn, flagged, summary="synthetic")
+        ordinary = kb.create_task(conn, title="ordinary card", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=ordinary, platform="telegram", chat_id="chat-ordinary",
+        )
+        kb.complete_task(conn, ordinary, summary="real work")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    sent = {s["chat_id"]: s["text"] for s in adapter.sent}
+    assert "chat-flagged" not in sent, (
+        f"flagged readback card must not be delivered; got chats {sorted(sent)}"
+    )
+    assert "chat-ordinary" in sent, (
+        f"ordinary card must still be delivered alongside a flagged card; "
+        f"got chats {sorted(sent)}"
+    )
+    assert adapter.handled == [], (
+        "no wake may be injected for the flagged card; ordinary card wake "
+        "not expected on this push adapter + plain notify sub"
+    )
+
+
+def test_notifier_do_not_deliver_flag_not_leaked_into_ordinary_delivery(tmp_path, monkeypatch):
+    """An ordinary card keeps the flag at 0 through the DB round-trip.
+
+    The create side defaults do_not_deliver to 0 (never leaks the synthetic
+    marker into normal card creation) and the notifier must deliver an
+    ordinary card regardless of any flagged card present on the same board.
+    """
+    db_path = tmp_path / "dnd-default.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="plain", assignee="worker")
+        row = conn.execute(
+            "SELECT do_not_deliver FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row[0] == 0, f"ordinary card must default do_not_deliver to 0; got {row[0]}"
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        f"ordinary default card must be delivered; got {adapter.sent}"
+    )
+    assert adapter.sent[0]["chat_id"] == "chat-1"
+
+
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 

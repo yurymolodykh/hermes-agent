@@ -1498,11 +1498,11 @@ async def test_incident_wave_91420_91431_no_redelivery_of_named_old_roots(
     await _run_one_branch_tick(monkeypatch, runner)
 
     sent = {s["chat_id"] for s in adapter.sent}
-    # 1) the 12 wave cards ARE delivered (their own completed events are in-wave).
-    expected_wave = {f"tg-wave-{w}" for w in wave_ids}
-    assert expected_wave <= sent, (
-        f"wave cards must be delivered this tick; missing "
-        f"{expected_wave - sent}; sent={sorted(sent)}"
+    # 1) the 12 wave cards are synthetic [F7 readback] fixtures carrying
+    #    do_not_deliver=1 -> they must NOT be delivered to any channel (the
+    #    branch-summary routing skips them entirely; see t_01d91fbf).
+    assert not ({"tg-wave-{w}".format(w=w) for w in wave_ids} & sent), (
+        f"synthetic readback wave cards must NOT be delivered; sent={sorted(sent)}"
     )
     # 2) the old roots must NOT be re-delivered.
     assert "tg-old" not in sent, (
@@ -1615,4 +1615,120 @@ def test_f7_readback_wave_default_do_not_deliver_zero_for_normal_cards(board_env
     by_id = {r["id"]: r["do_not_deliver"] for r in rows}
     assert by_id[root] == 0 and by_id[child] == 0, (
         f"ordinary cards must NOT carry do_not_deliver; got {by_id}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Branch-summary delivery routing on a mixed board (t_5a227053): when a board
+# holds BOTH a synthetic readback root flagged do_not_deliver=1 AND an
+# ordinary closed branch, the branch-summary watcher must deliver exactly the
+# ordinary branch итог and nothing for the flagged root — no plan, no TG ping,
+# no delivered marker (the `_task_do_not_deliver(_root_task)` gate in the
+# collect loop short-circuits the flagged root before planning).
+# ---------------------------------------------------------------------------
+
+
+def _mk_flagged(conn, title, assignee="worker"):
+    """Create a synthetic readback card with do_not_deliver=True."""
+    return kb.create_task(conn, title=title, assignee=assignee, do_not_deliver=True)
+
+
+@pytest.mark.asyncio
+async def test_branch_summary_mixed_board_flagged_root_skipped_ordinary_delivered(
+    board_env, monkeypatch,
+):
+    """Ordinary branch delivered, flagged synthetic readback root excluded.
+
+    Same tick, same board, same watcher: the do_not_deliver gate must bleed
+    out of nothing — a closed ordinary root still reaches its TG channel
+    while a flagged synthetic readback root is not planned, not delivered and
+    never gets a delivered marker.
+    """
+    # Ordinary full mission (branch root + child, both closed) -> must deliver.
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env, task_id=root, platform="telegram", chat_id="tg-chat-9",
+    )
+    _complete_branch(board_env, root, [a])
+
+    # Flagged synthetic readback root (closed, subscribed) -> must NOT deliver.
+    flagged = _mk_flagged(board_env, "[F7 readback] mission A (host stays open)")
+    kb.add_notify_sub(
+        board_env, task_id=flagged, platform="telegram", chat_id="tg-chat-flagged",
+    )
+    kb.complete_task(board_env, flagged, summary="readback")
+
+    called_roots = []
+    runner = _make_runner(adapter := RecordingAdapter())
+    real_plan = runner._plan_branch_summary
+
+    def spy_plan(conn, root_id, root_subs, board_slug):
+        called_roots.append(root_id)
+        return real_plan(conn, root_id, root_subs, board_slug)
+
+    runner._plan_branch_summary = spy_plan
+
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # Exactly ONE delivery: the ordinary branch itog, to its own channel.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"], (
+        f"only the ordinary branch итог may be delivered; got {adapter.sent}"
+    )
+    assert adapter.sent[0]["chat_id"] == "tg-chat-9"
+    # Flagged root was never even considered for planning.
+    assert called_roots == [root], (
+        f"flagged root must be short-circuited before planning; "
+        f"called_roots={called_roots}"
+    )
+    # No delivered marker for the flagged root.
+    assert kb.has_branch_summary(board_env, flagged) is None, (
+        "flagged synthetic root must never receive a delivered marker"
+    )
+    assert _read_suppression_journal() == [], (
+        "no suppression journal for the ordinary terminal итог"
+    )
+
+
+@pytest.mark.asyncio
+async def test_branch_summary_flagged_only_root_not_delivered_no_marker(
+    board_env, monkeypatch,
+):
+    """A board whose ONLY subscribed root is flagged yields zero deliveries.
+
+    Guard for boards produced exclusively by synthetic readback: with nothing
+    but do_not_deliver roots, the branch-summary watcher must produce no plan,
+    no TG ping and no marker — leaving the board silent (no manual re-send).
+    """
+    flagged = _mk_flagged(board_env, "[F7 readback] wave fixture")
+    kb.add_notify_sub(
+        board_env, task_id=flagged, platform="telegram", chat_id="tg-chat-fl",
+    )
+    kb.complete_task(board_env, flagged, summary="readback")
+
+    called_roots = []
+    runner = _make_runner(adapter := RecordingAdapter())
+    real_plan = runner._plan_branch_summary
+
+    def spy_plan(conn, root_id, root_subs, board_slug):
+        called_roots.append(root_id)
+        return real_plan(conn, root_id, root_subs, board_slug)
+
+    runner._plan_branch_summary = spy_plan
+
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    assert adapter.sent == [], (
+        f"flagged-only board must produce no delivery; got {adapter.sent}"
+    )
+    assert called_roots == [], (
+        f"flagged-only board must short-circuit every root; called_roots={called_roots}"
+    )
+    assert kb.has_branch_summary(board_env, flagged) is None, (
+        "flagged-only root must not be marked delivered"
+    )
+    # Second tick stays silent too (nothing is left pending).
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert adapter.sent == [], (
+        f"repeat tick must remain silent on a flagged-only board; got {adapter.sent}"
     )

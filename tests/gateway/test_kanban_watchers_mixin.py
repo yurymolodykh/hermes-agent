@@ -172,3 +172,27 @@ async def test_deliver_kanban_artifacts_same_name_diff_content_not_deduped(tmp_p
         "одинаковое имя при РАЗНОМ содержимом — оба должны дойти: "
         f"{adapter.documents}"
     )
+
+
+# ---------------------------------------------------------------------------
+# do_not_deliver helper (t_01d91fbf / t_896ff347): the defensive read of the
+# synthetic-readback delivery-suppression flag must never raise and must map
+# every real-world stored value to the correct boolean.
+# ---------------------------------------------------------------------------
+
+
+def test_task_do_not_deliver_defensive_truth_table():
+    from gateway.kanban_watchers import _task_do_not_deliver
+
+    # None task row (e.g. task deleted / stale sub) -> not a delivery subject
+    # reason, so False (deliver normally is NOT the case here — see the
+    # helper's docstring: None -> False means "not flagged").
+    assert _task_do_not_deliver(None) is False
+    # Missing attribute (older cached model instances) -> False
+    assert _task_do_not_deliver(SimpleNamespace()) is False
+    # Default/ordinary stored value 0 -> False
+    assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=0)) is False
+    assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=False)) is False
+    # Flagged synthetic readback -> True
+    assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=True)) is True
+    assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=1)) is True

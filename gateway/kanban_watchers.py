@@ -93,6 +93,24 @@ def _kanban_branch_summary_replace() -> bool:
         return False
 
 
+def _task_do_not_deliver(task) -> bool:
+    """True when a card is marked ``do_not_deliver`` (synthetic readback).
+
+    Synthetic [F7 readback] verification fixtures and watcher-created
+    bookkeeping cards carry ``tasks.do_not_deliver = 1``: they are
+    bookkeeping-only and must NEVER become a delivery subject for the
+    terminal notifier (Telegram mirrors, api_server staging, notifier wakes)
+    or the branch-summary итог routing. Ordinary user-created cards leave the
+    flag at its default ``False`` and are delivered exactly as before.
+
+    The guard is defensive: ``task`` may be ``None`` (task row missing) and
+    the attribute may not exist on older cached model instances.
+    """
+    if task is None:
+        return False
+    return bool(getattr(task, "do_not_deliver", False))
+
+
 def _tg_delivery_policy_allowed_users() -> list:
     """Parse ``TELEGRAM_ALLOWED_USERS`` env into a list of chat/user ids."""
     try:
@@ -412,9 +430,55 @@ _MISSION_CONTROLLER_LIVE_STATUSES = frozenset({
 })
 
 
+#: D5 (delivery-fix): detached controllers and their work cards subscribe
+#: back-to-back from the same mission run; independent tasks land in the same
+#: owner chat much later (or earlier). Only subscriptions created within this
+#: window of each other count as same mission session.
+_MISSION_SESSION_WINDOW_SECONDS = 3600
+
+
+def _mission_controller_related(conn, root_id, controller_id) -> bool:
+    """D5: is the live goal_mode controller part of the SAME mission as the
+    closing branch root?
+
+    Attribution paths (either makes them related):
+      1. task_links: the controller is an ancestor of the root (linked tree);
+      2. session window: both api_server subscriptions were created in the
+         same chat within the window - the detached-controller case.
+
+    Anything else (a live controller that merely shares the chat) is an
+    INDEPENDENT task: its terminality must not be hijacked.
+    """
+    try:
+        ancestors = kb.get_ancestor_ids(conn, root_id)
+        if controller_id in ancestors:
+            return True
+    except Exception:
+        pass
+    try:
+        row = conn.execute(
+            "SELECT n.chat_id, n.created_at FROM kanban_notify_subs n "
+            "WHERE n.task_id = ? AND n.platform = 'api_server' "
+            "ORDER BY n.created_at LIMIT 1",
+            (root_id,),
+        ).fetchone()
+        if not row or not row["chat_id"] or not row["created_at"]:
+            return False
+        chat, created = str(row["chat_id"]), int(row["created_at"])
+        crow = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = 'api_server' AND chat_id = ? "
+            "AND ABS(created_at - ?) <= ? LIMIT 1",
+            (controller_id, chat, created, _MISSION_SESSION_WINDOW_SECONDS),
+        ).fetchone()
+        return crow is not None
+    except Exception:
+        return False
+
+
 def _has_live_mission_controller(conn, kb, task_id: str) -> bool:
-    """True when a LIVE goal_mode mission controller shares task_id's OWUI
-    session.
+    """True when a LIVE goal_mode mission controller belongs to the SAME
+    mission tree/session as task_id (D5-scoped).
 
     A kanban "mission" is driven by an orchestrator controller card created
     with ``goal_mode=True`` (a Ralph-style goal loop worker).  The controller
@@ -422,20 +486,19 @@ def _has_live_mission_controller(conn, kb, task_id: str) -> bool:
     the controller is live is an INTERMEDIATE close of the whole mission, not
     its terminal итог (F9, t_85a095e0).
 
-    The controller is deliberately NOT located via ``task_links``: orchestrator
-    controllers on this board are routinely created detached from the worker
-    subtree (the R4 sno-economics case: t_2cfdc4e4 goal_mode=1 running, no
-    ``task_links`` edge to the t_7d11fc80 R1 subtree).  The robust mission
-    identity is the shared **OWUI session**: every card of a mission carries an
-    ``api_server`` notification subscription on the same ``chat_id`` (the
-    originating Open WebUI thread).  So the predicate is: is there any task
-    with ``goal_mode=1``, a live status, and an ``api_server`` subscription on
-    the same chat_id as ``task_id``'s own ``api_server`` subscription?
+    Controllers are located via ``task_links`` when linked, and via a
+    subscription-timing window when detached (the R4 sno-economics case:
+    controller + its work cards subscribe back-to-back from one mission run).
+    D5: a live controller that merely shares the chat (an independent task in
+    flight) NO LONGER de-terminalizes unrelated closed trees - that chat-wide
+    reading starved the owner of every terminal result while ANY mission was
+    open.
 
     Returns ``False`` when ``task_id`` has no api_server subscription of its
     own (the signal is meaningless outside an OWUI mission) and when no live
-    controller shares its session.  Fail-closed: a controller that cannot be
-    located (no shared sub) simply does not change the terminal decision.
+    controller belongs to the same mission.  Fail-closed: a controller that
+    cannot be attributed to this mission does not change the terminal
+    decision.
     """
     row = conn.execute(
         "SELECT chat_id FROM kanban_notify_subs "
@@ -445,18 +508,29 @@ def _has_live_mission_controller(conn, kb, task_id: str) -> bool:
     if not row or not row["chat_id"]:
         return False
     session = str(row["chat_id"])
-    rows = conn.execute(
-        "SELECT t.id FROM tasks t "
+    # D5: candidates are live goal_mode controllers subscribed in the same
+    # chat; each must additionally pass same-mission attribution before it
+    # may de-terminalize this root (see _mission_controller_related).
+    cand_rows = conn.execute(
+        "SELECT DISTINCT t.id FROM tasks t "
         "WHERE t.goal_mode = 1 AND t.status IN (%s) "
         "AND EXISTS ("
         "  SELECT 1 FROM kanban_notify_subs n "
         "  WHERE n.task_id = t.id AND n.platform = 'api_server' "
         "  AND n.chat_id = ?"
-        ") LIMIT 1"
+        ")"
         % (", ".join("?" * len(_MISSION_CONTROLLER_LIVE_STATUSES))),
         (*sorted(_MISSION_CONTROLLER_LIVE_STATUSES), session),
-    ).fetchone()
-    return rows is not None
+    ).fetchall()
+    for cand in cand_rows:
+        cid = str(cand["id"])
+        if cid == task_id:
+            # The closing card IS the live controller: the mission it
+            # drives is unambiguously in flight.
+            return True
+        if _mission_controller_related(conn, task_id, cid):
+            return True
+    return False
 
 
 def _branch_summary_terminal(conn, kb, root_id: str) -> bool:
@@ -1400,6 +1474,16 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Synthetic readback cards (do_not_deliver=1,
+                                    # e.g. [F7 readback] verification fixtures)
+                                    # must NEVER be delivered to any channel:
+                                    # no text ping, no api_server staging, no
+                                    # wake. The events stay CLAIMED so the
+                                    # cursor advances past them below (same
+                                    # non-replay semantics as the `silent`
+                                    # branch_summary_replace skip) — they can
+                                    # never wedge the subscription.
+                                    do_not_deliver = _task_do_not_deliver(task)
                                     # K1 RF2/RF3: expose branch-root marker and
                                     # the branch owner's TG id to the policy
                                     # gate. A task is a branch ROOT when NONE
@@ -1478,6 +1562,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "silent": silent,
+                                        "do_not_deliver": do_not_deliver,
                                         "task_is_root": task_is_root,
                                         "mission_live": mission_live,
                                         "task_tg_owner": task_tg_owner,
@@ -1549,10 +1634,13 @@ class GatewayKanbanWatchersMixin:
                     # terminal event goes through the persisted chat outbox.
                     wake_agent = mode in ("notify+wake", "wake") and platform_str != "api_server"
                     send_passive = mode != "wake" or platform_str == "api_server"
-                    if d.get("silent"):
-                        # branch_summary_replace: nothing to send or wake for
-                        # this subscription — the branch итог is the single
-                        # channel message. Cursor still advances below.
+                    if d.get("silent") or d.get("do_not_deliver"):
+                        # silent (branch_summary_replace): nothing to send or
+                        # wake for this subscription — the branch итог is the
+                        # single channel message.  do_not_deliver: synthetic
+                        # readback cards are never a delivery subject at all.
+                        # Either way nothing is sent or woken, and the cursor
+                        # still advances below (events already claimed).
                         wake_agent = False
                         send_passive = False
                     # Worker handoff carried into the synthetic wake turn below
@@ -1567,10 +1655,13 @@ class GatewayKanbanWatchersMixin:
                     _tg_suppressed_event_ids: set = set()
                     for ev in d["events"]:
                         kind = ev.kind
-                        if d.get("silent") and kind in TERMINAL_KINDS:
-                            # Suppressed in branch_summary_replace mode. The
-                            # event is claimed so the cursor advances below and
-                            # it can never replay/wedge the sub.
+                        if (d.get("silent") and kind in TERMINAL_KINDS) or d.get("do_not_deliver"):
+                            # silent (branch_summary_replace): the branch итог
+                            # is the single channel message. do_not_deliver:
+                            # synthetic readback cards are never delivered.
+                            # Either way the event is claimed so the cursor
+                            # advances below and it can never replay/wedge
+                            # the sub.
                             continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -1588,8 +1679,15 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
+                                try:
+                                    # RESULT-BLOCK: показать первую FACTS-строку
+                                    # (компактная сводка) вместо сырого "RESULT-BLOCK v1".
+                                    from hermes_cli.handoff_result_block import chat_line as _hrb_chat
+                                    h = _hrb_chat(payload_summary) or payload_summary
+                                except Exception:
+                                    h = payload_summary
+                                if len(h) > 200:
+                                    h = h[:200]
                                 handoff = f"\n{h}"
                                 wake_handoff = h
                             elif task and task.result:
@@ -1644,7 +1742,12 @@ class GatewayKanbanWatchersMixin:
                             # first-class review lane. Wake the origin thread.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                try:
+                                    # RESULT-BLOCK: компактная сводка из FACTS.
+                                    from hermes_cli.handoff_result_block import chat_line as _hrb_chat
+                                    handoff = f"\n{(_hrb_chat(str(ev.payload['summary'])) or str(ev.payload['summary']))[:200]}"
+                                except Exception:
+                                    handoff = f"\n{str(ev.payload['summary'])[:200]}"
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
@@ -2388,6 +2491,13 @@ class GatewayKanbanWatchersMixin:
                                     str(sub.get("task_id")), []
                                 ).append(sub)
                             for root_id in roots:
+                                # A synthetic readback / bookkeeping root
+                                # (do_not_deliver=1) is never a branch-summary
+                                # delivery subject: the итог must not be
+                                # planned, marked, or delivered for it.
+                                _root_task = _kb.get_task(conn, root_id)
+                                if _task_do_not_deliver(_root_task):
+                                    continue
                                 # A channel subscribed to ANY task of the
                                 # branch must receive the итог — in
                                 # ``kanban.branch_summary_replace`` mode its
@@ -2532,6 +2642,11 @@ class GatewayKanbanWatchersMixin:
         concurrent gateways cannot double-deliver a fresh итог.
         """
         from hermes_cli import kanban_db as _kb
+        # Synthetic readback/bookkeeping roots (do_not_deliver=1) are never a
+        # branch-summary subject; a direct caller (e.g. a test) must get the
+        # same skip the watcher loop applies before planning.
+        if _task_do_not_deliver(_kb.get_task(conn, root_id)):
+            return None
         st = _kb.branch_state(conn, root_id)
         if st is None:
             # Branch is open. If a marker from a previous close lingers, clear
