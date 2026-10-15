@@ -1775,7 +1775,19 @@ class GatewayKanbanWatchersMixin:
                     _tg_suppressed_event_ids: set = set()
                     for ev in d["events"]:
                         kind = ev.kind
-                        if (d.get("silent") and kind in TERMINAL_KINDS) or d.get("do_not_deliver"):
+                        # Legacy branch_summary_replace suppression: a strict
+                        # DESCENDANT of a subscribed branch root is claimed +
+                        # silent in the notifier — the whole-branch итог (from
+                        # _kanban_branch_summary_watcher) is the single channel
+                        # message. This legacy rule is deliberately kept OUT of
+                        # the api_server lane: there the canonical predicate
+                        # below is the sole suppression authority, so loud
+                        # human-action kinds (blocked+provider_route,
+                        # block_loop_detected, review_requested, triage) on
+                        # api_server descendants are NOT blanket-dropped here.
+                        if ((d.get("silent") and kind in TERMINAL_KINDS
+                             and platform_str != "api_server")
+                                or d.get("do_not_deliver")):
                             # silent (branch_summary_replace): the branch итог
                             # is the single channel message. do_not_deliver:
                             # synthetic readback cards are never delivered.
@@ -1783,19 +1795,33 @@ class GatewayKanbanWatchersMixin:
                             # advances below and it can never replay/wedge
                             # the sub.
                             continue
-                        if _owui_suppress_intermediate_event(
-                            kind, ev, bool(d.get("replace_summary")),
-                            platform_str,
-                        ):
-                            # api_server lane in branch_summary_replace mode:
-                            # an intermediate state change (plain completed/
-                            # status/archived/unblocked, self-resolving blocked)
-                            # stays claimed+silent — the branch итог from
-                            # _kanban_branch_summary_watcher is the single
-                            # channel message, and human-action kinds are kept
-                            # loud by the helper. Nothing is staged to the
-                            # OWUI outbox and the OWUI→TG mirror is skipped
-                            # (the same event must not leak to TG either).
+                        # api_server lane in branch_summary_replace mode: the
+                        # canonical predicate is the sole suppression
+                        # authority. An intermediate state change (plain
+                        # completed/status/archived/unblocked, self-resolving
+                        # blocked on ANY card — child, root, or unsubscribed)
+                        # stays claimed+silent — the branch итог from
+                        # _kanban_branch_summary_watcher is the single channel
+                        # message, and human-action kinds (blocked with
+                        # provider_route / needs_input / capability,
+                        # block_loop_detected, review_requested, triage) are
+                        # kept loud by the predicate. Nothing is staged to the
+                        # OWUI outbox and the OWUI→TG mirror is skipped (the
+                        # same event must not leak to TG either). ``task`` (the
+                        # subscribed card, loaded above) is passed as ``card``
+                        # so the card-status==triage rule is meaningful;
+                        # ``parent`` is not needed at this call site (the
+                        # predicate decides on kind/payload/card-status alone
+                        # in replace mode).
+                        if (platform_str == "api_server"
+                                and should_suppress_api_server_event(
+                                    ev,
+                                    card=task,
+                                    parent=None,
+                                    branch_summary_replace=bool(
+                                        d.get("replace_summary")
+                                    ),
+                                )):
                             continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
