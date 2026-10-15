@@ -92,6 +92,22 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+
+def _import_handoff_result_block():
+    """Lazily import the structured result-block helper module.
+
+    Kept lazy so nothing in the hot connect/init path pays the import cost,
+    and so a missing module can never break board operations unrelated to
+    worker-context rendering.
+    """
+    from hermes_cli.handoff_result_block import (  # noqa: PLC0415
+        chat_line as _hrb_chat_line,
+        has_result_block as _hrb_has,
+        metadata_diff as _hrb_metadata_diff,
+        parse_result_block as _hrb_parse,
+    )
+    return _hrb_has, _hrb_parse, _hrb_chat_line, _hrb_metadata_diff
+
 _log = logging.getLogger(__name__)
 
 
@@ -505,6 +521,10 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+# Caps the per-key value list when compact-printing uncovered metadata keys
+# for RESULT-BLOCK parents (result-block contract, t_084230a5). Long lists
+# (e.g. 40 changed files) stay bounded without the full JSON dump.
+_CTX_META_EXTRA_MAX      = 8
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -14138,6 +14158,95 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+def _render_parent_handoff(run, fallback_result: Optional[str]) -> list[str]:
+    """Render ONE upstream parent's handoff for a downstream worker.
+
+    When the parent's ``summary`` is written in the structured
+    ``RESULT-BLOCK`` format (result-block contract, t_084230a5), render the
+    block's canonical form and do NOT append the redundant ``_metadata_`` JSON
+    dump — the block's FACTS/PATHS/LIMITATIONS already carry the structured
+    facts, and appending a full JSON dump duplicates them (input reduction,
+    Н3). Structured metadata keys not covered by the block (e.g. a bare
+    ``model`` key) are surfaced as a short compact line rather than a full
+    pretty JSON dump.
+
+    Legacy prose summaries (no ``RESULT-BLOCK`` marker) keep the historical
+    rendering: full summary + ``_metadata_`` JSON dump. Backward compatible.
+    """
+    import json as _json
+
+    is_block = False
+    body: list[str] = []
+    if run is not None and run.summary and run.summary.strip():
+        try:
+            _hrb_has, _hrb_parse, _hrb_chat, _hrb_diff = _import_handoff_result_block()
+            if _hrb_has(run.summary):
+                parsed = _hrb_parse(run.summary)
+                if parsed is not None:
+                    is_block = True
+                    lines_: list[str] = []
+                    for name in ("FACTS", "PATHS", "LIMITATIONS"):
+                        items = parsed.get(name) or []
+                        if items:
+                            lines_.append(f"{name}:")
+                            lines_.extend(f"- {it}" for it in items)
+                    body.append("RESULT-BLOCK v1")
+                    body.extend(lines_)
+        except Exception:
+            # Never let the renderer break the worker context; fall back to
+            # the legacy full-text path on any helper failure.
+            is_block = False
+            body = []
+    if not is_block:
+        # Legacy path (unchanged behaviour).
+        if run is not None and run.summary and run.summary.strip():
+            body.append(run.summary)
+        elif fallback_result:
+            body.append(_cap_ctx(fallback_result))
+        else:
+            body.append("(no result recorded)")
+    if is_block and run is not None and run.metadata:
+        # Structured metadata NOT covered by the block → compact short line.
+        try:
+            _hrb_diff = _import_handoff_result_block()[3]
+            diff = _hrb_diff(run.metadata)
+            extra = []
+            for key in sorted(diff):
+                items = diff[key]
+                shown = ", ".join(str(x) for x in items[:_CTX_META_EXTRA_MAX])
+                extra.append(f"{key}={shown}")
+            if extra:
+                body.append(f"metadata: " + "; ".join(extra))
+        except Exception:
+            pass
+    elif not is_block and run is not None and run.metadata:
+        # Legacy: full JSON dump as before.
+        try:
+            meta_str = _json.dumps(
+                run.metadata, ensure_ascii=False, sort_keys=True
+            )
+            body.append(f"_metadata_: `{_cap_ctx(meta_str)}`")
+        except Exception:
+            pass
+    return body
+
+
+def _cap_ctx(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Truncate a string to `limit` chars with a visible ellipsis.
+
+    Module-scope equivalent of the former closure inside
+    ``build_worker_context`` — shared by the worker-context builder and the
+    result-block renderer (``_render_parent_handoff``) which both cap
+    handoff text.
+    """
+    if not s:
+        return ""
+    s = str(s).strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -14170,15 +14279,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # by the seconds it takes to build the block).
     _now = int(time.time())
 
-    def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-        """Truncate a string to `limit` chars with a visible ellipsis."""
-        if not s:
-            return ""
-        s = s.strip()
-        if len(s) <= limit:
-            return s
-        return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-
     lines: list[str] = []
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
@@ -14202,7 +14302,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     if task.body and task.body.strip():
         lines.append("## Body")
-        lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append(_cap_ctx(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
@@ -14255,13 +14355,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             outcome = run.outcome or run.status
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
             if run.summary and run.summary.strip():
-                lines.append(_cap(run.summary))
+                lines.append(_cap_ctx(run.summary))
             if run.error and run.error.strip():
-                lines.append(f"_error_: {_cap(run.error)}")
+                lines.append(f"_error_: {_cap_ctx(run.error)}")
             if run.metadata:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    lines.append(f"_metadata_: `{_cap(meta_str)}`")
+                    lines.append(f"_metadata_: `{_cap_ctx(meta_str)}`")
                 except Exception:
                     pass
             lines.append("")
@@ -14306,20 +14406,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             age = _relative_age(done_ts, _now)
             lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
 
-            body_lines: list[str] = []
-            if run is not None and run.summary and run.summary.strip():
-                body_lines.append(_cap(run.summary))
-            elif pt.result:
-                body_lines.append(_cap(pt.result))
-            else:
-                body_lines.append("(no result recorded)")
-
-            if run is not None and run.metadata:
-                try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
-                    pass
+            body_lines = _render_parent_handoff(run, pt.result)
             lines.extend(body_lines)
             lines.append("")
 
@@ -14380,7 +14467,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
             lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
-            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+            lines.append(_cap_ctx(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
