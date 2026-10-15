@@ -422,6 +422,125 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
     return f"{msg}\n\n{art}"
 
 
+#: Kinds that ALWAYS stay loud on the api_server lane, even in
+#: branch_summary_replace mode.  These are either terminal-failure states the
+#: branch итог lists, or explicit "needs a human decision" transitions that
+#: must reach the origin OWUI session immediately (they carry no equivalent in
+#: the branch_summary_message, and the whole point of ``block_loop_detected`` /
+#: ``review_requested`` is to force human attention).
+_OWUI_ALWAYS_LOUD_KINDS = frozenset({
+    "gave_up", "crashed", "timed_out",
+    "block_loop_detected", "review_requested",
+})
+
+
+def should_suppress_api_server_event(event, card, parent,
+                                     branch_summary_replace) -> bool:
+    """Pure predicate: is ``event`` an intermediate api_server-lane noise.
+
+    With ``kanban.branch_summary_replace: true`` the api_server (OWUI) lane
+    must NOT emit a per-event ping for every intermediate state change of a
+    mission tree — the user only wants the terminal branch итог (delivered by
+    ``_kanban_branch_summary_watcher``, which appends the root report artifact
+    inline) plus anything that genuinely needs their action.
+
+    Returns True to SUPPRESS the event (skip OWUI staging + OWUI→TG mirror +
+    text ping — the event is still claimed so the subscription cursor advances
+    and it can never wedge/replay), False to deliver normally.
+
+    Suppressed (True) — INTERMEDIATE events:
+      * any descendant card (``parent`` present): child / sub-branch cards,
+        including abrupt mid-tree closes ([split N/M], one-off child done);
+      * plain non-terminal ``completed`` / ``status`` / ``archived`` /
+        ``unblocked`` and a self-resolving ``blocked`` (dependency/transient);
+      * the SAME routine kinds even for ROOT / unsubscribed tasks — under
+        replace mode the root's own completion ping is not the итог: the
+        branch_summary stage owns that single channel message.
+
+    Loud (False) — NOT suppressed:
+      * the terminal ``branch_summary`` event itself (the whole-branch итог);
+      * ``_OWUI_ALWAYS_LOUD_KINDS`` — terminal-failure / human-attention kinds
+        (gave_up, crashed, timed_out, block_loop_detected, review_requested);
+      * ``blocked`` that requires an operator route choice or a human fix —
+        provider outage (payload ``provider_route``) or a needs-a-fix
+        ``block_kind`` (``needs_input`` / ``capability`` / legacy NULL);
+      * a card routed to ``triage`` (human decision needed).
+
+    The predicate is PURE and side-effect free. ``card``/``parent`` may be
+    ``None`` (row missing / no parent). Returns False whenever
+    ``branch_summary_replace`` is off — replace mode OFF means additive,
+    per-event notifications keep flowing exactly as before. The TG
+    delivery-policy gate is deliberately OUT of scope: this predicate is
+    api_server-lane only and never alters Telegram behavior.
+    """
+    if not branch_summary_replace:
+        return False
+    if event is None:
+        return False
+    kind = str(getattr(event, "kind", "") or "").strip()
+    # An unclassifiable event (no kind) must never be silently dropped — a
+    # malformed/unknown event is ambiguous, and on the api_server lane the
+    # cost of losing a real terminal итог far outweighs one extra ping.
+    if not kind:
+        return False
+    try:
+        payload = getattr(event, "payload", None) or {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    # The terminal whole-branch итог is the single channel message — it is
+    # NEVER suppressed (nothing downstream re-emits it if it is).
+    if kind == "branch_summary":
+        return False
+    # Terminal-failure / human-attention kinds always stay loud.
+    if kind in _OWUI_ALWAYS_LOUD_KINDS:
+        return False
+    # A card routed to triage needs a human decision — never drop it, whether
+    # signalled via an explicit ``triage`` event kind or the card status.
+    if kind == "triage":
+        return False
+    card_status = str(getattr(card, "status", "") or "").strip()
+    if card_status == "triage":
+        return False
+    if kind == "blocked":
+        block_kind = str(payload.get("kind") or "").strip() or None
+        if payload.get("provider_route"):
+            return False  # provider outage — operator must pick a route
+        if block_kind in ("needs_input", "capability"):
+            return False  # human fix required
+        if block_kind is None:
+            # Legacy un-typed block → treated as a human blocker (same rule as
+            # classify_branch_node_status / branch_state).
+            return False
+        # dependency / transient / any other auto-resolving kind → routine.
+        return True
+    # completed / status / archived / unblocked / any other routine kind —
+    # intermediate on the mission tree, suppressed under replace mode
+    # (including root / unsubscribed cards: the branch итог is the итог).
+    return True
+
+
+def _owui_suppress_intermediate_event(kind: str, ev: Any,
+                                      replace_summary: bool,
+                                      platform_str: str) -> bool:
+    """Legacy forwarding shim for ``should_suppress_api_server_event``.
+
+    Keeps the existing call site (which passes ``kind``/``ev``/platform
+    separately) behaviourally identical while routing through the canonical
+    pure predicate.  Gates on the api_server lane + replace mode first, then
+    delegates; ``card``/``parent`` are unknown at this call site so they are
+    passed as None (the canonical predicate still suppresses all routine
+    intermediate kinds and keeps the loud set + blocked-with-provider_route /
+    needs-human-fix cases).
+    """
+    if platform_str != "api_server" or not replace_summary:
+        return False
+    return should_suppress_api_server_event(
+        ev, card=None, parent=None, branch_summary_replace=replace_summary,
+    )
+
+
 #: Live statuses for a goal_mode mission controller: while ANY of these hold
 #: the mission is still in flight, so a leaf/daughter close must NOT be treated
 #: as the terminal итог of the whole tree.
@@ -1562,6 +1681,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "silent": silent,
+                                        "replace_summary": replace_summary,
                                         "do_not_deliver": do_not_deliver,
                                         "task_is_root": task_is_root,
                                         "mission_live": mission_live,
@@ -1662,6 +1782,20 @@ class GatewayKanbanWatchersMixin:
                             # Either way the event is claimed so the cursor
                             # advances below and it can never replay/wedge
                             # the sub.
+                            continue
+                        if _owui_suppress_intermediate_event(
+                            kind, ev, bool(d.get("replace_summary")),
+                            platform_str,
+                        ):
+                            # api_server lane in branch_summary_replace mode:
+                            # an intermediate state change (plain completed/
+                            # status/archived/unblocked, self-resolving blocked)
+                            # stays claimed+silent — the branch итог from
+                            # _kanban_branch_summary_watcher is the single
+                            # channel message, and human-action kinds are kept
+                            # loud by the helper. Nothing is staged to the
+                            # OWUI outbox and the OWUI→TG mirror is skipped
+                            # (the same event must not leak to TG either).
                             continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
