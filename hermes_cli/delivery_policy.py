@@ -187,19 +187,44 @@ def _condense_interim(text: str) -> str:
         return text
     if not any(low.startswith(stamp) for stamp in _INTERIM_STAMPS):
         return text
-    if not (re.search(_FUTURE_TENSE_RE, low) and re.search(_SEQUENCE_RE, low)):
-        # No forward-looking plan intent — a completed narrative ("Сначала я
-        # проверил…, потом сделал…") must not lose its results.
+    future_matches = list(_FUTURE_TENSE_RE.finditer(low))
+    has_sequence = bool(re.search(_SEQUENCE_RE, low))
+    if not future_matches:
+        # No forward-looking intent at all — a completed narrative stays intact.
+        return text
+    if not (has_sequence or len(future_matches) >= 2):
+        # One short forward verb with no sequencing is not a long plan.
         return text
     # First paragraph.
     first = text.strip()
     para = first.split("\n", 1)[0]
     # First sentence within the paragraph.
+    had_sentence_split = False
     for sep in ("。", ". ", "! ", "? ", " — ", "…", " — "):
         if sep in para:
             para = para.split(sep, 1)[0] + ("。" if sep == "。" else ". ")
+            had_sentence_split = True
             break
     para = para.strip()
+    if had_sentence_split:
+        # Multi-sentence interim block: the first sentence IS the short
+        # "работа идёт" signal.
+        if len(para) > _INTERIM_KEEP_FIRST_SENTENCE:
+            para = para[:_INTERIM_KEEP_FIRST_SENTENCE].rstrip() + "…"
+        return para
+    # Single (unbroken) sentence plan — e.g. "сейчас сделаю X, потом Y,
+    # затем Z…".  No sentence separator exists, so the whole paragraph is one
+    # long forward-looking plan: cut at the first sequence marker so only the
+    # first stage survives (a short "работа идёт" signal).  When no sequence
+    # marker exists (pure comma chain), cut at the SECOND future-tense verb so
+    # a long plan never rides through verbatim.
+    m = _SEQUENCE_RE.search(para)
+    if m and m.start() > 0:
+        para = para[: m.start()].rstrip(" ,;:") + "…"
+    else:
+        verbs = list(_FUTURE_TENSE_RE.finditer(para))
+        if len(verbs) >= 2:
+            para = para[: verbs[1].start()].rstrip(" ,;:") + "…"
     if len(para) > _INTERIM_KEEP_FIRST_SENTENCE:
         para = para[:_INTERIM_KEEP_FIRST_SENTENCE].rstrip() + "…"
     return para

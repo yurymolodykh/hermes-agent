@@ -107,3 +107,42 @@ def test_sanitize_idempotent():
     once = sanitize_delivery_text(text)
     twice = sanitize_delivery_text(once)
     assert twice == once
+
+
+def test_condense_single_sentence_comma_joined_plan():
+    """A long one-sentence 'сейчас сделаю X, потом Y, затем Z…' plan must be
+    cut at the first sequence marker — it is an in-flight thought, not a final
+    result (regression for t_9788fb90)."""
+    plan = (
+        "Сейчас сделаю полный аудит всех конфигураций сервера, затем обновлю "
+        "все зависимости, потом перезапущу gateway и проверю, что всё работает "
+        "корректно, после чего отправлю полный отчёт пользователю, если не будет "
+        "ошибок."
+    )
+    assert len(plan) > 120  # above the interim floor
+    out = _condense_interim(plan)
+    assert len(out) < len(plan)
+    assert out.startswith("Сейчас сделаю полный аудит всех конфигураций")
+    assert "ошибок" not in out  # later stages dropped
+
+
+def test_condense_single_sentence_no_sequence_marker():
+    """A long comma-chain without an explicit sequence marker must not ride
+    through verbatim — hard-cap it so only the short signal survives."""
+    plan = (
+        "Сейчас сделаю проверку всех конфигураций на сервере, обновлю базу "
+        "данных, перезапущу gateway, сверю логи и сравню результаты с прошлым "
+        "запуском, отправлю полный отчёт."
+    )
+    assert len(plan) > 120
+    out = _condense_interim(plan)
+    assert len(out) < len(plan)
+    assert out.startswith("Сейчас сделаю")
+    assert len(out) <= 220 + 2
+
+
+def test_condense_keeps_single_sentence_short_plan():
+    """A short one-sentence plan (under the floor) is left untouched."""
+    plan = "Сейчас сделаю проверку конфигурации."
+    assert _condense_interim(plan) == plan
+
