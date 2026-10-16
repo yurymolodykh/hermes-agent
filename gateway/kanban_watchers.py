@@ -351,6 +351,7 @@ def _owui_artifact_text(artifacts: Any) -> str:
     """
     if artifacts is None:
         return ""
+    from hermes_cli.delivery_policy import sanitize_delivery_text
     paths = artifacts if isinstance(artifacts, (list, tuple)) else [artifacts]
     for raw in paths:
         if not isinstance(raw, str) or not raw.strip():
@@ -363,7 +364,12 @@ def _owui_artifact_text(artifacts: Any) -> str:
                 continue
             text = p.read_text(encoding="utf-8", errors="replace")[:_OWUI_ARTIFACT_MAX_CHARS]
             if text.strip():
-                return f"📄 Отчёт <b>{p.name}</b>:\n\n{text}"
+                # Reasoning hygiene: the report artifact rides inline in the
+                # OWUI chat message — strip reasoning_content / condense any
+                # leftover long interim blocks the report may carry.
+                text = sanitize_delivery_text(text)
+                if text:
+                    return f"📄 Отчёт <b>{p.name}</b>:\n\n{text}"
         except (OSError, ValueError):
             continue
     return ""
@@ -377,10 +383,11 @@ def _owui_completed_text(task_id: str, title: str, payload: Any, fallback: str) 
     """
     if not isinstance(payload, dict):
         return fallback
+    from hermes_cli.delivery_policy import sanitize_delivery_text
     parts = [f"✅ Kanban {task_id} done — {title}"]
     summary = payload.get("summary")
     if isinstance(summary, str) and summary.strip():
-        parts.append(summary.strip())
+        parts.append(sanitize_delivery_text(summary.strip()))
     art = _owui_artifact_text(payload.get("artifacts"))
     if art:
         parts.append(art)
@@ -416,10 +423,11 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
         conn.close()
     if not isinstance(payload, dict):
         return msg
+    from hermes_cli.delivery_policy import sanitize_delivery_text
     art = _owui_artifact_text(payload.get("artifacts"))
     if not art:
         return msg
-    return f"{msg}\n\n{art}"
+    return sanitize_delivery_text(f"{msg}\n\n{art}", max_chars=8000)
 
 
 #: Kinds that ALWAYS stay loud on the api_server lane, even in
@@ -2081,6 +2089,15 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+
+                        # Reasoning / interim hygiene (F1): strip model-internal
+                        # reasoning_content and condense long "сейчас сделаю…"
+                        # interim plans from the text that reaches OWUI (api_server)
+                        # and Telegram — the generic notifier message is the shared
+                        # payload for BOTH lanes. Pure, non-throwing; normal short
+                        # summaries pass through untouched.
+                        from hermes_cli.delivery_policy import sanitize_delivery_text
+                        msg = sanitize_delivery_text(msg, max_chars=1600)
 
                         # TG delivery-policy gate (D0 F1, ИНВ1/ИНВ2): skip
                         # recipient-mismatched and routine telegram events

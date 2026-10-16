@@ -32,6 +32,180 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
+# Санитизация текста доставки (reasoning / interim-шум)
+# --------------------------------------------------------------------------
+# ЕДИНАЯ точка очистки текста, который отправляется в OWUI (api_server) и
+# Telegram.  Гарантирует, что ``reasoning_content`` и длинные interim-тексты
+# «сейчас сделаю X…Y» не попадают в каналы доставки, даже если в payload
+# (summary/result/handoff) они присутствуют.  Чистые эвристики, без LLM.
+
+#: Reasoning-блоки, которые модели встраивают inline в основной текст.
+#: Синхронизировано с agent/think_scrubber.py::_OPEN_TAG_NAMES и
+#: cli.py _OPEN_TAGS/_CLOSE_TAGS.
+_THINK_OPEN_RE = re.compile(
+    r"(?:"
+    r"<REASONING_SCRATCHPAD>|<thinking>|<THINKING>|<reasoning>|<reasoning>|<thought>|<Thought>"
+    r"|─{3,}\s*thinking\s*─{3,}"
+    r"|```(?:reasoning|thinking)"
+    r")",
+    re.IGNORECASE,
+)
+_THINK_CLOSE_RE = re.compile(
+    r"(?:"
+    r"</REASONING_SCRATCHPAD>|</thinking>|</THINKING>|</reasoning>|</thought>"
+    r"|─{3,}\s*response\s*─{3,}"
+    r"|```"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Reasoning-поля, которые может тащить JSON/YAML-подобный payload
+#: (``reasoning_content: …``, ``"reasoning": …`` и т.п.).
+_REASONING_FIELD_RE = re.compile(
+    r"(?m)^\s*(?:reasoning_content|reasoning|reasoning_details|"
+    r"codex_reasoning_items|codex_message_items)"
+    r"\s*[:=]\s*[\"']?[^\n]{0,200}\n?",
+    re.IGNORECASE,
+)
+
+#: Ключевые слова interim-планирования «сейчас сделаю…» / «начинаю…».
+#: Если текст БОЛЬШЕ лимита и начинается с такого штампа, он считается
+#: незавершённым рассуждением вслух, а не финальным резюме, и обрезается.
+_INTERIM_STAMPS: tuple[str, ...] = (
+    "сейчас сделаю", "сейчас пробую", "сейчас проверю", "сейчас посмотрю",
+    "сейчас попробую", "щас сделаю", "начинаю с", "приступаю к",
+    "сейчас выясню", "сначала я", "сейчас гляну", "погнали",
+    "сперва посмотрю", "давай начнём", "давай начнем",
+)
+_INTERIM_KEEP_FIRST_SENTENCE: int = 220
+
+#: Нижняя граница длины «длинного» текста (для interim-подавления).
+_INTERIM_MIN_LENGTH: int = 120
+
+#: Маркеры «плана на будущее»: будущее время глагола + последовательность
+#: действий.  Только при наличии ОБОИХ текст считается незавершённым
+#: рассуждением вслух (plan), а не отчётом о сделанном.
+_FUTURE_TENSE_RE = re.compile(
+    r"\b(?:сделаю|проверю|обновлю|настрою|перезапущу|посмотрю|выясню|"
+    r"запущу|сверю|сравню|соберу|напишу|подготовлю|выполню|пройдусь|"
+    r"гляну|грону|проведу|разберу|попробую|проверять|обновлять|настроить)\b",
+)
+_SEQUENCE_RE = re.compile(r"\b(?:потом|затем|далее|после|сперва|сначала)\b")
+
+
+def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str:
+    """Убрать reasoning-блоки и обрезать long interim-тексты из текста доставки.
+
+    Применяется СРАЗУ ПЕРЕД отправкой в OWUI (api_server) и Telegram:
+     1. Коэрсия в строку (не-строки → ``""``).
+     2. Удаление reasoning/thinking-блоков (``…``, ``<reasoning>…``,
+        fenced ```reasoning…``` и т.п.) — случаи 1–3 из
+        ``agent_runtime_helpers.strip_think_blocks``.
+     3. Удаление полей ``reasoning_content`` / ``reasoning``, если они
+        попали в текст как JSON/YAML-подобные строки.
+     4. Interim-подавление: если текст начинается со штампа «сейчас сделаю…»
+        И длиннее ``_INTERIM_MIN_LENGTH`` — оставляем только первый абзац /
+        первое предложение (короткий сигнал «работа идёт»), обрезанный до
+        ``_INTERIM_KEEP_FIRST_SENTENCE``.  Это канал «что сделано…» без
+        простыни рассуждений о том, что ещё планируется.
+     5. Опциональный общий лимит ``max_chars`` (мягкий, на символ).
+
+    Функция ЧИСТАЯ (без side-эффектов) и не бросает исключений — очистка
+    никогда не должна ломать доставку.
+    """
+    if not isinstance(text, str):
+        if text is None:
+            return ""
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    if not text:
+        return ""
+
+    # 2. Reasoning/thinking-блоки.
+    stripped = _strip_think_blocks(text)
+    # 3. JSON/YAML-подобные reasoning-поля.
+    stripped = _REASONING_FIELD_RE.sub("", stripped)
+    # 4. Interim-подавление.
+    stripped = _condense_interim(stripped)
+    # 5. Общий лимит.
+    if max_chars is not None and max_chars > 0 and len(stripped) > max_chars:
+        stripped = stripped[:max_chars]
+    stripped = stripped.strip()
+    return stripped
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove inline reasoning/thinking blocks while preserving visible text.
+
+    Handles the same four shapes as ``agent.agent_runtime_helpers.
+    strip_think_blocks`` (closed pairs, unterminated open at boundary,
+    stray orphan tags, tag variants) using the shared tag vocabulary.
+    """
+    if not text:
+        return ""
+    # Closed pairs first: from the first open tag to its close tag.
+    while True:
+        m_open = _THINK_OPEN_RE.search(text)
+        if not m_open:
+            break
+        start = m_open.start()
+        rest = text[m_open.end():]
+        m_close = _THINK_CLOSE_RE.search(rest)
+        if m_close:
+            # Remove open…close inclusive, keep surrounding text.
+            text = text[:start] + rest[m_close.end():]
+        else:
+            # Unterminated open block: drop everything from the open tag on
+            # (matches the block-boundary handling in the agent scrubber).
+            text = text[:start]
+            break
+    # Stray orphan close tags.
+    text = _THINK_CLOSE_RE.sub("", text)
+    # Snip blank runs left by removed blocks (but preserve paragraphs).
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _condense_interim(text: str) -> str:
+    """Condense long 'сейчас сделаю X…Y' planning prose.
+
+    When the text starts with an interim stamp AND is longer than the floor,
+    AND reads as a forward-looking plan (future-tense markers + sequencing),
+    it is an in-flight thought, not a final result — keep only a short
+    'work in progress' signal (first sentence, bounded to
+    ``_INTERIM_KEEP_FIRST_SENTENCE`` chars). A long text that already
+    reports done work (past-tense markers) is left intact so real results
+    are never lost by over-condensation.
+    """
+    if not text:
+        return text
+    low = text.lstrip().lower()
+    if len(text) <= _INTERIM_MIN_LENGTH:
+        return text
+    if not any(low.startswith(stamp) for stamp in _INTERIM_STAMPS):
+        return text
+    if not (re.search(_FUTURE_TENSE_RE, low) and re.search(_SEQUENCE_RE, low)):
+        # No forward-looking plan intent — a completed narrative ("Сначала я
+        # проверил…, потом сделал…") must not lose its results.
+        return text
+    # First paragraph.
+    first = text.strip()
+    para = first.split("\n", 1)[0]
+    # First sentence within the paragraph.
+    for sep in ("。", ". ", "! ", "? ", " — ", "…", " — "):
+        if sep in para:
+            para = para.split(sep, 1)[0] + ("。" if sep == "。" else ". ")
+            break
+    para = para.strip()
+    if len(para) > _INTERIM_KEEP_FIRST_SENTENCE:
+        para = para[:_INTERIM_KEEP_FIRST_SENTENCE].rstrip() + "…"
+    return para
+
+
+# --------------------------------------------------------------------------
 # Конфиг-флаг
 # --------------------------------------------------------------------------
 
