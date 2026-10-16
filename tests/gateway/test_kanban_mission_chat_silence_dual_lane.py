@@ -32,11 +32,13 @@ This wires ``should_suppress_api_server_event`` and
 the exact shape the acceptance statement describes.
 
 Red→green proof (acceptance): with ``_kanban_branch_summary_replace`` forced
-to False (pre-wiring behavior) all four tests FAIL — per-child pings leak to
-TG, the intermediate-noise wave stages to OWUI, and the terminal итог is
+to False (pre-wiring behavior) the silence tests FAIL — per-child pings leak
+to TG, the intermediate-noise wave stages to OWUI, and the terminal итог is
 delivered per-event instead of as the single branch message. With the wired
-flag True (current behavior) all four PASS — silence restored on both lanes.
-Measured on this file: 4 failed (flag False) / 4 passed (flag True).
+flag True (current behavior) they PASS — silence restored on both lanes, and
+the human-action loud kinds (provider_route / block_loop_detected / triage)
+stay visible on BOTH lanes as 'нужно действие'. Measured on this file:
+8 tests on the wired flag True.
 """
 
 import asyncio
@@ -438,6 +440,89 @@ async def test_provider_route_block_loud_on_both_lanes(mission_env, monkeypatch)
     tg_texts = adapter_sent_texts(tg)
     assert len(tg_texts) == 1, f"provider_route block must reach TG: {tg_texts}"
     assert "blocked" in tg_texts[0]
+
+
+@pytest.mark.asyncio
+async def test_block_loop_detected_triage_loud_on_both_lanes(mission_env, monkeypatch):
+    """A child re-blocked for the same cause past the recurrence limit is
+    routed to TRIAGE (``block_loop_detected``) — the ONE transition that
+    exists to force human attention. It MUST stay visible on BOTH the OWUI
+    lane (staged with a TRIAGE ping) and the owner's bound TG chat, even
+    under replace mode ('блокировки при наличии')."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-loop", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-loop")
+
+    assert _complete(mission_env, root, summary="mission done")
+    # Emulate the recurrence-limit path (same shape as block_task when
+    # recurrences >= BLOCK_RECURRENCE_LIMIT): route to triage + emit the
+    # block_loop_detected event.
+    with kb.write_txn(mission_env):
+        payload = {
+            "reason": "re-blocked for the same cause",
+            "kind": "needs_input",
+            "recurrences": 2,
+            "limit": 2,
+        }
+        mission_env.execute(
+            "UPDATE tasks SET status='triage', block_kind='needs_input', "
+            "block_recurrences=2 WHERE id=? AND status IN ('running','ready')",
+            (child,),
+        )
+        kb._append_event(mission_env, child, "block_loop_detected", payload)
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    # OWUI lane: TRIAGE ping staged to the child's bound session.
+    assert len(staged) == 1, f"block_loop_detected must stage OWUI: {staged}"
+    assert staged[0][0] == "owui-child-loop"
+    assert "TRIAGE" in staged[0][1].upper()
+    # TG lane: block_loop_detected is a HUMAN_ACTION_KIND -> delivered to the
+    # owner's bound chat, not suppressed by the routine gate.
+    tg_texts = adapter_sent_texts(tg)
+    assert len(tg_texts) == 1, f"block_loop_detected must reach TG: {tg_texts}"
+    assert "TRIAGE" in tg_texts[0].upper()
+
+
+@pytest.mark.asyncio
+async def test_triage_card_routed_loud_on_both_lanes(mission_env, monkeypatch):
+    """A card routed to ``triage`` (card status) stays visible on BOTH lanes
+    even when only a routine ``completed`` event remains on it — the
+    notifier/predicate reads the card status and never drops a triage card
+    (acceptance: 'triage остаются видимыми').  The TG mirror classifies the
+    staged message by its content shape rather than dropping a triage card."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-triage", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-triage")
+
+    assert _complete(mission_env, root, summary="mission done")
+    with kb.write_txn(mission_env):
+        # Card routed to triage but the LAST claimed event is a routine
+        # completed — the predicate must still keep it loud via card.status.
+        mission_env.execute(
+            "UPDATE tasks SET status='triage' WHERE id=?", (child,),
+        )
+        kb._append_event(mission_env, child, "completed", {"summary": "done"})
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    # OWUI lane: the triage card stays loud (staged via card.status).
+    assert len(staged) == 1, f"triage card must stage OWUI: {staged}"
+    assert staged[0][0] == "owui-child-triage"
 
 
 # ---------------------------------------------------------------------------
