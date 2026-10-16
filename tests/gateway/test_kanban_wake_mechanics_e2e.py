@@ -214,6 +214,36 @@ async def test_self_resolving_child_blocked_does_not_wake(board_env, monkeypatch
     )
 
 
+@pytest.mark.asyncio
+async def test_routine_child_status_does_not_wake(board_env, monkeypatch):
+    """Non-terminal ``status`` event on a child card must NOT wake.
+
+    Acceptance scenario 3 (status half): a mid-tree status flip (e.g. a
+    child promoted ready / transitioned) is routine book-keeping — the
+    terminal branch итог owns the single wake under replace mode.
+    """
+    root = _mk(board_env, "root")
+    child = _mk(board_env, "child")
+    kb.link_tasks(board_env, root, child)
+    _tg_sub(board_env, root, "chat-root")
+    _tg_sub(board_env, child, "chat-child")
+
+    with kb.write_txn(board_env):
+        board_env.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='running'",
+            (child,),
+        )
+        kb._append_event(board_env, child, "status", {"status": "ready"})
+
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    assert adapter.handled == [], (
+        f"routine child status must not wake; got {len(adapter.handled)} wakes"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. Human-action events DO wake (even on descendants).
 # ---------------------------------------------------------------------------
@@ -264,6 +294,46 @@ async def test_child_block_loop_detected_wakes(board_env, monkeypatch):
 
     assert adapter.handled, (
         "child block_loop_detected must wake the creator; "
+        f"got {len(adapter.handled)} wakes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_triage_routed_card_wakes(board_env, monkeypatch):
+    """A card routed to ``triage`` must wake the creator.
+
+    Acceptance scenario 6 (triage half). In production a card reaches
+    ``triage`` status via the unblock-loop breaker / block_task
+    recurrence limit, and the DB layer emits a ``block_loop_detected``
+    event alongside the status flip — that is the real wake-worthy signal
+    (a standalone ``triage`` event kind is never emitted and is not in the
+    notifier's claimable TERMINAL_KINDS; the predicate's ``kind ==
+    "triage"`` branch is a defensive pure-function path only). This test
+    drives the EXACT production shape: task status ``triage`` +
+    ``block_loop_detected`` event on a descendant — and asserts the
+    creator is woken.
+    """
+    root = _mk(board_env, "root")
+    child = _mk(board_env, "child")
+    kb.link_tasks(board_env, root, child)
+    _tg_sub(board_env, root, "chat-root")
+    _tg_sub(board_env, child, "chat-child")
+
+    with kb.write_txn(board_env):
+        board_env.execute(
+            "UPDATE tasks SET status='triage' WHERE id=? AND status IN "
+            "('running','ready')",
+            (child,),
+        )
+        kb._append_event(board_env, child, "block_loop_detected",
+                         {"reason": "operator decision needed",
+                          "kind": "needs_input", "recurrences": 3})
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    assert adapter.handled, (
+        "triage-routed child (block_loop_detected) must wake the creator; "
         f"got {len(adapter.handled)} wakes"
     )
 
