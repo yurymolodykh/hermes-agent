@@ -595,3 +595,120 @@ async def test_terminal_itog_both_lanes_one_message_with_artifacts(mission_env, 
         assert _read_suppression_journal() == [], (
             f"no suppression expected for terminal delivery: {_read_suppression_journal()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 4. П.4 addressee: every owner gets THEIR OWN итог, never a foreign/home chat.
+#    (non-Yuri OWUI creator -> own OWUI chat + own bound TG chat, NOT home;
+#     unbound foreign creator -> OWUI-only, fail-closed, nothing to home)
+# ---------------------------------------------------------------------------
+
+
+FOREIGN_OWUI = "sess-owui-maria"
+FOREIGN_TG = "tg-maria-400500600"
+HOME_TG = "tg-home-yuri-900100200"
+
+
+@pytest.mark.asyncio
+async def test_p4_foreign_owner_with_binding_delivers_to_own_lanes(mission_env, monkeypatch):
+    """П.4 (t_6692dd10): a terminal итог created by a foreign OWUI owner
+    (Maria) who HAS a server binding goes to HER OWN OWUI chat AND HER OWN
+    bound TG chat — never to the home channel (Yuri 125805788) by default.
+
+    Regression guard for the 'отчёты приходят Юрию, а не постановщику'
+    complaint: the TG mirror must resolve ``owui_telegram_users[sub.user_id]``
+    (per-owner), not fall back to the configured home channel.
+    """
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    # Binding for the FOREIGN owner only; home is the OWNER_TG from the
+    # fixture. A per-owner fallback would (wrongly) target home.
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        json.dumps({OWNER_OWUI: OWNER_TG, FOREIGN_OWUI: FOREIGN_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+    # Maria's bound chat must be allowlisted (mirror gate: bound chat in
+    # ALLOWED/home before a TG lane exists for her).
+    monkeypatch.setenv(
+        "TELEGRAM_ALLOWED_USERS", ",".join([OWNER_TG, FOREIGN_TG, HOME_TG]),
+    )
+
+    root = _mk(mission_env, "mission-maria")
+    # Maria's OWUI session owns the mission; ONLY her subscription exists.
+    _owui_sub(mission_env, root, "owui-maria-request", user_id=FOREIGN_OWUI)
+    assert _complete(mission_env, root, summary="mission maria done")
+
+    # Notifier tick is covered by prior tests; here only the branch-summary
+    # lane decides the addressee, so go straight to the branch tick.
+    from gateway import kanban_origin_delivery as _kod
+
+    branch_staged = []
+
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        branch_staged.append(
+            (sub.get("chat_id"), sub.get("user_id"), message, event_id)
+        )
+        return ("acknowledged", 1)
+
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # OWUI lane: staged to MARIA's chat (never home/Yuri's).
+    assert branch_staged, f"no OWUI итог staged for Maria: {branch_staged}"
+    assert all(chat[0].startswith("owui-maria") for chat in branch_staged), (
+        f"OWUI итог must go to Maria's chat: {branch_staged}"
+    )
+    # TG mirror: delivered to Maria's OWN bound chat, never home.
+    tg_chats = [s["chat_id"] for s in tg.sent]
+    assert tg_chats == [FOREIGN_TG], (
+        f"П.4: foreign owner итог must reach her OWN TG chat, not home/Yuri: "
+        f"{tg.sent}"
+    )
+    assert all(t == "✅ Задача выполнена" for t in adapter_sent_texts(tg))
+
+
+@pytest.mark.asyncio
+async def test_binding_absent_foreign_owner_stays_owui_only(mission_env, monkeypatch):
+    """П.4: a foreign OWUI owner with NO server TG binding must stay
+    OWUI-only (fail-closed, §8.3/V8) — the итог lands in her OWUI chat but
+    is NEVER mirrored to any Telegram chat (in particular not to the home /
+    Yuri by default). This is the acceptance: 'чужие итоги не падают Юрию
+    по умолчанию'.
+    """
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    # Binding and home stay from the fixture; FOREIGN_OWUI is deliberately
+    # ABSENT from the binding map => no Telegram lane for her (fail-closed).
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+
+    root = _mk(mission_env, "mission-unbound-maria")
+    _owui_sub(mission_env, root, "owui-maria-unbound", user_id=FOREIGN_OWUI)
+    assert _complete(mission_env, root, summary="unbound mission done")
+
+    from gateway import kanban_origin_delivery as _kod
+
+    branch_staged = []
+
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        branch_staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # OWUI lane: her own chat gets the итог (primary lane always delivers).
+    assert branch_staged, f"unbound owner still gets OWUI итог: {branch_staged}"
+    assert branch_staged[0][0] == "owui-maria-unbound"
+    # TG mirror: NO send anywhere — not her (no binding), not home/Yuri.
+    assert tg.sent == [], (
+        f"П.4: unbound owner must not mirror to ANY telegram chat (home/Yuri "
+        f"is not a default sink): {tg.sent}"
+    )
