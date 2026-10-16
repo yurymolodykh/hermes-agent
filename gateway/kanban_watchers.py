@@ -521,6 +521,83 @@ def should_suppress_api_server_event(event, card, parent,
     return True
 
 
+def should_wake_agent_for_event(event, card, parent,
+                                branch_summary_replace) -> bool:
+    """Pure predicate: may ``event`` WAKE the originating agent session?
+
+    Complements ``should_suppress_api_server_event`` on the wake side.  The
+    wake turn (a synthetic agent turn injected into the creator's session)
+    is expensive and disruptive: it must NOT fire for every intermediate
+    state change of a mission tree.  Under ``kanban.branch_summary_replace:
+    true`` the notifier must only wake the agent for things that either ARE
+    the terminal branch итог or genuinely need a human decision:
+
+      * terminal whole-branch итог (``branch_summary`` event);
+      * terminal-failure / human-attention kinds (``_OWUI_ALWAYS_LOUD_KINDS``
+        — gave_up, crashed, timed_out, block_loop_detected,
+        review_requested);
+      * a card routed to ``triage`` (event kind or card status);
+      * ``blocked`` needing an operator route choice or a human fix —
+        provider outage (payload ``provider_route``) or a needs-a-fix
+        ``block_kind`` (``needs_input`` / ``capability`` / legacy NULL).
+
+    Returns False (NO wake) for INTERMEDIATE events:
+      * any descendant card close (``parent`` present) — child / sub-branch
+        cards, incl. ``[split N/M]`` and one-off daughter completions;
+      * plain non-terminal ``completed`` / ``status`` / ``archived`` /
+        ``unblocked`` and a self-resolving ``blocked`` (dependency/transient);
+      * the SAME routine kinds even for ROOT tasks — under replace mode the
+        root's own completion ping is not the итог: the branch_summary stage
+        owns the single channel message and its wake.
+
+    Returns True whenever ``branch_summary_replace`` is off — replace mode
+    OFF means additive, per-event wakes keep flowing exactly as before (the
+    historical notifier contract: complete/gave_up/crashed/timed_out/blocked
+    all wake the creator).  The predicate is PURE and side-effect free;
+    ``card``/``parent`` may be ``None`` (row missing / no parent).
+    """
+    if not branch_summary_replace:
+        return True
+    if event is None:
+        return False
+    kind = str(getattr(event, "kind", "") or "").strip()
+    # An unclassifiable event can never be positively identified as wake-worthy.
+    if not kind:
+        return False
+    try:
+        payload = getattr(event, "payload", None) or {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    # The terminal whole-branch итог is the single wake the creator gets for
+    # a mission — routine intermediate closes never wake under replace mode.
+    if kind == "branch_summary":
+        return True
+    if kind in _OWUI_ALWAYS_LOUD_KINDS:
+        return True
+    if kind == "triage":
+        return True
+    card_status = str(getattr(card, "status", "") or "").strip()
+    if card_status == "triage":
+        return True
+    if kind == "blocked":
+        block_kind = str(payload.get("kind") or "").strip() or None
+        if payload.get("provider_route"):
+            return True  # provider outage — operator must pick a route
+        if block_kind in ("needs_input", "capability"):
+            return True  # human fix required
+        if block_kind is None:
+            # Legacy un-typed block → treated as a human blocker.
+            return True
+        # dependency / transient / any other auto-resolving kind → routine,
+        # never wakes the creator (the branch_summary итог carries it).
+        return False
+    # completed / status / archived / unblocked / any other routine kind —
+    # intermediate on the mission tree, does not wake under replace mode.
+    return False
+
+
 def _owui_suppress_intermediate_event(kind: str, ev: Any,
                                       replace_summary: bool,
                                       platform_str: str) -> bool:
@@ -1754,14 +1831,22 @@ class GatewayKanbanWatchersMixin:
                     # terminal event goes through the persisted chat outbox.
                     wake_agent = mode in ("notify+wake", "wake") and platform_str != "api_server"
                     send_passive = mode != "wake" or platform_str == "api_server"
-                    if d.get("silent") or d.get("do_not_deliver"):
-                        # silent (branch_summary_replace): nothing to send or
-                        # wake for this subscription — the branch итог is the
-                        # single channel message.  do_not_deliver: synthetic
-                        # readback cards are never a delivery subject at all.
-                        # Either way nothing is sent or woken, and the cursor
-                        # still advances below (events already claimed).
+                    if d.get("do_not_deliver"):
+                        # Synthetic readback cards are never a delivery
+                        # subject at all: no text ping, no wake, no staging.
                         wake_agent = False
+                        send_passive = False
+                    elif d.get("silent"):
+                        # silent (branch_summary_replace): the branch итог is
+                        # the single channel MESSAGE, so no per-event text
+                        # ping. Human-action kinds (blocked+provider_route,
+                        # block_loop_detected, triage, terminal failures) are
+                        # STILL allowed to wake — the wake is a synthetic
+                        # agent turn, not a channel message, and it is the
+                        # only way a descendant's "needs you now" reaches the
+                        # creator without spamming their channel. The per-event
+                        # predicate inside _wake_kinds decides which events
+                        # qualify; routine intermediate closes wake nothing.
                         send_passive = False
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
@@ -1785,15 +1870,32 @@ class GatewayKanbanWatchersMixin:
                         # human-action kinds (blocked+provider_route,
                         # block_loop_detected, review_requested, triage) on
                         # api_server descendants are NOT blanket-dropped here.
-                        if ((d.get("silent") and kind in TERMINAL_KINDS
-                             and platform_str != "api_server")
+                        # For the telegram lane the SAME wake-worthy human-action
+                        # events must still reach the per-event wake path below:
+                        # they skip the silent-descendant text suppression (their
+                        # channel message stays suppressed — branch итог owns
+                        # it) but are NOT skipped outright, so the creator is
+                        # woken for "needs you now" events (see
+                        # should_wake_agent_for_event).
+                        if ((d.get("silent")
+                             and kind in TERMINAL_KINDS
+                             and platform_str != "api_server"
+                             and not should_wake_agent_for_event(
+                                 ev,
+                                 card=task,
+                                 parent=None,
+                                 branch_summary_replace=bool(
+                                     d.get("replace_summary")
+                                 ),
+                             ))
                                 or d.get("do_not_deliver")):
-                            # silent (branch_summary_replace): the branch итог
-                            # is the single channel message. do_not_deliver:
-                            # synthetic readback cards are never delivered.
-                            # Either way the event is claimed so the cursor
-                            # advances below and it can never replay/wedge
-                            # the sub.
+                            # silent (branch_summary_replace): routine
+                            # intermediate closes have no channel message and
+                            # no wake — the branch итог owns the single
+                            # message+wake. do_not_deliver: synthetic readback
+                            # cards are never delivered. Either way the event
+                            # is claimed so the cursor advances below and it
+                            # can never replay/wedge the sub.
                             continue
                         # api_server lane in branch_summary_replace mode: the
                         # canonical predicate is the sole suppression
@@ -2226,12 +2328,30 @@ class GatewayKanbanWatchersMixin:
                         #   are handled above: only outbox readback ACK advances
                         #   their claimed cursor, never an HTTP self-post.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "blocked", "block_loop_detected", "review_requested",
+                        )
+                        # Wake gate (branch_summary_replace): only terminal
+                        # branch итоги and genuine human-action events wake the
+                        # creator. Intermediate closes of a mission tree (child
+                        # completions, [split N/M], routine status/blocked) are
+                        # claimed+advanced but NEVER wake the agent — the single
+                        # trunk message for the mission is the branch_summary
+                        # wake delivered by _kanban_branch_summary_watcher.
                         _wake_kinds = (
                             {
                                 ev.kind
                                 for ev in d["events"]
                                 if ev.kind in _WAKE_KINDS
+                                and should_wake_agent_for_event(
+                                    ev,
+                                    card=task,
+                                    parent=None,
+                                    branch_summary_replace=bool(
+                                        d.get("replace_summary")
+                                    ),
+                                )
                                 and getattr(ev, "id", None) not in _tg_suppressed_event_ids
                             }
                             if wake_agent
@@ -2268,6 +2388,10 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "block_loop_detected" in _wake_kinds:
+                                _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds:
+                                _parts.append(t("gateway.kanban.wake.review_requested"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -3088,11 +3212,105 @@ class GatewayKanbanWatchersMixin:
                 root_id, platform_str, sub.get("chat_id"), exc,
             )
             return False
+        # Terminal branch итог wake: the mission root finished and the creator
+        # must be woken to collect the result. This is the ONLY wake a mission
+        # yields under branch_summary_replace mode — the intermediate child
+        # events were claimed+silent in the notifier loop (see
+        # should_wake_agent_for_event). Best-effort: an injected wake failure
+        # must never fail the (already delivered) итог channel.
+        if plan.get("terminal", True) and (
+            sub.get("delivery_mode") in ("notify+wake", "wake")
+        ):
+            try:
+                await self._wake_branch_summary_sub(
+                    plan, sub, sub_profile, adapter, plat,
+                )
+            except Exception as _bs_wake_exc:
+                logger.warning(
+                    "kanban branch summary: terminal wake for %s on %s/%s "
+                    "failed: %s",
+                    root_id, platform_str, sub.get("chat_id"), _bs_wake_exc,
+                )
         await _to_thread_process_service(
             self._ack_branch_summary, board, root_id,
             platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
         )
         return True
+
+    async def _wake_branch_summary_sub(
+        self, plan: dict, sub: dict, sub_profile: str,
+        adapter: Any, plat: Any,
+    ) -> None:
+        """Wake the creator session for a delivered terminal branch итог.
+
+        Only the TERMINAL branch итог may wake the originating agent session
+        under ``kanban.branch_summary_replace: true``.  The intermediate
+        per-child events were claimed+advanced silently by the notifier, so
+        this single wake is what lets the creator collect the итог + report
+        artifacts.  Push-capable adapters (Telegram) receive a synthetic
+        ``handle_message`` turn rebuilding the exact session scope from the
+        subscription row; non-push (api_server) needs no self-post here — the
+        outbox ``persist_pending`` write IS the message landing in the OWUI
+        session, and a second HTTP self-post would be a duplicated turn.
+        """
+        from gateway.wake import adapter_supports_push as _wake_push_ok
+        from gateway.wake import deliver_wake
+        if not _wake_push_ok(adapter):
+            return  # api_server: outbox persist is the delivery/wake
+        board = plan.get("board") or ""
+        root_id = plan.get("root_id") or sub.get("task_id") or ""
+        title = str(plan.get("title") or "")[:120]
+        assignee = ""
+        try:
+            from hermes_cli import kanban_db as _kb_bs
+            conn = _kb_bs.connect(board=board)
+            try:
+                _t = _kb_bs.get_task(conn, root_id)
+                if _t is not None:
+                    assignee = str(getattr(_t, "assignee", "") or "")
+            finally:
+                conn.close()
+        except Exception:
+            assignee = ""
+        _synth = t(
+            "gateway.kanban.wake.message",
+            task_id=root_id,
+            status=t("gateway.kanban.wake.completed"),
+            title=title,
+            assignee=assignee,
+            board=board,
+        )
+        _synth += "\n\n" + t("gateway.kanban.wake.guidance")
+        _chat_type = str(sub.get("chat_type") or "").strip()
+        if not _chat_type:
+            _delivery_meta = sub.get("delivery_metadata")
+            if isinstance(_delivery_meta, dict):
+                _chat_type = str(
+                    _delivery_meta.get("chat_type") or ""
+                ).strip()
+        _chat_type = _chat_type or "group"
+        from gateway.session import SessionSource
+        _source = SessionSource(
+            platform=plat,
+            chat_id=sub["chat_id"],
+            chat_type=_chat_type,
+            thread_id=sub.get("thread_id") or None,
+            user_id=sub.get("user_id"),
+            user_id_alt=sub.get("user_id_alt"),
+            profile=sub_profile or None,
+            scope_id=_wake_scope_id(adapter, sub),
+        )
+        await deliver_wake(
+            adapter,
+            text=_synth,
+            session_id=sub.get("chat_id") or "",
+            source=_source,
+        )
+        logger.info(
+            "kanban branch summary: woke agent for terminal итог %s on %s/%s profile=%s",
+            root_id, sub.get("platform"), sub.get("chat_id"),
+            sub_profile or "default",
+        )
 
     def _ack_branch_summary(
         self,
