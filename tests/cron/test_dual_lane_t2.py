@@ -586,13 +586,15 @@ def _owui_task(status="done"):
 
 
 def _run_owui_lane(sub, ev, msg="Kanban T1 done — Результат", *, task=None,
-                   task_is_root=None, home_channel=None, allowed=None):
+                   task_is_root=None, home_channel=None, allowed=None,
+                   has_open_descendants=None):
     from gateway.kanban_watchers import _tg_owui_dual_lane
 
     return _tg_owui_dual_lane(
         sub, ev, ev.kind, msg, task or _owui_task(),
         list(allowed or ALLOWED),
         task_is_root=task_is_root, home_channel=home_channel or "",
+        has_open_descendants=has_open_descendants,
     )
 
 
@@ -658,6 +660,47 @@ def test_owui_lane_root_completed_with_final_artifact_delivers(monkeypatch):
     assert bound_chat == OWNER_TG
     assert _read_suppression_journal() == [], (
         "доставленный терминальный итог не должен писать в журнал подавлений"
+    )
+
+
+def test_owui_lane_p2_parent_with_open_children_completed_suppressed_tg(monkeypatch):
+    # P2 (t_ecab4990): завершившаяся карточка-РОДИТЕЛЬ, у которой ещё ЕСТЬ
+    # НЕ-терминальные потомки (has_open_descendants=True) — даже если она сама
+    # корень дерева — НЕ является итогом ветки: её completed в OWUI→TG-зеркало
+    # НЕ уходит (тишина; reason=routine status close — прецедент classify).
+    # Один терминальный итог всего дерева доставляет branch-summary watcher.
+    _ctx_owner_home_with_binding(monkeypatch)
+    # P2 семантика: в notifier has_open_descendants вычисляется по живому conn
+    # и прокидывается в _tg_owui_dual_lane; здесь моделируем явным kwarg.
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed", artifacts=["split-report.pdf"]),
+        task=_owui_task(status="done"), task_is_root=True,
+        has_open_descendants=True, home_channel=OWNER_TG, allowed=ALLOWED,
+    )
+    assert decision.suppressed is True, (
+        f"root-completed с открытыми детьми (P2) должен подавляться в TG: {decision}"
+    )
+    assert bound_chat == OWNER_TG
+    assert _read_suppression_journal(), (
+        "подавленный P2-completed должен писать в журнал подавлений"
+    )
+
+
+def test_owui_lane_p2_root_all_children_done_still_delivers(monkeypatch):
+    # P2 control: КОГДА все потомки завершены (has_open_descendants=False),
+    # root completed — настоящий терминальный итог дерева → TG доставляется.
+    _ctx_owner_home_with_binding(monkeypatch)
+    decision, bound_chat = _run_owui_lane(
+        _owui_sub(), _owui_ev(kind="completed"),
+        task=_owui_task(status="done"), task_is_root=True,
+        has_open_descendants=False, home_channel=OWNER_TG, allowed=ALLOWED,
+    )
+    assert decision.delivered is True, (
+        f"root-completed без открытых потомков должен доставляться: {decision}"
+    )
+    assert bound_chat == OWNER_TG
+    assert _read_suppression_journal() == [], (
+        "терминальный итог (все дети done) не должен писать в журнал"
     )
 
 

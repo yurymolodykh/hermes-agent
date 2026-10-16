@@ -167,6 +167,22 @@ def test_root_routine_kinds_suppressed():
     assert _supp("unblocked", card=_Card(), parent=None) is True
 
 
+def test_p2_parent_with_children_completed_suppressed():
+    # P2 (t_ecab4990): a completing ROOT/PARENT card that still has children
+    # is NOT the branch итог under replace mode — its completed is suppressed
+    # on the api_server lane regardless of whether it has a signed parent
+    # (the whole-mission итог is the branch_summary watcher's single message).
+    childed = _Card()
+    childed.children = ["t_child_1", "t_child_2"]  # has_children marker
+    for kind in ("completed", "status", "archived", "unblocked"):
+        assert _supp(kind, card=childed, parent=None) is True
+    # Even the parent card's own self-resolving blocked stays routine.
+    assert _supp("blocked", payload={"kind": "dependency"},
+                 card=childed, parent=None) is True
+    # A parent with children may also be a mid-tree node (has a parent too).
+    assert _supp("completed", card=childed, parent=_Card()) is True
+
+
 def test_root_blocked_self_resolving_suppressed():
     assert _supp("blocked", payload={"kind": "dependency"},
                  card=_Card(), parent=None) is True

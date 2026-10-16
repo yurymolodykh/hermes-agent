@@ -277,6 +277,87 @@ async def test_intermediate_child_noise_silent_on_both_lanes(mission_env, monkey
 
 
 @pytest.mark.asyncio
+async def test_parent_with_open_children_completed_silent_on_tg(mission_env, monkeypatch):
+    """P2 (t_ecab4990): the mission ROOT completes FIRST while its children are
+    still OPEN (running). Even though the completing card is the tree ROOT
+    (task_is_root=True), it is a PARENT with live descendants — so its
+    ``completed`` is NOT the branch итог and the OWUI→TG mirror must stay
+    SILENT in the notifier tick (one terminal итог comes later from the
+    branch-summary watcher once the whole tree closes).
+    """
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root, children = _setup_mission(mission_env, n_children=2)
+
+    # Root completes FIRST; children stay RUNNING (mid-tree, mission NOT closed).
+    assert _complete(mission_env, root, summary="mission done")
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    # P2: parent-with-open-children completed → SILENT on the TG mirror. The
+    # routine close is claimed+journaled, but never reaches Telegram; the
+    # whole-mission итог is the branch-summary watcher's single message.
+    assert adapter_sent_texts(tg) == [], (
+        f"P2: root-with-open-children must be silent on TG: {tg.sent}"
+    )
+    assert staged == [], f"P2: no OWUI staging for intermediate root close: {staged}"
+    assert tg.wakes == [] and owui.wakes == [], (
+        f"P2: intermediate root close must not wake: tg={tg.wakes} owui={owui.wakes}"
+    )
+    # The suppression path for a routine api_server close is the canonical
+    # api_server-lane predicate (claimed+silent), which precedes the OWUI→TG
+    # mirror — the journal entry is produced by the dual-lane branch (covered
+    # in unit form by tests/cron/test_dual_lane_t2.py P2 cases).  The
+    # acceptance invariant here is the SILENCE itself on both lanes.
+    assert adapter_sent_texts(tg) == [], (
+        f"P2: root-with-open-children must be silent on TG: {tg.sent}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_with_open_children_completed_control_tg(mission_env, monkeypatch):
+    """P2 control: once ALL descendants are terminal (has_open_descendants
+    becomes False), the same root confirmed close IS the terminal итог and
+    the branch-summary watcher delivers it to TG — the P2 suppression only
+    holds while children remain open.
+    """
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root, children = _setup_mission(mission_env, n_children=2)
+    assert _complete(mission_env, root, summary="mission done")
+    for i, cid in enumerate(children):
+        assert _complete(mission_env, cid, summary=f"child {i} done")
+
+    # Notifier tick stays silent on TG for the per-event closes...
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+    assert adapter_sent_texts(tg) == [], f"notifier must not send TG: {tg.sent}"
+
+    # ...and the branch-summary watcher delivers the single terminal итог to TG.
+    from gateway import kanban_origin_delivery as _kod
+
+    branch_staged = []
+
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        branch_staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    tg_texts = adapter_sent_texts(tg)
+    assert tg_texts, f"P2 control: terminal итог must reach TG: {tg_texts}"
+    assert branch_staged, f"P2 control: OWUI итог must be staged: {branch_staged}"
+
+
+@pytest.mark.asyncio
 async def test_split_sub_branch_close_silent_on_both_lanes(mission_env, monkeypatch):
     """A ``[split N/M]``-style mid-tree close (child chain under a still-open
     mission root) is silent on BOTH lanes — explicitly listed in acceptance."""

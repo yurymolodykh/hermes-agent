@@ -916,6 +916,7 @@ def _branch_summary_skip_untouched_delivered_root(
 def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
                        *, task_is_root: Optional[bool] = None,
                        mission_live: bool = False,
+                       has_open_descendants: Optional[bool] = None,
                        home_channel: str = "") -> Optional[tuple]:
     """Complementary OWUI→Telegram delivery lane for a non-RGZ kanban mission.
 
@@ -927,6 +928,13 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     ``TELEGRAM_ALLOWED_USERS``/home, the SAME event is also evaluated for a
     Telegram delivery to that bound chat through the SAME RGZ classifier
     (classify + verify_recipient + log_suppression).
+
+    ``has_open_descendants`` (P2, t_ecab4990): when True the completing card
+    still has NON-terminal descendants (children/sub-branches alive), so its
+    ``completed`` is NOT the branch итог — the OWUI→TG mirror must stay silent
+    even for a root card (the whole-mission terminal close is delivered by the
+    branch-summary watcher instead).  ``None`` (default) preserves legacy
+    behaviour for direct callers that cannot compute the tree shape.
 
     Returns:
       * ``None`` — no Telegram lane: not an api_server subscription, policy
@@ -1006,6 +1014,15 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     # sno-economics case: parent-less leaf, controller detached from
     # task_links, yet the mission was running).
     if root_closing and mission_live:
+        root_closing = False
+    # P2 (t_ecab4990): a completing card that still has NON-terminal
+    # descendants (children/sub-branches alive) is NOT the branch итог —
+    # its ``completed`` must stay out of the OWUI→TG mirror even when the
+    # card itself is the tree root (the whole-mission terminal close is the
+    # branch-summary watcher's single message).  This is the strict owner
+    # requirement: "родитель (не-лист дерева, у него есть дети) завершился
+    # → TG-тишина".
+    if root_closing and has_open_descendants:
         root_closing = False
     completed_terminal = bool(task_terminal or root_closing)
     # F6 (tg-delivery-hygiene, применяется ко ВСЕМ binding
@@ -1745,6 +1762,27 @@ class GatewayKanbanWatchersMixin:
                                             pid in subscribed_ids
                                             for pid in _kb.parent_ids(conn, sub["task_id"])
                                         )
+                                    # P2 (t_ecab4990): does the completing card
+                                    # still have NON-terminal descendants
+                                    # (children/sub-branches alive)? When yes,
+                                    # its ``completed`` is NOT the branch итог
+                                    # and the OWUI→TG mirror must stay silent
+                                    # (computed here where ``conn`` is live).
+                                    has_open_desc = False
+                                    _terms_statuses = {"done", "archived"}
+                                    _scan = list(_kb.child_ids(conn, sub["task_id"]))
+                                    while _scan and not has_open_desc:
+                                        _cid = _scan.pop()
+                                        _crow = conn.execute(
+                                            "SELECT status FROM tasks WHERE id=?",
+                                            (_cid,),
+                                        ).fetchone()
+                                        if not _crow:
+                                            continue
+                                        if str(_crow["status"] or "").strip() not in _terms_statuses:
+                                            has_open_desc = True
+                                            break
+                                        _scan = list(_kb.child_ids(conn, _cid)) + _scan
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -1762,6 +1800,7 @@ class GatewayKanbanWatchersMixin:
                                         "do_not_deliver": do_not_deliver,
                                         "task_is_root": task_is_root,
                                         "mission_live": mission_live,
+                                        "has_open_descendants": has_open_desc,
                                         "task_tg_owner": task_tg_owner,
                                     })
                                 except Exception as sub_exc:
@@ -2147,6 +2186,9 @@ class GatewayKanbanWatchersMixin:
                                     sub, ev, kind, msg, task, _tg_allowed,
                                     task_is_root=d.get("task_is_root"),
                                     mission_live=bool(d.get("mission_live")),
+                                    has_open_descendants=bool(
+                                        d.get("has_open_descendants")
+                                    ),
                                 )
                             except Exception as _lane_exc:
                                 logger.warning(
