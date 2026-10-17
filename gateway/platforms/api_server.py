@@ -557,8 +557,92 @@ def _request_agent_overrides(
 
     model_options = body.get("model_options")
     if isinstance(model_options, dict):
-        overrides["model_options"] = dict(model_options)
+        model_options = dict(model_options)
+    # A6 bridge: Open WebUI emits top-level ``reasoning_effort``; fold it into
+    # model_options so the fast-lane core (_request_reasoning_config /
+    # decide_slow_mode) sees the OWUI deepthink / reasoning toggle. Explicit
+    # client model_options always win over the top-level scalar.
+    bridged = _bridge_top_level_reasoning_effort(body)
+    if bridged:
+        model_options = _merge_model_options(model_options, bridged)
+    if model_options:
+        overrides["model_options"] = model_options
     return overrides
+
+
+def _bridge_top_level_reasoning_effort(body: Any) -> Dict[str, Any]:
+    """A6 (§6): map an OpenAI-top-level ``reasoning_effort`` into ``model_options``.
+
+    Open WebUI 0.11.4 sends chat-completions params via
+    ``apply_model_params_to_body_openai`` — i.e. ``reasoning_effort`` lands as
+    a TOP-LEVEL key of the request body, while the gateway core
+    (``_request_reasoning_config`` / ``decide_slow_mode``) reads slow-mode
+    markers from ``model_options`` only.  Without a bridge the OWUI deepthink
+    toggle (reasoning_effort=high) never reaches the fast-lane decision, so
+    the A6 OWUI channel would be dead end-to-end.
+
+    This helper returns a ``model_options``-compatible dict carrying the
+    top-level effort value (as both the compatibility scalar and the
+    structured ``reasoning.effort`` form), preserving D1 semantics: ``medium``
+    maps to fast (same as the OWUI default toggle), only ``high``/``xhigh``/
+    ``max``/``ultra`` are slow per ``model_options_mark_slow``.  Idempotent and
+    strictly additive — explicit ``model_options`` already supplied by the
+    client win over the top-level scalar, and a missing/absent value yields {}.
+    """
+    if not isinstance(body, dict):
+        return {}
+    effort = body.get("reasoning_effort")
+    if effort is None or (isinstance(effort, str) and not effort.strip()):
+        return {}
+    transported: Dict[str, Any] = {
+        "reasoning_effort": str(effort).strip().lower(),
+    }
+    # Structured form is what _request_reasoning_config reads first (reasoning
+    # object wins over the scalar), so keep both consistent.
+    transported.setdefault("reasoning", {}).update(
+        {"enabled": True, "effort": str(effort).strip().lower()}
+    )
+    return transported
+
+
+def _merge_model_options(model_options: Any, extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge a pre-parsed ``model_options`` dict with bridging extras.
+
+    ``extra`` carries values derived from top-level body keys (A6 bridge);
+    explicit client ``model_options`` keys always win over ``extra``, so a
+    client that already expresses reasoning via ``model_options`` is never
+    overridden.  Never mutates the caller's dict.
+    """
+    base = dict(model_options) if isinstance(model_options, dict) else {}
+    merged = dict(base)
+    for key, value in extra.items():
+        if key == "reasoning" and isinstance(value, dict):
+            existing = merged.get("reasoning")
+            if isinstance(existing, dict):
+                for sub_key, sub_value in value.items():
+                    existing.setdefault(sub_key, sub_value)
+            else:
+                merged["reasoning"] = dict(value)
+        else:
+            merged.setdefault(key, value)
+    return merged
+
+
+def _effective_api_user_message(agent: Any, user_message: Any) -> Any:
+    """Resolve the user text the agent should actually run with.
+
+    OWUI/PWA text-marker seam (A6 §4.2): when the fast-lane block stripped a
+    «подумай»/«думай» prefix from the request (stored on the agent as
+    ``_fast_lane_effective_message`` — only when ``fast_lane.enabled`` is ON),
+    the run call sites hand the model the marker-free text so the UI
+    directive is never surfaced. Otherwise the caller's ``user_message`` is
+    returned unchanged (fast-lane flag off, no marker, or degraded).
+    """
+    if agent is not None:
+        effective = getattr(agent, "_fast_lane_effective_message", None)
+        if effective is not None:
+            return effective
+    return user_message
 
 
 def _is_compressed_summary_message(message: Any) -> bool:
@@ -597,6 +681,69 @@ def _project_client_message(message: Dict[str, Any]) -> Dict[str, Any]:
         projected["content"] = ""
         projected["display_kind"] = "hidden"
     return projected
+
+
+#: Assistant thinking-chain fields that are model-internal scratch text, never
+#: intended for end-user display.  The CLI/gateway render them only when the
+#: user explicitly enables ``display.show_reasoning`` for the platform; the
+#: api_server message projections must hide them otherwise.  Keeping the strip
+#: here (shared by both the GET /api/sessions/{id}/messages projection and
+#: the run.completed per-turn transcript) guarantees OWUI reads the same
+#: reasoning-free surface the Telegram path already delivers.
+_REASONING_FOR_DISPLAY_KEYS: tuple[str, ...] = (
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+)
+
+
+def _api_server_show_reasoning() -> bool:
+    """Return whether the api_server platform should expose reasoning.
+
+    Resolves ``display.platforms.api_server.show_reasoning`` →
+    ``display.show_reasoning`` → default False, matching the rest of the
+    gateway.  Config loads are cheap (shared raw-yaml cache); no import cycle
+    because ``_load_gateway_config`` is imported lazily.
+    """
+    try:
+        from gateway.run import _load_gateway_config
+        from gateway.display_config import resolve_display_setting
+    except Exception:
+        return False
+    try:
+        value = resolve_display_setting(
+            _load_gateway_config(),
+            "api_server",
+            "show_reasoning",
+            False,
+        )
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "on", "raw", "verbose"}
+        return bool(value)
+    except Exception:
+        return False
+
+
+def _strip_reasoning_for_display(message: Dict[str, Any], *,
+                                 show_reasoning: Optional[bool] = None) -> Dict[str, Any]:
+    """Remove model-internal reasoning fields from a client message.
+
+    Used by the api_server message projections so that ``reasoning_content`` /
+    ``reasoning`` / ``reasoning_details`` / Codex reasoning items never reach
+    OWUI (or any OpenAI-compatible client) unless the operator explicitly
+    opted in via ``display.show_reasoning`` for the platform.  Mutates a copy;
+    returns the message for chaining.
+    """
+    if show_reasoning is None:
+        show_reasoning = _api_server_show_reasoning()
+    if not show_reasoning:
+        for _rkey in _REASONING_FOR_DISPLAY_KEYS:
+            message.pop(_rkey, None)
+    return message
 
 
 def _auto_truncate_response_history(
@@ -3365,6 +3512,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        user_message: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3656,6 +3804,112 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        # --- Fast-lane decision + fast-path activation (t_ae312f32) ------
+        # Slice A3(1) computed slow_mode; this slice (t_ae312f32) ACTIVATES
+        # the fast path (design §4.2 Track S): for fast requests (slow_mode=
+        # False) apply reasoning medium/high (D3 — routine/complex, never
+        # low), max_iterations cap ≤8, run_budget_seconds=300, and mark the
+        # session review_exempt (D5 -> no review card). Slow requests are
+        # untouched (full lane). Any failure degrades silently to the
+        # existing working path.
+        #
+        # Activation is gated on ``fast_lane.enabled`` (default false, design
+        # §6.2): with the flag unset the fast-path OVERRIDES are inert and
+        # every request stays on the full lane — the marker computation and
+        # logging still run so operators can observe the decision, but no
+        # reasoning/budget/review-exempt override is applied. The feature
+        # flag's config schema and the cron-forcer edit are owned by the
+        # sibling card t_09bf5ceb; this seam is its activation point.
+        _fast_decision = None
+        _fast_lane_active = False
+        _fast_stripped_message = None
+        try:
+            from agent.fast_lane import (
+                fast_lane_enabled as _fast_lane_enabled,
+                evaluate_request as _fast_lane_evaluate,
+                resolve_fast_path as _fast_lane_resolve,
+                strip_telegram_slow_prefix as _fast_lane_strip,
+                patch_session_fast_lane_marker as _patch_fast_lane_marker,
+            )
+            _fast_lane_config = (user_config or {}).get("fast_lane") or {}
+            _fast_lane_active = _fast_lane_enabled(user_config or {})
+            _fast_decision = _fast_lane_evaluate(
+                user_message or "",
+                model_options=model_options,
+                config=_fast_lane_config,
+            )
+            if _fast_lane_active:
+                _fast_decision = _fast_lane_resolve(
+                    _fast_decision, user_message or ""
+                )
+            # OWUI/PWA text marker (A6 §4.2): the «подумай»/«думай» prefix in
+            # the request body must be STRIPPED from the text the model runs
+            # with (same UI-directive semantics as the TG adapter). The strip
+            # is a no-op when the request carries no marker, so applying it
+            # under the flag is safe for every request. The marker itself
+            # already made the session slow (decide_slow_mode reads the raw
+            # text), so slow semantics and prefix-stripping coexist — exactly
+            # the owner request "подумай -> slow + префикс вырезан".
+            _fast_stripped_message = _fast_lane_strip(user_message or "")
+            _fast_effort = _fast_decision.reasoning_effort or "medium"
+            if _fast_decision.slow_mode:
+                logger.info(
+                    "fast_lane=SLOW api_server session=%s source=%s reason=%s",
+                    session_id or "",
+                    _fast_decision.source or "-",
+                    _fast_decision.reason or "-",
+                )
+            else:
+                logger.info(
+                    "fast_lane=FAST api_server session=%s source=%s "
+                    "complexity=%s reasoning=%s max_iterations=%s "
+                    "run_budget=%s review_exempt=%s active=%s",
+                    session_id or "",
+                    _fast_decision.source or "-",
+                    _fast_decision.complexity or "-",
+                    _fast_effort,
+                    _fast_decision.max_iterations,
+                    _fast_decision.run_budget_seconds,
+                    _fast_decision.review_exempt,
+                    _fast_lane_active,
+                )
+                if _fast_lane_active:
+                    # Fast-path overrides (only when the flag says ON):
+                    # reasoning config (overrides config reasoning for this
+                    # agent), iteration cap, wall-clock budget.
+                    reasoning_config = {"enabled": True, "effort": _fast_effort}
+                    if _fast_decision.max_iterations is not None:
+                        max_iterations = _fast_decision.max_iterations
+            # Persist the marker (incl. review_exempt for the D5 forcer).
+            # ONLY when the flag is ON — with the flag off the fast-lane
+            # state is not written, so the review-forcer's session_is_fast_lane
+            # stays False and the "flag off = behavior as before" contract
+            # (§6.2) holds end-to-end. Best-effort; never breaks the path.
+            if _fast_lane_active:
+                _patch_fast_lane_marker(
+                    self._ensure_session_db(), session_id, _fast_decision
+                )
+        except Exception:
+            # Degradation: marker-parse/fast-path failure must never break
+            # the turn — the request falls back to the full lane (§6.1). The
+            # fallback is observable via the degraded marker ONLY when the
+            # flag was ON (a non-flagged request must not get a false
+            # degradation note).
+            if _fast_lane_active:
+                from agent.fast_lane import (
+                    patch_session_fast_lane_degraded as _patch_degraded,
+                )
+                try:
+                    _patch_degraded(self._ensure_session_db(), session_id)
+                except Exception:
+                    pass
+            _fast_decision = None
+            _fast_lane_active = False
+            logger.warning(
+                "fast_lane decision skipped, degraded to full lane (api_server)",
+                exc_info=True,
+            )
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
@@ -3676,10 +3930,30 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        # Fast requests also carry a wall-clock run budget and a D5 review
+        # exemption on the agent object itself. Only when the fast-lane flag
+        # is ON (inert by default; §6.2).
+        if _fast_lane_active and _fast_decision is not None and not _fast_decision.slow_mode:
+            if _fast_decision.run_budget_seconds is not None:
+                agent_kwargs["run_budget_seconds"] = (
+                    _fast_decision.run_budget_seconds
+                )
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        # OWUI/PWA text marker (A6 §4.2): carry the strip result on the agent
+        # so the run call sites hand the model the marker-free text. Only
+        # when the flag is ON (inert by default; §6.2) and the strip changed
+        # the message (i.e. a «подумай»/«думай» prefix was actually present).
+        if (
+            _fast_lane_active
+            and _fast_stripped_message is not None
+            and _fast_stripped_message != (user_message or "")
+        ):
+            agent._fast_lane_effective_message = _fast_stripped_message
+        if _fast_lane_active and _fast_decision is not None and not _fast_decision.slow_mode:
+            agent.review_exempt = True  # D5: forcer skips fast sessions
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3694,6 +3968,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
         }
         return agent
+
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -4729,6 +5004,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
         message = _project_client_message(message)
+        _strip_reasoning_for_display(message)
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
@@ -8061,6 +8337,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        fast_lane_route: Optional[bool] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -8104,10 +8381,70 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         request_origin_binding = _api_request_origin_binding.get()
 
-        def _run():
+        # --- Fast-lane profile routing (design §4.2 Track M, t_746614d5) ---
+        # The fast-lane decision selects the EXECUTOR profile, which must be
+        # settled BEFORE _profile_scope() runs (the agent home / state.db /
+        # SOUL depend on it). Markerless (fast) requests execute under the
+        # 11-fast-answers profile (fast lane: medium reasoning, ≤8 iterations,
+        # 300s budget, review_exempt) while slow requests („подумай“ /
+        # „гигантская задача“ / OWUI deepthink) stay on the current (default
+        # 01-orchestrator) full lane. Gated on ``fast_lane.route_to_profile``
+        # (default off — pure Track S behavior when unset). Best-effort: any
+        # failure falls back to the current profile, never breaking the turn.
+        fast_lane_execute_profile = None
+        if fast_lane_route is not False:
+            try:
+                from agent.fast_lane import (
+                    decide_slow_mode as _fl_decide,
+                    resolve_fast_path as _fl_resolve,
+                    route_profile as _fl_route,
+                )
+                from gateway.run import _load_gateway_config as _fl_load_cfg
+
+                _fl_user_cfg = _fl_load_cfg()
+                _fl_cfg = (_fl_user_cfg or {}).get("fast_lane") or {}
+                _fl_route_enabled = bool(
+                    _fl_cfg.get("route_to_profile")
+                    if fast_lane_route is None
+                    else fast_lane_route
+                )
+                if _fl_route_enabled:
+                    _fl_decision = _fl_decide(
+                        user_message or "",
+                        model_options=model_options,
+                        config=_fl_cfg,
+                    )
+                    _fl_decision = _fl_resolve(_fl_decision, user_message or "")
+                    _fl_profile = _fl_route(_fl_decision)
+                    if _fl_profile:
+                        fast_lane_execute_profile = _fl_profile
+                        request_profile = _fl_profile
+                        logger.info(
+                            "fast_lane=ROUTE api_server session=%s target=%s "
+                            "slow=%s source=%s reasoning=%s",
+                            session_id or "",
+                            _fl_profile,
+                            _fl_decision.slow_mode,
+                            _fl_decision.source or "-",
+                            _fl_decision.reasoning_effort or "medium",
+                        )
+            except Exception:
+                # Degradation: profile-routing failure must never break the
+                # turn — the request stays on the current profile (§6.1).
+                fast_lane_execute_profile = None
+                logger.warning(
+                    "fast_lane profile routing skipped, staying on current "
+                    "profile (api_server)",
+                    exc_info=True,
+                )
+
+        origin_request_profile = _api_request_profile.get()
+
+        def _run_once(run_profile: Optional[str]) -> tuple:
+            """Run one turn under ``run_profile`` scope (Track M execution)."""
             from gateway.session_context import clear_session_vars
 
-            with self._profile_scope(request_profile):
+            with self._profile_scope(run_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -8134,6 +8471,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        user_message=user_message,
                     )
                     if confirmed_runtime_lock:
                         locked_provider = self._clean_runtime_id(
@@ -8177,7 +8515,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
                     result = agent.run_conversation(
-                        user_message=user_message,
+                        user_message=_effective_api_user_message(agent, user_message),
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
@@ -8317,7 +8655,39 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            if fast_lane_execute_profile:
+                # Track M with Ж1 fallback: if the fast profile fails to build
+                # or run (profile unservable, provider auth error, crash),
+                # degrade to the origin (default/full-lane) profile instead of
+                # failing the turn — one retry, then give up on the original
+                # exception (§6.1 "деградация вместо ошибки").
+                try:
+                    return await loop.run_in_executor(
+                        None, lambda: _run_once(fast_lane_execute_profile)
+                    )
+                except Exception as _fl_fallback_exc:
+                    logger.warning(
+                        "fast_lane=ROUTE fallback api_server session=%s "
+                        "profile=%s -> origin %s err=%s",
+                        session_id or "",
+                        fast_lane_execute_profile,
+                        origin_request_profile or "default",
+                        type(_fl_fallback_exc).__name__,
+                    )
+                    # Patch the degradation marker on the ORIGIN session DB
+                    # (best-effort; never breaks the fallback turn).
+                    try:
+                        from agent.fast_lane import (
+                            patch_session_fast_lane_degraded as _patch_deg,
+                        )
+
+                        _patch_deg(self._ensure_session_db(), session_id or "")
+                    except Exception:
+                        pass
+                    return await loop.run_in_executor(
+                        None, lambda: _run_once(origin_request_profile)
+                    )
+            return await loop.run_in_executor(None, lambda: _run_once(request_profile))
         finally:
             self._inflight_agent_runs -= 1
 
@@ -8606,6 +8976,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        user_message=user_message,
                     )
                 self._active_run_agents[run_id] = agent
 
@@ -8682,7 +9053,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
                             r = agent.run_conversation(
-                                user_message=user_message,
+                                user_message=_effective_api_user_message(agent, user_message),
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                             )

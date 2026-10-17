@@ -370,6 +370,25 @@ DEFAULT_CONFIG = {
         "reasoning_class_routing": False,
         "reasoning_class_efforts": {},
 
+        # Per-step reasoning routing (adaptive-reasoning-effort mission, W3
+        # level 3; DEFAULT OFF — see design/effort-policy-v1.md). A per-step
+        # router in agent/reasoning_effort (or its successor) picks the minimal
+        # sufficient reasoning effort on each agent step from observed signals
+        # (tool-call type, context length, task class), never wire-unsafe.
+        # While OFF the router is inert — per-step behavior is byte-identical
+        # to the base revision.
+        "reasoning_step_routing": False,
+
+        # L1 auxiliary-task reasoning pins (adaptive-reasoning-effort mission;
+        # only consulted when agent.reasoning_class_routing=True):
+        #   {aux_task: effort_level}  e.g. web_extract: none, compression: low
+        # Applied on top of (never overriding) an explicit
+        # ``auxiliary.<task>.reasoning_effort`` config. Values are clamped to
+        # the letovo wire domain ({none, low, high, max}) before use, so an
+        # invalid pin can never reach the wire. Empty/absent by default — L1
+        # is fully inert while the master switch is off.
+        "reasoning_aux_pins": {},
+
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name
@@ -3722,6 +3741,28 @@ DEFAULT_CONFIG = {
         # (regional endpoints silently 404 them). Override to a regional value
         # (e.g. "us-central1") only if your models are pinned to a region.
         "region": "global",
+    },
+
+    # Fast-lane feature gate (fast-lane-design.md §6.2). Default OFF: the
+    # fast-lane machinery (reasoning split, iteration/budget caps,
+    # review-exemption markers in agent/fast_lane.py) is compiled in but INERT,
+    # and every request runs on the existing full lane unchanged. When enabled,
+    # marker-less requests take the fast path (reasoning medium/high — never
+    # low — max 8 iterations, 300s budget) with review-exemption; any fast-path
+    # error degrades silently to the full lane (fast_lane_degraded=true) and is
+    # never surfaced as a request error. Roll out wave-style; roll back with a
+    # single config edit + gateway restart. Read per-request by the gateway
+    # call sites (gateway/run.py, gateway/platforms/api_server.py).
+    #
+    # ``route_to_profile`` (default False, §4.2 Track M): when enabled, fast
+    # (markerless) requests EXECUTE under the 11-fast-answers profile (its own
+    # home/state.db/SOUL, fast lane from the box) and slow requests stay on the
+    # default (full-lane) profile. Off = Track S (same profile, fast overrides
+    # applied in place). Requires the fast profile to exist; any routing error
+    # degrades to the current profile.
+    "fast_lane": {
+        "enabled": False,
+        "route_to_profile": False,
     },
 
     # Config schema version - bump this when adding new required fields

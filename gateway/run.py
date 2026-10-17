@@ -5751,6 +5751,110 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        # --- Fast-lane decision + fast-path activation (t_ae312f32) ------
+        # Slice A3(1) computed slow_mode; this slice ACTIVATES the fast path
+        # (design §4.2 Track S). For fast requests (slow_mode=False):
+        #   * TG «подумай» prefix is STRIPPED so the model never sees the UI
+        #     directive (only for fast requests; slow keeps the text as-is);
+        #   * reasoning medium/high (D3 — routine/complex, never low);
+        #   * max_iterations cap ≤8, run_budget_seconds=300;
+        #   * session marked review_exempt (D5 -> no review card).
+        # Slow requests stay on the full lane untouched. Any failure degrades
+        # silently to the existing working path.
+        #
+        # Activation is gated on ``fast_lane.enabled`` (default false, design
+        # §6.2): with the flag unset the fast-path OVERRIDES are inert — the
+        # marker computation and logging still run, but reasoning/budget are
+        # untouched and the message is NEVER rewritten (exact current
+        # behavior). The feature flag's config schema and the cron-forcer
+        # edit are owned by the sibling card t_09bf5ceb; this seam is its
+        # activation point.
+        _fast_decision = None
+        _fast_stripped_message = None
+        _fast_lane_active = False
+        try:
+            from agent.fast_lane import (
+                fast_lane_enabled as _fast_lane_enabled,
+                evaluate_request as _fast_lane_evaluate,
+                resolve_fast_path as _fast_lane_resolve,
+                strip_telegram_slow_prefix as _fast_lane_strip,
+                patch_session_fast_lane_marker as _patch_fast_lane_marker,
+            )
+            _fast_lane_config = (ctx.user_config or {}).get("fast_lane") or {}
+            _fast_lane_active = _fast_lane_enabled(ctx.user_config or {})
+            _fast_decision = _fast_lane_evaluate(
+                ctx.message or "",
+                config=_fast_lane_config,
+            )
+            if _fast_lane_active:
+                _fast_decision = _fast_lane_resolve(
+                    _fast_decision, ctx.message or ""
+                )
+            _fast_stripped_message = _fast_lane_strip(ctx.message or "")
+            if _fast_decision.slow_mode:
+                logger.info(
+                    "fast_lane=SLOW TG session=%s source=%s reason=%s "
+                    "prefix_present=%s",
+                    ctx.session_key or "",
+                    _fast_decision.source or "-",
+                    _fast_decision.reason or "-",
+                    _fast_stripped_message != (ctx.message or ""),
+                )
+            else:
+                logger.info(
+                    "fast_lane=FAST TG session=%s source=%s complexity=%s "
+                    "reasoning=%s max_iterations=%s run_budget=%s "
+                    "review_exempt=%s strip=%s active=%s",
+                    ctx.session_key or "",
+                    _fast_decision.source or "-",
+                    _fast_decision.complexity or "-",
+                    _fast_decision.reasoning_effort or "medium",
+                    _fast_decision.max_iterations,
+                    _fast_decision.run_budget_seconds,
+                    _fast_decision.review_exempt,
+                    _fast_stripped_message != (ctx.message or ""),
+                    _fast_lane_active,
+                )
+                # Fast path: strip the TG «подумай» prefix so the model
+                # answers the actual question (design §4.3 note). Only when
+                # the flag is ON; when OFF the message is never rewritten.
+                # Fast requests are rewritten; slow keeps the original text.
+                if _fast_lane_active and _fast_stripped_message:
+                    ctx.message = _fast_stripped_message
+            # Persist the marker so the D5 forcer and downstream routing can
+            # read review_exempt/fast_lane. ONLY when the flag is ON — with
+            # the flag off the fast-lane state is not written, so the forcer's
+            # session_is_fast_lane stays False and "flag off = behavior as
+            # before" (§6.2) holds end-to-end. Best-effort; never breaks the
+            # turn.
+            if _fast_lane_active:
+                _patch_fast_lane_marker(
+                    getattr(self._runner, "_session_db", None),
+                    ctx.session_id,
+                    _fast_decision,
+                )
+        except Exception:
+            # Degradation: marker-parse failure must never break the turn.
+            # Fall back to the full lane (§6.1), observable via the degraded
+            # marker ONLY when the flag was ON.
+            if _fast_lane_active:
+                from agent.fast_lane import (
+                    patch_session_fast_lane_degraded as _patch_degraded,
+                )
+                try:
+                    _patch_degraded(
+                        getattr(self._runner, "_session_db", None),
+                        ctx.session_id,
+                    )
+                except Exception:
+                    pass
+            _fast_decision = None
+            _fast_lane_active = False
+            logger.warning(
+                "fast_lane decision skipped, degraded to full lane (gateway TG)",
+                exc_info=True,
+            )
+
         turn_route = self._runner._resolve_turn_agent_config(
             ctx.message,
             model,
@@ -5995,7 +6099,23 @@ class TurnRunner:
                     pass
 
         if agent is None:
-            # Config changed or first message — create fresh agent
+            # Config changed or first message — create fresh agent. Fast-path
+            # overrides (t_ae312f32): reasoning medium/high, max_iterations
+            # cap ≤8, run_budget_seconds=300 are injected here when the
+            # decision is fast AND the fast-lane flag is ON (inert by default;
+            # §6.2).
+            _fast_agent_kwargs: dict = {}
+            if _fast_lane_active and _fast_decision is not None and not _fast_decision.slow_mode:
+                reasoning_config = {
+                    "enabled": True,
+                    "effort": _fast_decision.reasoning_effort or "medium",
+                }
+                if _fast_decision.max_iterations is not None:
+                    max_iterations = _fast_decision.max_iterations
+                if _fast_decision.run_budget_seconds is not None:
+                    _fast_agent_kwargs["run_budget_seconds"] = (
+                        _fast_decision.run_budget_seconds
+                    )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -6033,6 +6153,7 @@ class TurnRunner:
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
+                **_fast_agent_kwargs,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -6133,6 +6254,30 @@ class TurnRunner:
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
+        # Fast-path per-turn overrides on a REUSED (cached) agent
+        # (t_ae312f32). reasoning_config is already set per-message above;
+        # the iteration cap and wall-clock budget must also be pushed onto
+        # the reused object (turn_context.prepare_turn resets the
+        # IterationBudget from agent.max_iterations and stamps the run
+        # budget each turn). Slow requests restore the normal (unlimited)
+        # path so a fast request in an otherwise-unbounded session cannot
+        # accidentally inherit a previous fast cap. All of this is inert
+        # unless the fast-lane flag is ON (§6.2) — with the flag unset the
+        # agent is left exactly as before.
+        if _fast_lane_active and _fast_decision is not None:
+            if _fast_decision.slow_mode:
+                agent.max_iterations = _current_max_iterations()
+                agent.run_budget_seconds = None
+                agent.review_exempt = False
+            else:
+                if _fast_decision.max_iterations is not None:
+                    agent.max_iterations = _fast_decision.max_iterations
+                agent.run_budget_seconds = (
+                    _fast_decision.run_budget_seconds
+                    if _fast_decision.run_budget_seconds is not None
+                    else None
+                )
+                agent.review_exempt = True  # D5: forcer skips fast sessions
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact

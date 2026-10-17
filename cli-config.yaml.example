@@ -1080,6 +1080,31 @@ agent:
   #   "deepseek/deepseek-v4-pro": "xhigh" # dots and dashes are interchangeable
   reasoning_overrides: {}
   
+  # Adaptive reasoning routing (feature flags; adaptive-reasoning-effort mission,
+  # design/effort-policy-v1.md). All DEFAULT OFF — reasoning_effort stays
+  # byte-identical to the base revision until a later wave opts in. When OFF
+  # the class router, per-step router and the L1 per-card/aux pin helpers are
+  # inert (None / {} / no-op).
+  #   reasoning_class_routing: false   # master switch for class->effort (L2)
+  #                                    # + L1 per-card/aux pin layers
+  #   reasoning_step_routing: false    # per-step router (L3, per-step signals)
+  #   reasoning_aux_pins: {}           # {aux_task: effort} down-pins; only
+  #                                    # applied when reasoning_class_routing
+  #                                    # is true; values clamp to the letovo wire
+  #                                    # domain ({none,low,high,max}):
+  #                                    #   medium/xhigh -> high, ultra -> max
+  # L1 auxiliary down-pins declared per design/effort-policy-v1.md §2 rows 7/8
+  # (deterministic, no A/B gate): web_extract (deterministic transport) -> none,
+  # compression & indexing (context maintenance) -> low. Inert at default
+  # reasoning_class_routing: false — the pin helpers return None/{} until a
+  # later wave flips the master switch on.
+  reasoning_class_routing: false
+  reasoning_step_routing: false
+  reasoning_aux_pins:
+    web_extract: none
+    compression: low
+    indexing: low
+  
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,
   # pirate, shakespeare, surfer, noir, uwu, philosopher, hype) are always
@@ -1093,6 +1118,55 @@ agent:
   #     system_prompt: "You are a meticulous code reviewer."
   #     tone: "direct"
   #     style: "terse"
+
+# =============================================================================
+# Fast-lane (feature flag)
+# =============================================================================
+# Optional add-on speed tier over the regular agent lane (fast-lane-design.md
+# §6.2). The flag is a feature gate: the fast-lane machinery (reasoning
+# split, iteration/budget caps, review-exemption markers) is compiled in but
+# INERT unless enabled here. Default is OFF, so behavior is exactly the
+# normal full lane until you opt in.
+#
+#   fast_lane:
+#     enabled: false        # false (default) = fast lane fully inactive
+#                           # true = fast requests (no slow markers) take the
+#                           #        fast path with reduced reasoning/budget
+#
+# When OFF: every request runs on the full lane and the fast-path overrides
+# are never applied (reasoning stays as configured, no iteration or budget
+# caps, no review-exemption markers are written). When ON: marker-less
+# requests run on the fast path (reasoning medium/high — never low — max 8
+# iterations, 300s wall-clock budget) and are marked review-exempt so the
+# cron review forcer skips them. Any fast-path error degrades silently to
+# the full lane (fast_lane_degraded=true marker), never surfacing as an
+# error to the user. Roll out wave-style: flip ON only after the A8 gate
+# passes, and roll back with a single config edit + gateway restart.
+fast_lane:
+  enabled: false
+
+# =============================================================================
+# Adaptive reasoning effort (feature flags; adaptive-reasoning-effort mission)
+# =============================================================================
+# Class-based reasoning routing (design/effort-policy-v1.md). All switches are
+# DEFAULT OFF, so reasoning_effort is byte-identical to the base revision
+# until a later wave explicitly opts in. When OFF every helper in
+# agent/reasoning_effort_l1.py is inert (returns None / {} / no-op).
+#
+#   reasoning_class_routing: false   # master switch for class->effort (L2) and
+#                                    # the L1 per-card/aux pin layers
+#   reasoning_step_routing: false    # per-step router (L3, per-step signals)
+#   reasoning_aux_pins: {}           # {aux_task: effort} down-pins, e.g.
+#                                    #   web_extract: none
+#                                    #   compression: low
+#                                    # applied ONLY when reasoning_class_routing
+#                                    # is true; values clamp to the letovo wire
+#                                    # domain ({none,low,high,max}) — medium/
+#                                    # xhigh -> high, ultra -> max.
+#
+# Roll out wave-style; roll back with a single config edit + gateway restart.
+# (Set these under the existing `agent:` section, see the added
+# reasoning_class_routing / reasoning_step_routing / reasoning_aux_pins lines.)
 
 # =============================================================================
 # Toolsets
