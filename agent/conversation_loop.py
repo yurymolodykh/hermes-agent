@@ -2891,13 +2891,38 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                # L3 — per-step reasoning routing (adaptive-reasoning-effort,
+                # W3; agent.reasoning_step_routing DEFAULT OFF). When enabled,
+                # the step router may temporarily override reasoning_config
+                # effort from observed signals (tool type, context length,
+                # task class) for THIS request only; restored immediately so
+                # the agent-level config is untouched for every later use.
+                _l3_rc = None
+                if getattr(agent, "_reasoning_step_routing", False):
+                    try:
+                        from agent.reasoning_step_router import (
+                            per_step_agent_reasoning_config,
+                        )
+
+                        _l3_rc = per_step_agent_reasoning_config(
+                            agent, api_messages, tools_for_api
+                        )
+                    except Exception:
+                        _l3_rc = None  # L3 must never break the live path
+                if _l3_rc is not None:
+                    _prev_l3_rc = agent.reasoning_config
+                    agent.reasoning_config = _l3_rc
+                try:
+                    if tools_for_api == agent.tools:
+                        api_kwargs = agent._build_api_kwargs(api_messages)
+                    else:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages,
+                            tools_for_api=tools_for_api,
+                        )
+                finally:
+                    if _l3_rc is not None:
+                        agent.reasoning_config = _prev_l3_rc
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
