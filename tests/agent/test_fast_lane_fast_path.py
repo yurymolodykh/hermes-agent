@@ -5,7 +5,7 @@ review-exempt marker) for fast requests (slow_mode=False).
 
 Acceptance matrix exercised here:
   * fast request  -> reasoning medium (routine) / high (complex), never low;
-  * budget capped at 8 max_iterations + run_budget 300s;
+  * budget capped at 16 max_iterations + run_budget 300s;
   * fast request -> review_exempt=True (no review card);
   * slow request  -> untouched (budget unlimited, effort as configured,
     review_exempt=False);
@@ -90,7 +90,7 @@ def test_fast_request_routine_medium_budget_review_exempt():
     assert d.mode == "fast"
     assert d.complexity == "routine"
     assert d.reasoning_effort == FAST_REASONING_ROUTINE == "medium"
-    assert d.max_iterations == FAST_MAX_ITERATIONS == 8
+    assert d.max_iterations == FAST_MAX_ITERATIONS == 16
     assert d.run_budget_seconds == FAST_RUN_BUDGET_SECONDS == 300
     assert d.review_exempt is True  # D5
 
@@ -104,7 +104,7 @@ def test_fast_request_complex_high_reasoning():
     assert d.complexity == "high"
     assert d.reasoning_effort == FAST_REASONING_COMPLEX == "high"
     # Variant 1 (owner decision): complex fast work gets the FULL budget — no
-    # 8-call / 300s truncation that caused "нелепые обрывы" of production tasks.
+    # 16-call / 300s truncation that caused "нелепые обрывы" of production tasks.
     assert d.max_iterations is None
     assert d.run_budget_seconds is None
     assert d.review_exempt is True

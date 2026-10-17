@@ -11,7 +11,7 @@ design §4.2 Track S / §5 (D3) / §7 (D5):
 
   * fast request (no slow markers) ->
       reasoning_config medium (routine) / high (complex), NEVER low;
-      max_iterations capped at 8; run_budget_seconds=300;
+      max_iterations capped at 16; run_budget_seconds=300;
       agent.review_exempt=True; session marker fast_lane=True review_exempt=True
       (the D5 signal the review-forcer consumes to skip fast sessions).
   * slow request (OWUI deepthink, "гигантская задача", TG «подумай») ->
@@ -91,29 +91,29 @@ def _agent(adapter, **kwargs):
 
 
 def test_fast_request_applies_fast_path_parameters(monkeypatch):
-    """A routine fast request gets reasoning medium, 8 iterations, 300s budget,
+    """A routine fast request gets reasoning medium, 16 iterations, 300s budget,
     and review_exempt=True — the D5 signal for 'no review card'."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="сколько будет 2+2?")
 
     assert isinstance(agent, object)
     assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
-    assert captured["max_iterations"] == 8
+    assert captured["max_iterations"] == 16
     assert captured["run_budget_seconds"] == 300
     assert agent.review_exempt is True
 
 
 def test_fast_request_complex_uses_high_reasoning(monkeypatch):
     """Complex class-A request -> reasoning high (D3 complex split) and, per
-    variant 1 (owner decision), the FULL budget — no 8-call / 300s truncation
+    variant 1 (owner decision), the FULL budget — no 16-call / 300s truncation
     that caused 'нелепые обрывы'. Still review-exempt (D5)."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="проанализируй лог и сравни с baseline")
 
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
-    # Variant 1: complex work is NOT hard-capped to 8/300 — it keeps the full
+    # Variant 1: complex work is NOT hard-capped to 16/300 — it keeps the full
     # budget (unlimited sentinel), so production tasks can complete.
-    assert captured["max_iterations"] > 8
+    assert captured["max_iterations"] > 16
     assert "run_budget_seconds" not in captured
     assert agent.review_exempt is True
 
@@ -129,7 +129,7 @@ def test_fast_request_never_uses_low_reasoning(monkeypatch):
     # but the fast-path override must land on medium (never low).
     assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert captured["reasoning_config"]["effort"] != "low"
-    assert captured["max_iterations"] == 8
+    assert captured["max_iterations"] == 16
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ def test_slow_deepthink_request_untouched(monkeypatch):
     agent = _agent(adapter, user_message="детальный анализ", model_options=model_options)
 
     # Slow lane: no run_budget_seconds key at all (unlimited wall clock),
-    # max_iterations stays at the default (not forced to 8 by fast path,
+    # max_iterations stays at the default (not forced to 16 by fast path,
     # here the config default high), review not exempt.
     assert "run_budget_seconds" not in captured
     assert getattr(agent, "review_exempt", None) in (None, False)
@@ -217,22 +217,22 @@ def test_slow_request_persists_non_exempt_marker(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4) Budget-call cap ≤8: through the wiring the agent is told max_iterations=8
-#    for fast, and the slow lane is not force-capped to 8.
+# 4) Budget-call cap ≤16: through the wiring the agent is told max_iterations=16
+#    for fast, and the slow lane is not force-capped to 16.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "message, expected_effort, capped",
     [
-        # Routine class-A: still tight fast budget (≤8) — that is the point of
+        # Routine class-A: still tight fast budget (≤16) — that is the point of
         # the fast lane.
         ("сколько будет 2+2?", "medium", True),
         ("статус задачи", "medium", True),
         # «деплой сервиса» has no complex verb (deploy is only in the English
         # list; Russian deploy verbs are настрой/разверни/установи) -> routine.
         ("деплой сервиса", "medium", True),
-        # Complex work (variant 1): full budget — NOT forced into the 8-call cap.
+        # Complex work (variant 1): full budget — NOT forced into the 16-call cap.
         ("проанализируй всё и создай отчёт", "high", False),
     ],
 )
@@ -241,9 +241,9 @@ def test_fast_budget_routine_capped_complex_full(monkeypatch, message, expected_
     _agent(adapter, user_message=message)
 
     if capped:
-        assert captured["max_iterations"] <= 8
+        assert captured["max_iterations"] <= 16
     else:
-        assert captured["max_iterations"] > 8
+        assert captured["max_iterations"] > 16
         assert "run_budget_seconds" not in captured
     assert captured["reasoning_config"] == {
         "enabled": True,
@@ -270,7 +270,7 @@ def test_flag_off_default_fast_path_inert(monkeypatch):
 
     # Full lane: gateway-configured reasoning preserved, no fast cap/budget.
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
-    assert captured["max_iterations"] != 8  # not force-capped by fast path
+    assert captured["max_iterations"] != 16  # not force-capped by fast path
     assert "run_budget_seconds" not in captured
     assert getattr(agent, "review_exempt", None) in (None, False)
     # Marker NOT persisted -> forcer's session_is_fast_lane stays False.
@@ -328,7 +328,7 @@ def test_flag_true_fast_path_error_degrades_to_full_lane(monkeypatch, caplog):
     # default (high), no fast budget cap, no run_budget_seconds, and the
     # agent is NOT marked review-exempt.
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
-    assert captured["max_iterations"] != 8
+    assert captured["max_iterations"] != 16
     assert "run_budget_seconds" not in captured
     assert getattr(agent, "review_exempt", None) in (None, False)
     # A warning was logged signalling the degradation.
