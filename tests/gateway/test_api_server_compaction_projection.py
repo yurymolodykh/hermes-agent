@@ -131,6 +131,43 @@ class TestMessageProjection:
 
         assert projected["content"] == [{"type": "text", "text": REAL_USER}]
 
+    def test_assistant_reasoning_content_stripped_by_default(self, monkeypatch):
+        # show_reasoning defaults to off; reasoning chains must never reach OWUI.
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._api_server_show_reasoning",
+            lambda: False,
+        )
+        projected = APIServerAdapter._message_response(
+            _row(
+                "assistant",
+                "Итог: всё сделано.",
+                reasoning_content="Let me check W1's completion comment first...",
+                reasoning="internal chain-of-thought",
+                reasoning_details=[{"type": "reasoning", "summary": "thinking"}],
+            )
+        )
+        assert projected["content"] == "Итог: всё сделано."
+        assert "reasoning_content" not in projected
+        assert "reasoning" not in projected
+        assert "reasoning_details" not in projected
+
+    def test_assistant_reasoning_content_kept_when_opted_in(self, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._api_server_show_reasoning",
+            lambda: True,
+        )
+        projected = APIServerAdapter._message_response(
+            _row(
+                "assistant",
+                "Итог: всё сделано.",
+                reasoning_content="Let me check W1's completion comment first...",
+            )
+        )
+        assert projected["content"] == "Итог: всё сделано."
+        assert projected.get("reasoning_content") == (
+            "Let me check W1's completion comment first..."
+        )
+
     def test_real_message_that_mentions_marker_text_is_untouched(self):
         message = _row(
             "user",
