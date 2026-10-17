@@ -1651,7 +1651,15 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
-DEFAULT_BUSY_TIMEOUT_MS = 120_000
+# 2026-10-16 t_a7d45d6f: 120s -> 8s. A 120s default let every kanban
+# connection without an explicit env busy-wait inside SQLite for up to 2min,
+# and because webui-style readers hold the process-global _live_lock (GIL)
+# across sqlite3.connect()/close(), one contended open froze all concurrent
+# requests in a convoy (measured 5-131s). 8s still absorbs normal writer churn
+# (kanban write txns are sub-ms of real work; loader bursts use the jittered
+# _execute_boundary_with_retry backstop) but bounds the tail. Matches the
+# HERMES_KANBAN_BUSY_TIMEOUT_MS=8000 already proven on the webui env.
+DEFAULT_BUSY_TIMEOUT_MS = 8_000
 
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
 # board DB. Content-addressing already dedupes identical corrupt bytes, but
@@ -9221,6 +9229,7 @@ class DispatchResult:
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     reserved_by_daytime: list[str] = field(default_factory=list)
+    skipped_rgz_capped: list[str] = field(default_factory=list)
     """Ready/review task ids deferred this tick by the daytime worker reserve
     (``kanban.daytime_reserve_*``, t_b12721ab): background cards (priority
     below ``daytime_reserve_priority_below``) may not occupy the last
@@ -11920,6 +11929,70 @@ def count_running_background_slots(
     return total
 
 
+def count_running_rgz_slots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> float:
+    """Occupied РГЗ (giant-mission) worker slots on EVERY board (host view).
+
+    Class = title marker (``РГЗ``/``RGZ``, case-insensitive) — the same
+    classifier the РГЗ burst-guard job uses (``_task_is_rgz``), applied in
+    SQL. Goal-mode is deliberately NOT part of this class: the current corpus
+    has exactly one active goal-mode controller and it IS a РГЗ mission, but
+    tying the two would misclassify future non-РГЗ goal-mode cards. Plain
+    (unweighted) count: the РГЗ slot ceiling is a hard integer limit, weight
+    would only blur it. Fails open to 0 per board.
+    """
+    total = 0.0
+    try:
+        total += float(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' "
+                "AND (title LIKE '%РГЗ%' OR title LIKE '%ргз%' OR lower(title) LIKE '%rgz%')"
+            ).fetchone()[0]
+            or 0
+        )
+    except Exception:
+        pass
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return total
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                total += float(
+                    other.execute(
+                        "SELECT COUNT(*) FROM tasks "
+                        "WHERE status = 'running' "
+                        "AND (title LIKE '%РГЗ%' OR title LIKE '%ргз%' OR lower(title) LIKE '%rgz%')"
+                    ).fetchone()[0]
+                    or 0
+                )
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return total
+
+
 def _count_running_background_slots_other_boards(
     board: Optional[str] = None,
     priority_below: int = 0,
@@ -12924,7 +12997,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, model_override, provider_override, priority, goal_mode "
+        "SELECT id, assignee, model_override, provider_override, priority, goal_mode, title "
         "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
@@ -12934,7 +13007,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, model_override, provider_override, priority, goal_mode "
+            "SELECT id, assignee, model_override, provider_override, priority, goal_mode, title "
             "FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
@@ -13060,6 +13133,35 @@ def _dispatch_once_locked(
                 weighted=weighted,
             )
 
+    # ---- РГЗ class ceilings (t_rgzclass, owner directive 15.10 v2) ---------
+    # Workers are mostly I/O-bound; the primary lever is SLOT classes, not
+    # machine-wide resource reservation. During the day window РГЗ cards may
+    # hold at most ``rgz_day_slots`` host slots ("barely move"); at night
+    # they may hold at most ``rgz_night_slots_pct``% of the effective host
+    # cap so >=20% of the bottleneck always stays with non-РГЗ cards and
+    # no-card chat. Deferred РГЗ cards stay in ready/review — not blocked.
+    # Fail-open: any error reading the config/counters disables the gate.
+    _rgz_cfg = _kanban_limit_config()
+    _rgz_ceiling: Optional[int] = None
+    _rgz_counter: float = 0.0
+    if _rgz_cfg is not None:
+        if _daytime_window_active():
+            _rgz_ceiling = _rgz_cfg["day_slots"]
+        elif isinstance(effective_max_in_progress, int) and effective_max_in_progress > 0:
+            _rgz_ceiling = max(
+                1, int(effective_max_in_progress * _rgz_cfg["night_pct"] / 100.0)
+            )
+        else:
+            _rgz_ceiling = None  # no adaptive base -> slot gate off (fail-open)
+        if _rgz_ceiling is not None:
+            try:
+                _rgz_counter = count_running_rgz_slots(conn, board=board)
+            except Exception:
+                _rgz_counter = 0.0
+                _rgz_ceiling = None
+    rgz_slot_limit = _rgz_ceiling
+    rgz_running_counter = _rgz_counter
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -13184,6 +13286,17 @@ def _dispatch_once_locked(
         ):
             result.reserved_by_daytime.append(row["id"])
             continue
+        # РГЗ slot gate (v2, owner directive 15.10): hard class ceiling on
+        # concurrent РГЗ workers — tight by day (2-3 cards, barely moving),
+        # a fraction of the AIMD ceiling by night so 20% of slots always
+        # stay free for non-РГЗ cards and plain chat.
+        if (
+            rgz_slot_limit is not None
+            and _title_is_rgz(row["title"])
+            and rgz_running_counter >= rgz_slot_limit
+        ):
+            result.skipped_rgz_capped.append(row["id"])
+            continue
         try:
             if dry_run:
                 resolve_task_root_route(conn, row["id"], persist=False)
@@ -13212,6 +13325,8 @@ def _dispatch_once_locked(
             # iterations, not just the running backlog (t_b12721ab).
             if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
                 reserve_bg_counter += row_weight
+            if rgz_slot_limit is not None and _title_is_rgz(row["title"]):
+                rgz_running_counter += row_weight
             continue
         if not dry_run:
             # Defense-in-depth provider pre-flight: a card pinned to a route
@@ -13330,6 +13445,10 @@ def _dispatch_once_locked(
             # tick can't push background past the ceiling (t_b12721ab).
             if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
                 reserve_bg_counter += row_weight
+            # РГЗ slot gate: this spawn consumed a РГЗ slot this tick;
+            # count it so an in-tick burst can't exceed the class ceiling.
+            if rgz_slot_limit is not None and _title_is_rgz(row["title"]):
+                rgz_running_counter += row_weight
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -13403,6 +13522,17 @@ def _dispatch_once_locked(
         ):
             result.reserved_by_daytime.append(row["id"])
             continue
+        # РГЗ slot gate (v2, owner directive 15.10): hard class ceiling on
+        # concurrent РГЗ workers — tight by day (2-3 cards, barely moving),
+        # a fraction of the AIMD ceiling by night so 20% of slots always
+        # stay free for non-РГЗ cards and plain chat.
+        if (
+            rgz_slot_limit is not None
+            and _title_is_rgz(row["title"])
+            and rgz_running_counter >= rgz_slot_limit
+        ):
+            result.skipped_rgz_capped.append(row["id"])
+            continue
         try:
             if dry_run:
                 resolve_task_root_route(conn, row["id"], persist=False)
@@ -13424,6 +13554,8 @@ def _dispatch_once_locked(
                 )
             if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
                 reserve_bg_counter += row_weight
+            if rgz_slot_limit is not None and _title_is_rgz(row["title"]):
+                rgz_running_counter += row_weight
             continue
         if not dry_run:
             # Same assignee-aware provider pre-flight as the ready lane (see
@@ -13518,6 +13650,8 @@ def _dispatch_once_locked(
                 )
             if reserve_active and _is_reserve_background(row_priority, row_goal_mode):
                 reserve_bg_counter += row_weight
+            if rgz_slot_limit is not None and _title_is_rgz(row["title"]):
+                rgz_running_counter += row_weight
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -13834,6 +13968,363 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+# ---------------------------------------------------------------------------
+# Daytime worker resource caps (t_daycaps).
+#
+# Windows-only, JS-style nested Job Objects give BOTH a hard "all workers"
+# budget (so quick non-card requests never stall behind worker load) AND a
+# per-class budget for РГЗ cards (so they can never take more than N% of the
+# machine during the day) AT THE SAME TIME, because a process that is in two
+# jobs obeys the intersection (min) of both caps. Outside the daytime window
+# nothing is capped — night batch work runs at full speed.
+#
+#   day-job  (every worker, daytime only)  CPU hard-cap + job-RAM cap
+#   rgz-job  (nested, РГЗ workers only)     CPU hard-cap + job-RAM cap
+#
+# Probes (2026-10):
+#   * CPU HARD_CAP is linear: cap 8% of machine = exactly 1 of 12 cores.
+#   * Nested assignment (parent then child) succeeds: process obeys min().
+#   * JobMemoryLimit raises MemoryError in the child (clean exit, no crash) —
+#     a hard RAM ceiling is safe for workers.
+#
+# Fail-open contract: every helper degrades to "no cap" (returns None /
+# no-op) on non-Windows, missing ctypes, or any API failure. Spawn must
+# never break because a limit could not be applied.
+# ---------------------------------------------------------------------------
+
+
+def _kanban_limit_config() -> Optional[dict]:
+    """Read РГЗ class-limit config (``kanban.rgz_*``).
+
+    Model (owner directive 15.10, v2): workers are mostly I/O-bound, so the
+    primary lever is SLOT classes layered on the AIMD adaptive cap, not
+    machine-wide resource reservation. Job-object caps remain only as a
+    burst guard for РГЗ workers themselves:
+
+    * day (9-19 window)   -- РГЗ may occupy at most ``rgz_day_slots``
+      concurrent slots (they "barely move"); non-РГЗ cards keep the AIMD
+      cap + the existing daytime reserve.
+    * night               -- РГЗ may occupy at most ``rgz_night_slots_pct``%
+      of the effective host cap, so >=20% of the bottleneck stays available
+      for non-РГЗ cards and no-card chat requests.
+
+    Returns a dict, or None when the whole block is invalid (fail-open to
+    "no class limits"). Reuses the config loader used by
+    :func:`daytime_reserve_config` for symmetric behaviour.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    cfg = load_config_readonly() or {}
+    kanban_cfg = cfg.get("kanban") or {}
+    if not isinstance(kanban_cfg, dict):
+        return None
+    try:
+        day_slots = int(kanban_cfg.get("rgz_day_slots", 2))
+        night_pct = int(kanban_cfg.get("rgz_night_slots_pct", 80))
+        return {
+            "day_slots": max(0, day_slots),
+            "night_pct": min(100, max(0, night_pct)),
+            "day_cpu_pct": min(100, max(1, int(kanban_cfg.get("rgz_day_cpu_cap_pct", 40)))),
+            "day_ram_pct": min(100, max(1, int(kanban_cfg.get("rgz_day_ram_cap_pct", 45)))),
+            "night_cpu_pct": min(100, max(1, int(kanban_cfg.get("rgz_night_cpu_cap_pct", 80)))),
+            "night_ram_pct": min(100, max(1, int(kanban_cfg.get("rgz_night_ram_cap_pct", 75)))),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _title_is_rgz(title) -> bool:
+    """Title-level РГЗ classifier (Python lower() handles Cyrillic; SQL's
+    :func:`count_running_rgz_slots` uses explicit-case LIKE for the same
+    semantics because SQLite ``lower()`` is ASCII-only)."""
+    t = (title or "").lower()
+    return "ргз" in t or "rgz" in t
+
+
+def _task_is_rgz(task) -> bool:
+    """True when *task* is a РГЗ (giant-mission) card.
+
+    Reliable classifier for the current corpus: the title carries a
+    ``РГЗ``/``RGZ`` marker (prefix, or anywhere in the title), or the card is
+    a goal-mode controller (``goal_mode=1``). The goal-mode fallback closes
+    the "controller mission" cards whose title does not start with the marker.
+    """
+    title = (task.title or "") if task is not None else ""
+    rgz_marker = _title_is_rgz(title)
+    return bool(rgz_marker or (task and task.goal_mode))
+
+
+def _daytime_window_active() -> bool:
+    """True when the clock (in the reserve TZ) is inside the 9-19 window.
+
+    ``False`` (no cap) when the reserve window is not configured.
+    """
+    reserve_cfg = daytime_reserve_config()
+    if reserve_cfg is None:
+        # No reserve window configured -> keep the old behaviour entirely.
+        return False
+    try:
+        return in_daytime_window(reserve_cfg)
+    except Exception:
+        return False
+
+
+# --- Windows Job Object helpers (ctypes, stdlib-only) ----------------------
+# Job info classes:
+#   9  = JOBOBJECT_EXTENDED_LIMIT_INFORMATION  (CPU rate + job memory limit)
+#   15 = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+_JOB_INFO_EXT_LIMIT = 9
+_JOB_INFO_CPU_RATE = 15
+_JOB_CPU_RATE_CONTROL_ENABLE = 0x1
+_JOB_CPU_RATE_CONTROL_HARD_CAP = 0x4
+_JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+
+# Job-name -> cached handle. The kernel keeps a job alive as long as any
+# process is attached to it (even if our HANDLE is closed / dispatcher
+# restarts), but we keep the handle open too so the cap stays applied for
+# nested jobs spawned later.
+_WORKER_JOBS: dict = {}
+_JOB_API: Optional[dict] = None
+_JOB_API_TRIED = False
+
+
+def _job_api() -> Optional[dict]:
+    """Lazily build ctypes bindings for Job Objects; None on failure/non-Win.
+
+    Returns a dict with ``k32``, ``ext_struct``, ``cpu_struct`` and precomputed
+    sizes. Fail-open: any import/API failure returns None (no capping).
+    """
+    global _JOB_API, _JOB_API_TRIED
+    if _JOB_API_TRIED:
+        return _JOB_API
+    _JOB_API_TRIED = True
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class LARGE_INTEGER(ctypes.Structure):
+            _fields_ = [("QuadPart", ctypes.c_longlong)]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", LARGE_INTEGER),
+                        ("PerJobUserTimeLimit", LARGE_INTEGER),
+                        ("LimitFlags", wt.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wt.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wt.DWORD),
+                        ("SchedulingClass", wt.DWORD)]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        class CPU_RATE(ctypes.Structure):
+            _fields_ = [("ControlFlags", wt.DWORD), ("CpuRate", wt.DWORD)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _JOB_API = {
+            "k32": k32,
+            "ext_struct": JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            "cpu_struct": CPU_RATE,
+            "size_ext": ctypes.sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+            "size_cpu": ctypes.sizeof(CPU_RATE),
+        }
+    except Exception:
+        _JOB_API = None
+    return _JOB_API
+
+
+def _create_capped_job(cpu_rate: int, ram_bytes: Optional[int]) -> Optional[int]:
+    """Create a Job Object with a CPU hard-cap (and optional job-RAM cap).
+
+    ``cpu_rate`` is the HARD_CAP rate = percent-of-machine * 100.
+    Returns the kernel HANDLE (int) or None. Fail-open.
+    """
+    api = _job_api()
+    if api is None:
+        return None
+    try:
+        from ctypes import byref
+
+        k32 = api["k32"]
+        h = k32.CreateJobObjectW(None, None)
+        if not h:
+            return None
+
+        # CPU hard cap (class 15)
+        cpu = api["cpu_struct"]()
+        cpu.ControlFlags = _JOB_CPU_RATE_CONTROL_ENABLE | _JOB_CPU_RATE_CONTROL_HARD_CAP
+        cpu.CpuRate = int(cpu_rate)
+        if not k32.SetInformationJobObject(
+            h, _JOB_INFO_CPU_RATE, byref(cpu), api["size_cpu"]
+        ):
+            k32.CloseHandle(h)
+            return None
+
+        # Job RAM cap (class 9), optional
+        if ram_bytes is not None and ram_bytes > 0:
+            ext = api["ext_struct"]()
+            ext.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_JOB_MEMORY
+            ext.JobMemoryLimit = int(ram_bytes)
+            if not k32.SetInformationJobObject(
+                h, _JOB_INFO_EXT_LIMIT, byref(ext), api["size_ext"]
+            ):
+                k32.CloseHandle(h)
+                return None
+        return h
+    except Exception:
+        return None
+
+
+def _rgz_job_limits(task) -> Optional[dict]:
+    """Return rgz-job cap parameters for *task*'s worker, or None.
+
+    v2 model: no machine-wide day-job. A Job-object cap is applied ONLY to
+    РГЗ workers, as a burst guard (they occasionally run local tooling
+    bursts — pytest, builds — that would otherwise saturate the host while
+    the card itself waits on the LLM). Day (window) and night parameters
+    differ; non-РГЗ workers get NO job cap (slot classes above are their
+    limiter). Returns None outside the РГЗ class / fail-open paths.
+    """
+    global _WORKER_JOBS
+    if not _task_is_rgz(task):
+        return None
+    limits = _kanban_limit_config()
+    if not limits:
+        return None
+    api = _job_api()
+    if api is None:
+        return None
+    if _daytime_window_active():
+        return {"cpu_pct": limits["day_cpu_pct"], "ram_pct": limits["day_ram_pct"]}
+    # Night: generous caps — the slot class already bounds concurrency.
+    return {"cpu_pct": limits["night_cpu_pct"], "ram_pct": limits["night_ram_pct"]}
+
+
+def _get_or_create_rgz_job(caps: dict):
+    """Create (once per dispatcher process / mode) the shared rgz-job.
+
+    Keyed by mode (``day``/``night``) so a day/night transition creates a
+    fresh job with the new caps instead of reusing a stale handle; existing
+    workers keep their old job's caps until they exit. Fail-open: returns
+    ``[]`` when the job cannot be created (worker runs uncapped).
+    """
+    global _WORKER_JOBS
+    api = _job_api()
+    if api is None:
+        return []
+    try:
+        import psutil
+
+        total_ram = int(getattr(psutil.virtual_memory(), "total", 0) or 0)
+    except Exception:
+        total_ram = 0
+    mode = "day" if _daytime_window_active() else "night"
+    key = f"rgz-{mode}"
+    job = _WORKER_JOBS.get(key)
+    if job is not None:
+        return [job]
+    if not caps:
+        return []  # fail-open: no config -> uncapped (shouldn't happen; limits gate above)
+    cpu_rate = int(caps["cpu_pct"]) * 100
+    ram_bytes = int(total_ram * int(caps["ram_pct"]) // 100) if total_ram > 0 else None
+    h = _create_capped_job(cpu_rate, ram_bytes)
+    if h:
+        _WORKER_JOBS[key] = h
+        return [h]
+    return []
+
+
+def _assign_worker_to_jobs(proc, handles: Optional[list]) -> bool:
+    """Best-effort assign ``proc`` (a Popen) to the given job handles.
+
+    Handle values may be ints (from ctypes) or objects with a ``handle``
+    attribute. Returns True when at least one job was applied. Never raises.
+    """
+    if not handles:
+        return False
+    api = _job_api()
+    if api is None:
+        return False
+
+    def _hval(h):
+        return int(h) if isinstance(h, int) else int(h.handle)
+
+    try:
+        k32 = api["k32"]
+        hp = k32.OpenProcess(0x1F0FFF, False, int(proc.pid))
+        if not hp:
+            return False
+        applied = 0
+        for h in handles:
+            hv = _hval(h)
+            if hv and k32.AssignProcessToJobObject(hv, hp):
+                applied += 1
+        k32.CloseHandle(hp)
+        return applied > 0
+    except Exception:
+        return False
+
+
+def _resume_process(pid: int) -> int:
+    """Best-effort resume every suspended thread belonging to ``pid``.
+
+    Used after CREATE_SUSPENDED + AssignProcessToJobObject so the dispatched
+    worker actually starts. Returns the number of threads resumed. Never
+    raises.
+    """
+    api = _job_api()
+    if api is None:
+        return 0
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        k32 = api["k32"]
+
+        class TE32(ctypes.Structure):
+            _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                        ("th32ThreadID", wt.DWORD), ("th32OwnerProcessID", wt.DWORD),
+                        ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
+                        ("dwFlags", wt.DWORD)]
+
+        snap = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+        if not snap or snap == -1:  # INVALID_HANDLE_VALUE
+            return 0
+        te = TE32()
+        te.dwSize = ctypes.sizeof(TE32)
+        n = 0
+        ok = k32.Thread32First(snap, ctypes.byref(te))
+        while ok:
+            if te.th32OwnerProcessID == pid:
+                ht = k32.OpenThread(0x1FFFFF, False, te.th32ThreadID)
+                if ht:
+                    if k32.ResumeThread(ht) >= 0:  # >0 oversubscribed; 0 = was suspended
+                        n += 1
+                    k32.CloseHandle(ht)
+            ok = k32.Thread32Next(snap, ctypes.byref(te))
+        k32.CloseHandle(snap)
+        return n
+    except Exception:
+        return 0
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -14050,6 +14541,19 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    # РГЗ burst guard (v2): only РГЗ workers get a Job-object CPU/RAM cap
+    # (tighter by day, looser by night); non-РГЗ workers are bounded by the
+    # AIMD slot classes, NOT by resource caps. We spawn CREATE_SUSPENDED so
+    # the process joins its job BEFORE it runs (the venv trampoline would
+    # otherwise fork the real interpreter outside the job).
+    rgz_caps = _rgz_job_limits(task) if _IS_WINDOWS else None
+    job_handles = []
+    if rgz_caps is not None:
+        job_handles = _get_or_create_rgz_job(rgz_caps)
+    spawn_suspended = bool(job_handles)
+    creation_flags = subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0
+    if spawn_suspended:
+        creation_flags |= 0x4  # CREATE_SUSPENDED
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
@@ -14059,7 +14563,7 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=creation_flags,
         )
     except FileNotFoundError:
         log_f.close()
@@ -14067,6 +14571,14 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    if _IS_WINDOWS and hasattr(proc, "poll"):
+        if job_handles:
+            _assign_worker_to_jobs(proc, job_handles)
+        if spawn_suspended:
+            # Resume all threads of the freshly-spawned process (the child is
+            # the venv trampoline; its real interpreter may not exist yet, so
+            # enumerate threads by owner PID and resume each).
+            _resume_process(proc.pid)
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
