@@ -218,3 +218,8 @@ native/fts5_cjk/*.so
 artifacts/
 *.pre-*
 *.bak-*
+
+# Kanban card handoff artifacts (per-card markdown handoffs) — process
+# artifacts, never working drift to commit (watchdog-excluded via
+# task-backups convention; kept local under .kanban-artifacts/)
+.kanban-artifacts/
