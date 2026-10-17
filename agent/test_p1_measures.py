@@ -1,8 +1,11 @@
-"""P1 measures (token-optimization rollout, W2) — focused unit tests.
+"""P1 measures (token-optimization rollout, W2) + L1 adaptive-reasoning pins
+(adaptive-reasoning-effort mission) — focused unit tests.
 
-Validates the five P1 implementation points are gated DEFAULT OFF and behave
-byte-identically to the base revision when off, and exercise the gated
-behavior when flipped on. Run: python -m pytest agent/test_p1_measures.py -q
+Validates the P1 implementation points are gated DEFAULT OFF and behave
+byte-identically to the base revision when off, exercise the gated behavior
+when flipped on, and cover the L1 per-card/auxiliary pin layer (letovo wire
+ladder clamping, gated per-card effort helper). Run:
+    python -m pytest agent/test_p1_measures.py -q
 """
 
 from __future__ import annotations
@@ -281,3 +284,199 @@ class TestM67ClassRouting:
         assert detect_task_class("Вычисли среднее и процент от суммы") == "math"
         assert detect_task_class("Проведи аудит и ревью архитектуры") == "logic"
         assert detect_task_class("Кратко суммаризируй и подготовь справку") == "routine"
+
+
+# ---------------------------------------------------------------------------
+# L1: reasoning_step_routing flag + letovo ladder + gated aux/per-card pins
+# (adaptive-reasoning-effort mission; design/effort-policy-v1.md)
+# ---------------------------------------------------------------------------
+
+
+class TestReasoningStepRoutingFlag:
+    def test_step_routing_default_off(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        ac = (DEFAULT_CONFIG or {}).get("agent") or {}
+        assert ac.get("reasoning_step_routing") is False
+
+
+class TestReasoningClassRoutingFlag:
+    def test_class_routing_default_off(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        ac = (DEFAULT_CONFIG or {}).get("agent") or {}
+        assert ac.get("reasoning_class_routing") is False
+
+
+class TestLetovoLadder:
+    def test_wire_domain(self):
+        from agent.reasoning_effort_l1 import LETOVO_EFFORTS
+
+        assert LETOVO_EFFORTS == ("none", "low", "high", "max")
+
+    def test_clamp_collapses_medium_and_xhigh_to_high(self):
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        assert clamp_to_letovo("medium") == "high"
+        assert clamp_to_letovo("xhigh") == "high"
+
+    def test_clamp_maps_ultra_to_max_and_minimal_to_low(self):
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        assert clamp_to_letovo("ultra") == "max"
+        assert clamp_to_letovo("minimal") == "low"
+
+    def test_clamp_passes_through_wire_native(self):
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        for level in ("none", "low", "high", "max"):
+            assert clamp_to_letovo(level) == level
+
+    def test_clamp_never_returns_unsafe_level(self):
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        for bad in ("ultra", "xhigh", "medium", "minimal"):
+            assert clamp_to_letovo(bad) in ("low", "high", "max")
+
+
+class TestGatedAuxPins:
+    def test_aux_pins_inert_when_routing_off(self):
+        from agent.reasoning_effort_l1 import reasoning_aux_pins, resolve_aux_effort
+
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": False,
+                "reasoning_aux_pins": {"web_extract": "none", "compression": "low"},
+            }
+        }
+        assert reasoning_aux_pins(cfg) == {}
+        assert resolve_aux_effort("web_extract", cfg) is None
+        assert resolve_aux_effort("compression", cfg) is None
+
+    def test_aux_pins_active_when_routing_on(self):
+        from agent.reasoning_effort_l1 import reasoning_aux_pins, resolve_aux_effort
+
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"web_extract": "none", "compression": "low"},
+            }
+        }
+        pins = reasoning_aux_pins(cfg)
+        assert pins == {"web_extract": "none", "compression": "low"}
+        assert resolve_aux_effort("web_extract", cfg) == "none"
+        assert resolve_aux_effort("compression", cfg) == "low"
+        # A task without a pin resolves to None (caller keeps its behavior).
+        assert resolve_aux_effort("title_generation", cfg) is None
+
+    def test_aux_pin_invalid_value_skipped_not_crashed(self):
+        from agent.reasoning_effort_l1 import reasoning_aux_pins
+
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"web_extract": "bogus", "compression": "low"},
+            }
+        }
+        pins = reasoning_aux_pins(cfg)
+        assert "web_extract" not in pins
+        assert pins.get("compression") == "low"
+
+    def test_aux_pin_clamped_to_letovo(self):
+        from agent.reasoning_effort_l1 import reasoning_aux_pins
+
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"web_extract": "medium", "compression": "ultra"},
+            }
+        }
+        pins = reasoning_aux_pins(cfg)
+        assert pins["web_extract"] == "high"  # medium -> high
+        assert pins["compression"] == "max"  # ultra -> max
+
+
+class TestGatedCardPin:
+    def test_card_effort_inert_when_routing_off(self):
+        from agent.reasoning_effort_l1 import resolve_card_effort
+
+        cfg = {"agent": {"reasoning_class_routing": False}}
+        assert resolve_card_effort("code", "03-software-engineer", cfg) is None
+
+    def test_card_effort_routes_complex_to_max(self):
+        from agent.reasoning_effort_l1 import resolve_card_effort
+
+        cfg = {"agent": {"reasoning_class_routing": True}}
+        assert resolve_card_effort("code", "03-software-engineer", cfg) == "max"
+        assert resolve_card_effort("logic", "01-orchestrator", cfg) == "max"
+
+    def test_card_effort_routes_routine_to_low(self):
+        from agent.reasoning_effort_l1 import resolve_card_effort
+
+        cfg = {"agent": {"reasoning_class_routing": True}}
+        assert resolve_card_effort("routine", "07-document-producer", cfg) == "low"
+
+    def test_card_effort_wired_pin_wins(self):
+        # An explicit operator pin (tasks.reasoning_effort) always wins over
+        # routing — the helper clamps it but never drops it.
+        from agent.reasoning_effort_l1 import resolve_card_effort
+
+        cfg = {"agent": {"reasoning_class_routing": True}}
+        assert resolve_card_effort("code", "03", cfg, wired_effort="high") == "high"
+        assert resolve_card_effort("code", "03", cfg, wired_effort="medium") == "high"
+
+
+class TestPinCardEffort:
+    def _tmp_kanban(self, tmp_path, monkeypatch):
+        import os
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import profiles
+
+        # synthetic assignee registry so create_task accepts test profiles
+        monkeypatch.setattr(
+            profiles, "profile_exists", lambda name: name in {"worker", "03-software-engineer"}
+        )
+        monkeypatch.setattr(kb, "_provider_route_blocker", lambda _p, _m: None)
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        os.environ["HERMES_HOME"] = str(home)
+        from pathlib import Path
+
+        # isolate the DB path so it does not touch the real board
+        db_path = tmp_path / "test_kanban.db"
+        os.environ["HERMES_KANBAN_DB"] = str(db_path)
+        kb.init_db()
+        conn = kb.connect(db_path=db_path)
+        return conn, kb
+
+    def test_pin_writes_when_routing_on(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import pin_card_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            tid = kb.create_task(conn, title="t", assignee="worker")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert pin_card_effort(conn, tid, "low", cfg) is True
+            t = kb.get_task(conn, tid)
+            assert t.reasoning_effort == "low"
+            # a non-letovo logical level collapses onto the wire domain
+            assert pin_card_effort(conn, tid, "medium", cfg) is True
+            t = kb.get_task(conn, tid)
+            assert t.reasoning_effort == "high"  # medium -> high
+        finally:
+            conn.close()
+
+    def test_pin_is_noop_when_routing_off(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import pin_card_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            tid = kb.create_task(conn, title="t", assignee="worker")
+            cfg = {"agent": {"reasoning_class_routing": False}}
+            assert pin_card_effort(conn, tid, "low", cfg) is False
+            t = kb.get_task(conn, tid)
+            assert t.reasoning_effort is None  # untouched
+        finally:
+            conn.close()

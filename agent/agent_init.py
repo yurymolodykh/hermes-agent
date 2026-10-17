@@ -1024,6 +1024,12 @@ def init_agent(
         )
         _rce = _acfg.get("reasoning_class_efforts") or {}
         agent._reasoning_class_efforts = _rce if isinstance(_rce, dict) else {}
+        # L3 — per-step reasoning routing (agent.reasoning_step_routing,
+        # DEFAULT OFF). Reads the master switch so the per-step router is
+        # inert while off and reasoning_effort stays byte-identical to base.
+        agent._reasoning_step_routing = is_truthy_value(
+            _acfg.get("reasoning_step_routing"), default=False
+        )
     except Exception:
         pass
 

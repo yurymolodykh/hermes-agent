@@ -8384,6 +8384,20 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
                     "(none, minimal, low, medium, high, xhigh, max, ultra) — ignoring",
                     task, effort,
                 )
+        else:
+            # L1 gated aux pin (adaptive-reasoning-effort mission): applied only
+            # when agent.reasoning_class_routing=true AND no explicit
+            # auxiliary.<task>.reasoning_effort was set above. resolve_aux_effort
+            # returns None while the master switch is off, so the implicit pin
+            # layer is fully inert by default. Values are clamped to the letovo
+            # wire domain by the resolver — an invalid pin can never 400.
+            from agent.reasoning_effort_l1 import resolve_aux_effort
+            pin = resolve_aux_effort(task)
+            if pin is not None:
+                from hermes_constants import parse_reasoning_effort
+                parsed = parse_reasoning_effort(pin)
+                if parsed is not None:
+                    result["reasoning"] = parsed
     return result
 
 

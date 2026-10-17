@@ -129,6 +129,21 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: lettovo (custom:letovo) OpenAI-compatible endpoint serving
+#: deepseek-v4-flash — live-verified wire vocabulary (adaptive-reasoning-effort
+#: mission W1, official DeepSeek docs §3.1): ``{none, low, high, max}``.
+#: ``medium`` and ``xhigh`` are NOT distinguishable on the wire — both collapse
+#: to ``high`` (DeepSeek has no medium tier; the server treats the pair as
+#: high). ``ultra`` is Hermes-internal and maps to ``max``. ``none`` fully
+#: disables chain-of-thought (the L1/L3 down-pin for routine/indexing/chat).
+LETOVO_EFFORTS: tuple[str, ...] = ("none", "low", "high", "max")
+LETOVO_OVERRIDES: dict[str, str] = {
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "high",
+    "ultra": "max",
+}
+
 #: Ollama Cloud /v1/chat/completions: accepts {none, low, medium, high, max};
 #: rejects ``minimal`` with HTTP 400. ``xhigh`` requests the top tier.
 OLLAMA_CLOUD_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")

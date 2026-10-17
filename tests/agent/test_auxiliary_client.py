@@ -2325,6 +2325,60 @@ class TestAuxiliaryTaskExtraBody:
         assert "reasoning" not in result
         assert any("per-slot" in rec.message for rec in caplog.records)
 
+    def test_l1_gated_aux_pin_applied_only_when_routing_on(self):
+        """L1 implicit aux pins (agent.reasoning_aux_pins) fold into
+        extra_body.reasoning ONLY when agent.reasoning_class_routing is true
+        and no explicit auxiliary.<task>.reasoning_effort is set."""
+        from agent.auxiliary_client import _get_task_extra_body
+
+        # routing OFF -> aux pin is inert, no reasoning key added
+        config = {
+            "auxiliary": {"web_extract": {}},
+            "agent": {
+                "reasoning_class_routing": False,
+                "reasoning_aux_pins": {"web_extract": "none"},
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), \
+             patch("hermes_cli.config.load_config_readonly", return_value=config):
+            result = _get_task_extra_body("web_extract")
+        assert "reasoning" not in result
+
+        # routing ON -> pin applies as extra_body.reasoning
+        config_on = {
+            "auxiliary": {"web_extract": {}},
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"web_extract": "none", "compression": "low"},
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=config_on), \
+             patch("hermes_cli.config.load_config_readonly", return_value=config_on):
+            result = _get_task_extra_body("web_extract")
+        assert result.get("reasoning") == {"enabled": False}  # none = thinking off
+
+        with patch("hermes_cli.config.load_config", return_value=config_on), \
+             patch("hermes_cli.config.load_config_readonly", return_value=config_on):
+            result = _get_task_extra_body("compression")
+        assert result.get("reasoning") == {"enabled": True, "effort": "low"}
+
+    def test_l1_explicit_aux_reasoning_effort_wins_over_pin(self):
+        """An explicit auxiliary.<task>.reasoning_effort takes precedence over
+        the L1 implicit pin for the same task."""
+        from agent.auxiliary_client import _get_task_extra_body
+
+        config = {
+            "auxiliary": {"web_extract": {"reasoning_effort": "high"}},
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"web_extract": "none"},
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), \
+             patch("hermes_cli.config.load_config_readonly", return_value=config):
+            result = _get_task_extra_body("web_extract")
+        assert result.get("reasoning") == {"enabled": True, "effort": "high"}
+
 
     def test_anthropic_aux_client_forwards_extra_body_reasoning(self):
         """_AnthropicCompletionsAdapter passes extra_body.reasoning into
