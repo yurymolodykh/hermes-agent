@@ -103,7 +103,10 @@ def test_fast_request_complex_high_reasoning():
     assert d.slow_mode is False
     assert d.complexity == "high"
     assert d.reasoning_effort == FAST_REASONING_COMPLEX == "high"
-    assert d.max_iterations == 8
+    # Variant 1 (owner decision): complex fast work gets the FULL budget — no
+    # 8-call / 300s truncation that caused "нелепые обрывы" of production tasks.
+    assert d.max_iterations is None
+    assert d.run_budget_seconds is None
     assert d.review_exempt is True
 
 

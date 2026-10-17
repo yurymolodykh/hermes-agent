@@ -104,14 +104,17 @@ def test_fast_request_applies_fast_path_parameters(monkeypatch):
 
 
 def test_fast_request_complex_uses_high_reasoning(monkeypatch):
-    """Complex class-A request -> reasoning high (D3 complex split), still
-    capped at 8 iterations and review-exempt."""
+    """Complex class-A request -> reasoning high (D3 complex split) and, per
+    variant 1 (owner decision), the FULL budget — no 8-call / 300s truncation
+    that caused 'нелепые обрывы'. Still review-exempt (D5)."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="проанализируй лог и сравни с baseline")
 
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
-    assert captured["max_iterations"] == 8
-    assert captured["run_budget_seconds"] == 300
+    # Variant 1: complex work is NOT hard-capped to 8/300 — it keeps the full
+    # budget (unlimited sentinel), so production tasks can complete.
+    assert captured["max_iterations"] > 8
+    assert "run_budget_seconds" not in captured
     assert agent.review_exempt is True
 
 
@@ -220,21 +223,28 @@ def test_slow_request_persists_non_exempt_marker(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "message, expected_effort",
+    "message, expected_effort, capped",
     [
-        ("сколько будет 2+2?", "medium"),
-        ("статус задачи", "medium"),
-        ("проанализируй всё и создай отчёт", "high"),
+        # Routine class-A: still tight fast budget (≤8) — that is the point of
+        # the fast lane.
+        ("сколько будет 2+2?", "medium", True),
+        ("статус задачи", "medium", True),
         # «деплой сервиса» has no complex verb (deploy is only in the English
         # list; Russian deploy verbs are настрой/разверни/установи) -> routine.
-        ("деплой сервиса", "medium"),
+        ("деплой сервиса", "medium", True),
+        # Complex work (variant 1): full budget — NOT forced into the 8-call cap.
+        ("проанализируй всё и создай отчёт", "high", False),
     ],
 )
-def test_fast_budget_cap_never_exceeds_8(monkeypatch, message, expected_effort):
+def test_fast_budget_routine_capped_complex_full(monkeypatch, message, expected_effort, capped):
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     _agent(adapter, user_message=message)
 
-    assert captured["max_iterations"] <= 8
+    if capped:
+        assert captured["max_iterations"] <= 8
+    else:
+        assert captured["max_iterations"] > 8
+        assert "run_budget_seconds" not in captured
     assert captured["reasoning_config"] == {
         "enabled": True,
         "effort": expected_effort,

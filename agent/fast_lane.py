@@ -329,6 +329,16 @@ def resolve_fast_path(
     effort = (
         FAST_REASONING_COMPLEX if complexity == "high" else FAST_REASONING_ROUTINE
     )
+    # Owner decision (variant 1): complex fast tasks (complexity=high) must NOT be
+    # hard-cut to 8 LLM calls / 300s — that was causing "нелепые обрывы" of real
+    # production work ("почини", "создай", "проанализируй") that got classified
+    # high on reasoning but still squeezed into the 8-call fast budget. For high
+    # complexity we now clear both caps (max_iterations=None, run_budget_seconds=None)
+    # so api_server keeps the parent full budget (120/140) — the task still runs
+    # on the fast-lane PROFILE with high reasoning, it just is no longer truncated.
+    # Routine class-A questions keep the tight 8/300 fast budget (that IS the point
+    # of the fast lane). Slow requests are unaffected (handled in the branch above).
+    complex_gets_full_budget = complexity == "high"
     return FastLaneDecision(
         slow_mode=False,
         mode="fast",
@@ -337,11 +347,13 @@ def resolve_fast_path(
         reason=decision.reason,
         complexity=complexity,
         reasoning_effort=effort,
-        max_iterations=int(max_iterations or FAST_MAX_ITERATIONS),
+        max_iterations=(
+            None if complex_gets_full_budget else (max_iterations or FAST_MAX_ITERATIONS)
+        ),
         run_budget_seconds=(
-            float(run_budget_seconds)
-            if run_budget_seconds
-            else FAST_RUN_BUDGET_SECONDS
+            None
+            if complex_gets_full_budget
+            else (float(run_budget_seconds) if run_budget_seconds else FAST_RUN_BUDGET_SECONDS)
         ),
         review_exempt=True,             # D5: fast requests -> no review card
         debug=dict(decision.debug),
