@@ -93,6 +93,49 @@ _FUTURE_TENSE_RE = re.compile(
 _SEQUENCE_RE = re.compile(r"\b(?:потом|затем|далее|после|сперва|сначала)\b")
 
 
+#: Строки-фрагменты служебного слоя (канон R5, стиль «деловой простой»):
+#: удаляются из text-доставки, чтобы владельцу не утекали внутренние
+#: коды/сленг/локальные пути. МЯГКИЙ денylist — только заведомо служебное.
+_MISSION_HEADER_SEG_RE = re.compile(
+    r"(?:\*\*)?(?:"
+    r"Миссия|Контроллер|Контур|Модель[/ ]провайдер|Модель[/]провайдер|Код[ \t]*задачи|assignee"
+    r"|Метаданные|Провенанс|Сентинел|Пиннинг"
+    r")(?:\*\*)?[ \t]*[:：][^\n§]*(?:\n|$)",
+    re.IGNORECASE,
+)
+_MISSION_TOKEN_RE = re.compile(
+    r"(?:"
+    r"\bt_[A-Za-z0-9_]+\b"
+    r"|\bМодель[/ ]провайдер\b|\bassignee\b|\bsентинел\b|\bканбан\b|\bРГЗ\b"
+    r"|\bГермес\b"
+    r"|\b[0-9a-f]{12,}\b"
+    r"|\b\d{2}-[a-zA-Z][\w-]*\b(?![0-9]+-bit)"
+    r"|C:[/\\]Users[/\\][\w./\\\-]+"
+    r"|\[[ \t]*служ[ \t]*\.[ \t]*\]"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_mission_slang(text: str) -> str:
+    """Удалить явно служебные токены из текста доставки (канон R5/R6).
+
+    Применяется как финальный гигиенический шаг перед отправкой в каналы.
+    Мягкий денylist: убирает заведомо служебные метки (коды задач, имена
+    профилей, локальные пути, внутренний сленг), сохраняя предметный
+    деловой текст. НЕ удаляет словарь делового языка (названия моделей как
+    предмет, цифры, факты), чтобы не искажать содержательные сообщения.
+    """
+    out = _MISSION_HEADER_SEG_RE.sub("", text)
+    out = _MISSION_TOKEN_RE.sub("", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r",[ \t]*,", ",", out)
+    out = re.sub(r"[ \t]*,", ",", out)
+    out = re.sub(r",[ \t]*$", "", out, flags=re.MULTILINE)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
 def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str:
     """Убрать reasoning-блоки и обрезать long interim-тексты из текста доставки.
 
@@ -129,6 +172,8 @@ def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str
     stripped = _REASONING_FIELD_RE.sub("", stripped)
     # 4. Interim-подавление.
     stripped = _condense_interim(stripped)
+    # 4b. Съём служебного слоя (канон R6): коды задач/сленг/локальные пути.
+    stripped = _strip_mission_slang(stripped)
     # 5. Общий лимит.
     if max_chars is not None and max_chars > 0 and len(stripped) > max_chars:
         stripped = stripped[:max_chars]

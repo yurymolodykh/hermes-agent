@@ -146,3 +146,55 @@ def test_condense_keeps_single_sentence_short_plan():
     plan = "Сейчас сделаю проверку конфигурации."
     assert _condense_interim(plan) == plan
 
+
+# ---------------------------------------------------------------------------
+# R6: съём служебного слоя (канон «деловой простой»)
+# ---------------------------------------------------------------------------
+
+def test_sanitize_drops_mission_header_segment():
+    """Служебный сегмент шапки «**Модель/провайдер:** deepseek …» удаляется целиком."""
+    text = (
+        "✅ Kanban t_123abc done — Готово: Отчёт.\n"
+        "**Модель/провайдер:** deepseek-v4-flash / custom:letovo (П.6).\n"
+        "Итог: сделано."
+    )
+    out = sanitize_delivery_text(text)
+    assert "t_123abc" not in out
+    assert "deepseek" not in out
+    assert "Модель/провайдер" not in out
+    assert "Готово: Отчёт" in out
+    assert "Итог: сделано" in out
+
+
+def test_sanitize_drops_hex_ids_and_profiles():
+    text = (
+        "Резюме: отчёт готов, пути C:/Users/hermes/AppData/Local/Temp/x.html, "
+        "канбан t_a1b2c3d4e5f6, профиль 05-web-researcher."
+    )
+    out = sanitize_delivery_text(text)
+    assert "t_a1b2c3d4e5f6" not in out
+    assert "05-web-researcher" not in out
+    assert "C:/Users/hermes" not in out
+    assert "отчёт готов" in out
+
+
+def test_sanitize_keeps_subject_model_terms():
+    """Предметные названия моделей/квантов НЕ удаляются (антирегрессия §Б1)."""
+    text = "Отчёт Б: DeepSeek V4-Flash — лидер, 284B, 2-bit квант, 120 ГБ Mac."
+    assert sanitize_delivery_text(text) == text
+
+
+def test_sanitize_mission_cclean_empty_ok():
+    """Полностью служебная строка сходит в пустоту без исключения."""
+    out = sanitize_delivery_text("**Миссия:** t_x · **Контроллер:** 01-orchestrator")
+    assert isinstance(out, str)
+
+
+def test__strip_mission_slang_idempotent():
+    from hermes_cli.delivery_policy import _strip_mission_slang
+    t = "✅ Готово — Отчёт. t_abc 01-orchestrator C:/Users/x/y"
+    once = _strip_mission_slang(t)
+    twice = _strip_mission_slang(once)
+    assert twice == once
+
+

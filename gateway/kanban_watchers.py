@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextvars import Context
@@ -383,10 +384,14 @@ def _owui_completed_text(task_id: str, title: str, payload: Any, fallback: str) 
     """
     if not isinstance(payload, dict):
         return fallback
-    from hermes_cli.delivery_policy import sanitize_delivery_text
-    parts = [f"✅ Kanban {task_id} done — {title}"]
+    from hermes_cli.delivery_policy import sanitize_delivery_text, _strip_mission_slang
+    # Человекочитаемый заголовок без служебных кодов (канон R7): «✅ Готово — {title}».
+    clean_title = _strip_mission_slang(title or "")
+    clean_title = re.sub(r"^\s*(?:РГЗ|РГЗ:|rgz)[:\s-]*", "", clean_title, flags=re.IGNORECASE).strip()
+    parts = [f"✅ Готово — {clean_title or task_id}"]
     summary = payload.get("summary")
     if isinstance(summary, str) and summary.strip():
+        # Словарная чистка служебных токенов (R6) + reasoning-чистка
         parts.append(sanitize_delivery_text(summary.strip()))
     art = _owui_artifact_text(payload.get("artifacts"))
     if art:

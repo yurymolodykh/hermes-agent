@@ -42,7 +42,9 @@ def test_owui_completed_text_embeds_summary_and_artifact(tmp_path):
     art.write_text("Полный текст отчёта".center(400, "~"), encoding="utf-8")
     payload = {"summary": "2-й проход завершён", "artifacts": [str(art)]}
     msg = kw._owui_completed_text("t_abc", "Задача", payload, "fallback ✔ ... done")
-    assert msg.startswith("✅ Kanban t_abc done — Задача")
+    # R7: человекочитаемый заголовок без служебного кода задачи.
+    assert msg.startswith("✅ Готово — Задача")
+    assert "t_abc done" not in msg
     assert "2-й проход завершён" in msg
     assert "Полный текст отчёта" in msg
     # No richer payload -> fallback preserved.
