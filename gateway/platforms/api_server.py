@@ -3808,7 +3808,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Slice A3(1) computed slow_mode; this slice (t_ae312f32) ACTIVATES
         # the fast path (design §4.2 Track S): for fast requests (slow_mode=
         # False) apply reasoning medium/high (D3 — routine/complex, never
-        # low), max_iterations cap ≤8, run_budget_seconds=300, and mark the
+        # low), max_iterations cap ≤16, run_budget_seconds=300, and mark the
         # session review_exempt (D5 -> no review card). Slow requests are
         # untouched (full lane). Any failure degrades silently to the
         # existing working path.
@@ -8385,7 +8385,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # The fast-lane decision selects the EXECUTOR profile, which must be
         # settled BEFORE _profile_scope() runs (the agent home / state.db /
         # SOUL depend on it). Markerless (fast) requests execute under the
-        # 11-fast-answers profile (fast lane: medium reasoning, ≤8 iterations,
+        # 11-fast-answers profile (fast lane: medium reasoning, ≤16 iterations,
         # 300s budget, review_exempt) while slow requests („подумай“ /
         # „гигантская задача“ / OWUI deepthink) stay on the current (default
         # 01-orchestrator) full lane. Gated on ``fast_lane.route_to_profile``

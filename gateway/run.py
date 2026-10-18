@@ -5757,7 +5757,7 @@ class TurnRunner:
         #   * TG «подумай» prefix is STRIPPED so the model never sees the UI
         #     directive (only for fast requests; slow keeps the text as-is);
         #   * reasoning medium/high (D3 — routine/complex, never low);
-        #   * max_iterations cap ≤8, run_budget_seconds=300;
+        #   * max_iterations cap ≤16, run_budget_seconds=300;
         #   * session marked review_exempt (D5 -> no review card).
         # Slow requests stay on the full lane untouched. Any failure degrades
         # silently to the existing working path.
@@ -6101,7 +6101,7 @@ class TurnRunner:
         if agent is None:
             # Config changed or first message — create fresh agent. Fast-path
             # overrides (t_ae312f32): reasoning medium/high, max_iterations
-            # cap ≤8, run_budget_seconds=300 are injected here when the
+            # cap ≤16, run_budget_seconds=300 are injected here when the
             # decision is fast AND the fast-lane flag is ON (inert by default;
             # §6.2).
             _fast_agent_kwargs: dict = {}
