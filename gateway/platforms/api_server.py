@@ -3511,6 +3511,7 @@ class APIServerAdapter(BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
+        fast_budget_notice_callback=None,
         confirmed_runtime_lock: bool = False,
         user_message: Optional[str] = None,
     ) -> Any:
@@ -3972,6 +3973,16 @@ class APIServerAdapter(BasePlatformAdapter):
             agent._fast_lane_effective_message = _fast_stripped_message
         if _fast_lane_active and _fast_decision is not None and not _fast_decision.slow_mode:
             agent.review_exempt = True  # D5: forcer skips fast sessions
+            # Fast-lane user overflow notice (part 3, «не молчать»): attach the
+            # dedicated non-content callback the conversation loop fires when the
+            # soft 5-min budget is exceeded. Defaults to None for slow/CLI paths,
+            # so the agent never touches a callback it wasn't given.
+            if fast_budget_notice_callback is not None:
+                agent._fast_budget_notice_callback = fast_budget_notice_callback
+        # One-shot per-turn latch for the user notice (mirrors
+        # _run_budget_wrapup_injected in agent_init; set defensively here too so
+        # callers that never go through agent_init have a stable attribute).
+        agent._fast_budget_user_notice_fired = False
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -6229,6 +6240,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put_threadsafe(delta)
 
+            def _on_fast_budget_notice(text):
+                # Fast-lane overflow user notice (part 3, «не молчать»). The
+                # conversation loop fires this from the worker thread when the
+                # soft 5-min budget elapses. It is delivered as a TAGGED tuple —
+                # never as a content delta — so the SSE writer can route it to
+                # an OWUI status envelope without corrupting the final-answer
+                # content stream. put_threadsafe is required (worker thread).
+                if text:
+                    _stream_q.put_threadsafe(("__fast_budget_notice__", str(text)))
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -6294,6 +6315,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                fast_budget_notice_callback=_on_fast_budget_notice,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -6517,6 +6539,28 @@ class APIServerAdapter(BasePlatformAdapter):
                             current_status_description = status_event["event"]["data"]["description"]
                         else:
                             current_status_description = "Обдумываю следующий шаг"
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__fast_budget_notice__":
+                    # Fast-lane overflow user notice (part 3, «не молчать»).
+                    # Deliberately NOT routed into delta.content — that would
+                    # corrupt the final-answer render in Open WebUI. Instead it
+                    # becomes a transient OWUI status envelope (action
+                    # "hermes_work", done=False) so the user sees the options
+                    # while the run continues, and the durable footer in the
+                    # final response covers non-streaming/JSON paths.
+                    _notice_text = str(item[1] or "")
+                    if is_openwebui:
+                        _notice_status = {
+                            "event": {
+                                "type": "status",
+                                "data": {
+                                    "action": "hermes_work",
+                                    "description": _notice_text,
+                                    "done": False,
+                                },
+                            }
+                        }
+                        await response.write(_sse_frame(_notice_status))
+                        current_status_description = _notice_text
                 else:
                     # Hide absolute local file paths from streamed content.
                     # The file is delivered as an attachment via the ``files``
@@ -8344,6 +8388,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        fast_budget_notice_callback=None,
         agent_ref: Optional[list] = None,
         active_run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
@@ -8482,6 +8527,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
+                        fast_budget_notice_callback=fast_budget_notice_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
@@ -8937,6 +8983,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
+                return
+            # Fast-budget overflow notice (part 3) arrives via the dedicated
+            # callback, not through stream_delta_callback — but defensively
+            # drop any tagged tuple that ever lands here instead of letting it
+            # break JSON event serialization below.
+            if isinstance(delta, tuple):
                 return
             if run_id not in self._run_streams:
                 return

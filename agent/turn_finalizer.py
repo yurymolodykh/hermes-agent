@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
+from typing import Any
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -56,6 +57,32 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+
+def _append_fast_budget_footer(final_response: str, agent: Any) -> str:
+    """Append the fast-lane overflow options block when the latch fired.
+
+    Fast-lane part 3 («не молчать»): when a fast request exceeded its soft
+    wall-clock budget and the live one-shot notice fired, durably append the
+    three options (wait / «в карточку» / «подумай») to the final assistant
+    response.  This covers paths where the transient live status pill may not
+    be rendered (non-streaming JSON, Responses, /v1/runs) and guarantees the
+    user always has the options in the saved final answer.
+
+    Pure (no agent side effects) except reading the latch; returns the
+    possibly-augmented text.  Gated on a REAL conversational answer —
+    empty/interrupted turns are untouched.
+    """
+    if not final_response:
+        return final_response
+    if not getattr(agent, "_fast_budget_user_notice_fired", False):
+        return final_response
+    try:
+        from agent.fast_budget_text import FAST_BUDGET_USER_NOTICE
+        return final_response.rstrip() + "\n\n" + FAST_BUDGET_USER_NOTICE
+    except Exception as _fb_err:
+        logger.debug("fast-budget footer failed: %s", _fb_err)
+        return final_response
 
 
 def _record_kanban_budget_exhausted(
@@ -627,6 +654,17 @@ def finalize_turn(
                             )
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
+
+    # Fast-lane budget overflow footer (part 3, «не молчать»).
+    # When a fast request exceeded its soft wall-clock budget and the live
+    # overflow notice was fired, also append the options durably to the final
+    # assistant response — the user always has the три варианта even if they
+    # missed the transient status pill.  Gated on the one-shot latch; empty /
+    # interrupted turns untouched (see _append_fast_budget_footer).
+    if final_response and not interrupted:
+        _final_aug = _append_fast_budget_footer(final_response, agent)
+        if _final_aug is not final_response:
+            final_response = _final_aug
 
     _response_transformed = False
     _pre_transform_response = None

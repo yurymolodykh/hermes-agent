@@ -617,6 +617,10 @@ def build_turn_context(
     else:
         agent._run_budget_started_at = None
     agent._run_budget_wrapup_injected = False
+    # Fast-budget user notice latch (part 3) — reset per turn so the live
+    # status event + durable footer fire once per run, mirroring the model
+    # wrap-up latch above.
+    agent._fast_budget_user_notice_fired = False
 
     # Log conversation turn start for debugging/observability.
     _preview_text = "[validated tool resume]" if resume_mode else summarize_user_message_for_log(user_message)

@@ -1052,6 +1052,12 @@ def init_agent(
     agent._run_budget_started_at = None
     # One-shot latch for the 80% wrap-up notice (reset each turn).
     agent._run_budget_wrapup_injected = False
+    # Fast-lane user overflow notice (part 3, «не молчать»): dedicated
+    # non-content callback wired by the gateway (api_server OWUI fast path)
+    # and a one-shot per-turn latch. Both default to inert values so the
+    # conversation loop never touches an attribute it wasn't given.
+    agent._fast_budget_notice_callback = None
+    agent._fast_budget_user_notice_fired = False
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the

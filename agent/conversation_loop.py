@@ -118,6 +118,55 @@ RUN_BUDGET_WRAPUP_NOTICE = (
 )
 
 
+def _fire_fast_budget_user_notice(agent: Any) -> bool:
+    """One-shot user-facing overflow notice for fast-lane requests (part 3).
+
+    When a fast request exceeds its soft 5-minute run budget, the model gets
+    the internal RUN_BUDGET_WRAPUP_NOTICE (dormant unless a budget is set) but
+    the *user* would otherwise see nothing until the final answer arrives
+    minutes later — the "не молчать" requirement (owner 2026-10-19, part 2).
+
+    This helper fires a dedicated, non-content callback
+    (``agent._fast_budget_notice_callback``) with a plain-text status message
+    that lists the available options (wait / перевести в карточку / «подумай»).
+
+    Delivery polarities (balanced):
+      * Timeliness — fired live at the same 80% wall-clock threshold that
+        latches the model wrap-up notice, so the user learns of the overflow
+        while the run is still in progress, not only when it completes.
+      * Render purity — the callback is a SEPARATE channel from
+        ``stream_delta_callback``. It is never routed into the SSE content
+        stream (no ``delta.content``), so Open WebUI's final-answer render
+        cannot be corrupted by arbitrary interleaved text. The gateway maps
+        it to a transient OWUI status pill or, in the chat-completions JSON
+        path / final block, to a durable footer on the final response.
+
+    Latching: reuses the same ``_run_budget_wrapup_injected`` latch as the
+    model notice so the user notice fires exactly once per turn, at the same
+    moment as the model wrap-up (no separate clock race). Returns True on
+    first fire.
+    """
+    if not getattr(agent, "_run_budget_wrapup_injected", False):
+        return False
+    if getattr(agent, "_fast_budget_user_notice_fired", False):
+        return False
+    if not getattr(agent, "run_budget_seconds", None):
+        return False
+    cb = getattr(agent, "_fast_budget_notice_callback", None)
+    if cb is None:
+        # No consumer wired — nothing to do (e.g. CLI or non-fast gateway).
+        return False
+    from agent.fast_budget_text import FAST_BUDGET_USER_NOTICE
+    try:
+        cb(FAST_BUDGET_USER_NOTICE)
+    except Exception:
+        logger.debug("fast-budget user notice callback failed", exc_info=True)
+        return False
+    agent._fast_budget_user_notice_fired = True
+    logger.info("Fast-budget user notice fired (budget elapsed) — options shown")
+    return True
+
+
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
 
@@ -2091,6 +2140,15 @@ def run_conversation(
         # result); dormant when no budget is set.
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
+
+        # ── Fast-budget user notice (part 3, «не молчать») ────────────
+        # Immediately after the model wrap-up is latched, fire the
+        # one-shot user-facing overflow notice through the dedicated
+        # non-content callback (if one is wired). Kept in this same block
+        # so both latch off the same 80% wall-clock cross and the user
+        # learns about the overflow at the same moment the model does.
+        if getattr(agent, "run_budget_seconds", None):
+            _fire_fast_budget_user_notice(agent)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
