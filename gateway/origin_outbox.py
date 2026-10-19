@@ -10,12 +10,60 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, TypeVar
 
 
 _BINDING = ("platform", "profile", "chat_id", "session_id", "owner_id")
+
+_T = TypeVar("_T")
+
+#: Transient SQLite contention — safe to retry without changing semantics.
+_LOCK_ERROR_MARKERS = ("database is locked", "database table is locked", "is locked", "is busy")
+
+#: Default bounded lock-retry policy for outbox writes. Kept small: the
+#: outbox is shared by the cron scheduler, the OWUI delivery worker and the
+#: kanban notifier, and a slow writer (FULL synchronous commit on a large
+#: DB) can hold `BEGIN IMMEDIATE` for longer than a single busy-timeout.
+_RETRY_ATTEMPTS = 4
+_RETRY_BASE_DELAY_S = 0.05
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    """True for sqlite3 lock/busy contention that is transient (retryable)."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _LOCK_ERROR_MARKERS)
+
+
+def _retry_on_lock(fn: Callable[[], _T], *, attempts: int = _RETRY_ATTEMPTS,
+                   base_delay: float = _RETRY_BASE_DELAY_S) -> _T:
+    """Run ``fn`` retrying transient SQLite lock contention with backoff.
+
+    A bounded retry turns a momentary `BEGIN IMMEDIATE` lock (caused by a
+    concurrent writer holding the shared outbox) into a short wait instead
+    of a lost delivery. Non-lock errors propagate immediately; a fully
+    exhausted-retry lock error re-raises the last lock error so the caller
+    can surface it (e.g. as `delivery_error` on the cron job).
+    """
+    attempts = max(1, int(attempts))
+    base_delay = max(0.0, float(base_delay))
+    last: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            if not _is_lock_error(exc):
+                raise
+            last = exc
+            if attempt + 1 < attempts:
+                # Linear-ish backoff: 0.05, 0.1, 0.2 … capped at 0.5s.
+                time.sleep(min(base_delay * (2 ** attempt), 0.5))
+    assert last is not None  # at least one attempt ran
+    raise last
 
 
 def _destination(origin: Mapping[str, object]) -> str:
@@ -68,28 +116,32 @@ def enqueue(path: str | Path, source_id: str, origin: Mapping[str, object], cont
     if not source_id or not isinstance(content, str) or not content or len(content) > 1_000_000:
         raise ValueError("invalid source event or delivery content")
     event_id = hashlib.sha256(f"{source_id}\0{destination}".encode()).hexdigest()
-    with _open(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute("""INSERT OR IGNORE INTO origin_delivery(id, source_id, destination, content)
-                      VALUES(?, ?, ?, ?)""", (event_id, source_id, destination, content))
-        row = db.execute(
-            "SELECT content, status FROM origin_delivery WHERE id = ?",
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("source event enqueue lost its row")
-        existing_content, existing_status = row[0], row[1]
-        # An acknowledged row is terminal: the source event was already
-        # delivered and read back, so re-staging it (e.g. the notifier
-        # recomputing a terminal summary that grew since delivery) must be
-        # an idempotent no-op returning the existing event id — NOT a
-        # hard conflict that would make the notifier rewind its cursor and
-        # re-claim the same event forever ("delivery failed; cursor
-        # retained" spam, incident 2026-10-08/09). Only a still-pending
-        # (undelivered) row with changed content is a genuine conflict.
-        if existing_content != content and existing_status != "acknowledged":
-            raise ValueError("source event already bound to different content")
-    return event_id
+
+    def _do_enqueue() -> str:
+        with _open(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT OR IGNORE INTO origin_delivery(id, source_id, destination, content)
+                          VALUES(?, ?, ?, ?)""", (event_id, source_id, destination, content))
+            row = db.execute(
+                "SELECT content, status FROM origin_delivery WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("source event enqueue lost its row")
+            existing_content, existing_status = row[0], row[1]
+            # An acknowledged row is terminal: the source event was already
+            # delivered and read back, so re-staging it (e.g. the notifier
+            # recomputing a terminal summary that grew since delivery) must be
+            # an idempotent no-op returning the existing event id — NOT a
+            # hard conflict that would make the notifier rewind its cursor and
+            # re-claim the same event forever ("delivery failed; cursor
+            # retained" spam, incident 2026-10-08/09). Only a still-pending
+            # (undelivered) row with changed content is a genuine conflict.
+            if existing_content != content and existing_status != "acknowledged":
+                raise ValueError("source event already bound to different content")
+        return event_id
+
+    return _retry_on_lock(_do_enqueue)
 
 
 def pending(path: str | Path, origin: Mapping[str, object]) -> list[dict[str, str]]:
@@ -117,12 +169,16 @@ def ack(path: str | Path, event_id: str, origin: Mapping[str, object], receipt: 
     destination = _destination(origin)
     if not isinstance(receipt, str) or not receipt.strip() or len(receipt) > 256:
         return False
-    with _open(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        changed = db.execute("""UPDATE origin_delivery
-            SET status = 'acknowledged', receipt = ?, ack_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND destination = ? AND status = 'pending'""",
-            (receipt, event_id, destination)).rowcount
+
+    def _do_ack() -> int:
+        with _open(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            return db.execute("""UPDATE origin_delivery
+                SET status = 'acknowledged', receipt = ?, ack_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND destination = ? AND status = 'pending'""",
+                (receipt, event_id, destination)).rowcount
+
+    changed = _retry_on_lock(_do_ack)
     return bool(changed)
 
 
@@ -138,17 +194,21 @@ def due(path: str | Path, *, now: int, limit: int = 100) -> list[dict]:
 def fail_attempt(path: str | Path, event_id: str, *, now: int, max_attempts: int,
                  base_delay: int, error: str) -> None:
     """Bound retries and keep exhausted items inspectable rather than deleting."""
-    with _open(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute("SELECT attempts FROM origin_delivery WHERE id=? AND status='pending'",
-                         (event_id,)).fetchone()
-        if row is None:
-            return
-        count = row[0] + 1
-        db.execute("""UPDATE origin_delivery SET attempts=?, status=?, next_attempt_at=?, last_error=?
-                      WHERE id=? AND status='pending'""",
-                   (count, "failed" if count >= max_attempts else "pending",
-                    now + min(base_delay * (2 ** min(count - 1, 10)), 3600), error[:300], event_id))
+
+    def _do_fail_attempt() -> None:
+        with _open(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT attempts FROM origin_delivery WHERE id=? AND status='pending'",
+                             (event_id,)).fetchone()
+            if row is None:
+                return
+            count = row[0] + 1
+            db.execute("""UPDATE origin_delivery SET attempts=?, status=?, next_attempt_at=?, last_error=?
+                          WHERE id=? AND status='pending'""",
+                       (count, "failed" if count >= max_attempts else "pending",
+                        now + min(base_delay * (2 ** min(count - 1, 10)), 3600), error[:300], event_id))
+
+    _retry_on_lock(_do_fail_attempt)
 
 
 def counts(path: str | Path) -> dict[str, int]:

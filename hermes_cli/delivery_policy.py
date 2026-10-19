@@ -329,6 +329,60 @@ def policy_enabled(cfg: Optional[dict] = None) -> bool:
 _BINDING_CFG_KEY = "openwebui_telegram_users"
 _BINDING_ENV = "HERMES_OPENWEBUI_TELEGRAM_USERS"
 
+#: Синк-файл привязок (F3, ``tools/owui_tg_binding_sync.py``): JSON-источник
+#: соответствий «OWUI→TG», записываемый синк-джобой из webui.db +
+#: channel_directory.json (неоднозначность не матчится, fail-closed).
+#: Приоритет НИЖЕ явных источников: записи env/cfg/load_config не
+#: перекрываются файлом; файл дополняет только отсутствующие user_id.
+_BINDING_FILE_CFG_KEY = "openwebui_telegram_bindings_file"
+_BINDING_FILE_ENV = "HERMES_OPENWEBUI_TELEGRAM_BINDINGS_FILE"
+_BINDING_FILE_NAME = "tg_bindings.json"
+
+
+def _binding_file_path(cfg: Optional[dict] = None) -> Optional[str]:
+    """Путь к синк-файлу привязок: env → cfg → <hermes_home>/tg_bindings.json."""
+    env_path = os.environ.get(_BINDING_FILE_ENV, "").strip()
+    if env_path:
+        return env_path
+    if isinstance(cfg, dict):
+        val = cfg.get(_BINDING_FILE_CFG_KEY)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home() / _BINDING_FILE_NAME)
+    except Exception:
+        return None
+
+
+def _read_binding_file(path: Optional[str]) -> Dict[str, str]:
+    """Прочитать синк-файл привязок; при любой проблеме — ``{}`` (fail-closed).
+
+    Ожидаемая схема: ``{"bindings": {owui_user_id: tg_chat_id}, ...}``.
+    Некорректный/нечитаемый/не-JSON файл не поднимает исключений и не
+    открывает лейн: возвращается пустой mapping (OWUI-only).
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        logger.warning(
+            "delivery-policy: binding file %s unreadable (%s) — OWUI-only, "
+            "fail-closed", path, exc,
+        )
+        return {}
+    bindings = data.get("bindings") if isinstance(data, dict) else None
+    if not isinstance(bindings, dict):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in bindings.items()
+        if str(k).strip() and str(v).strip()
+    }
+
 
 def owui_telegram_users(cfg: Optional[dict] = None) -> Dict[str, str]:
     """Серверная привязка «TG-чат принадлежит данному OWUI-пользователю» (T2 §8.1).
@@ -342,7 +396,12 @@ def owui_telegram_users(cfg: Optional[dict] = None) -> Dict[str, str]:
          ``{owui_user_id: tg_chat_id}`` (устойчив к перезаписи config.yaml).
       2. Per-call ``cfg`` dict (``openwebui_telegram_users``).
       3. ``load_config()`` (тот же ключ).
-    Оба источника читаются только серверной стороной (scheduler), никогда
+      4. F3 (t_0aedc91c): синк-файл ``tg_bindings.json`` (env/cfg-переопределение
+         пути ``openwebui_telegram_bindings_file`` / ``HERMES_OPENWEBUI_TELEGRAM_BINDINGS_FILE``;
+         по умолчанию ``<hermes_home>/tg_bindings.json``) — дополняет только
+         отсутствующие user_id.  Записи явных источников (1–3) файлом НЕ
+         перекрываются; испорченный файл = ``{}`` по этому источнику.
+    Источники читаются только серверной стороной (scheduler), никогда
     из client-запросов.
 
     Возвращает mapping ``{str(owui_user_id): str(tg_chat_id)}``; при
@@ -372,10 +431,18 @@ def owui_telegram_users(cfg: Optional[dict] = None) -> Dict[str, str]:
             cfg = load_config() or {}
         except Exception:
             cfg = {}
+    merged: Dict[str, str] = {}
     raw = (cfg or {}).get(_BINDING_CFG_KEY) if isinstance(cfg, dict) else None
-    if not isinstance(raw, dict):
+    if isinstance(raw, dict):
+        merged.update({str(k): str(v) for k, v in raw.items()})
+    elif raw is not None:
+        # Привязка в явном конфиге есть, но не-объект — ошибка конфига:
+        # fail-closed по этому источнику, синк-файл халатность не маскирует.
         return {}
-    return {str(k): str(v) for k, v in raw.items()}
+    # F3: синк-файл дополняет отсутствующие user_id (самый низкий приоритет).
+    for uid, chat in _read_binding_file(_binding_file_path(cfg)).items():
+        merged.setdefault(uid, chat)
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -521,6 +588,24 @@ _FAIL_TEXT_STAMPS: Sequence[str] = (
     "delivery failed",
 )
 
+#: Cron-failure фразы, где между «Cron»/'cron' и «failed»/«skipped»/«script
+#: failed» стоит ИМЯ джоба (реальный формат summarizer scheduler.py:
+#: «⚠️ Cron 'cg-...' failed: Script not found: …»).  Штампы выше требуют
+#: непрерывности, поэтому имя в середине ломало детект (F4/D4-D8 root).
+#: Паттерн опционален: и «cron failed» и «cron '<name>' failed» ловятся.
+_FAIL_STAMP_RE: re.Pattern[str] = re.compile(
+    r"\bcron(?:job)?\s+(?:'[^']*'|\"[^\"]*\")?\s+("
+    r"failed|skipped|script\s+failed)\b",
+    re.IGNORECASE,
+)
+
+#: Обёртка _deliver_result (scheduler.py ~3216-3222) ставит «Cronjob
+#: Response: <name>…» ПЕРЕД failure-текстом → не-startswith.  Узнаём её и
+#: ищем failure-штамп ВНУТРИ после заголовка.
+_CRON_WRAP_RE: re.Pattern[str] = re.compile(
+    r"^cronjob\s+response:.*?(?:\n|$)", re.IGNORECASE | re.DOTALL
+)
+
 
 def detect_system_alert(content: Optional[str]) -> Optional[str]:
     """Вернуть имя системной тревоги в ``content`` или None.
@@ -528,6 +613,11 @@ def detect_system_alert(content: Optional[str]) -> Optional[str]:
     Согласовано с фактическими маркерами scheduler.py: блокировки конфига,
     drift-пропуски и тексты провалов cron, которые ДОЛЖНЫ доставляться
     (alert-once контракт) независимо от прочих эвристик.
+
+    F4: покрывает реальную cron-обёртку и failure-фразы с именем джоба
+    между «Cron» и «failed» (иначе аномалия классифицируется как
+    final_report и гасится по recipient mismatch — root аномалии
+    cg-report-early-tg-watcher).
     """
     if not content:
         return None
@@ -538,9 +628,25 @@ def detect_system_alert(content: Optional[str]) -> Optional[str]:
     for prefix in _ALERT_PREFIXES:
         if low.startswith(prefix.lower()):
             return "cron_alert"
+    head = low[:400]
     for stamp in _FAIL_TEXT_STAMPS:
-        if stamp in low[:400]:
+        if stamp in head:
             return "cron_failure"
+    # Обёрнутый cron-заголовок: «Cronjob Response: <name>» с failure-телом
+    # после него — всё равно системная тревога (детект не должен зависеть
+    # от того, обернул ли scheduler текст заголовком).
+    wrapped = low if _CRON_WRAP_RE.match(low) else None
+    if wrapped is not None:
+        for stamp in _FAIL_TEXT_STAMPS:
+            if stamp in wrapped[:400]:
+                return "cron_failure"
+        if _FAIL_STAMP_RE.search(wrapped[:400]):
+            return "cron_failure"
+    # Cron-фраза с именем джоба между «cron» и «failed/skipped» — тоже
+    # системная тревога (напр. «⚠️ Cron 'cg-...' failed: Script not found»).
+    # Ограничено началом текста, чтобы не срабатывать на цитатах в отчёте.
+    if _FAIL_STAMP_RE.search(head):
+        return "cron_failure"
     return None
 
 

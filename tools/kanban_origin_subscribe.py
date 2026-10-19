@@ -45,6 +45,28 @@ def subscribe_verified_origin(conn: Any, task_id: str) -> bool:
             delivery_mode="notify+wake",
             delivery_metadata=None,
         )
+        # F3 slice 3 (t_cdb88a42): the verified-origin subscription also
+        # carries the server-side nullable OWUI-owner marker in
+        # ``delivery_metadata[owui_user_id_attr]``.  This is the durable
+        # attribution the notifier's ``_sub_owui_owner_id`` uses to resolve the
+        # owner for PWA/yadisk api_server subscriptions (and a belt-and-braces
+        # copy for OWUI-prefixed chats).  It is written ONLY from this
+        # server-verified seam — never from client-supplied parameters — and
+        # ``set_notify_sub_owui_owner`` clears it (fail-closed) when absent.
+        try:
+            _kb.set_notify_sub_owui_owner(
+                conn,
+                task_id=task_id,
+                platform="api_server",
+                chat_id=binding["chat_id"],
+                thread_id=None,
+                owui_user_id=binding["user_id"],
+            )
+        except Exception:
+            logger.exception(
+                "kanban_create: failed to set owui_user_id_attr marker on "
+                "verified-origin api_server subscription"
+            )
         return True
     except Exception:
         logger.exception(

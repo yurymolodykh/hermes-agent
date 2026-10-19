@@ -2589,6 +2589,48 @@ def clear_drift_alerted(job_id: str) -> None:
     _set_alert_flag(job_id, "drift_alerted", False)
 
 
+def _get_failure_alerted(job_id: str) -> Optional[str]:
+    """Return the persisted failure-alert class for the job (or None)."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                val = job.get("failure_alerted")
+                return str(val) if val else None
+    return None
+
+
+def mark_failure_alerted(job_id: str, error_class: str) -> bool:
+    """Record that THIS failure class was already alerted; return True if a
+    DIFFERENT (or no) alert for this class is already on record — i.e. True
+    means "alert already sent for this exact class".
+
+    Alert-once dedup by ``(job, error_class)`` (F4): first tick of a failure
+    class sets the marker and must deliver; subsequent ticks with the same
+    class return True and must stay silent.  A NEW class (root cause changed)
+    clears the prior marker and returns False so a fresh alert goes out.
+    Survives gateway restarts (persisted on the job record, #73506 shape).
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                prior = str(job.get("failure_alerted") or "")
+                if prior == error_class:
+                    return True
+                job["failure_alerted"] = error_class
+                jobs[i] = job
+                save_jobs(jobs)
+                return False
+    return False
+
+
+def clear_failure_alerted(job_id: str) -> None:
+    """Clear the failure-alert marker after a successful run (condition
+    healed) so a FUTURE failure re-alerts instead of being swallowed."""
+    _set_alert_flag(job_id, "failure_alerted", False)
+
+
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     """Durably record that a scheduled fire could not be handed to the runner.
 
@@ -2688,6 +2730,10 @@ def _mark_job_run_locked(
                 if success:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
+                    # F4: a successful run means the failure condition healed —
+                    # drop the failure-alert dedup marker so a FUTURE failure
+                    # of any class re-alerts (alert-once, not alert-forever).
+                    job.pop("failure_alerted", None)
                     # The fire hand-off demonstrably works again — clear the
                     # forward-failure stamp so it only ever describes the
                     # CURRENT auto-fire health, not a healed past incident.

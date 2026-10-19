@@ -131,16 +131,19 @@ DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
 #: lettovo (custom:letovo) OpenAI-compatible endpoint serving
 #: deepseek-v4-flash — live-verified wire vocabulary (adaptive-reasoning-effort
-#: mission W1, official DeepSeek docs §3.1): ``{none, low, high, max}``.
-#: ``medium`` and ``xhigh`` are NOT distinguishable on the wire — both collapse
-#: to ``high`` (DeepSeek has no medium tier; the server treats the pair as
-#: high). ``ultra`` is Hermes-internal and maps to ``max``. ``none`` fully
-#: disables chain-of-thought (the L1/L3 down-pin for routine/indexing/chat).
-LETOVO_EFFORTS: tuple[str, ...] = ("none", "low", "high", "max")
+#: mission): ``{none, low, medium, high, max}``. Experiment v4 (REPORT_v4.md,
+#: durable/rgz-exp-long/) disproved the W1 assumption "DeepSeek has no medium
+#: tier": ``--reasoning medium`` reaches the wire as its own medium step —
+#: live probe latency 102.2s / reasoning_tokens 1140 / full answer, while
+#: ``high`` on the same prompt read-timed out (>180s). ``xhigh`` maps to the
+#: top tier ``max`` (distinguishable from high), ``ultra`` is Hermes-internal
+#: and maps to ``max``, ``minimal`` -> ``low``. ``none`` fully disables
+#: chain-of-thought (the L1/L3 down-pin for routine/indexing/chat).
+LETOVO_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
 LETOVO_OVERRIDES: dict[str, str] = {
     "minimal": "low",
-    "medium": "high",
-    "xhigh": "high",
+    "medium": "medium",
+    "xhigh": "max",
     "ultra": "max",
 }
 

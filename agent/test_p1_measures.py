@@ -312,13 +312,19 @@ class TestLetovoLadder:
     def test_wire_domain(self):
         from agent.reasoning_effort_l1 import LETOVO_EFFORTS
 
-        assert LETOVO_EFFORTS == ("none", "low", "high", "max")
+        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
 
-    def test_clamp_collapses_medium_and_xhigh_to_high(self):
+    def test_clamp_medium_stays_medium(self):
+        # Experiment v4 (REPORT_v4.md): medium is its own wire step — it must
+        # NOT collapse to high.
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        assert clamp_to_letovo("medium") == "high"
-        assert clamp_to_letovo("xhigh") == "high"
+        assert clamp_to_letovo("medium") == "medium"
+
+    def test_clamp_maps_xhigh_to_max(self):
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        assert clamp_to_letovo("xhigh") == "max"
 
     def test_clamp_maps_ultra_to_max_and_minimal_to_low(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
@@ -329,13 +335,13 @@ class TestLetovoLadder:
     def test_clamp_passes_through_wire_native(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        for level in ("none", "low", "high", "max"):
+        for level in ("none", "low", "medium", "high", "max"):
             assert clamp_to_letovo(level) == level
 
     def test_clamp_never_returns_unsafe_level(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        for bad in ("ultra", "xhigh", "medium", "minimal"):
+        for bad in ("ultra", "xhigh", "minimal"):
             assert clamp_to_letovo(bad) in ("low", "high", "max")
 
 
@@ -392,8 +398,9 @@ class TestGatedAuxPins:
             }
         }
         pins = reasoning_aux_pins(cfg)
-        assert pins["web_extract"] == "high"  # medium -> high
-        assert pins["compression"] == "max"  # ultra -> max
+        # medium stays medium (experiment v4); ultra -> max.
+        assert pins["web_extract"] == "medium"
+        assert pins["compression"] == "max"
 
 
 class TestGatedCardPin:
@@ -423,7 +430,7 @@ class TestGatedCardPin:
 
         cfg = {"agent": {"reasoning_class_routing": True}}
         assert resolve_card_effort("code", "03", cfg, wired_effort="high") == "high"
-        assert resolve_card_effort("code", "03", cfg, wired_effort="medium") == "high"
+        assert resolve_card_effort("code", "03", cfg, wired_effort="medium") == "medium"
 
 
 class TestPinCardEffort:
@@ -461,10 +468,10 @@ class TestPinCardEffort:
             assert pin_card_effort(conn, tid, "low", cfg) is True
             t = kb.get_task(conn, tid)
             assert t.reasoning_effort == "low"
-            # a non-letovo logical level collapses onto the wire domain
+            # medium is letovo wire-native — the pin survives unchanged
             assert pin_card_effort(conn, tid, "medium", cfg) is True
             t = kb.get_task(conn, tid)
-            assert t.reasoning_effort == "high"  # medium -> high
+            assert t.reasoning_effort == "medium"  # medium survives (experiment v4)
         finally:
             conn.close()
 

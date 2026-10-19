@@ -4,10 +4,10 @@ mission, W3 — card t_90a6a1ca).
 Covers the two L1 contracts from design/effort-policy-v1.md:
 
 1. The effort **ladder** — clamping onto the letovo wire domain
-   ``{none, low, high, max}``: invalid values slice to the nearest valid
-   (never escalate cost above the ask, never invert the ladder; ``medium``/
-   ``xhigh`` collapse to ``high`` per the W1-verified DeepSeek mapping,
-   ``ultra`` -> ``max``, ``minimal`` -> ``low``).
+   ``{none, low, medium, high, max}``: invalid values slice to the nearest valid
+   (never escalate cost above the ask, never invert the ladder; ``medium``
+   stays ``medium``, ``xhigh`` -> ``max``, ``ultra`` -> ``max``, ``minimal``
+   -> ``low`` per the experiment-v4-verified DeepSeek mapping).
 
 2. The **feature-flag gating** — while ``agent.reasoning_class_routing`` is
    false (the default) every L1 public entry point is inert: per-card pins are
@@ -36,19 +36,21 @@ from agent.reasoning_effort_l1 import (
 
 class TestLetovoClamp:
     def test_domain_is_exactly_letovo_wire_set(self):
-        assert LETOVO_DOMAIN == ("none", "low", "high", "max")
-        assert LETOVO_EFFORTS == ("none", "low", "high", "max")
+        assert LETOVO_DOMAIN == ("none", "low", "medium", "high", "max")
+        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
 
     def test_supported_levels_pass_through(self):
         for level in LETOVO_EFFORTS:
             assert clamp_to_letovo(level) == level
 
-    def test_medium_collapses_to_high(self):
-        # W1 §3.1: DeepSeek has no medium tier — medium → high (not low).
-        assert clamp_to_letovo("medium") == "high"
+    def test_medium_stays_medium(self):
+        # Experiment v4 (REPORT_v4.md) disproved W1: the wire distinguishes
+        # medium as its own step — it must NOT collapse to high.
+        assert clamp_to_letovo("medium") == "medium"
 
-    def test_xhigh_collapses_to_high(self):
-        assert clamp_to_letovo("xhigh") == "high"
+    def test_xhigh_maps_to_max(self):
+        # xhigh requests the top tier on the letovo wire (distinguishable).
+        assert clamp_to_letovo("xhigh") == "max"
 
     def test_ultra_clamps_to_max(self):
         # Hermes-internal; letovo has no ultra tier → max.
@@ -77,6 +79,8 @@ class TestLetovoClamp:
         for source, mapped in LETOVO_OVERRIDES.items():
             assert mapped in LETOVO_EFFORTS, (source, mapped)
             assert clamp_to_letovo(source) == mapped, source
+            # medium is now a pass-through identity override.
+            assert clamp_effort(source, LETOVO_EFFORTS, LETOVO_OVERRIDES) == mapped
 
 
 class TestClampNeverEscalates:
@@ -153,12 +157,22 @@ class TestGatingOn:
                 "reasoning_aux_pins": {
                     "web_extract": "none",
                     "compression": "low",
-                    "indexing": "medium",  # collapses to high
+                    "indexing": "high",
                 },
             }
         }
         pins = reasoning_aux_pins(cfg)
         assert pins == {"web_extract": "none", "compression": "low", "indexing": "high"}
+
+    def test_aux_pin_medium_stays_medium_when_on(self):
+        # medium is a distinct wire step now — it must NOT collapse to high.
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_aux_pins": {"indexing": "medium"},
+            }
+        }
+        assert reasoning_aux_pins(cfg) == {"indexing": "medium"}
 
     def test_resolve_aux_effort_when_on(self):
         cfg = {
@@ -179,8 +193,20 @@ class TestGatingOn:
                 {"agent": {"reasoning_class_routing": True}},
             )
         assert ok is True
-        # medium → high (letovo wire), model untouched.
-        mock_set.assert_called_once_with(conn, "t_123", "high")
+        # medium survives to the wire (experiment v4), model untouched.
+        mock_set.assert_called_once_with(conn, "t_123", "medium")
+
+    def test_pin_card_effort_xhigh_clamps_to_max_when_on(self):
+        conn = MagicMock()
+        with patch("hermes_cli.kanban_db.set_reasoning_effort") as mock_set:
+            mock_set.return_value = True
+            ok = pin_card_effort(
+                conn, "t_123", "xhigh",
+                {"agent": {"reasoning_class_routing": True}},
+            )
+        assert ok is True
+        # xhigh requests the letovo top tier max.
+        mock_set.assert_called_once_with(conn, "t_123", "max")
 
     def test_pin_card_effort_clear_when_on(self):
         conn = MagicMock()

@@ -94,16 +94,28 @@ async def _run_one_branch_tick(monkeypatch, runner, interval=1):
 
 
 class RecordingAdapter:
-    """Records ``send()`` and, when push-capable, ``handle_message`` wakes."""
+    """Records ``send()``/``send_document()`` and, when push-capable,
+    ``handle_message`` wakes."""
 
     supports_async_delivery = True
 
     def __init__(self):
         self.sent = []
+        self.docs = []
         self.wakes = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kwargs):
+        self.docs.append(
+            {"chat_id": chat_id, "file_path": file_path,
+             "file_name": file_name or os.path.basename(file_path),
+             "metadata": metadata or {}}
+        )
+        from gateway.platforms.base import SendResult
+        return SendResult(success=True)
 
     async def handle_message(self, event):
         self.wakes.append(getattr(event, "text", ""))
@@ -439,7 +451,11 @@ async def test_provider_route_block_loud_on_both_lanes(mission_env, monkeypatch)
     # TG lane: mirrored to the owner's bound chat (HUMAN_ACTION_KINDS delivers).
     tg_texts = adapter_sent_texts(tg)
     assert len(tg_texts) == 1, f"provider_route block must reach TG: {tg_texts}"
-    assert "blocked" in tg_texts[0]
+    # F2: the OWUI→TG mirror carries the owner-facing «Требует решения»
+    # format (title + reason), not the generic notifier excerpt.
+    assert "Требует решения" in tg_texts[0]
+    assert "child-provider" in tg_texts[0]
+    assert "letovo/deepseek-v4-flash" in tg_texts[0]
 
 
 @pytest.mark.asyncio
@@ -488,7 +504,7 @@ async def test_block_loop_detected_triage_loud_on_both_lanes(mission_env, monkey
     # owner's bound chat, not suppressed by the routine gate.
     tg_texts = adapter_sent_texts(tg)
     assert len(tg_texts) == 1, f"block_loop_detected must reach TG: {tg_texts}"
-    assert "TRIAGE" in tg_texts[0].upper()
+    assert "Требует решения" in tg_texts[0]
 
 
 @pytest.mark.asyncio
@@ -661,13 +677,17 @@ async def test_p4_foreign_owner_with_binding_delivers_to_own_lanes(mission_env, 
     assert all(chat[0].startswith("owui-maria") for chat in branch_staged), (
         f"OWUI итог must go to Maria's chat: {branch_staged}"
     )
-    # TG mirror: delivered to Maria's OWN bound chat, never home.
+    # TG mirror: delivered to Maria's OWN bound chat, never home.  F1
+    # (tg-delivery-contract): the итог to TG carries the handoff summary below
+    # the closed-branch header — no more contentless "✅" alone.
     tg_chats = [s["chat_id"] for s in tg.sent]
     assert tg_chats == [FOREIGN_TG], (
         f"П.4: foreign owner итог must reach her OWN TG chat, not home/Yuri: "
         f"{tg.sent}"
     )
-    assert all(t == "✅ Задача выполнена" for t in adapter_sent_texts(tg))
+    assert len(tg.sent) == 1
+    assert "Задача выполнена" in tg.sent[0]["text"]
+    assert "mission maria done" in tg.sent[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -711,4 +731,437 @@ async def test_binding_absent_foreign_owner_stays_owui_only(mission_env, monkeyp
     assert tg.sent == [], (
         f"П.4: unbound owner must not mirror to ANY telegram chat (home/Yuri "
         f"is not a default sink): {tg.sent}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F1 (tg-delivery-contract, t_030b5f47): terminal итог in the OWUI→TG mirror
+# carries CONTENT (summary + file artifacts); a bare "✅ Задача выполнена"
+# with no summary and no artifacts is SUPPRESSED with a journal entry.
+# ---------------------------------------------------------------------------
+
+def _adapter_sent_texts(adapter):
+    return [s["text"] for s in adapter.sent]
+
+
+@pytest.mark.asyncio
+async def test_f1_terminal_itog_mirror_carries_summary_and_artifact_files(
+    mission_env, monkeypatch,
+):
+    """F1 acceptance (1)+(2): a TERMINAL branch итог whose root carries a
+    handoff summary AND a file artifact reaches the owner's bound TG chat as
+    (a) enriched text (summary below the closed-branch header) and
+    (b) the artifact uploaded as a native file via send_document (the existing
+    ``_deliver_kanban_artifacts`` helper — D2 path now wired into the mirror).
+    No suppression journal entry for a terminal delivery with content.
+    """
+    import tempfile
+
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "f1-report.md")
+        with open(report, "w", encoding="utf-8") as fh:
+            fh.write("F1: терминальный итог с отчётом.\n")
+
+        root, children = _setup_mission(mission_env, n_children=1)
+        assert _complete(
+            mission_env, root, summary="Миссия F1 завершена: все карточки закрыты",
+            artifacts=[report],
+        )
+        assert _complete(mission_env, children[0], summary="child done")
+
+        from gateway import kanban_origin_delivery as _kod
+
+        branch_staged = []
+
+        def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+            branch_staged.append((sub.get("chat_id"), message, event_id))
+            return ("acknowledged", 1)
+
+        monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+        owui, tg, runner = _dual_adapters()
+        await _run_one_branch_tick(monkeypatch, runner)
+
+        # OWUI primary lane still delivers (unchanged).
+        assert branch_staged
+        # TG mirror: every mirror send to the owner's bound chat carries the
+        # enriched message with summary content (one send per api_server sub;
+        # count is not the contract — content is).
+        assert tg.sent, f"TG mirror must deliver the terminal итог: {tg.sent}"
+        assert all(s["chat_id"] == OWNER_TG for s in tg.sent)
+        for s in tg.sent:
+            assert "Задача выполнена" in s["text"]
+            assert "Миссия F1 завершена" in s["text"]
+        # Artifact uploaded as a native file via send_document (D2 closed):
+        # all mirror sends attach the same report file to the owner's chat.
+        assert tg.docs, f"artifact must be uploaded as file: {tg.docs}"
+        assert all(d["chat_id"] == OWNER_TG for d in tg.docs)
+        assert all(
+            os.path.basename(d["file_path"]) == "f1-report.md" for d in tg.docs
+        )
+        # No suppression journal for a terminal delivery with content.
+        assert _read_suppression_journal() == []
+
+
+@pytest.mark.asyncio
+async def test_f1_bare_terminal_itog_suppressed_with_journal(
+    mission_env, monkeypatch,
+):
+    """F1 acceptance (3): a TERMINAL branch итог with NO handoff summary and
+    NO artifacts (the bare ``✅ Задача выполнена`` baked one-liner) is
+    SUPPRESSED entirely in the OWUI→TG mirror — silence in TG — and journaled
+    with ``reason=bare terminal итог without content``.  OWUI primary lane is
+    unaffected (the итог is still staged there).
+    """
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root, children = _setup_mission(mission_env, n_children=1)
+    # No summary, no artifacts → the completed payload carries only the
+    # generic first-line placeholder; the mirror has nothing to enrich with.
+    assert _complete(mission_env, root, summary="")
+    assert _complete(mission_env, children[0], summary="")
+
+    from gateway import kanban_origin_delivery as _kod
+
+    branch_staged = []
+
+    def fake_stage(outbox, registry, sub, profile, board, event_id, message):
+        branch_staged.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", 1)
+
+    monkeypatch.setattr(_kod, "stage_terminal", fake_stage)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # OWUI primary lane still gets the итог (mirror suppression never touches it).
+    assert branch_staged, f"OWUI must still receive the итог: {branch_staged}"
+    # TG mirror: fully suppressed — nothing sent.
+    assert tg.sent == [], f"bare итог must be suppressed in TG: {tg.sent}"
+
+    # Journal: at least one record (one per mirrored api_server sub), every
+    # record reason=bare terminal итог without content.
+    journal = _read_suppression_journal()
+    assert journal, f"journal must record the suppression: {journal}"
+    assert all(
+        r["reason"] == "bare terminal итог without content" for r in journal
+    ), f"all suppressions must be the bare-итог reason: {journal}"
+    first = journal[0]
+    assert first["app"] == "kanban"
+    assert first["target"] == f"telegram:{OWNER_TG}"
+    assert first["task_id"] == root
+    assert first["event_kind"] == "branch_summary"
+    assert first["owui_to_tg"] is True
+
+
+# ---------------------------------------------------------------------------
+# t_f659bef2 — OWUI→TG mirror honours plan-payload artifact rider (D0 D2/A4):
+# ``plan['artifacts']`` is merged alongside the kanban.db sources, so a future
+# source that puts paths directly on the branch_summary plan reaches TG as
+# file attachments.  Missing / non-absolute / oversize plan artifacts are
+# skipped with a warning and never fail the text delivery.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mirror_plan_payload_artifact_rider(mission_env, monkeypatch):
+    """t_f659bef2: the OWUI→TG mirror honours an explicit ``plan['artifacts']``
+    list exactly like the native-TG lane (parity, D0 D2/A4).  A real file on
+    the plan payload rides ``_deliver_kanban_artifacts`` → ``send_document``;
+    a missing path is dropped (never breaks the text); the driver keeps the
+    enriched итог with summary.
+    """
+    import tempfile
+
+    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
+
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS", json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED_TG))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "plan-rider.md")
+        with open(report, "w", encoding="utf-8") as fh:
+            fh.write("План-артефакт.\n")
+        missing = os.path.join(tmp, "missing.md")
+
+        plan = {
+            "root_id": "root-x",
+            "board": "default",
+            "terminal": True,
+            "artifacts": [report, missing],
+        }
+        sub = {
+            "platform": "api_server",
+            "chat_id": "owui-request-x",
+            "user_id": OWNER_OWUI,
+            "thread_id": None,
+        }
+
+        lane = _branch_summary_owui_tg_lane(
+            sub, plan, "✅ Задача выполнена",
+            allowed_users=ALLOWED_TG,
+            home_channel=OWNER_TG,
+        )
+        assert lane is not None, "mirror lane must exist for bound owner"
+        decision, bound_chat, content = lane
+        assert not decision.suppressed, (
+            f"plan artifact makes the итог contentful: {decision}"
+        )
+        assert bound_chat == OWNER_TG
+        # With a plan artifact present the итог is CONTENTFUL even though
+        # the hermetic DB has no completed event/summary to enrich the text
+        # with (the bare gate is msg+bare+no-artifacts; the artifact makes
+        # it delivered, parity with the native-TG lane).
+        # The real file rides the artifact list; the missing one was dropped
+        # (never reached the deliverable artifact list as a broken path).
+        art_paths = content["artifacts"]
+        real = os.path.realpath(report)
+        assert real in art_paths, f"plan artifact must ride the mirror: {art_paths}"
+        assert os.path.realpath(missing) not in art_paths
+        # No suppress journal: a contentful итог is not suppressed.
+        assert _read_suppression_journal() == []
+
+
+@pytest.mark.asyncio
+async def test_mirror_plan_rider_bare_itog_still_suppressed(mission_env, monkeypatch):
+    """t_f659bef2: with NO kanban.db content and NO plan artifacts the mirror
+    still suppresses the bare ``✅ Задача выполнена`` — the plan rider never
+    re-opens the contentless-итог path."""
+    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
+
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS", json.dumps({OWNER_OWUI: OWNER_TG}),
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED_TG))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+
+    plan = {
+        "root_id": "root-y",
+        "board": "default",
+        "terminal": True,
+        "artifacts": [],
+    }
+    sub = {
+        "platform": "api_server",
+        "chat_id": "owui-request-y",
+        "user_id": OWNER_OWUI,
+        "thread_id": None,
+    }
+    # No completed event / no summary for root-y in the hermetic DB → the
+    # mirror has nothing to enrich with; bare итог must be suppressed.
+    lane = _branch_summary_owui_tg_lane(
+        sub, plan, "✅ Задача выполнена",
+        allowed_users=ALLOWED_TG,
+        home_channel=OWNER_TG,
+    )
+    assert lane is not None
+    decision, bound_chat, content = lane
+    assert decision.suppressed, f"bare итог must be suppressed: {decision}"
+    assert content["artifacts"] == []
+    journal = _read_suppression_journal()
+    assert journal
+    assert all(
+        r["reason"] == "bare terminal итог without content" for r in journal
+    )
+
+
+# ---------------------------------------------------------------------------
+# F2 (t_a14f7e23): OWUI→TG mirror for blocked/needs_input human-action events.
+# ---------------------------------------------------------------------------
+
+
+def _emit_human_block(conn, tid, *, reason="need an answer", kind="needs_input",
+                      provider_route=None):
+    """Route ``tid`` to ``blocked`` and append a human-action ``blocked`` event."""
+    payload = {"reason": reason, "kind": kind}
+    if provider_route:
+        payload["provider_route"] = provider_route
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind=? "
+            "WHERE id=? AND status IN ('running','ready')",
+            (kind, tid),
+        )
+        kb._append_event(conn, tid, "blocked", payload)
+
+
+@pytest.mark.asyncio
+async def test_f2_needs_input_block_mirrors_to_tg_with_title_reason(
+    mission_env, monkeypatch,
+):
+    """F2 criterion (1): a blocked/needs_input OWUI task reaches the initiator's
+    bound TG chat as «Требует решения: <title> + краткая причина», with the
+    OWUI primary lane intact and no agent wake."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "нужен выбор модели", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child")
+
+    assert _complete(mission_env, root, summary="mission done")
+    _emit_human_block(
+        mission_env, child, reason="Выберите маршрут: letovo или deepseek",
+        kind="needs_input", provider_route="letovo/deepseek-v4-flash",
+    )
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    # OWUI primary lane: staged to the child's session.
+    assert len(staged) == 1, f"needs_input block must stage OWUI: {staged}"
+    # TG mirror: the owner-facing «Требует решения» text with title + reason.
+    tg_texts = adapter_sent_texts(tg)
+    assert len(tg_texts) == 1, f"needs_input block must reach TG: {tg_texts}"
+    assert "Требует решения" in tg_texts[0]
+    assert "нужен выбор модели" in tg_texts[0]
+    assert "letovo или deepseek" in tg_texts[0]
+    # No agent wake on the mirror.
+    assert tg.wakes == [] and owui.wakes == [], (
+        f"block mirror must not wake: tg={tg.wakes} owui={owui.wakes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_f2_block_mirror_dedup_same_cause_within_cooldown_suppressed(
+    mission_env, monkeypatch,
+):
+    """F2 criterion (2): a repeated human-action block of the SAME (task, kind,
+    cause) inside the cooldown is NOT re-mirrored to TG — the dedup marker is
+    written on the first delivery and gates the repeat."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-retry", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-retry")
+
+    assert _complete(mission_env, root, summary="mission done")
+    _emit_human_block(mission_env, child, reason="prov is down", kind="needs_input")
+
+    # First tick: the block is mirrored exactly once.
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+    assert len(adapter_sent_texts(tg)) == 1, "first block must mirror once"
+
+    # Second tick: the same cause inside the cooldown must NOT re-mirror.
+    staged2 = []
+    _staged_sink(monkeypatch, staged2)
+    owui2, tg2, runner2 = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner2)
+    assert adapter_sent_texts(tg2) == [], (
+        f"repeat same-cause block inside cooldown must not re-mirror: {adapter_sent_texts(tg2)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_f2_block_mirror_different_cause_bypasses_cooldown(
+    mission_env, monkeypatch,
+):
+    """F2 dedup nuance: a NEW cause (different reason signature) bypasses the
+    cooldown — the owner must be pinged for a genuinely new question even if
+    the previous mirror was recent."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-2causes", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-2causes")
+
+    assert _complete(mission_env, root, summary="mission done")
+    _emit_human_block(mission_env, child, reason="provider offline",
+                      kind="needs_input")
+
+    _staged_sink(monkeypatch, [])
+    _, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+    assert len(adapter_sent_texts(tg)) == 1
+
+    # Different cause: must re-mirror despite the fresh marker.
+    _emit_human_block(mission_env, child, reason="credentials expired",
+                      kind="needs_input")
+    _staged_sink(monkeypatch, [])
+    _, tg2, runner2 = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner2)
+    texts = adapter_sent_texts(tg2)
+    assert len(texts) == 1, f"new cause must re-mirror: {texts}"
+    assert "credentials expired" in texts[0]
+
+
+@pytest.mark.asyncio
+async def test_f2_routine_self_resolving_block_not_mirrored(
+    mission_env, monkeypatch,
+):
+    """F2 criterion (3): a self-resolving (dependency/transient) block on the
+    api_server lane is routine noise — it must NOT reach TG (and not wake),
+    under replace mode."""
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-dep", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-dep")
+
+    assert _complete(mission_env, root, summary="mission done")
+    _emit_self_resolving_blocked(mission_env, child, kind="dependency",
+                                 reason="waiting on parent")
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    # Routine self-resolving block: silent on BOTH lanes.
+    assert staged == [], f"routine block must not stage OWUI: {staged}"
+    assert adapter_sent_texts(tg) == [], (
+        f"routine block must not reach TG: {adapter_sent_texts(tg)}"
+    )
+    assert tg.wakes == [] and owui.wakes == []
+
+
+@pytest.mark.asyncio
+async def test_f2_block_mirror_policy_off_no_tg(mission_env, monkeypatch):
+    """F2 gate: with ``telegram_delivery_policy`` off, a needs_input block is
+    NOT mirrored to TG (the whole OWUI→TG lane is disabled), while the OWUI
+    primary lane still stages it."""
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
+    )
+    root = _mk(mission_env, "mission")
+    child = _mk(mission_env, "child-policy", parent=root)
+    _owui_sub(mission_env, root, "owui-request")
+    _owui_sub(mission_env, child, "owui-child-policy")
+
+    assert _complete(mission_env, root, summary="mission done")
+    _emit_human_block(mission_env, child, reason="need answer",
+                      kind="needs_input")
+
+    staged = []
+    _staged_sink(monkeypatch, staged)
+    owui, tg, runner = _dual_adapters()
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    assert len(staged) == 1, f"OWUI primary lane must stage: {staged}"
+    assert adapter_sent_texts(tg) == [], (
+        f"policy off → no TG mirror: {adapter_sent_texts(tg)}"
     )

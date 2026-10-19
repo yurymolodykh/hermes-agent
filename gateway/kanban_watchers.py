@@ -435,6 +435,130 @@ def _owui_branch_result_text(plan: dict, msg: str) -> str:
     return sanitize_delivery_text(f"{msg}\n\n{art}", max_chars=8000)
 
 
+# ---------------------------------------------------------------------------
+# F2 (t_a14f7e23): OWUI→TG mirror for blocked/needs_input human-action events.
+# ---------------------------------------------------------------------------
+
+#: Human-action block kinds mirrored to the initiator's bound TG chat as a
+#: «требует решения» message (F2).  block_loop_detected routes the card to
+#: triage and is already loud on both lanes; it is included so the TRIAGE ping
+#: and the «требует решения» ping stay consistent for the owner.
+_OWUI_TG_HUMAN_BLOCK_KINDS = frozenset({
+    "blocked", "needs_input", "capability", "block_loop_detected",
+})
+
+#: Max length of the owner-facing reason in the «требует решения» mirror.
+_OWUI_TG_BLOCK_REASON_MAX_CHARS = 500
+
+
+def _owui_tg_block_mirror_text(
+    sub: Mapping[str, Any], ev: Any, kind: str, task: Any, msg: str,
+    *, fallback: str = "",
+) -> str:
+    """Build the «требует решения: <заголовок> + краткая причина» TG text.
+
+    F2 owner spec: a blocked/needs_input event on an OWUI task mirrors into
+    TG as ``⚠️ Требует решения: <title>`` followed by a short reason (up to
+    ``_OWUI_TG_BLOCK_REASON_MAX_CHARS``).  Prefers the card's human title
+    (mission slang stripped), falls back to the task id, and reuses the
+    per-event ``msg`` only when the payload carries no reason at all.
+    """
+    try:
+        from hermes_cli.delivery_policy import sanitize_delivery_text
+        from hermes_cli.delivery_policy import _strip_mission_slang
+    except Exception:  # pragma: no cover - pure text helper, never fails hard
+        _strip_mission_slang = lambda s: s or ""
+        sanitize_delivery_text = lambda s, **_: s or ""
+    task_id = str(sub.get("task_id") or "")
+    title = ""
+    if task is not None:
+        t = getattr(task, "title", None) or ""
+        if t:
+            title = str(t)
+    if not title:
+        title = task_id
+    clean_title = _strip_mission_slang(title or "")
+    clean_title = re.sub(
+        r"^\s*(?:РГЗ|РГЗ:|rgz)[:\s-]*", "", clean_title, flags=re.IGNORECASE,
+    ).strip()
+    reason = ""
+    try:
+        payload = getattr(ev, "payload", None) or {}
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("reason"):
+        reason = str(payload["reason"]).strip()
+    lines = [f"⚠️ Требует решения: {clean_title or task_id}"]
+    if reason:
+        lines.append(reason[:_OWUI_TG_BLOCK_REASON_MAX_CHARS])
+    text = "\n\n".join(lines)
+    text = sanitize_delivery_text(text, max_chars=1600)
+    if text.strip():
+        return text
+    return fallback or msg
+
+
+def _owui_tg_block_mirror_due(
+    conn: Any, sub: Mapping[str, Any], ev: Any, kind: str,
+) -> bool:
+    """Dedup gate for the F2 TG block mirror (cooldown by (task, kind, cause)).
+
+    Returns False when a repeat human-action block on the same task/cause is
+    still inside the cooldown (already mirrored → do not send again).  The
+    logic lives in ``hermes_cli.kanban_db.tg_block_mirror_due`` so the
+    cooldown state is a ``tg_block_mirror`` task_events marker shared with
+    any other component; here we just extract the reason for the signature.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:  # pragma: no cover - fail-open (no dedup state)
+        return True
+    reason = ""
+    try:
+        payload = getattr(ev, "payload", None) or {}
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("reason"):
+        reason = str(payload["reason"])
+    return _kb.tg_block_mirror_due(
+        conn, str(sub.get("task_id") or ""), kind=kind, reason=reason,
+    )
+
+
+def _owui_tg_mark_block_mirror(
+    conn: Any, sub: Mapping[str, Any], ev: Any, kind: str, *,
+    chat: str = "",
+) -> int:
+    """Record the F2 TG block mirror marker (once-per-cooldown claim)."""
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:  # pragma: no cover - marker write must never fail the send
+        return 0
+    reason = ""
+    event_id = None
+    try:
+        payload = getattr(ev, "payload", None) or {}
+        event_id = getattr(ev, "id", None)
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("reason"):
+        reason = str(payload["reason"])
+    return _kb.mark_tg_block_mirror(
+        conn, str(sub.get("task_id") or ""), kind=kind,
+        event_id=int(event_id) if event_id else None,
+        reason=reason, chat=chat,
+    )
+
+
+def _owui_tg_clear_block_mirror(conn: Any, task_id: str) -> int:
+    """Clear block-mirror markers for a task that left ``blocked``."""
+    try:
+        from hermes_cli import kanban_db as _kb
+        return _kb.clear_tg_block_mirror(conn, task_id)
+    except Exception:  # pragma: no cover
+        return 0
+
+
 #: Kinds that ALWAYS stay loud on the api_server lane, even in
 #: branch_summary_replace mode.  These are either terminal-failure states the
 #: branch итог lists, or explicit "needs a human decision" transitions that
@@ -992,7 +1116,7 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
             "(%s) — kanban OWUI→TG lane FAIL-CLOSED (no lane)", exc,
         )
         return None
-    owner_id = str(sub.get("user_id") or "").strip()
+    owner_id = str(_sub_owui_owner_id(sub)).strip()
     if not owner_id:
         return None
     bound_chat = str(binding.get(owner_id) or "").strip()
@@ -1116,6 +1240,296 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
     return (decision, bound_chat)
 
 
+#: Ключ в ``delivery_metadata`` подписки, по которому api_server-подписка
+#: (в т.ч. PWA/yadisk, без ``owui-``-префикса и без ``user_id``) привязывается
+#: к OWUI-пользователю (F3, t_0aedc91c): ``{"owui_user_id_attr":
+#: "<owui_user_id>"}``.  Заполняется только серверной стороной (верифицированная
+#: PWA-идентичность), никогда из client-запроса; отсутствие маркера =
+#: OWUI-only (fail-closed).  Это «признак привязки подписки к owui_user_id» из
+#: требования 3.
+_OWUI_ATTR_META_KEY = "owui_user_id_attr"
+
+
+def _sub_owui_owner_id(sub: dict) -> str:
+    """OWUI-владелец api_server-подписки: ``user_id`` или серверный attr-маркер.
+
+    Приоритет: штатный ``sub.user_id`` (verified-origin OWUI) → серверный
+    ``delivery_metadata[owui_user_id_attr]`` (F3: PWA/yadisk-подписка, явно
+    привязанная сервером к OWUI-пользователю).  Пустая строка = нет владельца
+    → обе lanes остаются OWUI-only (fail-closed, V8).
+    """
+    owner = str(sub.get("user_id") or "").strip()
+    if owner:
+        return owner
+    meta = sub.get("delivery_metadata")
+    if isinstance(meta, dict):
+        attr = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
+        return attr
+    return ""
+
+
+#: Telegram message-size floor under which a kanban terminal итог has no real
+#: content (F1, tg-delivery-contract): the legacy baked one-liners
+#: ``✅ Задача выполнена`` / ``❌ Задача не выполнена (нужен фикс): ...`` produce a
+#: ~20-80 char message with no summary and no artifacts.  Those are exactly the
+#: "голый итог" the owner banned — they must be SUPPRESSED in the OWUI→TG mirror
+#: (silence + journal), not delivered as a contentless ping.  A terminal итог is
+#: only worth a Telegram message when it carries meat: a real summary
+#: (>this many chars, from the completed event / kanban_complete.summary) OR at
+#: least one readable artifact attached as a file.  Success messages shorter than
+#: this are treated as bare; failure messages always carry the failing ids and
+#: stay usable (they start with '❌', never "✅ Задача выполнена").
+_OWUI_TG_BARE_ITOG_MAX_CHARS = 120
+
+#: Cap for the summary carried in the OWUI→TG mirror итог (F1).  The card
+#: body fixes "~2000 знаков" as the content budget for the terminal итог.
+_OWUI_TG_SUMMARY_MAX_CHARS = 2000
+
+#: Cap for mirrored root artifacts (F1).  Telegram's hard platform limit is
+#: 50 MB; the contract fixes a comfortable 25 MB ceiling so an oversized
+#: artifact is skipped with a warning instead of failing the whole delivery.
+#: Mirrors the watcher card body ("25MB cap, несуществующие файлы пропускать
+#: с warning, не ронять доставку текста").
+_OWUI_TG_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
+
+#: Text extensions whose FIRST artifACT of the root is both (a) attached as a
+#: file AND (b) inlined as a summary when the event summary itself is empty —
+#: the api_server-lane inline-report convention (see ``_owui_artifact_text``).
+_OWUI_TG_INLINE_REPORT_EXTS = frozenset({".md", ".txt", ".rst", ".log"})
+
+
+def _owui_root_final_summary(plan: dict, msg: str) -> str:
+    """Full итог text for the OWUI→TG branch mirror (F1, tg-delivery-contract).
+
+    The branch-summary watcher's ``msg`` is the short baked one-liner (``✅
+    Задача выполнена`` or the ❌ list).  For the Telegram mirror the owner's
+    contract demands CONTENT: a short summary (~2000 chars) from the root's
+    ``completed`` event (kanban_complete.summary) plus the root's artifacts.
+    This helper composes the best available итог:
+
+      1. The root's last ``completed`` event payload (first summary line is
+         already capped at 400 chars by kanban_db.complete_task; we take the
+         short summary up to ``_OWUI_TG_SUMMARY_MAX_CHARS`` from the run row
+         for the full text, falling back to the event's ``summary`` field).
+      2. If that summary is empty, the root's first inline text report
+         artifact (md/txt/rst/log) is inlined as a report — same convention
+         as ``_owui_branch_result_text`` / ``_owui_artifact_text`` on the
+         api_server lane.
+      3. The original short ``msg`` is kept only when neither produces real
+         content, so the mirror never fabricates text the worker didn't write.
+
+    Pure and side-effect free apart from a closed DB read; failures degrade to
+    ``msg`` so the delivery pipeline never breaks on data access.
+    """
+    from hermes_cli import kanban_db as _kb
+    import json as _json
+
+    root_id = plan.get("root_id")
+    if not root_id:
+        return msg
+    try:
+        conn = _kb.connect(board=plan.get("board"))
+        try:
+            # Full summary lives on the closing run row (first 400 chars of
+            # the summary also ride the event payload).  The run row carries
+            # the worker's full handoff; the event payload is the durable
+            # fallback when the run row was synthesized/short.
+            run = conn.execute(
+                "SELECT summary, metadata FROM task_runs "
+                "WHERE task_id=? AND outcome='completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+                (root_id,),
+            ).fetchone()
+            payload = None
+            if run is not None and run["summary"]:
+                summary_text = str(run["summary"]).strip()
+            else:
+                row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? "
+                    "AND kind='completed' ORDER BY id DESC LIMIT 1",
+                    (root_id,),
+                ).fetchone()
+                if row and row[0]:
+                    payload = _json.loads(row[0])
+                summary_text = ""
+                if isinstance(payload, dict):
+                    s = payload.get("summary")
+                    if isinstance(s, str):
+                        summary_text = s.strip()
+            artifacts: list[str] = []
+            if isinstance(payload, dict):
+                raw = payload.get("artifacts")
+                if isinstance(raw, (list, tuple)):
+                    artifacts = [str(p) for p in raw if isinstance(p, str) and p.strip()]
+            # metadata["artifacts"] may also carry paths the run row promoted
+            # (complete_task merges prose artifacts into metadata before the
+            # payload is built) — prefer the event payload list, then the run
+            # metadata as an extra source.
+            run_artifacts: list[str] = []
+            if run is not None:
+                try:
+                    m = _json.loads(run["metadata"]) if run["metadata"] else {}
+                except (TypeError, ValueError):
+                    m = {}
+                if isinstance(m, dict):
+                    rawm = m.get("artifacts")
+                    if isinstance(rawm, (list, tuple)):
+                        run_artifacts = [str(p) for p in rawm if isinstance(p, str) and p.strip()]
+            for p in run_artifacts:
+                if p not in artifacts:
+                    artifacts.append(p)
+        finally:
+            conn.close()
+    except Exception:
+        return msg
+
+    parts: list[str] = []
+    # Header: keep the short baked итог line (``✅ Задача выполнена`` /
+    # ``❌ …нужен фикс``) so the mirror message still reads as "the branch
+    # closed" even when the handoff summary is short; the summary rides below.
+    parts.append(msg.strip() or "✅ Задача выполнена")
+    if summary_text:
+        parts.append(summary_text[:_OWUI_TG_SUMMARY_MAX_CHARS])
+    else:
+        # No handoff summary — inline the root's first report artifact text
+        # (the api_server-lane convention) so the TG message still has meat.
+        from hermes_cli.delivery_policy import sanitize_delivery_text
+
+        for raw in artifacts:
+            try:
+                p = Path(raw)
+                if not p.is_file() or p.suffix.lower() not in _OWUI_TG_INLINE_REPORT_EXTS:
+                    continue
+                if p.stat().st_size > _OWUI_ARTIFACT_MAX_BYTES:
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")[:_OWUI_ARTIFACT_MAX_CHARS]
+                text = sanitize_delivery_text(text)
+                if text:
+                    parts.append(f"📄 Отчёт <b>{p.name}</b>:\n\n{text}")
+                    break
+            except (OSError, ValueError):
+                continue
+    full = "\n\n".join(parts).strip()
+    if not full or full == (msg or "").strip():
+        return msg
+    from hermes_cli.delivery_policy import sanitize_delivery_text
+    return sanitize_delivery_text(full, max_chars=8000)
+
+
+def _owui_tg_is_bare_itog(msg: str) -> bool:
+    """True when ``msg`` is a contentless terminal итог (F1).
+
+    A bare итог is the baked one-liner with no summary and no artifacts:
+    ``✅ Задача выполнена`` (and any generic success-under-``_OWUI_TG_
+    BARE_ITOG_MAX_CHARS``), while failure итоги (❌) always carry the failing
+    ids and stay usable.  The mirror suppresses these with a journal entry
+    instead of delivering a contentless ping to the owner's Telegram.
+    """
+    if not msg:
+        return True
+    return msg.startswith("✅") and len(msg.strip()) <= _OWUI_TG_BARE_ITOG_MAX_CHARS
+
+
+def _owui_root_artifact_paths(plan: dict) -> list[str]:
+    """Absolute readable artifact paths for the OWUI→TG mirror (F1).
+
+    Sources, in priority order:
+      1. ``artifacts[]`` on the root's last ``completed`` event payload
+         (kanban_complete(artifacts=...) promoted by complete_task).
+      2. ``metadata[\"artifacts\"]`` on the root's closing run row.
+      3. ``task_attachments`` rows for the root (files attached via
+         kanban_attach / kanban_attach_url).
+
+    Every candidate is verified to exist on disk; missing files are dropped
+    with a warning (the spec explicitly allows skipping nonexistent paths so
+    delivery of the text is never dropped).  Returns only files that
+    ``validate_media_delivery_path`` would also accept.
+    """
+    from hermes_cli import kanban_db as _kb
+    import json as _json
+
+    root_id = plan.get("root_id")
+    if not root_id:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw) -> None:
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        try:
+            check = Path(os.path.expanduser(raw.strip()))
+        except (OSError, ValueError):
+            return
+        if not check.is_absolute():
+            return
+        resolved = str(check.resolve(strict=False))
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        if not check.is_file():
+            logger.warning(
+                "kanban branch summary: OWUI→TG artifact %s for root %s "
+                "missing on disk — skipped",
+                raw.strip(), root_id,
+            )
+            return
+        try:
+            if check.stat().st_size > _OWUI_TG_ARTIFACT_MAX_BYTES:
+                logger.warning(
+                    "kanban branch summary: OWUI→TG artifact %s for root %s "
+                    "exceeds 25MB cap — skipped",
+                    raw.strip(), root_id,
+                )
+                return
+        except OSError:
+            pass
+        paths.append(resolved)
+
+    try:
+        conn = _kb.connect(board=plan.get("board"))
+        try:
+            row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='completed' ORDER BY id DESC LIMIT 1",
+                (root_id,),
+            ).fetchone()
+            if row and row[0]:
+                try:
+                    payload = _json.loads(row[0])
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    for p in payload.get("artifacts") or ():
+                        _add(p)
+            run = conn.execute(
+                "SELECT metadata FROM task_runs "
+                "WHERE task_id=? AND outcome='completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+                (root_id,),
+            ).fetchone()
+            if run is not None and run["metadata"]:
+                try:
+                    m = _json.loads(run["metadata"])
+                except (TypeError, ValueError):
+                    m = None
+                if isinstance(m, dict):
+                    for p in m.get("artifacts") or ():
+                        _add(p)
+            # task_attachments rows — durable per-task attachment blobs.
+            for att in _kb.list_attachments(conn, root_id):
+                _add(att.stored_path)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "kanban branch summary: could not enumerate root artifacts for "
+            "%s: %s", root_id, exc,
+        )
+        return paths
+    return paths
+
+
 def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
                                  *, home_channel: str = "") -> Optional[tuple]:
     """Complementary OWUI→Telegram mirror for a kanban branch итог.
@@ -1137,10 +1551,15 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
       * ``None`` — no Telegram lane: not an api_server subscription, policy
         disabled, policy module unavailable (fail-closed), no binding for the
         owner, or bound chat not in ALLOWED/home.  Mission stays OWUI-only.
-      * ``(decision, bound_chat)`` — ``decision.delivered`` → send ``msg`` to
-        Telegram ``bound_chat``; ``decision.suppressed`` → already journaled,
-        do NOT send.  ``verify_recipient`` enforces recipient == initiator
-        (ИНВ1); a foreign recipient is never delivered.
+      * ``(decision, bound_chat, content)`` — ``decision.delivered`` → send
+        ``content["msg"]`` to Telegram ``bound_chat`` and attach
+        ``content["artifacts"]`` as files; ``decision.suppressed`` → already
+        journaled, do NOT send.  ``content`` always carries the enriched итог
+        message (summary, F1) and the root's artifact paths (empty when
+        suppressed).  ``verify_recipient`` enforces recipient == initiator
+        (ИНВ1); a foreign recipient is never delivered.  A TERMINAL итог with
+        NO summary and NO artifacts (the bare ``✅ Задача выполнена``) is
+        suppressed (F1) — never a contentless ping.
     """
     if str(sub.get("platform") or "").lower() != "api_server":
         return None
@@ -1174,7 +1593,7 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
             exc,
         )
         return None
-    owner_id = str(sub.get("user_id") or "").strip()
+    owner_id = str(_sub_owui_owner_id(sub)).strip()
     if not owner_id:
         return None
     bound_chat = str(binding.get(owner_id) or "").strip()
@@ -1234,7 +1653,7 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
             "summary for %s to telegram:%s (non-terminal mission tree)",
             root_id, bound_chat,
         )
-        return (_suppr, bound_chat)
+        return (_suppr, bound_chat, {"msg": msg, "artifacts": []})
     ctx = default_context(
         kind="kanban",
         initiator=initiator,
@@ -1248,7 +1667,75 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
         completed_terminal=True,
         no_agent=False,
     )
-    decision = classify(msg, ctx)
+    # F1 do-implementation (tg-delivery-contract): a TERMINAL branch итог must
+    # carry CONTENT in the OWUI→TG mirror — a short summary (~2000 chars) from
+    # the root's completed event / kanban_complete.summary plus the root's
+    # artifacts attached as files.  The legacy baked one-liner ``✅ Задача
+    # выполнена`` (no summary, no artifacts) is exactly the "голый итог" the
+    # owner banned: it is SUPPRESSED entirely (silence in TG) and journaled,
+    # never sent as a contentless ping.  Failure итоги (❌ …нужен фикс) carry
+    # the failing ids and stay usable — they are delivered with the summary
+    # enrichment when available.
+    deliver_msg = _owui_root_final_summary(plan, msg)
+    root_artifacts = _owui_root_artifact_paths(plan)
+    # Payload rider (t_f659bef2, D0 D2/A4): the branch_summary marker may also
+    # carry an explicit artifact list (``plan['artifacts']``, currently None
+    # on the marker; sources that may be added later).  Merge any plan-level
+    # artifact paths so the OWUI→TG mirror honours paths riders put directly
+    # on the plan payload — parity with the native-TG lane.  Every candidate
+    # is re-validated (absolute, exists, 25MB cap) so nothing unverified ever
+    # reaches `_deliver_kanban_artifacts`.
+    _plan_arts = plan.get("artifacts") or []
+    if isinstance(_plan_arts, (list, tuple)):
+        for _pa in _plan_arts:
+            if not isinstance(_pa, str) or not _pa.strip():
+                continue
+            if _pa.strip() in root_artifacts:
+                continue
+            try:
+                _check = Path(os.path.expanduser(_pa.strip()))
+            except (OSError, ValueError):
+                continue
+            if not _check.is_absolute() or not _check.is_file():
+                logger.warning(
+                    "kanban branch summary: OWUI→TG plan artifact %s for root %s "
+                    "missing on disk — skipped",
+                    _pa.strip(), root_id,
+                )
+                continue
+            try:
+                if _check.stat().st_size > _OWUI_TG_ARTIFACT_MAX_BYTES:
+                    logger.warning(
+                        "kanban branch summary: OWUI→TG plan artifact %s for "
+                        "root %s exceeds 25MB cap — skipped",
+                        _pa.strip(), root_id,
+                    )
+                    continue
+            except OSError:
+                pass
+            root_artifacts.append(str(_check.resolve(strict=False)))
+    # Bare = the delivered text is still the contentless one-liner (no summary
+    # was found to enrich it — ``_owui_root_final_summary`` returns ``msg``
+    # verbatim) AND there are no file artifacts to attach.  A short-but-real
+    # summary (``deliver_msg != msg``) always counts as content.
+    bare_itog = (
+        deliver_msg == msg
+        and _owui_tg_is_bare_itog(msg)
+        and not root_artifacts
+    )
+    if bare_itog:
+        _suppr = _suppress_decision(
+            "bare terminal итог without content",
+            detail=(
+                "terminal branch summary has no summary and no artifacts — "
+                "suppressed in OWUI→TG lane (owner contract F1)"
+            ),
+        )
+    else:
+        _suppr = None
+    decision = _suppr or classify(
+        deliver_msg, {**ctx, "artifacts": root_artifacts},
+    )
     if not decision.suppressed:
         if verify_recipient(
             initiator, target,
@@ -1256,7 +1743,10 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
             allowed_users=allowed_users,
             owui_to_tg=binding,
         ):
-            return (decision, bound_chat)
+            return (decision, bound_chat, {
+                "msg": deliver_msg,
+                "artifacts": root_artifacts,
+            })
         decision = _suppress_decision(
             "recipient mismatch",
             detail=f"cross-platform api_server→telegram target={bound_chat}",
@@ -1266,15 +1756,23 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
         who=str(sub.get("user_id") or sub.get("chat_id") or ""),
         target=f"telegram:{bound_chat}",
         decision=decision,
-        snippet=(msg or "")[:200],
+        snippet=(deliver_msg or "")[:200],
         extra={
             "task_id": root_id,
             "event_kind": "branch_summary",
             "event_id": plan.get("marker_id") or 0,
             "owui_to_tg": True,
+            "artifact_count": len(root_artifacts),
         },
     )
-    return (decision, bound_chat)
+    # Suppressed — no content for the owner's Telegram.  Return the enriched
+    # message and artifact list so the caller CANNOT deliver a bare ping: if
+    # ``bare_itog`` the message stays the short one-liner but the decision is
+    # suppressed, and the caller only sends when the decision is NOT suppressed.
+    return (decision, bound_chat, {
+        "msg": deliver_msg,
+        "artifacts": root_artifacts,
+    })
 
 
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
@@ -2221,54 +2719,145 @@ class GatewayKanbanWatchersMixin:
                             if _tg_lane is not None:
                                 _tg_decision, _tg_bound_chat = _tg_lane
                                 if not _tg_decision.suppressed:
-                                    _tg_adapter = self._authorization_adapter(
-                                        _Platform.TELEGRAM, sub_profile or None,
+                                    # F2 (t_a14f7e23): for human-action block
+                                    # events (blocked / needs_input /
+                                    # capability / block_loop_detected) the
+                                    # OWUI→TG mirror carries the owner-facing
+                                    # «требует решения: <заголовок> + краткая
+                                    # причина» text AND is deduped by
+                                    # (task, kind, cause) with a cooldown — a
+                                    # worker re-blocking the same task for the
+                                    # same cause must not spam the owner's TG.
+                                    # The dedup gate runs BEFORE the send; the
+                                    # marker is written only after a real
+                                    # delivery so a transient send failure can
+                                    # retry next tick.
+                                    _is_human_block = (
+                                        kind in _OWUI_TG_HUMAN_BLOCK_KINDS
                                     )
-                                    if _tg_adapter is not None:
+                                    _f2_due = True
+                                    if _is_human_block:
+                                        # The DB connection used during
+                                        # collection is closed before the async
+                                        # delivery loop; open a short-lived
+                                        # board-scoped connection for the dedup
+                                        # marker (F2). Best-effort: if the DB is
+                                        # unavailable, fail-open and deliver
+                                        # (dedup is a hygiene nicety, never a
+                                        # delivery blocker).
+                                        _f2_conn = None
                                         try:
-                                            _tg_send_res = await _tg_adapter.send(
-                                                _tg_bound_chat, msg, metadata={},
+                                            from hermes_cli import kanban_db as _f2_kb
+                                            _f2_conn = _f2_kb.connect(
+                                                board=board_slug or "default"
                                             )
-                                            if getattr(_tg_send_res, "success", True) is False:
-                                                # Complementary best-effort lane:
-                                                # a TG transport failure must NOT
-                                                # rewind the OWUI cursor (the
-                                                # primary lane already staged and
-                                                # ACKed) — log for observability.
-                                                logger.warning(
-                                                    "kanban notifier: OWUI→TG lane send to telegram:%s reported failure: %s",
-                                                    _tg_bound_chat,
-                                                    getattr(_tg_send_res, "error", None) or "unknown error",
-                                                )
-                                            else:
-                                                logger.debug(
-                                                    "kanban notifier: OWUI→TG lane delivered %s event for %s to telegram:%s on board %s",
-                                                    kind, sub["task_id"],
-                                                    _tg_bound_chat, board_slug,
-                                                )
-                                            if kind == "completed":
-                                                # Native artifact upload for the
-                                                # TG lane, mirroring the telegram
-                                                # branch below. Best-effort: a
-                                                # failure must not fail the send.
+                                            _f2_due = _owui_tg_block_mirror_due(
+                                                _f2_conn, sub, ev, kind,
+                                            )
+                                        except Exception as _f2_exc:
+                                            logger.debug(
+                                                "kanban notifier: F2 block-dedup "
+                                                "probe failed for %s: %s",
+                                                sub["task_id"], _f2_exc,
+                                            )
+                                            _f2_due = True
+                                        finally:
+                                            if _f2_conn is not None:
                                                 try:
-                                                    await self._deliver_kanban_artifacts(
-                                                        adapter=_tg_adapter,
-                                                        chat_id=_tg_bound_chat,
-                                                        metadata={},
-                                                        event_payload=getattr(ev, "payload", None),
-                                                        task=task,
+                                                    _f2_conn.close()
+                                                except Exception:
+                                                    pass
+                                    if not _f2_due:
+                                        logger.info(
+                                            "kanban notifier: OWUI→TG block "
+                                            "mirror for %s suppressed (already "
+                                            "mirrored within cooldown, kind=%s)",
+                                            sub["task_id"], kind,
+                                        )
+                                    else:
+                                        _tg_adapter = self._authorization_adapter(
+                                            _Platform.TELEGRAM, sub_profile or None,
+                                        )
+                                        if _tg_adapter is not None:
+                                            try:
+                                                if _is_human_block:
+                                                    _tg_msg = _owui_tg_block_mirror_text(
+                                                        sub, ev, kind, task, msg,
                                                     )
-                                                except Exception as _art_exc:
+                                                else:
+                                                    _tg_msg = msg
+                                                _tg_send_res = await _tg_adapter.send(
+                                                    _tg_bound_chat, _tg_msg, metadata={},
+                                                )
+                                                if getattr(_tg_send_res, "success", True) is False:
+                                                    # Complementary best-effort lane:
+                                                    # a TG transport failure must NOT
+                                                    # rewind the OWUI cursor (the
+                                                    # primary lane already staged and
+                                                    # ACKed) — log for observability.
+                                                    logger.warning(
+                                                        "kanban notifier: OWUI→TG lane send to telegram:%s reported failure: %s",
+                                                        _tg_bound_chat,
+                                                        getattr(_tg_send_res, "error", None) or "unknown error",
+                                                    )
+                                                else:
                                                     logger.debug(
-                                                        "kanban notifier: OWUI→TG artifact delivery for %s failed: %s",
-                                                        sub["task_id"], _art_exc,
+                                                        "kanban notifier: OWUI→TG lane delivered %s event for %s to telegram:%s on board %s",
+                                                        kind, sub["task_id"],
+                                                        _tg_bound_chat, board_slug,
                                                     )
-                                        except Exception as _tg_exc:
-                                            logger.warning(
-                                                "kanban notifier: OWUI→TG send failed for %s to telegram:%s: %s",
-                                                sub["task_id"], _tg_bound_chat, _tg_exc,
-                                            )
+                                                    if _is_human_block:
+                                                        # Record the once-per-
+                                                        # cooldown claim (F2).
+                                                        # Open a short-lived
+                                                        # board-scoped connection
+                                                        # (collection conn is
+                                                        # closed before the
+                                                        # delivery loop).
+                                                        _mk_conn = None
+                                                        try:
+                                                            from hermes_cli import kanban_db as _f2_kb
+                                                            _mk_conn = _f2_kb.connect(
+                                                                board=board_slug or "default"
+                                                            )
+                                                            _owui_tg_mark_block_mirror(
+                                                                _mk_conn, sub, ev, kind,
+                                                                chat=_tg_bound_chat,
+                                                            )
+                                                        except Exception as _mk_exc:
+                                                            logger.debug(
+                                                                "kanban notifier: OWUI→TG block mirror marker for %s failed: %s",
+                                                                sub["task_id"], _mk_exc,
+                                                            )
+                                                        finally:
+                                                            if _mk_conn is not None:
+                                                                try:
+                                                                    _mk_conn.close()
+                                                                except Exception:
+                                                                    pass
+                                                if kind == "completed":
+                                                    # Native artifact upload for the
+                                                    # TG lane, mirroring the telegram
+                                                    # branch below. Best-effort: a
+                                                    # failure must not fail the send.
+                                                    try:
+                                                        await self._deliver_kanban_artifacts(
+                                                            adapter=_tg_adapter,
+                                                            chat_id=_tg_bound_chat,
+                                                            metadata={},
+                                                            event_payload=getattr(ev, "payload", None),
+                                                            task=task,
+                                                        )
+                                                    except Exception as _art_exc:
+                                                        logger.debug(
+                                                            "kanban notifier: OWUI→TG artifact delivery for %s failed: %s",
+                                                            sub["task_id"], _art_exc,
+                                                        )
+                                            except Exception as _tg_exc:
+                                                logger.warning(
+                                                    "kanban notifier: OWUI→TG send failed for %s to telegram:%s: %s",
+                                                    sub["task_id"], _tg_bound_chat, _tg_exc,
+                                                )
                             continue
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
@@ -3176,15 +3765,16 @@ class GatewayKanbanWatchersMixin:
                 )
                 _tg_lane = None
             if _tg_lane is not None:
-                _tg_decision, _tg_bound_chat = _tg_lane
+                _tg_decision, _tg_bound_chat, _tg_content = _tg_lane
                 if not _tg_decision.suppressed:
                     _tg_adapter = self._authorization_adapter(
                         _Platform.TELEGRAM, sub_profile or None,
                     )
                     if _tg_adapter is not None:
                         try:
+                            _tg_msg = _tg_content.get("msg", msg)
                             _tg_send_res = await _tg_adapter.send(
-                                _tg_bound_chat, msg, metadata={},
+                                _tg_bound_chat, _tg_msg, metadata={},
                             )
                             if getattr(_tg_send_res, "success", True) is False:
                                 raise RuntimeError(
@@ -3197,6 +3787,30 @@ class GatewayKanbanWatchersMixin:
                                 "итог for %s delivered to telegram:%s",
                                 root_id, _tg_bound_chat,
                             )
+                            # F1 (tg-delivery-contract): the terminal итог's
+                            # artifacts ride as native Telegram file
+                            # attachments (send_document/send_video/images)
+                            # via the existing artifact helper — same path the
+                            # per-event OWUI→TG completed lane uses.  A
+                            # failure must never fail the already-delivered
+                            # text (best-effort, logged).
+                            try:
+                                await self._deliver_kanban_artifacts(
+                                    adapter=_tg_adapter,
+                                    chat_id=_tg_bound_chat,
+                                    metadata={},
+                                    event_payload={
+                                        "artifacts": _tg_content.get("artifacts") or [],
+                                    },
+                                    task=None,
+                                )
+                            except Exception as _tg_art_exc:
+                                logger.warning(
+                                    "kanban branch summary: OWUI→TG mirror "
+                                    "artifact upload for %s to telegram:%s "
+                                    "failed: %s",
+                                    root_id, _tg_bound_chat, _tg_art_exc,
+                                )
                         except Exception as _tg_send_exc:
                             logger.warning(
                                 "kanban branch summary: OWUI→TG mirror send "
@@ -3261,9 +3875,98 @@ class GatewayKanbanWatchersMixin:
                 platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
             )
             return True
+        # F1 (tg-delivery-contract, native telegram lane): the TERMINAL branch
+        # итог to a native telegram subscription must carry CONTENT — a short
+        # summary (~2000 chars) from the root's completed event /
+        # kanban_complete.summary plus the root's artifacts attached as files.
+        # The baked one-liner ``✅ Задача выполнена`` with no summary and no
+        # artifacts (the "голый итог") is suppressed entirely (silence in TG)
+        # and journaled, never sent as a contentless ping.  Failure итоги (❌
+        # …нужен фикс) carry the failing ids and stay usable.  All gated by
+        # the existing ``telegram_delivery_policy`` flag (rollback).  The
+        # enrichment helpers are the same generic root-branch helpers the
+        # OWUI→TG mirror uses; artifact upload rides the existing helper.
+        deliver_msg = msg
+        root_artifacts: list[str] = []
+        if (
+            platform_str == "telegram"
+            and plan.get("terminal", True)
+        ):
+            try:
+                from hermes_cli.delivery_policy import policy_enabled
+
+                if policy_enabled():
+                    deliver_msg = _owui_root_final_summary(plan, msg)
+                    root_artifacts = _owui_root_artifact_paths(plan)
+                    # The branch_summary marker payload may also carry an
+                    # explicit artifact list (``payload['artifacts']``,
+                    # currently None on the marker; sources that may be added
+                    # later).  Merge any plan-level artifacts so the helper
+                    # also sees paths riders put directly on the plan payload.
+                    _plan_arts = plan.get("artifacts") or []
+                    if isinstance(_plan_arts, (list, tuple)):
+                        for _pa in _plan_arts:
+                            if (
+                                isinstance(_pa, str)
+                                and _pa.strip()
+                                and _pa not in root_artifacts
+                            ):
+                                root_artifacts.append(_pa.strip())
+                    bare_itog = (
+                        deliver_msg == msg
+                        and _owui_tg_is_bare_itog(msg)
+                        and not root_artifacts
+                    )
+                    if bare_itog:
+                        _suppr = _suppress_decision(
+                            "bare terminal итог without content",
+                            detail=(
+                                "terminal branch summary has no summary and "
+                                "no artifacts — suppressed in native telegram "
+                                "lane (owner contract F1)"
+                            ),
+                        )
+                        from hermes_cli.delivery_policy import log_suppression
+
+                        log_suppression(
+                            app="kanban",
+                            who=str(
+                                sub.get("user_id") or sub.get("chat_id") or ""
+                            ),
+                            target=f"telegram:{sub.get('chat_id')}",
+                            decision=_suppr,
+                            snippet=(msg or "")[:200],
+                            extra={
+                                "task_id": root_id,
+                                "event_kind": "branch_summary",
+                                "event_id": plan.get("marker_id") or 0,
+                                "native_tg": True,
+                                "artifact_count": 0,
+                            },
+                        )
+                        logger.info(
+                            "delivery-policy: bare terminal branch summary "
+                            "suppressed for %s to telegram:%s "
+                            "(no summary, no artifacts)",
+                            root_id, sub.get("chat_id"),
+                        )
+                        await _to_thread_process_service(
+                            self._ack_branch_summary, board, root_id,
+                            platform_str, sub.get("chat_id"),
+                            sub.get("thread_id") or "",
+                        )
+                        return True
+            except Exception as _tg_content_exc:
+                logger.warning(
+                    "kanban branch summary: native TG content enrichment for "
+                    "%s/%s failed (%s) — falling back to legacy message",
+                    platform_str, root_id, _tg_content_exc,
+                )
+                deliver_msg = msg
+                root_artifacts = []
         try:
             _send_res = await adapter.send(
-                sub["chat_id"], msg, metadata=metadata,
+                sub["chat_id"], deliver_msg, metadata=metadata,
             )
             if getattr(_send_res, "success", True) is False:
                 raise RuntimeError(
@@ -3276,6 +3979,28 @@ class GatewayKanbanWatchersMixin:
                 root_id, platform_str, sub.get("chat_id"), exc,
             )
             return False
+        # F1 (tg-delivery-contract, native telegram lane): the terminal итог's
+        # artifacts ride as native Telegram file attachments
+        # (send_document/send_video/images) via the existing artifact helper —
+        # same path the per-event telegram lane and the OWUI→TG mirror use.
+        # Best-effort: an upload failure must never fail the already-delivered
+        # text (logged only).  Only the native-TG terminal branch-итог carries
+        # files here (root_artifacts stays empty for other platforms).
+        if root_artifacts:
+            try:
+                await self._deliver_kanban_artifacts(
+                    adapter=adapter,
+                    chat_id=sub["chat_id"],
+                    metadata=metadata,
+                    event_payload={"artifacts": root_artifacts},
+                    task=None,
+                )
+            except Exception as _tg_art_exc:
+                logger.warning(
+                    "kanban branch summary: native TG artifact upload for %s "
+                    "to telegram:%s failed: %s",
+                    root_id, sub.get("chat_id"), _tg_art_exc,
+                )
         # Terminal branch итог wake: the mission root finished and the creator
         # must be woken to collect the result. This is the ONLY wake a mission
         # yields under branch_summary_replace mode — the intermediate child

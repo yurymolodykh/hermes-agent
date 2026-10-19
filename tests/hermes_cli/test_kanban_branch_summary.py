@@ -285,3 +285,136 @@ def test_marker_claim_ack_pending_clear(board_conn):
     # clear-on-reopen
     assert kb.clear_branch_summary(board_conn, root) == 1
     assert kb.has_branch_summary(board_conn, root) is None
+
+
+# ---------------------------------------------------------------------------
+# F2 (t_a14f7e23): TG block-mirror dedup marker lifecycle
+# ---------------------------------------------------------------------------
+
+def test_tg_block_mirror_marker_unset_then_due(board_conn):
+    tid = _mk(board_conn, "block-task")
+    # No marker yet → due (mirror should be sent).
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="answer please",
+    ) is True
+    assert kb.tg_block_mirror_marker(board_conn, tid, kind="needs_input") is None
+
+
+def test_tg_block_mirror_mark_and_dedup_same_cause(board_conn, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    kb.mark_tg_block_mirror(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+        chat="tg-owner",
+    )
+    marker = kb.tg_block_mirror_marker(board_conn, tid, kind="needs_input")
+    assert marker is not None
+    assert marker["kind"] == "needs_input"
+    assert marker["chat"] == "tg-owner"
+    # Same cause inside cooldown → NOT due.
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    ) is False
+
+
+def test_tg_block_mirror_different_cause_bypasses_cooldown(
+    board_conn, monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    kb.mark_tg_block_mirror(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    )
+    # New cause → due (owner deserves a fresh ping).
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="credentials expired",
+    ) is True
+
+
+def test_tg_block_mirror_different_kind_bypasses_cooldown(board_conn, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    kb.mark_tg_block_mirror(
+        board_conn, tid, kind="blocked", reason="provider is down",
+    )
+    # capability after blocked → new attention event.
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="capability", reason="provider is down",
+    ) is True
+
+
+def test_tg_block_mirror_cooldown_expired_redue(board_conn, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    mid = kb.mark_tg_block_mirror(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    )
+    assert mid > 0
+    # Marker recorded at current time; a LATER call (cooldown elapsed, e.g.
+    # 2h after a 1h cooldown) re-notifies the owner.
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+        now=int(__import__("time").time()) + 7200,
+    ) is True
+
+
+def test_tg_block_mirror_clear_reenables(board_conn, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    kb.mark_tg_block_mirror(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    )
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    ) is False
+    # Task unblocked → markers cleared → a later genuine re-block re-notifies.
+    assert kb.clear_tg_block_mirror(board_conn, tid) == 1
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="provider is down",
+    ) is True
+
+
+def test_unblock_task_clears_tg_block_mirror_markers(board_conn, monkeypatch):
+    """F2 R1-gate: unblocking a blocked task clears the stale block-mirror
+    cooldown markers, so a later GENUINE same-cause re-block re-notifies the
+    owner's TG instead of being swallowed by the pre-unblock marker."""
+    monkeypatch.setenv(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
+    )
+    tid = _mk(board_conn, "block-task")
+    # Block the task and mirror it once (marker written).
+    assert kb.block_task(board_conn, tid, kind="needs_input",
+                         reason="choose a provider")
+    kb.mark_tg_block_mirror(
+        board_conn, tid, kind="needs_input", reason="choose a provider",
+        chat="tg-owner",
+    )
+    assert kb.tg_block_mirror_marker(board_conn, tid, kind="needs_input") is not None
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="choose a provider",
+    ) is False
+    # Unblock → the dedup markers must be cleared.
+    assert kb.unblock_task(board_conn, tid) is True
+    assert kb.tg_block_mirror_marker(board_conn, tid, kind="needs_input") is None
+    # And a genuine re-block (same cause) is due again.
+    assert kb.tg_block_mirror_due(
+        board_conn, tid, kind="needs_input", reason="choose a provider",
+    ) is True
+
+
+def test_tg_block_mirror_cause_sig_normalization():
+    assert kb._tg_block_mirror_cause_sig("") == ""
+    s1 = kb._tg_block_mirror_cause_sig("  Provider   letovo is down\nretry later")
+    s2 = kb._tg_block_mirror_cause_sig("Provider letovo is down")
+    assert s1 == s2 == "provider letovo is down"
+    assert kb._tg_block_mirror_cause_sig("credentials expired") != s1

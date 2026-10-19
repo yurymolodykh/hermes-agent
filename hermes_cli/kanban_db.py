@@ -7862,7 +7862,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
-        return True
+    # F2 (tg-delivery-contract, OWUI→TG block mirror): the task left ``blocked``.
+    # Clear the ``tg_block_mirror`` dedup markers so a later GENUINE re-block
+    # (same cause) mirrors to the owner's TG again instead of being swallowed by
+    # the stale cooldown marker. Runs after the outer transaction commits — it
+    # opens its own write_txn (nesting would raise), and a post-commit failure
+    # must never fail the unblock itself (best-effort mirror hygiene).
+    try:
+        clear_tg_block_mirror(conn, task_id)
+    except Exception:  # pragma: no cover — best-effort, never fails an unblock
+        pass
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -15252,6 +15262,68 @@ def add_notify_sub(
             )
 
 
+#: Ключ в ``delivery_metadata`` подписки, по которому api_server-подписка
+#: (в т.ч. PWA/yadisk, без ``owui-``-префикса и без ``user_id``) привязывается
+#: к OWUI-пользователю (F3, t_0aedc91c): ``{"owui_user_id_attr": "<owui_user_id>"}``.
+#: Заполняется только серверной стороной (верифицированная PWA-идентичность),
+#: никогда из client-запроса; отсутствие маркера = OWUI-only (fail-closed).
+#: Это «nullable owui_user_id attribute» в хранилище подписок (требование 3):
+#: маркер живёт внутри JSON ``delivery_metadata`` и потому не требует смены
+#: схемы таблицы — существующие подписки (включая 234 боевые api_server-строки)
+#: остаются валидными без миграции, а новый nullable-атрибут де-факто добавлен.
+_OWUI_ATTR_META_KEY = "owui_user_id_attr"
+
+
+def set_notify_sub_owui_owner(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    owui_user_id: Optional[str] = None,
+) -> bool:
+    """Set (or clear) the server-side OWUI-owner attribution on a subscription.
+
+    Merges the nullable ``owui_user_id_attr`` marker into the row's
+    ``delivery_metadata`` (F3 slice 3, t_cdb88a42).  The marker is the
+    server-only attribution the notifier's ``_sub_owui_owner_id`` falls back
+    to when ``user_id`` is absent (PWA/yadisk subscriptions without an
+    ``owui-`` chat prefix).  Fail closed: an empty/whitespace ``owui_user_id``
+    removes the attribute (reverts to OWUI-only), never fabricates one.
+
+    Returns True when the row exists and was updated (or the marker was
+    already in the target state), False when no subscription matches.
+    """
+    owner = str(owui_user_id or "").strip()
+    row = conn.execute(
+        "SELECT delivery_metadata FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+        (task_id, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return False
+    meta = _decode_notify_delivery_metadata(row[0])
+    if owner:
+        meta[_OWUI_ATTR_META_KEY] = owner
+    else:
+        meta.pop(_OWUI_ATTR_META_KEY, None)
+    metadata_json = _encode_notify_delivery_metadata(meta)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET delivery_metadata = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                metadata_json,
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+            ),
+        )
+    return True
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
@@ -16006,6 +16078,162 @@ def ack_branch_summary_channel(
             (json.dumps(payload, ensure_ascii=False), int(row["id"])),
         )
         return int(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# F2 (t_a14f7e23): TG mirror for OWUI blocked/needs_input — dedup + cooldown.
+# ---------------------------------------------------------------------------
+
+#: Marker kind written to ``task_events`` when a human-action block has been
+#: mirrored to the initiator's bound Telegram chat (F2, tg-delivery-contract).
+TG_BLOCK_MIRROR_KIND = "tg_block_mirror"
+
+#: Default cooldown between two TG mirrors of the SAME (task, human-action
+#: kind, reason-cause) — a worker re-blocking repeatedly must not spam the
+#: owner.  Overridable via ``HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS``.
+DEFAULT_TG_BLOCK_MIRROR_COOLDOWN_SECONDS = 24 * 3600  # 24h
+
+
+def _tg_block_mirror_cooldown_seconds() -> int:
+    raw = os.environ.get(
+        "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", ""
+    ).strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = -1
+    if val < 0:
+        return DEFAULT_TG_BLOCK_MIRROR_COOLDOWN_SECONDS
+    return val
+
+
+def tg_block_mirror_marker(
+    conn: sqlite3.Connection, task_id: str, *, kind: str,
+) -> Optional[dict]:
+    """Return the most recent ``tg_block_mirror`` marker for ``task_id``.
+
+    Returns ``None`` when no mirror has ever been sent for the task (or the
+    marker was cleared).  The marker payload records ``kind`` (the original
+    human-action event kind: blocked / needs_input / capability / ...), the
+    event-id of the first mirrored event, the reason-cause signature (so a
+    genuinely DIFFERENT block reason re-notifies even inside the cooldown)
+    and the bound chat that received it.
+    """
+    row = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, TG_BLOCK_MIRROR_KIND),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["_event_id"] = int(row["id"])
+    return payload
+
+
+def tg_block_mirror_due(
+    conn: sqlite3.Connection, task_id: str, *,
+    kind: str, reason: str = "", cooldown_seconds: Optional[int] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Should a human-action block event be mirrored to TG for ``task_id``?
+
+    Dedup/cooldown rule (F2, ДЕДУП): the SAME (task, kind, reason-cause) is
+    mirrored at most once per ``cooldown_seconds`` (default 24h).  A repeat
+    ``blocked`` from a re-blocking worker inside the cooldown does NOT send
+    again.  A marker whose reason-cause differs from the current event (e.g.
+    a new provider route question) bypasses the cooldown: the cause changed,
+    so the owner deserves a fresh ping.
+
+    ``reason`` is normalized to a short cause-signature (first line, trimmed
+    to 200 chars, lowercased) so cosmetic re-wraps of the same cause still
+    dedup.
+    """
+    marker = tg_block_mirror_marker(conn, task_id, kind=kind)
+    if marker is None:
+        return True
+    if cooldown_seconds is None:
+        cooldown_seconds = _tg_block_mirror_cooldown_seconds()
+    mark_kind = str(marker.get("kind") or "")
+    if mark_kind and mark_kind != kind:
+        # Different human-action kind (e.g. capability after blocked) — new
+        # attention event, mirror again.
+        return True
+    cause_sig = _tg_block_mirror_cause_sig(reason)
+    if cause_sig and cause_sig != str(marker.get("cause_sig") or ""):
+        # The underlying cause changed — a genuinely new question for the
+        # owner, not a silent re-block of the same cause.
+        return True
+    if cooldown_seconds <= 0:
+        return False  # cooldown disabled → still dedup once-ever per cause
+    if now is None:
+        now = int(time.time())
+    created = int(marker.get("created_at") or 0)
+    return (now - created) >= cooldown_seconds
+
+
+def mark_tg_block_mirror(
+    conn: sqlite3.Connection, task_id: str, *,
+    kind: str, event_id: Optional[int] = None, reason: str = "",
+    chat: str = "",
+) -> int:
+    """Record that a human-action block was mirrored to the bound TG chat.
+
+    Appends a ``tg_block_mirror`` event; returns the new event id.  The
+    marker IS the once-per-cooldown claim (F2).
+    """
+    now = int(time.time())
+    payload = {
+        "kind": kind,
+        "cause_sig": _tg_block_mirror_cause_sig(reason),
+        "reason_head": (reason or "")[:200],
+        "chat": str(chat or "")[:200],
+        "created_at": now,
+    }
+    if event_id:
+        payload["event_id"] = int(event_id)
+    with write_txn(conn):
+        _append_event(conn, task_id, TG_BLOCK_MIRROR_KIND, payload)
+        event_id_new = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    return event_id_new
+
+
+def clear_tg_block_mirror(conn: sqlite3.Connection, task_id: str) -> int:
+    """Delete every ``tg_block_mirror`` marker of ``task_id``.
+
+    Called when the task leaves ``blocked`` (unblocked / status → active) so a
+    later genuine re-block mirrors again instead of being eaten by an old
+    cooldown marker.  Returns the number of rows removed.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, TG_BLOCK_MIRROR_KIND),
+        )
+    return int(cur.rowcount or 0)
+
+
+def _tg_block_mirror_cause_sig(reason: str) -> str:
+    """Normalize a block reason to a stable cause signature for dedup.
+
+    Takes the first non-empty line, collapses whitespace, lowercases and
+    trims to 200 chars — enough to distinguish "provider letovo offline" from
+    "missing credentials" while surviving re-wraps of the same text.
+    """
+    if not reason:
+        return ""
+    head = ""
+    for line in str(reason).splitlines():
+        line = line.strip()
+        if line:
+            head = line
+            break
+    return re.sub(r"\s+", " ", head).strip().lower()[:200]
 
 
 def gc_events(

@@ -1674,6 +1674,21 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            # L1 medium<->review lane pinner (design/medium-review-scheme-v1.md).
+            # Best-effort seed; gated by agent.reasoning_class_routing — while
+            # the board's master switch is off it is a no-op and the card
+            # keeps its profile default.
+            try:
+                from agent.reasoning_effort_l1 import apply_card_lane_effort
+
+                _lane_cfg = load_config()
+                apply_card_lane_effort(conn, new_tid, _lane_cfg)
+                # Creating a review child also promotes its writing parents
+                # into the medium lane (they now own a gate child).
+                for _pid in parents:
+                    apply_card_lane_effort(conn, str(_pid), _lane_cfg)
+            except Exception:
+                logger.exception("lane effort seed failed on kanban_create; ignoring")
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1922,6 +1937,17 @@ def _handle_link(args: dict, **kw) -> str:
             if binding_err:
                 return binding_err
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+            # L1 medium<->review lane pinner (design/medium-review-scheme-v1.md).
+            # Linking a review child promotes the writing parent to medium;
+            # the review card itself pins max. Best-effort, gated.
+            try:
+                from agent.reasoning_effort_l1 import apply_card_lane_effort
+
+                _lane_cfg = load_config()
+                apply_card_lane_effort(conn, str(parent_id), _lane_cfg)
+                apply_card_lane_effort(conn, str(child_id), _lane_cfg)
+            except Exception:
+                logger.exception("lane effort seed failed on kanban_link; ignoring")
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
             conn.close()

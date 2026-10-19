@@ -23,6 +23,8 @@ from agent.reasoning_effort import (
     KIMI_K2_EFFORTS,
     KIMI_K3_EFFORTS,
     KIMI_K3_OVERRIDES,
+    LETOVO_EFFORTS,
+    LETOVO_OVERRIDES,
     OPENAI_COMPAT_WIRE_EFFORTS,
     clamp_effort,
     kimi_supported_efforts,
@@ -133,6 +135,28 @@ class TestGlm52Vocabulary:
         # GLM's floor is high — weaker asks land there.
         assert clamp_effort("low", GLM52_EFFORTS, GLM52_OVERRIDES) == "high"
         assert clamp_effort("medium", GLM52_EFFORTS, GLM52_OVERRIDES) == "high"
+
+
+class TestLetovoVocabulary:
+    def test_wire_set_includes_medium_and_max(self):
+        # Experiment v4 (REPORT_v4.md) — medium is its own step on the wire.
+        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
+
+    def test_supported_levels_pass_through(self):
+        for level in LETOVO_EFFORTS:
+            assert clamp_effort(level, LETOVO_EFFORTS, LETOVO_OVERRIDES) == level
+
+    def test_medium_stays_medium(self):
+        assert clamp_effort("medium", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "medium"
+
+    def test_xhigh_maps_to_max(self):
+        assert clamp_effort("xhigh", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "max"
+
+    def test_ultra_maps_to_max(self):
+        assert clamp_effort("ultra", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "max"
+
+    def test_minimal_maps_to_low(self):
+        assert clamp_effort("minimal", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "low"
 
 
 class TestCodexVocabulary:

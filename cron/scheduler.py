@@ -342,6 +342,49 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+# ---------------------------------------------------------------------------
+# F4: alert-once по классу сбоя (дедуп на persisted-бит, #73506 shape)
+# ---------------------------------------------------------------------------
+
+#: Приоритетные классы системных сбоев крона, которые ДОЛЖНЫ алертить
+#: владельца ровно один раз до устранения (не каждый тик).  Порядок —
+#: от самой конкретной причины к общей; первый матч выигрывает.
+_FAILURE_ALERT_CLASSES: tuple = (
+    ("blocked_config", "[blocked_config]"),
+    ("drift_skip", "[drift_skip]"),
+    ("script_not_found", "script not found"),
+    ("script_timed_out", "script timed out"),
+    ("script_exit_code", "script exited with code"),
+    ("script_failed", "script execution failed"),
+    ("script_cancelled", "script cancelled"),
+    ("provider_timeout", "provider timeout"),
+    ("provider_rate_limit", "rate limit"),
+    ("provider_auth", "authentication"),
+    ("provider_generic", "provider"),
+)
+
+
+def _cron_failure_alert_class(error: Optional[str]) -> Optional[str]:
+    """Класс системного сбоя крона для alert-once дедупа (F4).
+
+    Возвращает каноническую строку класса (``script_not_found``,
+    ``script_timed_out``, ...) или None, когда сбой не является системной
+    крон-тревогой (например, обычный рантайм-сбой агента — там работает
+    существующий failure-streak nudge, а не alert-once).
+
+    Ограничено приоритетными фразами summarizer/раннера — детект по
+    конкретным маркерам, не по произвольному тексту, чтобы не спутать
+    системный алерт с обычным провалом выполнения.
+    """
+    if not error:
+        return None
+    low = str(error).strip().lower()
+    for cls, marker in _FAILURE_ALERT_CLASSES:
+        if marker in low:
+            return cls
+    return None
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -2973,6 +3016,36 @@ def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
     )
     decision = policy_ctx["classify"](delivery_content, ctx)
     if not decision.suppressed:
+        # F4: системные тревоги (cron failure / blocked_config / drift) —
+        # alert-once контракт владельца — доставляются в чат владельца
+        # (home / ALLOWED) БЕЗ требования verify_recipient.  root D5:
+        # api_server-cron-джобы без user_id в origin (cg / ostrov) иначе
+        # гасятся как recipient mismatch, и владелец не видит аномалию.
+        # Fail-closed: адресуются ТОЛЬКО home/ALLOWED — чужой TG-чат
+        # системный алерт по-прежнему не получает.
+        if decision.reason == "system_alert":
+            allowed = {
+                str(u).strip()
+                for u in (policy_ctx.get("allowed_users") or ())
+                if str(u).strip()
+            }
+            home = policy_ctx.get("home_channel") or ""
+            if chat_id in allowed or (home and chat_id == home):
+                return True
+            policy_ctx["log_suppression"](
+                app="cron",
+                who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
+                target=f"telegram:{chat_id}",
+                decision=_suppress_decision(
+                    "recipient mismatch",
+                    detail=(
+                        f"system_alert to non-owner chat={chat_id} "
+                        "(fail-closed: alerts go only to home/ALLOWED)"
+                    ),
+                ),
+                snippet=(delivery_content or "")[:200],
+            )
+            return False
         # Content is acceptable; enforce recipient == initiator (ИНВ1).
         if policy_ctx["verify_recipient"](
             policy_ctx["initiator"], target_ref,
@@ -7297,11 +7370,46 @@ def _run_one_job_body(
                         f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
                         f"{_drift_text}"
                     )
+            # F4 alert-once: системные сбои крона (script not found / timed
+            # out / exit code / provider) доставляются владельцу РОВНО ОДИН
+            # раз до устранения, не каждый тик.  blocked_config/drift имеют
+            # собственный silent-маркер в error — здесь только остальные
+            # системные классы.  Персистентный бит на джобе (cron.jobs),
+            # чистится при успешном прогоне (mark_job_run), так что после
+            # «выздоровления» новый сбой снова алертит.
+            failure_alert_class = None
+            failure_already_alerted = False
+            if not success and not blocked_config and not drift_skip:
+                failure_alert_class = _cron_failure_alert_class(error)
+                if failure_alert_class is not None:
+                    try:
+                        from cron.jobs import mark_failure_alerted
+
+                        failure_already_alerted = mark_failure_alerted(
+                            job["id"], failure_alert_class
+                        )
+                    except Exception as _fail_alert_exc:  # never break delivery
+                        logger.warning(
+                            "Job '%s': failure-alert dedup unavailable (%s) — "
+                            "alerting anyway",
+                            job["id"], _fail_alert_exc,
+                        )
+                        failure_already_alerted = False
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            if blocked_config_silent or drift_skip_silent:
+            if (
+                blocked_config_silent
+                or drift_skip_silent
+                or failure_already_alerted
+            ):
+                if failure_already_alerted:
+                    logger.info(
+                        "Job '%s': system failure class '%s' already alerted — "
+                        "suppressing repeat alert (alert-once, F4)",
+                        job["id"], failure_alert_class,
+                    )
                 should_deliver = False
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the

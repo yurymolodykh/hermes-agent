@@ -22,10 +22,19 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.docs = []
         self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kwargs):
+        self.docs.append(
+            {"chat_id": chat_id, "file_path": file_path,
+             "file_name": file_name or os.path.basename(file_path),
+             "metadata": metadata or {}}
+        )
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -95,7 +104,8 @@ async def test_summary_single_delivery_no_dup_telegram(board_env, monkeypatch):
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    # F1 (tg-delivery-contract): the terminal итог carries the root's summary.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
     assert adapter.sent[0]["chat_id"] == "chat-1"
     marker = kb.has_branch_summary(kb.connect(board="default"), root)
     assert marker is not None
@@ -148,7 +158,8 @@ async def test_summary_already_delivered_root_not_redelivered_when_descendant_cl
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    # F1 (tg-delivery-contract): the terminal итог carries the root's summary.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
 
     # Branch is delivered. Now a NEW descendant (synthetic readback card) is
     # linked under the root and closed — the branch fingerprint changes, but
@@ -266,7 +277,8 @@ async def test_summary_reactivation_resends_after_reclose(board_env, monkeypatch
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    # F1 (tg-delivery-contract): the terminal итог carries the root's summary.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
 
     # reopen a node (simulate done -> ready reactivation)
     with kb.write_txn(board_env):
@@ -282,7 +294,8 @@ async def test_summary_reactivation_resends_after_reclose(board_env, monkeypatch
     # re-close -> fresh summary delivered again
     kb.complete_task(board_env, a, summary="done")
     await _run_one_branch_tick(monkeypatch, runner)
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    # F1 (tg-delivery-contract): the re-closed terminal итог also carries summary.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
 
 
 @pytest.mark.asyncio
@@ -550,11 +563,103 @@ async def test_terminal_root_delivers_telegram_no_journal(board_env, monkeypatch
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
 
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    # F1 (tg-delivery-contract): the terminal итог carries the root's summary.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
     assert adapter.sent[0]["chat_id"] == "tg-chat-9"
     assert _read_suppression_journal() == [], (
         "терминальный итог не должен писать в журнал подавлений"
     )
+
+
+# ---------------------------------------------------------------------------
+# F1 (tg-delivery-contract, native telegram lane): терминальный итог ветки
+# обязан нести summary и/или артефакты; голый «✅ Задача выполнена»
+# подавляется с записью в журнал.  Эти тесты покрывают ПРЯМУЮ telegram
+# подписку (в отличие от OWUI→TG mirror в test_kanban_mission_chat_silence_
+# dual_lane.py), т.е. собственный объём карточки F1-watcher.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_f1_native_tg_terminal_itog_carries_summary_and_artifact(
+    board_env, monkeypatch,
+):
+    """Терминальный итог нативной telegram-подписки: текст несёт summary
+    корня, а артефакт (kanban_complete artifacts) уезжает файлом через
+    существующий хелпер (_deliver_kanban_artifacts → send_document)."""
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env, task_id=root, platform="telegram", chat_id="tg-chat-f1a",
+    )
+    # Artifact file must exist on disk (the helper skips missing files).
+    import tempfile
+    report = tempfile.NamedTemporaryFile(
+        suffix=".md", prefix="f1-native-", delete=False,
+    )
+    report.write("# F1 native lane report\n\nреальный отчёт\n".encode("utf-8"))
+    report.close()
+    report_path = report.name
+    # complete_task promotes metadata["artifacts"] onto the event payload.
+    for tid in [root, a]:
+        assert kb.complete_task(
+            board_env, tid, summary="done",
+            metadata={"artifacts": [report_path]},
+        )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # Text carries the summary under the F1 contract.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
+    assert adapter.sent[0]["chat_id"] == "tg-chat-f1a"
+    # Artifact rides as a native file via the existing helper.
+    assert adapter.docs, f"артефакт должен уехать файлом: {adapter.docs}"
+    assert os.path.realpath(adapter.docs[0]["file_path"]) == os.path.realpath(report_path)
+    # Terminal итог with content -> no suppression journal.
+    assert _read_suppression_journal() == [], (
+        f"terminal итог с контентом не должен подавляться: {_read_suppression_journal()}"
+    )
+    os.unlink(report_path)
+
+
+@pytest.mark.asyncio
+async def test_f1_native_tg_bare_itog_suppressed_with_journal(board_env, monkeypatch):
+    """Голый терминальный итог нативной telegram-подписки (нет summary,
+    нет артефактов) подавляется полностью: ни одного send(), в журнале
+    запись reason=bare terminal итог without content."""
+    root = _mk_bg(board_env, "root")
+    a = _mk_bg(board_env, "a", parent=root)
+    kb.add_notify_sub(
+        board_env, task_id=root, platform="telegram", chat_id="tg-chat-f1b",
+    )
+    # No summary, no artifacts: complete with EMPTY handoff (bare).
+    for tid in [root, a]:
+        assert kb.complete_task(board_env, tid, summary="")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    # Fully suppressed: no contentless ping to Telegram.
+    assert adapter.sent == [], f"голый итог не должен уходить в TG: {adapter.sent}"
+    assert adapter.docs == []
+    journal = _read_suppression_journal()
+    assert journal, f"подавление должно быть в журнале: {journal}"
+    assert any(
+        r["reason"] == "bare terminal итог without content" for r in journal
+    ), f"все подавления должны быть bare-итог: {journal}"
+    # The suppressed channel is still acked so the tick doesn't retry.
+    conn2 = kb.connect(board="default")
+    try:
+        marker = kb.has_branch_summary(conn2, root)
+        assert kb.branch_summary_pending_subs(
+            marker,
+            [{"platform": "telegram", "chat_id": "tg-chat-f1b", "thread_id": ""}],
+        ) == []
+    finally:
+        conn2.close()
 
 
 @pytest.mark.asyncio

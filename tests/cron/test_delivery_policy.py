@@ -209,6 +209,73 @@ def test_verify_recipient_admin_delivery_to_owner_home():
                             home_channel=home, allowed_users=[home])
 
 
+def test_verify_recipient_full_mapping_multi_user_isolation():
+    """t_780a6db2: verify_recipient читает ПОЛНЫЙ owui_telegram_users
+    (не только владельца) и держит изоляцию инициаторов fail-closed.
+
+    Полный mapping {owui_user_id: tg_chat_id} для НЕСКОЛЬКИХ пользователей:
+      * каждый привязанный owui-user доставляет ТОЛЬКО в СВОЙ chat (ИНВ1);
+      * чужой привязанный chat конструктивно недостижим;
+      * unbounded / отсутствующий пользователь — тишина (False).
+    """
+    home = "home-125805788"
+    mapping = {
+        "9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "125805788",
+        "3daba661-feb8-4c1d-a823-4c5223f98d30": "543447681",
+    }
+    allowed = ["125805788", "543447681", home]
+
+    # Владелец → свой чат привязки.
+    assert verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-1",
+                                  "user_id": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Второй привязанный пользователь → СВОЙ чат (не владельца, не home).
+    assert verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-2",
+                                  "user_id": "3daba661-feb8-4c1d-a823-4c5223f98d30"}),
+        _tg_target("543447681"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Изоляция: владелец НЕ получает чужой чат Марии.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-3",
+                                  "user_id": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"}),
+        _tg_target("543447681"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Изоляция: Мария НЕ получает чат владельца / home.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-4",
+                                  "user_id": "3daba661-feb8-4c1d-a823-4c5223f98d30"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Fail-closed: не привязанный к owui_telegram_users пользователь — тишина,
+    # даже если цель — allowed-чат.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-5",
+                                  "user_id": "0795993b-4cc5-431f-a7fb-45b18967a9ba"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Fail-closed: пустая привязка (не сконфигурирована) не открывает кросс-ленту.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-6",
+                                  "user_id": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg={},
+    )
+
+
 def test_non_telegram_target_unaffected():
     # Политика — только про TG; прочие платформы проходят.
     tgt = TargetRef.from_dict({"platform": "discord", "chat_id": "x"})
