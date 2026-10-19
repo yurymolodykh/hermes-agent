@@ -90,7 +90,10 @@ def test_fast_request_routine_medium_budget_review_exempt():
     assert d.mode == "fast"
     assert d.complexity == "routine"
     assert d.reasoning_effort == FAST_REASONING_ROUTINE == "medium"
-    assert d.max_iterations == FAST_MAX_ITERATIONS == 16
+    # Variant 2 (owner decision): fast lane bounds by TIME, not call count. Even
+    # routine fast requests are never hard-cut by max_iterations; they keep only
+    # the soft 5-minute run_budget (300s).
+    assert d.max_iterations is None
     assert d.run_budget_seconds == FAST_RUN_BUDGET_SECONDS == 300
     assert d.review_exempt is True  # D5
 
@@ -103,10 +106,11 @@ def test_fast_request_complex_high_reasoning():
     assert d.slow_mode is False
     assert d.complexity == "high"
     assert d.reasoning_effort == FAST_REASONING_COMPLEX == "high"
-    # Variant 1 (owner decision): complex fast work gets the FULL budget — no
-    # 16-call / 300s truncation that caused "нелепые обрывы" of production tasks.
+    # Variant 2 (owner decision, 2026-10-19): complex fast work gets the SAME
+    # time-bound as routine — max_iterations=None (never hard-cut by call count,
+    # which caused "нелепые обрывы") and a soft 5-minute run_budget (300s).
     assert d.max_iterations is None
-    assert d.run_budget_seconds is None
+    assert d.run_budget_seconds == FAST_RUN_BUDGET_SECONDS == 300
     assert d.review_exempt is True
 
 

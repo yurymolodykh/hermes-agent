@@ -3878,7 +3878,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     # reasoning config (overrides config reasoning for this
                     # agent), iteration cap, wall-clock budget.
                     reasoning_config = {"enabled": True, "effort": _fast_effort}
-                    if _fast_decision.max_iterations is not None:
+                    # Owner decision (variant 2, 2026-10-19): the fast lane must
+                    # NOT truncate by LLM-call count — a hard `max_iterations`
+                    # cap is what caused "нелепые обрывы" (a task that had done
+                    # real work got cut at call N and replaced with a forced
+                    # one-call summary). So a fast decision that clears
+                    # max_iterations (None) means "do not hard-cut by call
+                    # count": we lift the cap to the unlimited sentinel so the
+                    # executor profile's own max_turns (e.g. 11-fast-answers =
+                    # 16) cannot truncate it. The ONLY bounder is the soft
+                    # 5-minute wall-clock run_budget (run_budget_seconds=300),
+                    # which nudges the model to wrap up at 80% instead of
+                    # killing the turn mid-word. If a specific integer cap is
+                    # ever set on the decision, honour it (legacy behavior).
+                    if _fast_decision.max_iterations is None:
+                        from hermes_cli.config import (
+                            TURN_LIMIT_UNLIMITED as _FAST_TURN_UNLIMITED,
+                        )
+                        max_iterations = _FAST_TURN_UNLIMITED
+                    else:
                         max_iterations = _fast_decision.max_iterations
             # Persist the marker (incl. review_exempt for the D5 forcer).
             # ONLY when the flag is ON — with the flag off the fast-lane

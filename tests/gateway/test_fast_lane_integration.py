@@ -11,7 +11,8 @@ design §4.2 Track S / §5 (D3) / §7 (D5):
 
   * fast request (no slow markers) ->
       reasoning_config medium (routine) / high (complex), NEVER low;
-      max_iterations capped at 16; run_budget_seconds=300;
+      max_iterations = unlimited sentinel (never truncated by call count —
+      variant 2, owner 2026-10-19); run_budget_seconds=300 (soft time orienteer);
       agent.review_exempt=True; session marker fast_lane=True review_exempt=True
       (the D5 signal the review-forcer consumes to skip fast sessions).
   * slow request (OWUI deepthink, "гигантская задача", TG «подумай») ->
@@ -91,30 +92,30 @@ def _agent(adapter, **kwargs):
 
 
 def test_fast_request_applies_fast_path_parameters(monkeypatch):
-    """A routine fast request gets reasoning medium, 16 iterations, 300s budget,
-    and review_exempt=True — the D5 signal for 'no review card'."""
+    """A routine fast request gets reasoning medium, NO hard call-count cap
+    (unlimited sentinel), a soft 300s run budget, and review_exempt=True —
+    the D5 signal for 'no review card'. (Variant 2: bound by TIME, not calls.)"""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="сколько будет 2+2?")
 
     assert isinstance(agent, object)
     assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
-    assert captured["max_iterations"] == 16
+    assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
     assert captured["run_budget_seconds"] == 300
     assert agent.review_exempt is True
 
 
 def test_fast_request_complex_uses_high_reasoning(monkeypatch):
-    """Complex class-A request -> reasoning high (D3 complex split) and, per
-    variant 1 (owner decision), the FULL budget — no 16-call / 300s truncation
-    that caused 'нелепые обрывы'. Still review-exempt (D5)."""
+    """Complex class-A request -> reasoning high (D3 complex split). Per
+    variant 2 (owner decision, 2026-10-19) the fast lane bounds by TIME, so a
+    complex fast request has NO call-count truncation (unlimited sentinel) and
+    the same soft 5-minute run_budget; always review-exempt (D5)."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="проанализируй лог и сравни с baseline")
 
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
-    # Variant 1: complex work is NOT hard-capped to 16/300 — it keeps the full
-    # budget (unlimited sentinel), so production tasks can complete.
-    assert captured["max_iterations"] > 16
-    assert "run_budget_seconds" not in captured
+    assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
+    assert captured["run_budget_seconds"] == 300
     assert agent.review_exempt is True
 
 
@@ -129,7 +130,7 @@ def test_fast_request_never_uses_low_reasoning(monkeypatch):
     # but the fast-path override must land on medium (never low).
     assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert captured["reasoning_config"]["effort"] != "low"
-    assert captured["max_iterations"] == 16
+    assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
 
 
 # ---------------------------------------------------------------------------
@@ -223,28 +224,28 @@ def test_slow_request_persists_non_exempt_marker(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "message, expected_effort, capped",
+    "message, expected_effort",
     [
-        # Routine class-A: still tight fast budget (≤16) — that is the point of
-        # the fast lane.
-        ("сколько будет 2+2?", "medium", True),
-        ("статус задачи", "medium", True),
+        # Routine class-A: NO hard call-count cap — bounded by soft time budget
+        # (variant 2: the fast lane no longer truncates by LLM-call count).
+        ("сколько будет 2+2?", "medium"),
+        ("статус задачи", "medium"),
         # «деплой сервиса» has no complex verb (deploy is only in the English
         # list; Russian deploy verbs are настрой/разверни/установи) -> routine.
-        ("деплой сервиса", "medium", True),
-        # Complex work (variant 1): full budget — NOT forced into the 16-call cap.
-        ("проанализируй всё и создай отчёт", "high", False),
+        ("деплой сервиса", "medium"),
+        # Complex work: same time-bound — no call-count truncation, soft 300s.
+        ("проанализируй всё и создай отчёт", "high"),
     ],
 )
-def test_fast_budget_routine_capped_complex_full(monkeypatch, message, expected_effort, capped):
+def test_fast_budget_never_capped_by_calls(monkeypatch, message, expected_effort):
+    """Fast requests (routine and complex alike) are never truncated by
+    LLM-call count: max_iterations is the unlimited sentinel and the only
+    bounder is the soft 5-minute run_budget_seconds."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     _agent(adapter, user_message=message)
 
-    if capped:
-        assert captured["max_iterations"] <= 16
-    else:
-        assert captured["max_iterations"] > 16
-        assert "run_budget_seconds" not in captured
+    assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
+    assert captured["run_budget_seconds"] == 300
     assert captured["reasoning_config"] == {
         "enabled": True,
         "effort": expected_effort,

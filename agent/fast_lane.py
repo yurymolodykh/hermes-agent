@@ -329,16 +329,21 @@ def resolve_fast_path(
     effort = (
         FAST_REASONING_COMPLEX if complexity == "high" else FAST_REASONING_ROUTINE
     )
-    # Owner decision (variant 1): complex fast tasks (complexity=high) must NOT be
-    # hard-cut to 16 LLM calls / 300s — that was causing "нелепые обрывы" of real
-    # production work ("почини", "создай", "проанализируй") that got classified
-    # high on reasoning but still squeezed into the 16-call fast budget. For high
-    # complexity we now clear both caps (max_iterations=None, run_budget_seconds=None)
-    # so api_server keeps the parent full budget (120/140) — the task still runs
-    # on the fast-lane PROFILE with high reasoning, it just is no longer truncated.
-    # Routine class-A questions keep the tight 16/300 fast budget (that IS the point
-    # of the fast lane). Slow requests are unaffected (handled in the branch above).
-    complex_gets_full_budget = complexity == "high"
+    # Owner decision (variant 2, 2026-10-19): the fast lane bounds fast tasks by
+    # WALL-CLOCK TIME, not by LLM-call count. A hard `max_iterations` cap is what
+    # caused "нелепые обрывы" of perfectly normal answers (a task that had done
+    # real work got cut at call 16 and replaced with a forced one-call summary).
+    # So for EVERY fast request (routine AND complex) we now clear max_iterations
+    # (never hard-cut by call count) and keep only the soft 5-minute time budget
+    # `run_budget_seconds=300`. The time budget is deliberately SOFT (it injects a
+    # wrap-up notice at 80% and nudges the model to deliver from current state —
+    # run_agent._maybe_inject_run_budget_wrapup — rather than forcibly killing the
+    # turn), so a normal answer is never truncted mid-word; a genuinely stuck task
+    # still self-terminates via capped stale-timeouts. Reasoning stays medium
+    # (routine) / high (complex). Slow requests are unaffected (handled above).
+    run_budget = (
+        float(run_budget_seconds) if run_budget_seconds else FAST_RUN_BUDGET_SECONDS
+    )
     return FastLaneDecision(
         slow_mode=False,
         mode="fast",
@@ -347,14 +352,8 @@ def resolve_fast_path(
         reason=decision.reason,
         complexity=complexity,
         reasoning_effort=effort,
-        max_iterations=(
-            None if complex_gets_full_budget else (max_iterations or FAST_MAX_ITERATIONS)
-        ),
-        run_budget_seconds=(
-            None
-            if complex_gets_full_budget
-            else (float(run_budget_seconds) if run_budget_seconds else FAST_RUN_BUDGET_SECONDS)
-        ),
+        max_iterations=None,          # never hard-cut by LLM-call count
+        run_budget_seconds=run_budget,  # soft 5-minute wall-clock orienteer
         review_exempt=True,             # D5: fast requests -> no review card
         debug=dict(decision.debug),
     )
