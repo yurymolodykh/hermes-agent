@@ -59,15 +59,48 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _fast_budget_overflow_latched(agent: Any) -> bool:
+    """True when the run's soft wall-clock budget was actually exceeded.
+
+    Independent of whether a live user-notice callback is wired.  The
+    durable footer must appear on EVERY ``_run_agent`` path (chat, session,
+    responses, streaming and non-streaming) once a fast request ran past its
+    ~5-minute soft budget — the ``_fast_budget_user_notice_fired`` latch alone
+    is insufficient because it only latches when a live callback consumer was
+    attached (1 of 6 paths).
+
+    Signal, strongest-first:
+    * ``_fast_budget_user_notice_fired`` — the live one-shot user latch.  It
+      can only ever latch on a budgeted run whose wrap-up also latched (see
+      ``_fire_fast_budget_user_notice``), so it is a sufficient overflow
+      signal and remains the primary check (keeps the callback-independent
+      footer path covered for consumers that DID wire the live notice).
+    * otherwise: ``run_budget_seconds`` set AND ``_run_budget_wrapup_injected``
+      latched — the generic overflow signal that latches on every path the
+      moment 80% of the wall-clock budget has elapsed (see
+      ``conversation_loop._maybe_inject_run_budget_wrapup``).  This covers
+      transports with no callback consumer (non-streaming JSON, Responses,
+      session-chat, /v1/runs) so the durable text survives everywhere.
+    """
+    if getattr(agent, "_fast_budget_user_notice_fired", False):
+        return True
+    if not getattr(agent, "run_budget_seconds", None):
+        return False
+    return bool(getattr(agent, "_run_budget_wrapup_injected", False))
+
+
 def _append_fast_budget_footer(final_response: str, agent: Any) -> str:
-    """Append the fast-lane overflow options block when the latch fired.
+    """Append the fast-lane overflow options block when the budget overflowed.
 
     Fast-lane part 3 («не молчать»): when a fast request exceeded its soft
-    wall-clock budget and the live one-shot notice fired, durably append the
-    three options (wait / «в карточку» / «подумай») to the final assistant
-    response.  This covers paths where the transient live status pill may not
-    be rendered (non-streaming JSON, Responses, /v1/runs) and guarantees the
-    user always has the options in the saved final answer.
+    wall-clock budget, durably append the three options (wait / «в карточку» /
+    «подумай») to the final assistant response.  Gated on the overflow signal
+    (budget set + wrap-up latched OR the live one-shot user notice fired),
+    NOT on the live callback alone — the durable text must survive on every
+    transport (non-streaming JSON, Responses, session-chat) even when no
+    transient status-consumer callback was attached.  This covers paths where
+    the transient live status pill may not be rendered and guarantees the user
+    always has the options in the saved final answer.
 
     Pure (no agent side effects) except reading the latch; returns the
     possibly-augmented text.  Gated on a REAL conversational answer —
@@ -75,7 +108,7 @@ def _append_fast_budget_footer(final_response: str, agent: Any) -> str:
     """
     if not final_response:
         return final_response
-    if not getattr(agent, "_fast_budget_user_notice_fired", False):
+    if not _fast_budget_overflow_latched(agent):
         return final_response
     try:
         from agent.fast_budget_text import FAST_BUDGET_USER_NOTICE
@@ -656,11 +689,14 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     # Fast-lane budget overflow footer (part 3, «не молчать»).
-    # When a fast request exceeded its soft wall-clock budget and the live
-    # overflow notice was fired, also append the options durably to the final
-    # assistant response — the user always has the три варианта even if they
-    # missed the transient status pill.  Gated on the one-shot latch; empty /
-    # interrupted turns untouched (see _append_fast_budget_footer).
+    # When a fast request exceeded its soft wall-clock budget, also append
+    # the options durably to the final assistant response — the user always
+    # has the три варианта even if they missed the transient status pill.
+    # Gated on the overflow signal (`run_budget_seconds` set + wrap-up
+    # latched, or the live one-shot user notice fired) — independent of
+    # whether a transient callback consumer was attached, so the durable text
+    # reaches the user on EVERY _run_agent path; empty / interrupted turns
+    # untouched (see _append_fast_budget_footer).
     if final_response and not interrupted:
         _final_aug = _append_fast_budget_footer(final_response, agent)
         if _final_aug is not final_response:

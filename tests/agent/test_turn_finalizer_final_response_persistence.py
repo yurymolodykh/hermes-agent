@@ -323,3 +323,55 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     )
 
     assert agent._db_flush_scan_prefix is None
+
+
+def test_fast_budget_footer_durably_appended_without_callback():
+    """REGRESSION (review t_a7e7d08a R1): the durable overflow footer must
+    reach the final response through the real ``finalize_turn`` seam even on
+    paths that never wire a live notice callback (non-streaming JSON,
+    session-chat, /v1/runs — the 5 of 6 ``_run_agent`` paths).
+
+    The agent is a fast-lane (budgeted) agent whose soft budget was exceeded:
+    ``run_budget_seconds`` set and ``_run_budget_wrapup_injected`` latched,
+    but ``_fast_budget_notice_callback`` is None.  The footer must be appended
+    durably to the returned result — the user always sees «не молчать»
+    regardless of the transport's callback wiring.
+    """
+    from agent.fast_budget_text import FAST_BUDGET_USER_NOTICE
+
+    agent = FakeAgent()
+    # Fast-lane attributes (part 3, «не молчать»): budgeted run that exceeded
+    # its soft wall-clock budget, with NO live callback consumer wired.
+    agent.run_budget_seconds = 300
+    agent._run_budget_started_at = 1000.0
+    agent._run_budget_wrapup_injected = True
+    agent._fast_budget_notice_callback = None
+    agent._fast_budget_user_notice_fired = False
+
+    result = finalize_turn(
+        agent,
+        final_response="Ответ по результатам расчётов готов.",
+        api_call_count=8,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "посчитай"},
+            {"role": "assistant", "content": "промежуточно"},
+        ],
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="посчитай",
+        original_user_message="посчитай",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    final_text = result.get("final_response") if isinstance(result, dict) else None
+    assert final_text is not None
+    assert final_text.endswith(FAST_BUDGET_USER_NOTICE)
+    # The footer is appended before the result dict is built (line ~700 vs
+    # ~810 in turn_finalizer), so the message the gateway serves / persists
+    # as the turn answer carries the options — this is the user-visible
+    # deliverable the review criterion pins (но не молчать on all paths).
+    assert "не уложилась в быстрый режим" in final_text

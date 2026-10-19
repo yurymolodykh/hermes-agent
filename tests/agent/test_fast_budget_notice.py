@@ -11,8 +11,13 @@ run_budget_seconds=300). Part 3 adds a user-visible overflow notice:
     threshold that latches the model wrap-up notice. Never content deltas —
     render purity (OWUI final-answer bubble) is preserved.
   * ``agent.turn_finalizer.finalize_turn`` appends the durable options block
-    to the final assistant response when the latch fired (covers streaming
+    to the final assistant response on budget overflow (covers streaming
     paths where the transient status pill may be missed and the JSON paths).
+    Gated on the generic overflow signal — ``run_budget_seconds`` set AND
+    ``_run_budget_wrapup_injected`` latched, OR the live one-shot user notice
+    fired — independent of whether a transient callback consumer was wired,
+    so the durable text reaches the user on EVERY ``_run_agent`` path
+    (review t_a7e7d08a R1 fix).
 
 Covered here (unit): the latch semantics, callback firing, one-time-ness,
 inert-ness when no callback/flag/budget, and the durable footer appending in
@@ -178,6 +183,63 @@ def test_finalize_appends_fast_budget_footer_when_fired() -> None:
     assert "Ответ готов\n\n" in out
 
 
+def test_finalize_appends_footer_on_budget_overflow_without_callback() -> None:
+    """REGRESSION (review t_a7e7d08a R1): the durable footer must appear on the
+    5 of 6 ``_run_agent`` paths that never wire a live notice callback.
+
+    Signal: a fast request whose soft wall-clock budget was exceeded latches
+    ``_run_budget_wrapup_injected`` even when ``_fast_budget_notice_callback``
+    is None (CLI / non-streaming JSON / session-chat / /v1/runs).  The footer
+    gates on that generic overflow signal, NOT on the live-callback latch, so
+    \"не молчать\" reaches the user on every transport.
+    """
+    from unittest.mock import MagicMock
+
+    from agent.fast_budget_text import FAST_BUDGET_USER_NOTICE
+    from agent.turn_finalizer import _append_fast_budget_footer
+
+    agent = MagicMock()
+    agent._fast_budget_user_notice_fired = False
+    agent._fast_budget_notice_callback = None  # NO consumer wired
+    agent.run_budget_seconds = 300
+    agent._run_budget_wrapup_injected = True  # soft budget exceeded
+
+    out = _append_fast_budget_footer("Работа завершена", agent)
+    assert out.endswith(FAST_BUDGET_USER_NOTICE)
+    assert "Работа завершена\n\n" in out
+
+
+def test_finalize_skips_footer_when_budget_not_overflowed() -> None:
+    """Budget set but wrap-up NOT latched (run still inside soft budget) ->
+    no footer.  Callback absence must not change this (no false positives)."""
+    from unittest.mock import MagicMock
+
+    from agent.turn_finalizer import _append_fast_budget_footer
+
+    agent = MagicMock()
+    agent._fast_budget_user_notice_fired = False
+    agent.run_budget_seconds = 300
+    agent._run_budget_wrapup_injected = False  # still within soft budget
+
+    out = _append_fast_budget_footer("Быстрый ответ", agent)
+    assert out == "Быстрый ответ"
+
+
+def test_finalize_skips_footer_when_no_budget() -> None:
+    """No run budget (slow/full lane) -> wrapper latch meaningless -> clean."""
+    from unittest.mock import MagicMock
+
+    from agent.turn_finalizer import _append_fast_budget_footer
+
+    agent = MagicMock()
+    agent._fast_budget_user_notice_fired = False
+    agent.run_budget_seconds = None
+    agent._run_budget_wrapup_injected = True
+
+    out = _append_fast_budget_footer("Ответ", agent)
+    assert out == "Ответ"
+
+
 def test_finalize_skips_footer_when_not_fired() -> None:
     """No latch -> final response untouched (short fast answers stay clean)."""
     from unittest.mock import MagicMock
@@ -186,6 +248,10 @@ def test_finalize_skips_footer_when_not_fired() -> None:
 
     agent = MagicMock()
     agent._fast_budget_user_notice_fired = False
+    # Explicit absent-state (a bare MagicMock auto-creates truthy attrs): a
+    # non-budgeted run has no run_budget_seconds and no wrap-up latch.
+    agent.run_budget_seconds = None
+    agent._run_budget_wrapup_injected = False
 
     out = _append_fast_budget_footer("Короткий ответ", agent)
     assert out == "Короткий ответ"
