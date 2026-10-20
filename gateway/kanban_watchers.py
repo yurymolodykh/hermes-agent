@@ -1125,11 +1125,12 @@ def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
         return None
     if not home_channel:
         home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
-    allowed: set = {
-        str(p).strip() for p in (allowed_users or ()) if str(p).strip()
-    }
-    if bound_chat != home_channel and bound_chat not in allowed:
-        return None
+    # H-5 (red team t_d0bcecda): серверная привязка openwebui_telegram_users
+    # сама по себе — авторизация зеркала в СОБСТВЕННЫЙ bound-чат владельца
+    # подписки (allowed_users/home здесь НЕ используются как гейт — иначе
+    # второй/последующие привязанные пользователи голодают, когда ALLOWED/home
+    # настроены только на инициатора).  Изоляция остаётся в verify_recipient:
+    # доставляется только в exact bound-chat и только при реальной привязке.
     initiator = InitiatorRef.from_origin({
         "platform": "api_server",
         "chat_id": sub.get("chat_id") or "",
@@ -1456,12 +1457,33 @@ def _owui_root_artifact_paths(plan: dict) -> list[str]:
 
     def _add(raw) -> None:
         if not isinstance(raw, str) or not raw.strip():
+            # F-4.4 (K1 red team H-4): a non-string/blank artifact entry is
+            # excluded from the OWUI→TG artifact list.  It was silently
+            # dropped — now it is observable at warn level so a missing
+            # attachment is diagnosable (the entry is still NOT delivered;
+            # only the diagnostic changes).
+            if not isinstance(raw, str):
+                logger.warning(
+                    "kanban branch summary: OWUI→TG artifact entry for root "
+                    "%s is non-string (%s) — skipped (was silent)",
+                    root_id, repr(raw)[:200],
+                )
             return
         try:
             check = Path(os.path.expanduser(raw.strip()))
         except (OSError, ValueError):
+            logger.warning(
+                "kanban branch summary: OWUI→TG artifact %r for root %s has "
+                "an invalid path — skipped (was silent)",
+                raw.strip(), root_id,
+            )
             return
         if not check.is_absolute():
+            logger.warning(
+                "kanban branch summary: OWUI→TG artifact %r for root %s is "
+                "not an absolute path — skipped (was silent)",
+                raw.strip(), root_id,
+            )
             return
         resolved = str(check.resolve(strict=False))
         if resolved in seen:
@@ -1602,11 +1624,12 @@ def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
         return None
     if not home_channel:
         home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
-    allowed: set = {
-        str(p).strip() for p in (allowed_users or ()) if str(p).strip()
-    }
-    if bound_chat != home_channel and bound_chat not in allowed:
-        return None
+    # H-5 (red team t_d0bcecda): серверная привязка openwebui_telegram_users
+    # сама по себе — авторизация зеркала в СОБСТВЕННЫЙ bound-чат владельца
+    # подписки (allowed_users/home здесь НЕ используются как гейт — иначе
+    # второй/последующие привязанные пользователи голодают, когда ALLOWED/home
+    # настроены только на инициатора).  Изоляция остаётся в verify_recipient:
+    # доставляется только в exact bound-chat и только при реальной привязке.
     initiator = InitiatorRef.from_origin({
         "platform": "api_server",
         "chat_id": sub.get("chat_id") or "",
@@ -4191,7 +4214,36 @@ class GatewayKanbanWatchersMixin:
             if expanded in seen_paths:
                 return
             if not os.path.isfile(expanded):
+                # F-4.4 (K1 red team H-4): a broken/nonexistent artifact path
+                # was silently dropped here, so a promised attachment never
+                # reached the channel and nobody could see why.  The file is
+                # STILL not delivered (behavior unchanged) but the skip is now
+                # observable at warn level.
+                logger.warning(
+                    "kanban notifier: artifact %s does not exist on disk — "
+                    "skipped (was silent)",
+                    expanded,
+                )
                 return
+            # Size cap (F-4.3, K1 red team H-3): a >25MB artifact is rejected
+            # up front with an explicit warning instead of being handed to the
+            # adapter, whose channel can't accept it — the old path sent it to
+            # send_document and the delivery was silently lost (or failed).
+            # Mirrors the root-lane 25MB ceiling (_OWUI_TG_ARTIFACT_MAX_BYTES
+            # at :1293, applied in _owui_root_artifact_paths :1478).  The text
+            # delivery is never dropped: only this one oversized attachment is
+            # skipped, observable in the logs.
+            try:
+                if os.path.getsize(expanded) > _OWUI_TG_ARTIFACT_MAX_BYTES:
+                    logger.warning(
+                        "kanban notifier: artifact %s exceeds %d-byte (%d MB) "
+                        "cap — skipped (text delivery unaffected)",
+                        expanded, _OWUI_TG_ARTIFACT_MAX_BYTES,
+                        _OWUI_TG_ARTIFACT_MAX_BYTES // (1024 * 1024),
+                    )
+                    return
+            except OSError:
+                pass
             seen_paths.add(expanded)
             try:
                 name = os.path.basename(expanded)

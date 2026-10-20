@@ -662,12 +662,37 @@ def test_payload_control_chars_and_long_text_sanitized(tmp_path, monkeypatch):
 
 
 def test_sanitize_delivery_text_control_chars_unit():
-    """sanitize_delivery_text is a pure function: control chars survive as text
-    (they are not hex-escaped), but long text is truncated with max_chars."""
+    """sanitize_delivery_text is a pure function: C0 control chars and ANSI
+    escape sequences are stripped (H-2 K1 red team), `\n`/`\t` are preserved,
+    and long text is truncated with max_chars."""
     from hermes_cli.delivery_policy import sanitize_delivery_text
     text = "line1\x00\x01\x02responding\nline2"
     out = sanitize_delivery_text(text, max_chars=1000)
     assert out  # does not raise
+    assert "\x00" not in out and "\x01" not in out and "\x02" not in out, (
+        f"C0 control chars must be stripped, got: {out!r}"
+    )
+    assert "responding" in out and "\n" in out, (
+        f"C0-stripped body and newlines preserved, got: {out!r}"
+    )
+    # ANSI/ECMA-48 escape sequences (incl. OWUI/TG spoofing) are stripped too.
+    ansi_text = "ok \x1b[31mred\x1b[0m bell\x07 tail"
+    out_ansi = sanitize_delivery_text(ansi_text)
+    assert "\x1b" not in out_ansi and "\x07" not in out_ansi, (
+        f"ANSI/BEL must be stripped, got: {out_ansi!r}"
+    )
+    assert "ok" in out_ansi and "red" in out_ansi and "tail" in out_ansi
+    # U+2028/U+2029 line/paragraph separators (outside C0) are removed.
+    sep_text = "a\u2028b\u2029c"
+    out_sep = sanitize_delivery_text(sep_text)
+    assert "\u2028" not in out_sep and "\u2029" not in out_sep, (
+        f"U+2028/U+2029 must be stripped, got: {out_sep!r}"
+    )
+    # Plain business text (Cyrillic/Latin/digits/spaces/newlines/tabs) passes.
+    plain = "Отчёт готов.\n\tИтог: 42 шт.\tГотово."
+    assert sanitize_delivery_text(plain) == plain, (
+        "plain business text must pass through unchanged"
+    )
     long_text = "x" * 5000
     out2 = sanitize_delivery_text(long_text, max_chars=1000)
     assert len(out2) <= 1000

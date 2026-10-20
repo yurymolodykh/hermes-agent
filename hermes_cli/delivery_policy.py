@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
+from tools.ansi_strip import sanitize_display_text
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
@@ -81,6 +83,13 @@ _INTERIM_KEEP_FIRST_SENTENCE: int = 220
 
 #: Нижняя граница длины «длинного» текста (для interim-подавления).
 _INTERIM_MIN_LENGTH: int = 120
+
+#: Символы-разделители строк U+2028 LINE SEPARATOR / U+2029 PARAGRAPH
+#: SEPARATOR. Они вне диапазона C0 (0x00–0x1F) и вне базовых ``\n``/``\t``,
+#: поэтому не покрываются ``tools.ansi_strip.sanitize_display_text``, но в
+#: Telegram/OWUI ломают разметку сообщения (вставляют разрывы там, где их
+#: не ждали). Кандидатный вектор из находки H-2 (K1 red team).
+_U2028_U2029_RE = re.compile(r"[\u2028\u2029]")
 
 #: Маркеры «плана на будущее»: будущее время глагола + последовательность
 #: действий.  Только при наличии ОБОИХ текст считается незавершённым
@@ -137,7 +146,8 @@ def _strip_mission_slang(text: str) -> str:
 
 
 def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str:
-    """Убрать reasoning-блоки и обрезать long interim-тексты из текста доставки.
+    """Убрать reasoning-блоки, обрезать long interim-тексты и вычистить
+    управляющие символы из текста доставки.
 
     Применяется СРАЗУ ПЕРЕД отправкой в OWUI (api_server) и Telegram:
      1. Коэрсия в строку (не-строки → ``""``).
@@ -151,10 +161,19 @@ def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str
         первое предложение (короткий сигнал «работа идёт»), обрезанный до
         ``_INTERIM_KEEP_FIRST_SENTENCE``.  Это канал «что сделано…» без
         простыни рассуждений о том, что ещё планируется.
-     5. Опциональный общий лимит ``max_chars`` (мягкий, на символ).
+     5. Гигиена управляющих символов (находка H-2, K1 red team): C0 control
+        (0x00–0x1F) и ANSI/ECMA-48 escape-последовательности удаляются через
+        ``tools.ansi_strip.sanitize_display_text`` (тот же канонический seam,
+        что и ``session_recap``/``console_engine``); ``\\r`` нормализуется в
+        ``\\n``; легитимные ``\\n``/``\\t`` сохраняются.  Дополнительно
+        удаляются разделители строк U+2028/U+2029, которые вне диапазона C0
+        и не покрываются канонической функцией, но ломают разметку TG/OWUI.
+     6. Съём служебного слоя (канон R6): коды задач/сленг/локальные пути.
+     7. Опциональный общий лимит ``max_chars`` (мягкий, на символ).
 
     Функция ЧИСТАЯ (без side-эффектов) и не бросает исключений — очистка
-    никогда не должна ломать доставку.
+    никогда не должна ломать доставку.  Нормальные деловые сообщения
+    (кириллица/латиница/цифры/пробелы/``\\n``/``\\t``) проходят без изменений.
     """
     if not isinstance(text, str):
         if text is None:
@@ -172,9 +191,13 @@ def sanitize_delivery_text(text: Any, *, max_chars: Optional[int] = None) -> str
     stripped = _REASONING_FIELD_RE.sub("", stripped)
     # 4. Interim-подавление.
     stripped = _condense_interim(stripped)
-    # 4b. Съём служебного слоя (канон R6): коды задач/сленг/локальные пути.
+    # 5. Гигиена управляющих символов: C0 + ANSI/ECMA-48 (канон),
+    #    затем U+2028/U+2029 (вне диапазона канона).
+    stripped = sanitize_display_text(stripped)
+    stripped = _U2028_U2029_RE.sub("", stripped)
+    # 6. Съём служебного слоя (канон R6): коды задач/сленг/локальные пути.
     stripped = _strip_mission_slang(stripped)
-    # 5. Общий лимит.
+    # 7. Общий лимит.
     if max_chars is not None and max_chars > 0 and len(stripped) > max_chars:
         stripped = stripped[:max_chars]
     stripped = stripped.strip()
@@ -728,9 +751,17 @@ def verify_recipient(
       * T2 (спека §8.2.3): при заданной серверной привязке ``owui_to_tg``
             (непустой mapping ``{owui_user_id: tg_chat_id}``) кросс-платформа
             api_server→telegram проходит ТОЛЬКО если
-            ``target.chat_id == owui_to_tg[initiator.user_id]`` и этот чат
-            ∈ ALLOWED/home.  Пустая привязка (привязка не сконфигурирована)
-            сохраняет прежнее V1-поведение (F1/F3 не меняются).
+            ``target.chat_id == owui_to_tg[initiator.user_id]``.  Сама
+            серверная привязка (F3, H-5 red team t_d0bcecda) — достаточная
+            авторизация маршрута в СОБСТВЕННЫЙ bound-чат пользователя:
+            ALLOWED/home-гейт на bound-чат не накладывается, иначе второй
+            (и последующий) привязанный пользователь голодает, когда
+            ALLOWED/home настроены только на первого (инициатора).
+            Изоляция сохраняется конструктивно: отсечение по
+            ``target != bound_chat`` и наличие самой записи привязки
+            (не-авторизованные/непривязанные пользователи — False).
+            Пустая привязка (привязка не сконфигурирована) сохраняет
+            прежнее V1-поведение (F1/F3 не меняются).
     """
     if target is None or not target.platform:
         return False
@@ -776,7 +807,15 @@ def verify_recipient(
             if str(target.chat_id) != bound_chat:
                 # Перекрёстная утечка в чужой TG-чат конструктивно невозможна.
                 return False
-            return bound_chat == home_channel or bound_chat in allowed
+            # H-5 (red team t_d0bcecda): серверная привязка сама по себе —
+            # достаточная авторизация маршрута в СОБСТВЕННЫЙ bound-чат
+            # пользователя (target == bound_chat уже проверено выше).  Ранее
+            # здесь требовалось ``bound_chat == home_channel or bound_chat in
+            # allowed``, что голодало второго (и последующих) привязанных
+            # пользователей, когда ALLOWED/home настроены только на первого
+            # (инициатора).  Изоляция неизменна: чужие bound-чаты и
+            # непривязанные пользователи по-прежнему False.
+            return True
         if (
             target.chat_id == home_channel
             and initiator.user_id

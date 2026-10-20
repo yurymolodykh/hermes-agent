@@ -6418,6 +6418,24 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+                # F-4.4 (K1 red team H-4): a non-string entry in the
+                # artifact-catalog otherwise drops out of the list silently
+                # (the list comprehension's isinstance(p, str) filter) leaving
+                # the user short an artifact with no diagnostic.  The bad entry
+                # is STILL excluded (delivery behavior unchanged) but the fact
+                # is now observable at warn level instead of a silent drop.
+                _nons = [
+                    repr(p)[:200]
+                    for p in md_artifacts
+                    if not (isinstance(p, str) and str(p).strip())
+                ]
+                if _nons:
+                    _log.warning(
+                        "kanban: complete_task %s artifact-catalog contains "
+                        "%d non-string/blank entry/entries — skipped from "
+                        "delivery (was silent): %s",
+                        task_id, len(_nons), ", ".join(_nons),
+                    )
         _append_event(
             conn, task_id, "completed",
             completed_payload,

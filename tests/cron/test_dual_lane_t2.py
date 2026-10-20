@@ -173,9 +173,13 @@ def test_verify_recipient_bound_user_other_chat_rejected():
     ) is False
 
 
-def test_verify_recipient_owui_bound_chat_not_allowed_rejected():
-    # Привязка вендорит пользователю чат, НЕ входящий в ALLOWED/home —
-    # прав на него нет (fail-closed).
+def test_verify_recipient_owui_bound_chat_not_allowed_delivers():
+    # H-5 (t_f_efffb731): привязка вендорит пользователю чат, НЕ входящий
+    # в ALLOWED/home — сама серверная привязка (openwebui_telegram_users)
+    # является достаточной авторизацией маршрута в СОБСТВЕННЫЙ bound-чат
+    # пользователя.  Ранее ALLOWED/home-гейт голодал второго (и последующих)
+    # привязанных пользователей, когда ALLOWED/home настроены только на
+    # первого (инициатора).
     binding = {OWNER_OWUI: "123456"}
     assert verify_recipient(
         _api_initiator(OWNER_OWUI),
@@ -183,7 +187,7 @@ def test_verify_recipient_owui_bound_chat_not_allowed_rejected():
         home_channel=OWNER_TG,
         allowed_users=ALLOWED,
         owui_to_tg=binding,
-    ) is False
+    ) is True
 
 
 def test_verify_recipient_empty_binding_keeps_v1(monkeypatch):
@@ -356,11 +360,14 @@ def test_dual_lane_policy_off_keeps_owui_only(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# §8.1 — привязка только при ALLOWED/home: augmentation-условие
+# §8.1 — привязка сама по себе даёт ленту в СОБСТВЕННЫЙ bound-чат (H-5)
 # ---------------------------------------------------------------------------
 
-def test_dual_lane_bound_chat_not_allowed_no_lane(monkeypatch):
-    # Привязка вендорит чат вне ALLOWED/home → лента не добавляется.
+def test_dual_lane_bound_chat_not_allowed_lane_added(monkeypatch):
+    # H-5 (t_f_efffb731): привязка вендорит чат вне ALLOWED/home — серверная
+    # привязка (openwebui_telegram_users) сама по себе авторизует TG-ленту в
+    # СОБСТВЕННЫЙ bound-чат владельца.  Ранее ALLOWED/home-гейт голодал
+    # второго (и последующих) привязанных пользователей.
     _ctx_owner_home_with_binding(monkeypatch, binding_target="888888888")
     job = {
         "id": "t2-7",
@@ -369,7 +376,10 @@ def test_dual_lane_bound_chat_not_allowed_no_lane(monkeypatch):
                    "user_id": OWNER_OWUI},
     }
     results = _run_dual_gate(job, ARTIFACT)
-    assert results == [], "bound-чат вне ALLOWED/home — TG-ленты быть не должно"
+    assert results, "bound-чат вне ALLOWED/home — TG-лента всё равно должна добавляться (H-5)"
+    for chat_id, allowed in results:
+        assert chat_id == "888888888", f"лента должна вести в bound-чат: {results}"
+        assert allowed is True, f"артефакт владельцу в bound-чат должен доставляться: {results}"
 
 
 def _ctx_owner_home(monkeypatch):

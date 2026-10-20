@@ -196,3 +196,60 @@ def test_task_do_not_deliver_defensive_truth_table():
     # Flagged synthetic readback -> True
     assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=True)) is True
     assert _task_do_not_deliver(SimpleNamespace(do_not_deliver=1)) is True
+
+
+# ---------------------------------------------------------------------------
+# F-4.3 (K1 red team): the per-event completed lane `_deliver_kanban_artifacts`
+# MUST apply the same 25MB ceiling the OWUI→TG root lane applies
+# (_OWUI_TG_ARTIFACT_MAX_BYTES).  Boundary: exactly-at-cap delivers, over-cap
+# is rejected with an explicit warning (never a silent drop), and the text
+# delivery / sibling artifacts are unaffected.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deliver_kanban_artifacts_size_cap_boundary(tmp_path, caplog):
+    """F-4.3: artifact exactly at the 25MB cap uploads; 25MB+1 is rejected
+    with a loud warning and never reaches the adapter.  Sibling under-cap
+    artifacts still upload (only the oversized one is skipped)."""
+    from gateway.kanban_watchers import _OWUI_TG_ARTIFACT_MAX_BYTES
+
+    at_cap = tmp_path / "at_cap.bin"
+    at_cap.write_bytes(b"\x00" * _OWUI_TG_ARTIFACT_MAX_BYTES)  # exactly 25MB
+    over_cap = tmp_path / "over_cap.bin"
+    over_cap.write_bytes(b"\x00" * (_OWUI_TG_ARTIFACT_MAX_BYTES + 1))  # 25MB+1
+    small = tmp_path / "small.txt"
+    small.write_text("ok", encoding="utf-8")
+
+    adapter = _ArtifactAdapter()
+    runner = _make_mixin_runner(adapter)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._deliver_kanban_artifacts(
+            adapter=adapter,
+            chat_id="tg-cap",
+            metadata={},
+            event_payload={
+                "artifacts": [str(at_cap), str(over_cap), str(small)],
+                "summary": "Результат",
+            },
+            task=SimpleNamespace(result=""),
+        )
+
+    # Exactly-at-cap uploads; only the >25MB file is rejected.
+    assert str(at_cap) in adapter.documents, (
+        f"25MB-exactly artifact must still upload: {adapter.documents}"
+    )
+    assert str(small) in adapter.documents, (
+        f"under-cap sibling must upload: {adapter.documents}"
+    )
+    assert str(over_cap) not in adapter.documents, (
+        f">25MB artifact must be capped: {adapter.documents}"
+    )
+    # Rejection is logged loudly (not a silent drop).
+    assert any(
+        "over_cap.bin" in r.message and "cap" in r.message
+        for r in caplog.records
+    ), f"oversized skip must be logged with the path: {caplog.records}"

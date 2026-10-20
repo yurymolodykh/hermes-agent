@@ -3112,7 +3112,11 @@ def _augment_owui_telegram_lane(job: dict, origin: dict, targets: List[dict]) ->
       * policy on (``policy_enabled()``);
       * известный authoritative owner из серверного реестра OWUI
         (``origin.owner_id``);
-      * серверная привязка ``openwebui_telegram_users[owner_id]`` ∈ ALLOWED/home.
+      * серверная привязка ``openwebui_telegram_users[owner_id]`` существует
+        (H-5 red team t_d0bcecda: сама привязка — достаточная авторизация
+        маршрута в СОБСТВЕННЫЙ bound-чат; ALLOWED/home-гейт не накладывается,
+        иначе второй/последующие привязанные пользователи голодают, когда
+        ALLOWED/home настроены только на инициатора).
 
     Иначе возвращает ``targets`` без изменений (флаг-фейл: «нет привязки —
     OWUI-only», поведение V8).  Добавленный target проходит тот же
@@ -3135,17 +3139,12 @@ def _augment_owui_telegram_lane(job: dict, origin: dict, targets: List[dict]) ->
     bound_chat = str(binding.get(owner_id) or "").strip()
     if not bound_chat:
         return targets
-    # Привязка даёт право ТОЛЬКО если целевой TG-чат ∈ ALLOWED/home (§8.1).
-    try:
-        home_chat = _get_home_target_chat_id("telegram")
-    except Exception:
-        home_chat = None
-    allowed = {
-        p.strip() for p in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
-        if p.strip()
-    }
-    if bound_chat != home_chat and bound_chat not in allowed:
-        return targets
+    # H-5 (red team t_d0bcecda): серверная привязка сама по себе — достаточная
+    # авторизация маршрута в СОБСТВЕННЫЙ bound-чат пользователя.  Ранее здесь
+    # требовалось ``bound_chat ∈ ALLOWED/home`` (§8.1), что голодало второго
+    # (и последующих) привязанных пользователей, когда ALLOWED/home настроены
+    # только на первого (инициатора).  Изоляция остаётся в verify_recipient:
+    # доставляется только в exact bound-chat и только при реальной привязке.
     # Не дублировать уже присутствующий telegram:<bound_chat>.
     for t in targets:
         if str(t.get("platform", "")).lower() == "telegram" and str(t.get("chat_id")) == bound_chat:
@@ -7383,10 +7382,17 @@ def _run_one_job_body(
                 failure_alert_class = _cron_failure_alert_class(error)
                 if failure_alert_class is not None:
                     try:
-                        from cron.jobs import mark_failure_alerted
+                        # Read-only dedup check: has THIS failure class already
+                        # been alerted (persisted marker)?  Do NOT write the
+                        # marker here — it must only be persisted AFTER the
+                        # alert was actually delivered, so a failed first
+                        # delivery leaves the marker unset and the next tick
+                        # re-alerts (F4 red-team H-1: alert-once applied to
+                        # delivery attempt, not to delivered alert).
+                        from cron.jobs import _get_failure_alerted
 
-                        failure_already_alerted = mark_failure_alerted(
-                            job["id"], failure_alert_class
+                        failure_already_alerted = (
+                            _get_failure_alerted(job["id"]) == failure_alert_class
                         )
                     except Exception as _fail_alert_exc:  # never break delivery
                         logger.warning(
@@ -7450,6 +7456,26 @@ def _run_one_job_body(
                         raise
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+                # F4 red-team H-1: persist the alert-once marker ONLY after the
+                # alert was actually delivered (delivery_error is None).  A
+                # failed first delivery leaves the marker unset, so the next
+                # tick re-sends the alert instead of silencing the owner
+                # forever.  On success the marker is stored now and subsequent
+                # ticks of the same failure class stay silent (dedup).
+                if (
+                    delivery_error is None
+                    and failure_alert_class is not None
+                ):
+                    try:
+                        from cron.jobs import mark_failure_alerted
+
+                        mark_failure_alerted(job["id"], failure_alert_class)
+                    except Exception as _mark_fail_exc:  # never break delivery
+                        logger.warning(
+                            "Job '%s': failed to persist failure-alert marker (%s) — "
+                            "will re-alert next tick",
+                            job["id"], _mark_fail_exc,
+                        )
         except _FireClaimLostDuringSideEffect:
             side_effect_ownership_lost = True
         finally:

@@ -317,20 +317,23 @@ def test_failure_alert_marker_persisted_before_delivery_error_source_order():
 
 
 # ---------------------------------------------------------------------------
-# Part-2 Scenario 2 / F-4.3: per-event completed lane artifact delivery has NO
-# size cap (`_deliver_kanban_artifacts`, kanban_watchers.py:4147-4285) unlike
-# the root lane (_owui_root_artifact_paths, cap at :1478). A >25MB artifact
-# reaches the adapter upload path in the notifier TG lane.
+# Part-2 Scenario 2 / F-4.3: per-event completed lane artifact delivery applies
+# the 25MB cap, mirroring the root lane (`_deliver_kanban_artifacts`,
+# kanban_watchers.py:4147-4295; cap constant _OWUI_TG_ARTIFACT_MAX_BYTES :1293).
+# A >25MB artifact is rejected up front with a warning and does NOT reach the
+# adapter upload path in the notifier TG lane.
 # ---------------------------------------------------------------------------
 
-def test_per_event_lane_artifact_over25mb_reaches_upload(tmp_path, monkeypatch):
-    """F-4.3 fact: the per-event `_deliver_kanban_artifacts` does NOT apply the
-    25MB cap the root lane applies.  A >25MB artifact in the event payload
-    reaches the adapter's send_document (no size gate before upload).
+def test_per_event_lane_artifact_over25mb_rejected(tmp_path, monkeypatch, caplog):
+    """F-4.3 fix: the per-event `_deliver_kanban_artifacts` now applies the
+    25MB cap the root lane already applies.  A >25MB artifact in the event
+    payload is skipped with an explicit warning (not a silent drop) and never
+    reaches the adapter's send_document.
 
     Called exactly as the notifier calls it for a completed event's artifacts
     (kanban_watchers.py:2927 / :2844) — passing the raw `ev.payload` straight
-    into the helper without any size pre-filter."""
+    into the helper without any size pre-filter.
+    """
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "pe.db"))
     kb.init_db()
     big = tmp_path / "big.bin"
@@ -351,12 +354,15 @@ def test_per_event_lane_artifact_over25mb_reaches_upload(tmp_path, monkeypatch):
     ))
 
     uploaded = [d["file_path"] for d in adapter.docs]
-    # F-4.3: BOTH files reach the adapter upload path — the >25MB file is
-    # handed to send_document just like the small one (no size gate).
-    assert str(big) in uploaded, (
-        f">25MB artifact must reach the upload path (no per-event cap): {uploaded}"
+    # F-4.3: the >25MB file is capped (NOT handed to send_document), the small
+    # file uploads as before.  The skip is logged as a warning (not silent).
+    assert str(big) not in uploaded, (
+        f">25MB artifact must be capped (must NOT reach upload path): {uploaded}"
     )
     assert str(small) in uploaded, f"small artifact must upload: {uploaded}"
+    assert any(
+        "exceeds" in r.message and "cap" in r.message for r in caplog.records
+    ), f"oversized artifact skip must be loudly logged: {caplog.records}"
 
 
 def test_root_lane_over25mb_capped_for_comparison(tmp_path, monkeypatch):

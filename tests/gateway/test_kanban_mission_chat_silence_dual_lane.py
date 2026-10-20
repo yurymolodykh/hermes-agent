@@ -645,10 +645,12 @@ async def test_p4_foreign_owner_with_binding_delivers_to_own_lanes(mission_env, 
         json.dumps({OWNER_OWUI: OWNER_TG, FOREIGN_OWUI: FOREIGN_TG}),
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
-    # Maria's bound chat must be allowlisted (mirror gate: bound chat in
-    # ALLOWED/home before a TG lane exists for her).
+    # H-5 (t_efffb731): сама серверная привязка — достаточная авторизация
+    # зеркала в СОБСТВЕННЫЙ bound-чат.  Maria's chat NOT in ALLOWED — зеркало
+    # всё равно должно дойти в её bound-чат (ранее гейт ALLOWED/home требовал
+    # allowlisting и голодал второго/последующих привязанных пользователей).
     monkeypatch.setenv(
-        "TELEGRAM_ALLOWED_USERS", ",".join([OWNER_TG, FOREIGN_TG, HOME_TG]),
+        "TELEGRAM_ALLOWED_USERS", ",".join([OWNER_TG, HOME_TG]),
     )
 
     root = _mk(mission_env, "mission-maria")

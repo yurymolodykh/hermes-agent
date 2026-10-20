@@ -276,6 +276,69 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
     )
 
 
+def test_verify_recipient_second_bound_user_gets_mirror_h5():
+    """H-5 (t_efffb731): второй привязанный OWUI-пользователь получает
+    зеркало в СВОЙ bound-чат, даже когда его чат НЕ входит в ALLOWED/home
+    (настроены только на первого/инициатора).
+
+    Контракт миссии F3: доставка ЛЮБОМУ пользователю с установленным
+    соответствием в openwebui_telegram_users, не только инициатору.
+    Сама серверная привязка — достаточная авторизация маршрута в
+    СОБСТВЕННЫЙ bound-чат (изоляция: чужие bound-чаты и непривязанные
+    — по-прежнему False).
+    """
+    home = "125805788"  # home/ALLOWED настроены только на первого
+    mapping = {
+        "9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "125805788",  # 1st (инициатор)
+        "3daba661-feb8-4c1d-a823-4c5223f98d30": "543447681",  # 2nd (вне ALLOWED/home)
+    }
+    allowed = ["125805788", home]  # НЕ содержит bound-чат второго
+
+    # Владелец → свой bound-чат (по-прежнему проходит).
+    assert verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-1",
+                                  "user_id": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Второй привязанный пользователь → СВОЙ bound-чат вне ALLOWED/home —
+    # зеркало ДОХОДИТ (H-5: ранее гейт голодал второго пользователя).
+    assert verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-2",
+                                  "user_id": "3daba661-feb8-4c1d-a823-4c5223f98d30"}),
+        _tg_target("543447681"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Безопасность сохранена: второй НЕ получает чат инициатора / home.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-3",
+                                  "user_id": "3daba661-feb8-4c1d-a823-4c5223f98d30"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Безопасность сохранена: непривязанный пользователь — тишина, даже в
+    # allowed-чат.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-4",
+                                  "user_id": "0795993b-4cc5-431f-a7fb-45b18967a9ba"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=allowed, owui_to_tg=mapping,
+    )
+    # Безопасность сохранена: привязка есть у второго, но target = ЧУЖОЙ
+    # bound-чат первого — перекрёстная утечка невозможна.
+    assert not verify_recipient(
+        InitiatorRef.from_origin({"platform": "api_server",
+                                  "chat_id": "job-5",
+                                  "user_id": "3daba661-feb8-4c1d-a823-4c5223f98d30"}),
+        _tg_target("125805788"), home_channel=home,
+        allowed_users=[*allowed, "543447681"], owui_to_tg=mapping,
+    )
+
+
 def test_non_telegram_target_unaffected():
     # Политика — только про TG; прочие платформы проходят.
     tgt = TargetRef.from_dict({"platform": "discord", "chat_id": "x"})
