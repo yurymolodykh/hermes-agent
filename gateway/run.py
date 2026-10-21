@@ -5652,6 +5652,21 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        # RGZ mechanical guarantee (owner decision 2026-10-20): when the
+        # inbound message triggers RGZ planning («гигантский план/задача/
+        # миссия/проект»), the session is pinned to reasoning=max for this
+        # and every following turn until the owner sees the plan. Safe no-op
+        # on any non-trigger / failure — the resolved config still applies.
+        try:
+            from agent.rgz_reasoning import apply_rgz_session_override
+
+            if apply_rgz_session_override(
+                self._runner, ctx.session_key, ctx.message or ""
+            ):
+                # Session override wins over per-model/global config.
+                reasoning_config = {"enabled": True, "effort": "max"}
+        except Exception:  # pragma: no cover — guarantee must never break a turn
+            logger.debug("rgz_reasoning: trigger check skipped", exc_info=True)
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -23389,6 +23404,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
+            # RGZ mechanical guarantee (owner decision 2026-10-20): pin the
+            # session to max when the background prompt carries an RGZ
+            # trigger. Best-effort — safe no-op on failure.
+            try:
+                from agent.rgz_reasoning import apply_rgz_session_override, rgz_trigger_detected
+
+                if apply_rgz_session_override(
+                    self,
+                    getattr(source, "chat_id", "") or "",
+                    prompt or "",
+                ) or rgz_trigger_detected(prompt or ""):
+                    reasoning_config = {"enabled": True, "effort": "max"}
+            except Exception:
+                logger.debug("rgz_reasoning: background trigger check skipped", exc_info=True)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)

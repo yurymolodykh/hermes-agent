@@ -1641,6 +1641,36 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Delivery-live-status (R1 delivery engine, rule 2): one live/editable
+-- status row per running task so a restart cannot spawn a second message.
+-- ``message_id`` is the platform's editable message id (Telegram); OWUI/PWA
+-- read the status directly from this table. ``closed`` flips on
+-- [final]/[aborted] so later live ticks do nothing.
+CREATE TABLE IF NOT EXISTS delivery_live_status (
+    task_id       TEXT PRIMARY KEY,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    message_id    TEXT,
+    interval_s    INTEGER NOT NULL DEFAULT 30,
+    next_update_at REAL,
+    closed        INTEGER NOT NULL DEFAULT 0,
+    updated_at    REAL
+);
+
+-- Delivery-dedup (R1 delivery engine, rule 2): once-only markers for
+-- [needs-decision]/[aborted]/[final] so a gateway restart (fresh claim of
+-- the same event) cannot re-send the same notification.  PK (task_id, kind,
+-- cause_hash) keeps replay impossible; rows are written by the engine's
+-- dedup_mark() and read by dedup_seen().
+CREATE TABLE IF NOT EXISTS delivery_dedup (
+    task_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    cause_hash TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (task_id, kind, cause_hash)
+);
 """
 
 
@@ -16552,3 +16582,131 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Delivery live-status (R1 delivery engine, rule 2)
+# ---------------------------------------------------------------------------
+# One editable status row per running task (delivery_live_status).  Written
+# by the delivery engine on [live-status] transitions, closed on
+# [final]/[aborted].  PK task_id makes restart-created duplicates impossible;
+# a lost message_id (edge: TG unavailable at send) degrades to a fresh send.
+
+def get_live_status(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the live-status row for ``task_id`` (or None)."""
+    return conn.execute(
+        "SELECT * FROM delivery_live_status WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def upsert_live_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    interval_s: int = 30,
+    next_update_at: Optional[float] = None,
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Insert-or-keep one live-status row for ``task_id``.
+
+    Idempotent on the PK: an existing row is preserved (its ``message_id`` /
+    interval are NOT overwritten by a re-send).  ``next_update_at`` is only
+    bumped by the edit path via :func:`bump_live_status_edit`.
+    """
+    import time as _time
+    ts = now if now is not None else _time.time()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_live_status "
+            "(task_id, platform, chat_id, thread_id, message_id, interval_s, "
+            " next_update_at, closed, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                task_id,
+                str(platform or "").lower(),
+                str(chat_id or ""),
+                str(thread_id or ""),
+                message_id,
+                int(interval_s or 30),
+                next_update_at,
+                ts,
+            ),
+        )
+
+
+def set_live_status_message_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    message_id: str,
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Record the editable message id for ``task_id`` (after the first send).
+
+    ``message_id`` is only ever written once so a restart cannot rotate the
+    live message: the first send wins.
+    """
+    import time as _time
+    ts = now if now is not None else _time.time()
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE delivery_live_status "
+            "SET message_id = COALESCE(message_id, ?), updated_at = ? "
+            "WHERE task_id = ?",
+            (message_id, ts, task_id),
+        )
+
+
+def bump_live_status_edit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    next_update_at: float,
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Push ``next_update_at`` forward after a live edit (30s → x2, cap 15m)."""
+    import time as _time
+    ts = now if now is not None else _time.time()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT interval_s FROM delivery_live_status WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        interval = int(row["interval_s"] or 30)
+        nxt = 2 * interval
+        if nxt > 900:  # cap 15 min per design §2b
+            nxt = 900
+        conn.execute(
+            "UPDATE delivery_live_status "
+            "SET interval_s = ?, next_update_at = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            (nxt, next_update_at, ts, task_id),
+        )
+
+
+def close_live_status(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None,
+) -> int:
+    """Mark the live-status row closed (flip ``closed``).  Returns rowcount.
+
+    Called on [final]/[aborted]; later live ticks see ``closed`` and do
+    nothing.
+    """
+    import time as _time
+    ts = now if now is not None else _time.time()
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE delivery_live_status SET closed = 1, updated_at = ? "
+            "WHERE task_id = ? AND closed = 0",
+            (ts, task_id),
+        )
+    return int(cur.rowcount or 0)

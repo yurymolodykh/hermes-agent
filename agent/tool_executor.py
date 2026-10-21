@@ -692,6 +692,24 @@ def _run_agent_tool_execution_middleware(
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
+        # RGZ mechanical guarantee (owner decision 2026-10-20): a
+        # ``kanban_create`` call from a live session raises that session's
+        # reasoning effort to max starting with the NEXT LLM request, so the
+        # decomposition turns that follow a card-creation call run at max.
+        # Best-effort single chokepoint — both the sequential and concurrent
+        # dispatch paths converge here with the resolved tool name, and any
+        # failure degrades silently (the tool still executes normally).
+        if function_name == "kanban_create":
+            try:
+                from agent.rgz_reasoning import ensure_max_for_agent
+
+                ensure_max_for_agent(agent)
+            except Exception:  # pragma: no cover — hook must never break the tool call
+                logger.debug(
+                    "rgz_reasoning: kanban_create hook skipped for %s", function_name,
+                    exc_info=True,
+                )
+
         _advance_start_order(_begin)
 
         # Keep the gateway turn-inactivity watchdog from abandoning a turn

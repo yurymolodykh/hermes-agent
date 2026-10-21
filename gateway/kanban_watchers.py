@@ -76,24 +76,6 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
-def _kanban_branch_summary_replace() -> bool:
-    """Return whether ``kanban.branch_summary_replace`` is enabled.
-
-    When enabled, the notifier suppresses the INDIVIDUAL per-task terminal
-    pings for every task that is a strict descendant of a subscribed branch
-    root (the branch итог delivered by ``_kanban_branch_summary_watcher`` is
-    the single channel message). Default ``False``: the branch итог is ADDED
-    on top of the existing per-event notifications, which stay untouched.
-    """
-    try:
-        from hermes_cli.config import load_config as _load_cfg
-        _cfg = _load_cfg() or {}
-        _kanban_cfg = _cfg.get("kanban") or {}
-        return bool(_kanban_cfg.get("branch_summary_replace", False))
-    except Exception:
-        return False
-
-
 def _task_do_not_deliver(task) -> bool:
     """True when a card is marked ``do_not_deliver`` (synthetic readback).
 
@@ -110,194 +92,6 @@ def _task_do_not_deliver(task) -> bool:
     if task is None:
         return False
     return bool(getattr(task, "do_not_deliver", False))
-
-
-def _tg_delivery_policy_allowed_users() -> list:
-    """Parse ``TELEGRAM_ALLOWED_USERS`` env into a list of chat/user ids."""
-    try:
-        raw = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
-        return [p.strip() for p in raw.split(",") if p.strip()]
-    except Exception:
-        return []
-
-
-def _tg_notify_policy_decision(sub, ev, kind: str, msg: str, task, allowed_users: list,
-                                *, task_is_root: Optional[bool] = None,
-                                mission_live: bool = False,
-                                task_tg_owner: str = ""):
-    """Apply the TG delivery-policy gate to ONE kanban notifier event.
-
-    Returns ``None`` when the gate is OFF (policy disabled) or the
-    subscription is not telegram (api_server subs are verified by the
-    server-owned registry and are out of the gate's scope).  Otherwise
-    returns a ``PolicyDecision``:
-      * ``deliver`` — event may be sent+woken;
-      * ``suppress(reason)`` — event must be skipped (text send AND wake) and
-        the reason journaled (ИНВ1/ИНВ2).
-
-    K1 RF1 (fail-open закрыт): когда модуль политики недоступен или
-    ``policy_enabled()`` бросил исключение — возвращается
-    ``suppress("policy unavailable")`` (журнал + ERROR-лог), а НЕ ``None``
-    (``None`` означал бы «deliver»).  ``task_is_root`` — явный маркер
-    «закрытие корня ветки» (RF2); ``task_tg_owner`` — TG-идентичность
-    владельца ветки (RF3) — оба вычисляются сборщиком, где есть conn.
-    """
-    try:
-        from hermes_cli.delivery_policy import (
-            InitiatorRef,
-            TargetRef,
-            classify,
-            default_context,
-            log_suppression,
-            policy_enabled,
-            verify_subscription_recipient,
-        )
-    except Exception as exc:
-        logger.error(
-            "delivery-policy: module import failed (%s) — kanban telegram "
-            "events FAIL-CLOSED (suppressed)", exc,
-        )
-        return _fail_closed_decision(sub, ev, kind, msg, exc)
-    try:
-        if not policy_enabled():
-            return None
-    except Exception as exc:
-        logger.error(
-            "delivery-policy: policy_enabled() raised (%s) — kanban telegram "
-            "events FAIL-CLOSED (suppressed)", exc,
-        )
-        return _fail_closed_decision(sub, ev, kind, msg, exc)
-    platform = str(sub.get("platform") or "").lower()
-    if platform != "telegram":
-        return None
-    if not verify_subscription_recipient(
-        sub, allowed_users, task_tg_owner=task_tg_owner,
-    ):
-        log_suppression(
-            app="kanban",
-            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-            target=f"telegram:{sub.get('chat_id')}",
-            decision=_suppress_decision(
-                "recipient mismatch", detail=f"sub user not in ALLOWED_USERS"
-            ),
-            snippet=(msg or "")[:200],
-            extra={
-                "task_id": sub.get("task_id"),
-                "event_kind": kind,
-                "event_id": getattr(ev, "id", None),
-            },
-        )
-        return _suppress_decision(
-            "recipient mismatch", detail=f"sub user not in ALLOWED_USERS"
-        )
-    payload = getattr(ev, "payload", None) or {}
-    artifacts = list(payload.get("artifacts") or ()) if isinstance(payload, dict) else []
-    # K1 RF2 (ИНВ2): терминальность — ЯВНЫЙ маркер финала, а НЕ «есть
-    # summary». Финал = task.status=="archived" ЛИБО факт закрытия корня
-    # ветки (task_is_root && kind=="completed"). Промежуточная суб-задача,
-    # даже с «Окончательным отчётом» в summary, — НЕ терминальна: её
-    # completed подавляется как routine status close (§5). Артефакты и
-    # human-action события доставляются независимо от этого флага.
-    task_terminal = bool(task and task.status == "archived")
-    root_closing = bool(task_is_root and kind == "completed")
-    # F9 (t_85a095e0): a root card whose mission controller is still live is
-    # NOT a terminal close — the mission is in flight, so de-terminalize.
-    if root_closing and mission_live:
-        root_closing = False
-    ctx = default_context(
-        kind="kanban",
-        initiator=InitiatorRef.from_origin({
-            "platform": "telegram",
-            "chat_id": sub.get("user_id") or sub.get("chat_id") or "",
-        }),
-        target=TargetRef.from_dict({
-            "platform": "telegram",
-            "chat_id": sub.get("chat_id") or "",
-            "thread_id": sub.get("thread_id"),
-        }),
-        home_channel=os.environ.get("TELEGRAM_HOME_CHANNEL", ""),
-        allowed_users=allowed_users,
-        event_kind=kind,
-        artifacts=artifacts,
-        has_media=bool(artifacts),
-        completed_terminal=bool(task_terminal or root_closing),
-        no_agent=False,
-    )
-    decision = classify(msg, ctx)
-    if decision.suppressed:
-        log_suppression(
-            app="kanban",
-            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-            target=f"telegram:{sub.get('chat_id')}",
-            decision=decision,
-            snippet=(msg or "")[:200],
-            extra={
-                "task_id": sub.get("task_id"),
-                "event_kind": kind,
-                "event_id": getattr(ev, "id", None),
-            },
-        )
-    return decision
-
-
-def _suppress_decision(reason: str = "", detail: str = "") -> "PolicyDecision":
-    from hermes_cli.delivery_policy import suppress
-
-    return suppress(reason, detail)
-
-
-class _UnavailableSuppress:
-    """Module-free ``PolicyDecision`` stand-in for the fail-closed path (K1 RF1).
-
-    Used ONLY when ``hermes_cli.delivery_policy`` itself is unimportable —
-    the one case where ``_suppress_decision()`` / ``log_suppression()`` are
-    unreachable.  Exposes the same shape the notifier reads (``suppressed``,
-    ``reason``, ``detail``) so a broken policy module still FAILS CLOSED and
-    the event id lands in ``_tg_suppressed_event_ids`` (wake suppressed too).
-    """
-
-    action = "suppress"
-
-    def __init__(self, reason: str = "policy unavailable", detail: str = ""):
-        self.reason = reason
-        self.detail = detail
-
-    @property
-    def suppressed(self) -> bool:
-        return True
-
-    @property
-    def delivered(self) -> bool:
-        return False
-
-
-def _fail_closed_decision(sub, ev, kind, msg, exc) -> "PolicyDecision":
-    """Journal + build ``suppress("policy unavailable")`` for one event (RF1).
-
-    Best-effort: uses the real module's ``suppress``/``log_suppression`` when
-    importable (writes the standard JSONL record); when the module is
-    unimportable falls back to ``_UnavailableSuppress`` and relies on the
-    callers' ERROR log as the audit trail.  Never returns None.
-    """
-    who = str(sub.get("user_id") or sub.get("chat_id") or "")
-    target = f"telegram:{sub.get('chat_id')}"
-    detail = f"{type(exc).__name__}: {exc}"
-    try:
-        from hermes_cli.delivery_policy import log_suppression, suppress
-
-        decision = suppress("policy unavailable", detail=detail)
-        log_suppression(
-            app="kanban", who=who, target=target, decision=decision,
-            snippet=(msg or "")[:200],
-            extra={
-                "task_id": sub.get("task_id"),
-                "event_kind": kind,
-                "event_id": getattr(ev, "id", None),
-            },
-        )
-        return decision
-    except Exception:
-        return _UnavailableSuppress("policy unavailable", detail)
 
 
 def _kanban_branch_tg_owner(conn, kb, root_id: str) -> str:
@@ -341,6 +135,12 @@ def _kanban_branch_tg_owner(conn, kb, root_id: str) -> str:
 _OWUI_ARTIFACT_TEXT_EXTS = frozenset({".md", ".txt", ".rst", ".log"})
 _OWUI_ARTIFACT_MAX_BYTES = 300_000
 _OWUI_ARTIFACT_MAX_CHARS = 60_000
+#: Cap for requested/attached root artifacts (F1).  Telegram's hard platform
+#: limit is 50 MB; the contract fixes a comfortable 25 MB ceiling so an
+#: oversized artifact is skipped with a warning instead of failing the whole
+#: delivery.  Shared by the notifier artifact path and the branch-summary
+#: routing in gateway/delivery_engine.py.
+_OWUI_TG_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
 
 
 def _owui_artifact_text(artifacts: Any) -> str:
@@ -400,364 +200,10 @@ def _owui_completed_text(task_id: str, title: str, payload: Any, fallback: str) 
     return full if len(full) > len(fallback) else fallback
 
 
-def _owui_branch_result_text(plan: dict, msg: str) -> str:
-    """api_server branch итог: append the root node's report artifact inline.
-
-    Covers ``branch_summary_replace`` mode, where the individual ``completed``
-    pings (which carry the report inline) are suppressed and the branch итог
-    is the only message the channel receives. Harmless no-op when the root has
-    no readable completed-event artifact.
-    """
-    from hermes_cli import kanban_db as _kb
-    root_id = plan.get("root_id")
-    board = plan.get("board")
-    conn = _kb.connect(board=board)
-    try:
-        row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='completed' "
-            "ORDER BY id DESC LIMIT 1",
-            (root_id,),
-        ).fetchone()
-        if not row or not row[0]:
-            return msg
-        import json as _json
-        payload = _json.loads(row[0])
-    except Exception:
-        return msg
-    finally:
-        conn.close()
-    if not isinstance(payload, dict):
-        return msg
-    from hermes_cli.delivery_policy import sanitize_delivery_text
-    art = _owui_artifact_text(payload.get("artifacts"))
-    if not art:
-        return msg
-    return sanitize_delivery_text(f"{msg}\n\n{art}", max_chars=8000)
-
-
-# ---------------------------------------------------------------------------
-# F2 (t_a14f7e23): OWUI→TG mirror for blocked/needs_input human-action events.
-# ---------------------------------------------------------------------------
-
 #: Human-action block kinds mirrored to the initiator's bound TG chat as a
 #: «требует решения» message (F2).  block_loop_detected routes the card to
 #: triage and is already loud on both lanes; it is included so the TRIAGE ping
 #: and the «требует решения» ping stay consistent for the owner.
-_OWUI_TG_HUMAN_BLOCK_KINDS = frozenset({
-    "blocked", "needs_input", "capability", "block_loop_detected",
-})
-
-#: Max length of the owner-facing reason in the «требует решения» mirror.
-_OWUI_TG_BLOCK_REASON_MAX_CHARS = 500
-
-
-def _owui_tg_block_mirror_text(
-    sub: Mapping[str, Any], ev: Any, kind: str, task: Any, msg: str,
-    *, fallback: str = "",
-) -> str:
-    """Build the «требует решения: <заголовок> + краткая причина» TG text.
-
-    F2 owner spec: a blocked/needs_input event on an OWUI task mirrors into
-    TG as ``⚠️ Требует решения: <title>`` followed by a short reason (up to
-    ``_OWUI_TG_BLOCK_REASON_MAX_CHARS``).  Prefers the card's human title
-    (mission slang stripped), falls back to the task id, and reuses the
-    per-event ``msg`` only when the payload carries no reason at all.
-    """
-    try:
-        from hermes_cli.delivery_policy import sanitize_delivery_text
-        from hermes_cli.delivery_policy import _strip_mission_slang
-    except Exception:  # pragma: no cover - pure text helper, never fails hard
-        _strip_mission_slang = lambda s: s or ""
-        sanitize_delivery_text = lambda s, **_: s or ""
-    task_id = str(sub.get("task_id") or "")
-    title = ""
-    if task is not None:
-        t = getattr(task, "title", None) or ""
-        if t:
-            title = str(t)
-    if not title:
-        title = task_id
-    clean_title = _strip_mission_slang(title or "")
-    clean_title = re.sub(
-        r"^\s*(?:РГЗ|РГЗ:|rgz)[:\s-]*", "", clean_title, flags=re.IGNORECASE,
-    ).strip()
-    reason = ""
-    try:
-        payload = getattr(ev, "payload", None) or {}
-    except Exception:
-        payload = {}
-    if isinstance(payload, dict) and payload.get("reason"):
-        reason = str(payload["reason"]).strip()
-    lines = [f"⚠️ Требует решения: {clean_title or task_id}"]
-    if reason:
-        lines.append(reason[:_OWUI_TG_BLOCK_REASON_MAX_CHARS])
-    text = "\n\n".join(lines)
-    text = sanitize_delivery_text(text, max_chars=1600)
-    if text.strip():
-        return text
-    return fallback or msg
-
-
-def _owui_tg_block_mirror_due(
-    conn: Any, sub: Mapping[str, Any], ev: Any, kind: str,
-) -> bool:
-    """Dedup gate for the F2 TG block mirror (cooldown by (task, kind, cause)).
-
-    Returns False when a repeat human-action block on the same task/cause is
-    still inside the cooldown (already mirrored → do not send again).  The
-    logic lives in ``hermes_cli.kanban_db.tg_block_mirror_due`` so the
-    cooldown state is a ``tg_block_mirror`` task_events marker shared with
-    any other component; here we just extract the reason for the signature.
-    """
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:  # pragma: no cover - fail-open (no dedup state)
-        return True
-    reason = ""
-    try:
-        payload = getattr(ev, "payload", None) or {}
-    except Exception:
-        payload = {}
-    if isinstance(payload, dict) and payload.get("reason"):
-        reason = str(payload["reason"])
-    return _kb.tg_block_mirror_due(
-        conn, str(sub.get("task_id") or ""), kind=kind, reason=reason,
-    )
-
-
-def _owui_tg_mark_block_mirror(
-    conn: Any, sub: Mapping[str, Any], ev: Any, kind: str, *,
-    chat: str = "",
-) -> int:
-    """Record the F2 TG block mirror marker (once-per-cooldown claim)."""
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:  # pragma: no cover - marker write must never fail the send
-        return 0
-    reason = ""
-    event_id = None
-    try:
-        payload = getattr(ev, "payload", None) or {}
-        event_id = getattr(ev, "id", None)
-    except Exception:
-        payload = {}
-    if isinstance(payload, dict) and payload.get("reason"):
-        reason = str(payload["reason"])
-    return _kb.mark_tg_block_mirror(
-        conn, str(sub.get("task_id") or ""), kind=kind,
-        event_id=int(event_id) if event_id else None,
-        reason=reason, chat=chat,
-    )
-
-
-def _owui_tg_clear_block_mirror(conn: Any, task_id: str) -> int:
-    """Clear block-mirror markers for a task that left ``blocked``."""
-    try:
-        from hermes_cli import kanban_db as _kb
-        return _kb.clear_tg_block_mirror(conn, task_id)
-    except Exception:  # pragma: no cover
-        return 0
-
-
-#: Kinds that ALWAYS stay loud on the api_server lane, even in
-#: branch_summary_replace mode.  These are either terminal-failure states the
-#: branch итог lists, or explicit "needs a human decision" transitions that
-#: must reach the origin OWUI session immediately (they carry no equivalent in
-#: the branch_summary_message, and the whole point of ``block_loop_detected`` /
-#: ``review_requested`` is to force human attention).
-_OWUI_ALWAYS_LOUD_KINDS = frozenset({
-    "gave_up", "crashed", "timed_out",
-    "block_loop_detected", "review_requested",
-})
-
-
-def should_suppress_api_server_event(event, card, parent,
-                                     branch_summary_replace) -> bool:
-    """Pure predicate: is ``event`` an intermediate api_server-lane noise.
-
-    With ``kanban.branch_summary_replace: true`` the api_server (OWUI) lane
-    must NOT emit a per-event ping for every intermediate state change of a
-    mission tree — the user only wants the terminal branch итог (delivered by
-    ``_kanban_branch_summary_watcher``, which appends the root report artifact
-    inline) plus anything that genuinely needs their action.
-
-    Returns True to SUPPRESS the event (skip OWUI staging + OWUI→TG mirror +
-    text ping — the event is still claimed so the subscription cursor advances
-    and it can never wedge/replay), False to deliver normally.
-
-    Suppressed (True) — INTERMEDIATE events:
-      * any descendant card (``parent`` present): child / sub-branch cards,
-        including abrupt mid-tree closes ([split N/M], one-off child done);
-      * plain non-terminal ``completed`` / ``status`` / ``archived`` /
-        ``unblocked`` and a self-resolving ``blocked`` (dependency/transient);
-      * the SAME routine kinds even for ROOT / unsubscribed tasks — under
-        replace mode the root's own completion ping is not the итог: the
-        branch_summary stage owns that single channel message.
-
-    Loud (False) — NOT suppressed:
-      * the terminal ``branch_summary`` event itself (the whole-branch итог);
-      * ``_OWUI_ALWAYS_LOUD_KINDS`` — terminal-failure / human-attention kinds
-        (gave_up, crashed, timed_out, block_loop_detected, review_requested);
-      * ``blocked`` that requires an operator route choice or a human fix —
-        provider outage (payload ``provider_route``) or a needs-a-fix
-        ``block_kind`` (``needs_input`` / ``capability`` / legacy NULL);
-      * a card routed to ``triage`` (human decision needed).
-
-    The predicate is PURE and side-effect free. ``card``/``parent`` may be
-    ``None`` (row missing / no parent). Returns False whenever
-    ``branch_summary_replace`` is off — replace mode OFF means additive,
-    per-event notifications keep flowing exactly as before. The TG
-    delivery-policy gate is deliberately OUT of scope: this predicate is
-    api_server-lane only and never alters Telegram behavior.
-    """
-    if not branch_summary_replace:
-        return False
-    if event is None:
-        return False
-    kind = str(getattr(event, "kind", "") or "").strip()
-    # An unclassifiable event (no kind) must never be silently dropped — a
-    # malformed/unknown event is ambiguous, and on the api_server lane the
-    # cost of losing a real terminal итог far outweighs one extra ping.
-    if not kind:
-        return False
-    try:
-        payload = getattr(event, "payload", None) or {}
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    # The terminal whole-branch итог is the single channel message — it is
-    # NEVER suppressed (nothing downstream re-emits it if it is).
-    if kind == "branch_summary":
-        return False
-    # Terminal-failure / human-attention kinds always stay loud.
-    if kind in _OWUI_ALWAYS_LOUD_KINDS:
-        return False
-    # A card routed to triage needs a human decision — never drop it, whether
-    # signalled via an explicit ``triage`` event kind or the card status.
-    if kind == "triage":
-        return False
-    card_status = str(getattr(card, "status", "") or "").strip()
-    if card_status == "triage":
-        return False
-    if kind == "blocked":
-        block_kind = str(payload.get("kind") or "").strip() or None
-        if payload.get("provider_route"):
-            return False  # provider outage — operator must pick a route
-        if block_kind in ("needs_input", "capability"):
-            return False  # human fix required
-        if block_kind is None:
-            # Legacy un-typed block → treated as a human blocker (same rule as
-            # classify_branch_node_status / branch_state).
-            return False
-        # dependency / transient / any other auto-resolving kind → routine.
-        return True
-    # completed / status / archived / unblocked / any other routine kind —
-    # intermediate on the mission tree, suppressed under replace mode
-    # (including root / unsubscribed cards: the branch итог is the итог).
-    return True
-
-
-def should_wake_agent_for_event(event, card, parent,
-                                branch_summary_replace) -> bool:
-    """Pure predicate: may ``event`` WAKE the originating agent session?
-
-    Complements ``should_suppress_api_server_event`` on the wake side.  The
-    wake turn (a synthetic agent turn injected into the creator's session)
-    is expensive and disruptive: it must NOT fire for every intermediate
-    state change of a mission tree.  Under ``kanban.branch_summary_replace:
-    true`` the notifier must only wake the agent for things that either ARE
-    the terminal branch итог or genuinely need a human decision:
-
-      * terminal whole-branch итог (``branch_summary`` event);
-      * terminal-failure / human-attention kinds (``_OWUI_ALWAYS_LOUD_KINDS``
-        — gave_up, crashed, timed_out, block_loop_detected,
-        review_requested);
-      * a card routed to ``triage`` (event kind or card status);
-      * ``blocked`` needing an operator route choice or a human fix —
-        provider outage (payload ``provider_route``) or a needs-a-fix
-        ``block_kind`` (``needs_input`` / ``capability`` / legacy NULL).
-
-    Returns False (NO wake) for INTERMEDIATE events:
-      * any descendant card close (``parent`` present) — child / sub-branch
-        cards, incl. ``[split N/M]`` and one-off daughter completions;
-      * plain non-terminal ``completed`` / ``status`` / ``archived`` /
-        ``unblocked`` and a self-resolving ``blocked`` (dependency/transient);
-      * the SAME routine kinds even for ROOT tasks — under replace mode the
-        root's own completion ping is not the итог: the branch_summary stage
-        owns the single channel message and its wake.
-
-    Returns True whenever ``branch_summary_replace`` is off — replace mode
-    OFF means additive, per-event wakes keep flowing exactly as before (the
-    historical notifier contract: complete/gave_up/crashed/timed_out/blocked
-    all wake the creator).  The predicate is PURE and side-effect free;
-    ``card``/``parent`` may be ``None`` (row missing / no parent).
-    """
-    if not branch_summary_replace:
-        return True
-    if event is None:
-        return False
-    kind = str(getattr(event, "kind", "") or "").strip()
-    # An unclassifiable event can never be positively identified as wake-worthy.
-    if not kind:
-        return False
-    try:
-        payload = getattr(event, "payload", None) or {}
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    # The terminal whole-branch итог is the single wake the creator gets for
-    # a mission — routine intermediate closes never wake under replace mode.
-    if kind == "branch_summary":
-        return True
-    if kind in _OWUI_ALWAYS_LOUD_KINDS:
-        return True
-    if kind == "triage":
-        return True
-    card_status = str(getattr(card, "status", "") or "").strip()
-    if card_status == "triage":
-        return True
-    if kind == "blocked":
-        block_kind = str(payload.get("kind") or "").strip() or None
-        if payload.get("provider_route"):
-            return True  # provider outage — operator must pick a route
-        if block_kind in ("needs_input", "capability"):
-            return True  # human fix required
-        if block_kind is None:
-            # Legacy un-typed block → treated as a human blocker.
-            return True
-        # dependency / transient / any other auto-resolving kind → routine,
-        # never wakes the creator (the branch_summary итог carries it).
-        return False
-    # completed / status / archived / unblocked / any other routine kind —
-    # intermediate on the mission tree, does not wake under replace mode.
-    return False
-
-
-def _owui_suppress_intermediate_event(kind: str, ev: Any,
-                                      replace_summary: bool,
-                                      platform_str: str) -> bool:
-    """Legacy forwarding shim for ``should_suppress_api_server_event``.
-
-    Keeps the existing call site (which passes ``kind``/``ev``/platform
-    separately) behaviourally identical while routing through the canonical
-    pure predicate.  Gates on the api_server lane + replace mode first, then
-    delegates; ``card``/``parent`` are unknown at this call site so they are
-    passed as None (the canonical predicate still suppresses all routine
-    intermediate kinds and keeps the loud set + blocked-with-provider_route /
-    needs-human-fix cases).
-    """
-    if platform_str != "api_server" or not replace_summary:
-        return False
-    return should_suppress_api_server_event(
-        ev, card=None, parent=None, branch_summary_replace=replace_summary,
-    )
-
-
-#: Live statuses for a goal_mode mission controller: while ANY of these hold
-#: the mission is still in flight, so a leaf/daughter close must NOT be treated
-#: as the terminal итог of the whole tree.
 _MISSION_CONTROLLER_LIVE_STATUSES = frozenset({
     "todo", "ready", "running", "review", "blocked", "triage", "scheduled",
 })
@@ -1050,754 +496,6 @@ def _branch_summary_skip_untouched_delivered_root(
     return True
 
 
-def _tg_owui_dual_lane(sub, ev, kind: str, msg: str, task, allowed_users: list,
-                       *, task_is_root: Optional[bool] = None,
-                       mission_live: bool = False,
-                       has_open_descendants: Optional[bool] = None,
-                       home_channel: str = "") -> Optional[tuple]:
-    """Complementary OWUI→Telegram delivery lane for a non-RGZ kanban mission.
-
-    Mirror of cron T2 (``cron/scheduler.py::_augment_owui_telegram_lane`` +
-    ``_tg_gate_target``, спека §8.2.2/§8.3): an ``api_server`` subscription's
-    PRIMARY lane is the exact-owner OWUI chat staged in the server-owned
-    outbox.  When the OWUI owner (``sub.user_id``) is server-bound to a
-    Telegram chat via ``openwebui_telegram_users`` AND that chat is in
-    ``TELEGRAM_ALLOWED_USERS``/home, the SAME event is also evaluated for a
-    Telegram delivery to that bound chat through the SAME RGZ classifier
-    (classify + verify_recipient + log_suppression).
-
-    ``has_open_descendants`` (P2, t_ecab4990): when True the completing card
-    still has NON-terminal descendants (children/sub-branches alive), so its
-    ``completed`` is NOT the branch итог — the OWUI→TG mirror must stay silent
-    even for a root card (the whole-mission terminal close is delivered by the
-    branch-summary watcher instead).  ``None`` (default) preserves legacy
-    behaviour for direct callers that cannot compute the tree shape.
-
-    Returns:
-      * ``None`` — no Telegram lane: not an api_server subscription, policy
-        disabled, policy module unavailable (fail-closed), no binding for the
-        owner, or bound chat not in ALLOWED/home.  Nothing is sent, nothing
-        journaled — the mission stays OWUI-only (V8 behavior).
-      * ``(decision, bound_chat)`` — ``decision.delivered`` → send ``msg`` to
-        Telegram ``bound_chat``; ``decision.suppressed`` → already journaled,
-        do NOT send.  ``verify_recipient`` enforces recipient == initiator
-        (ИНВ1); a foreign recipient is never delivered.  Bound chat matching
-        (owner → chat) is exclusive to the server registry: the chat of one
-        owner can never receive another owner's mission.
-    """
-    if str(sub.get("platform") or "").lower() != "api_server":
-        return None
-    try:
-        from hermes_cli.delivery_policy import (
-            InitiatorRef,
-            TargetRef,
-            classify,
-            default_context,
-            log_suppression,
-            owui_telegram_users,
-            policy_enabled,
-            verify_recipient,
-        )
-    except Exception as exc:
-        # Fail-closed: a broken policy module must not open a new lane.
-        logger.error(
-            "delivery-policy: module import failed (%s) — kanban OWUI→TG "
-            "lane FAIL-CLOSED (no lane)", exc,
-        )
-        return None
-    try:
-        if not policy_enabled():
-            return None
-        binding = owui_telegram_users() or {}
-    except Exception as exc:
-        # Fail-closed: конфиг/модуль недоступен — TG-ленту не добавляем.
-        logger.error(
-            "delivery-policy: policy_enabled()/owui_telegram_users() raised "
-            "(%s) — kanban OWUI→TG lane FAIL-CLOSED (no lane)", exc,
-        )
-        return None
-    owner_id = str(_sub_owui_owner_id(sub)).strip()
-    if not owner_id:
-        return None
-    bound_chat = str(binding.get(owner_id) or "").strip()
-    if not bound_chat:
-        # Нет серверной привязки у владельца → OWUI-only (§8.3/V8).
-        return None
-    if not home_channel:
-        home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
-    # H-5 (red team t_d0bcecda): серверная привязка openwebui_telegram_users
-    # сама по себе — авторизация зеркала в СОБСТВЕННЫЙ bound-чат владельца
-    # подписки (allowed_users/home здесь НЕ используются как гейт — иначе
-    # второй/последующие привязанные пользователи голодают, когда ALLOWED/home
-    # настроены только на инициатора).  Изоляция остаётся в verify_recipient:
-    # доставляется только в exact bound-chat и только при реальной привязке.
-    initiator = InitiatorRef.from_origin({
-        "platform": "api_server",
-        "chat_id": sub.get("chat_id") or "",
-        "user_id": owner_id,
-        "thread_id": sub.get("thread_id") or "",
-    })
-    target = TargetRef.from_dict({
-        "platform": "telegram",
-        "chat_id": bound_chat,
-        "thread_id": None,
-    })
-    payload = getattr(ev, "payload", None) or {}
-    artifacts = list(payload.get("artifacts") or ()) if isinstance(payload, dict) else []
-    task_terminal = bool(task and getattr(task, "status", None) == "archived")
-    root_closing = bool(task_is_root and kind == "completed")
-    # F9 (t_85a095e0): a live goal_mode controller in the same OWUI session
-    # keeps the mission in flight — a root card's completed must not be the
-    # terminal итог to Telegram while the controller is alive (the R4
-    # sno-economics case: parent-less leaf, controller detached from
-    # task_links, yet the mission was running).
-    if root_closing and mission_live:
-        root_closing = False
-    # P2 (t_ecab4990): a completing card that still has NON-terminal
-    # descendants (children/sub-branches alive) is NOT the branch итог —
-    # its ``completed`` must stay out of the OWUI→TG mirror even when the
-    # card itself is the tree root (the whole-mission terminal close is the
-    # branch-summary watcher's single message).  This is the strict owner
-    # requirement: "родитель (не-лист дерева, у него есть дети) завершился
-    # → TG-тишина".
-    if root_closing and has_open_descendants:
-        root_closing = False
-    completed_terminal = bool(task_terminal or root_closing)
-    # F6 (tg-delivery-hygiene, применяется ко ВСЕМ binding
-    # openwebui_telegram_users): в TG-ленте (dual-lane) доставляется ТОЛЬКО
-    # терминальный итог миссии / корневой карточки.  Промежуточный completed
-    # дочерней карточки — даже с артефактами сплита (отчёты/диффы/тестлоги) —
-    # в TG подавляется (ИНВ2, reason=routine status close — прецедент в
-    # classify); OWUI-лента (primary) при этом НЕ затрагивается.
-    # Гейт стоит ДО classify, чтобы не срабатывала артефактная ветка:
-    # completed терминален только когда закрывается корень ветки
-    # (task_is_root) либо карточка архивирована (task.status==archived).
-    if kind == "completed" and not completed_terminal:
-        _suppr = _suppress_decision(
-            "routine status close",
-            detail=(
-                "intermediate completed child — non-terminal mission card "
-                "suppressed in OWUI→TG lane"
-            ),
-        )
-        log_suppression(
-            app="kanban",
-            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-            target=f"telegram:{bound_chat}",
-            decision=_suppr,
-            snippet=(msg or "")[:200],
-            extra={
-                "task_id": sub.get("task_id"),
-                "event_kind": kind,
-                "event_id": getattr(ev, "id", None),
-                "owui_to_tg": True,
-            },
-        )
-        logger.info(
-            "delivery-policy: OWUI→TG lane suppressed intermediate completed "
-            "for %s to telegram:%s (not terminal mission card)",
-            sub.get("task_id"), bound_chat,
-        )
-        return (_suppr, bound_chat)
-    ctx = default_context(
-        kind="kanban",
-        initiator=initiator,
-        target=target,
-        home_channel=home_channel,
-        allowed_users=allowed_users,
-        owui_to_tg=binding,
-        event_kind=kind,
-        artifacts=artifacts,
-        has_media=bool(artifacts),
-        completed_terminal=completed_terminal,
-        no_agent=False,
-    )
-    decision = classify(msg, ctx)
-    if not decision.suppressed:
-        if verify_recipient(
-            initiator, target,
-            home_channel=home_channel,
-            allowed_users=allowed_users,
-            owui_to_tg=binding,
-        ):
-            return (decision, bound_chat)
-        decision = _suppress_decision(
-            "recipient mismatch",
-            detail=f"cross-platform api_server→telegram target={bound_chat}",
-        )
-    log_suppression(
-        app="kanban",
-        who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-        target=f"telegram:{bound_chat}",
-        decision=decision,
-        snippet=(msg or "")[:200],
-        extra={
-            "task_id": sub.get("task_id"),
-            "event_kind": kind,
-            "event_id": getattr(ev, "id", None),
-            "owui_to_tg": True,
-        },
-    )
-    return (decision, bound_chat)
-
-
-#: Ключ в ``delivery_metadata`` подписки, по которому api_server-подписка
-#: (в т.ч. PWA/yadisk, без ``owui-``-префикса и без ``user_id``) привязывается
-#: к OWUI-пользователю (F3, t_0aedc91c): ``{"owui_user_id_attr":
-#: "<owui_user_id>"}``.  Заполняется только серверной стороной (верифицированная
-#: PWA-идентичность), никогда из client-запроса; отсутствие маркера =
-#: OWUI-only (fail-closed).  Это «признак привязки подписки к owui_user_id» из
-#: требования 3.
-_OWUI_ATTR_META_KEY = "owui_user_id_attr"
-
-
-def _sub_owui_owner_id(sub: dict) -> str:
-    """OWUI-владелец api_server-подписки: ``user_id`` или серверный attr-маркер.
-
-    Приоритет: штатный ``sub.user_id`` (verified-origin OWUI) → серверный
-    ``delivery_metadata[owui_user_id_attr]`` (F3: PWA/yadisk-подписка, явно
-    привязанная сервером к OWUI-пользователю).  Пустая строка = нет владельца
-    → обе lanes остаются OWUI-only (fail-closed, V8).
-    """
-    owner = str(sub.get("user_id") or "").strip()
-    if owner:
-        return owner
-    meta = sub.get("delivery_metadata")
-    if isinstance(meta, dict):
-        attr = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
-        return attr
-    return ""
-
-
-#: Telegram message-size floor under which a kanban terminal итог has no real
-#: content (F1, tg-delivery-contract): the legacy baked one-liners
-#: ``✅ Задача выполнена`` / ``❌ Задача не выполнена (нужен фикс): ...`` produce a
-#: ~20-80 char message with no summary and no artifacts.  Those are exactly the
-#: "голый итог" the owner banned — they must be SUPPRESSED in the OWUI→TG mirror
-#: (silence + journal), not delivered as a contentless ping.  A terminal итог is
-#: only worth a Telegram message when it carries meat: a real summary
-#: (>this many chars, from the completed event / kanban_complete.summary) OR at
-#: least one readable artifact attached as a file.  Success messages shorter than
-#: this are treated as bare; failure messages always carry the failing ids and
-#: stay usable (they start with '❌', never "✅ Задача выполнена").
-_OWUI_TG_BARE_ITOG_MAX_CHARS = 120
-
-#: Cap for the summary carried in the OWUI→TG mirror итог (F1).  The card
-#: body fixes "~2000 знаков" as the content budget for the terminal итог.
-_OWUI_TG_SUMMARY_MAX_CHARS = 2000
-
-#: Cap for mirrored root artifacts (F1).  Telegram's hard platform limit is
-#: 50 MB; the contract fixes a comfortable 25 MB ceiling so an oversized
-#: artifact is skipped with a warning instead of failing the whole delivery.
-#: Mirrors the watcher card body ("25MB cap, несуществующие файлы пропускать
-#: с warning, не ронять доставку текста").
-_OWUI_TG_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
-
-#: Text extensions whose FIRST artifACT of the root is both (a) attached as a
-#: file AND (b) inlined as a summary when the event summary itself is empty —
-#: the api_server-lane inline-report convention (see ``_owui_artifact_text``).
-_OWUI_TG_INLINE_REPORT_EXTS = frozenset({".md", ".txt", ".rst", ".log"})
-
-
-def _owui_root_final_summary(plan: dict, msg: str) -> str:
-    """Full итог text for the OWUI→TG branch mirror (F1, tg-delivery-contract).
-
-    The branch-summary watcher's ``msg`` is the short baked one-liner (``✅
-    Задача выполнена`` or the ❌ list).  For the Telegram mirror the owner's
-    contract demands CONTENT: a short summary (~2000 chars) from the root's
-    ``completed`` event (kanban_complete.summary) plus the root's artifacts.
-    This helper composes the best available итог:
-
-      1. The root's last ``completed`` event payload (first summary line is
-         already capped at 400 chars by kanban_db.complete_task; we take the
-         short summary up to ``_OWUI_TG_SUMMARY_MAX_CHARS`` from the run row
-         for the full text, falling back to the event's ``summary`` field).
-      2. If that summary is empty, the root's first inline text report
-         artifact (md/txt/rst/log) is inlined as a report — same convention
-         as ``_owui_branch_result_text`` / ``_owui_artifact_text`` on the
-         api_server lane.
-      3. The original short ``msg`` is kept only when neither produces real
-         content, so the mirror never fabricates text the worker didn't write.
-
-    Pure and side-effect free apart from a closed DB read; failures degrade to
-    ``msg`` so the delivery pipeline never breaks on data access.
-    """
-    from hermes_cli import kanban_db as _kb
-    import json as _json
-
-    root_id = plan.get("root_id")
-    if not root_id:
-        return msg
-    try:
-        conn = _kb.connect(board=plan.get("board"))
-        try:
-            # Full summary lives on the closing run row (first 400 chars of
-            # the summary also ride the event payload).  The run row carries
-            # the worker's full handoff; the event payload is the durable
-            # fallback when the run row was synthesized/short.
-            run = conn.execute(
-                "SELECT summary, metadata FROM task_runs "
-                "WHERE task_id=? AND outcome='completed' "
-                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-                (root_id,),
-            ).fetchone()
-            payload = None
-            if run is not None and run["summary"]:
-                summary_text = str(run["summary"]).strip()
-            else:
-                row = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id=? "
-                    "AND kind='completed' ORDER BY id DESC LIMIT 1",
-                    (root_id,),
-                ).fetchone()
-                if row and row[0]:
-                    payload = _json.loads(row[0])
-                summary_text = ""
-                if isinstance(payload, dict):
-                    s = payload.get("summary")
-                    if isinstance(s, str):
-                        summary_text = s.strip()
-            artifacts: list[str] = []
-            if isinstance(payload, dict):
-                raw = payload.get("artifacts")
-                if isinstance(raw, (list, tuple)):
-                    artifacts = [str(p) for p in raw if isinstance(p, str) and p.strip()]
-            # metadata["artifacts"] may also carry paths the run row promoted
-            # (complete_task merges prose artifacts into metadata before the
-            # payload is built) — prefer the event payload list, then the run
-            # metadata as an extra source.
-            run_artifacts: list[str] = []
-            if run is not None:
-                try:
-                    m = _json.loads(run["metadata"]) if run["metadata"] else {}
-                except (TypeError, ValueError):
-                    m = {}
-                if isinstance(m, dict):
-                    rawm = m.get("artifacts")
-                    if isinstance(rawm, (list, tuple)):
-                        run_artifacts = [str(p) for p in rawm if isinstance(p, str) and p.strip()]
-            for p in run_artifacts:
-                if p not in artifacts:
-                    artifacts.append(p)
-        finally:
-            conn.close()
-    except Exception:
-        return msg
-
-    parts: list[str] = []
-    # Header: keep the short baked итог line (``✅ Задача выполнена`` /
-    # ``❌ …нужен фикс``) so the mirror message still reads as "the branch
-    # closed" even when the handoff summary is short; the summary rides below.
-    parts.append(msg.strip() or "✅ Задача выполнена")
-    if summary_text:
-        parts.append(summary_text[:_OWUI_TG_SUMMARY_MAX_CHARS])
-    else:
-        # No handoff summary — inline the root's first report artifact text
-        # (the api_server-lane convention) so the TG message still has meat.
-        from hermes_cli.delivery_policy import sanitize_delivery_text
-
-        for raw in artifacts:
-            try:
-                p = Path(raw)
-                if not p.is_file() or p.suffix.lower() not in _OWUI_TG_INLINE_REPORT_EXTS:
-                    continue
-                if p.stat().st_size > _OWUI_ARTIFACT_MAX_BYTES:
-                    continue
-                text = p.read_text(encoding="utf-8", errors="replace")[:_OWUI_ARTIFACT_MAX_CHARS]
-                text = sanitize_delivery_text(text)
-                if text:
-                    parts.append(f"📄 Отчёт <b>{p.name}</b>:\n\n{text}")
-                    break
-            except (OSError, ValueError):
-                continue
-    full = "\n\n".join(parts).strip()
-    if not full or full == (msg or "").strip():
-        return msg
-    from hermes_cli.delivery_policy import sanitize_delivery_text
-    return sanitize_delivery_text(full, max_chars=8000)
-
-
-def _owui_tg_is_bare_itog(msg: str) -> bool:
-    """True when ``msg`` is a contentless terminal итог (F1).
-
-    A bare итог is the baked one-liner with no summary and no artifacts:
-    ``✅ Задача выполнена`` (and any generic success-under-``_OWUI_TG_
-    BARE_ITOG_MAX_CHARS``), while failure итоги (❌) always carry the failing
-    ids and stay usable.  The mirror suppresses these with a journal entry
-    instead of delivering a contentless ping to the owner's Telegram.
-    """
-    if not msg:
-        return True
-    return msg.startswith("✅") and len(msg.strip()) <= _OWUI_TG_BARE_ITOG_MAX_CHARS
-
-
-def _owui_root_artifact_paths(plan: dict) -> list[str]:
-    """Absolute readable artifact paths for the OWUI→TG mirror (F1).
-
-    Sources, in priority order:
-      1. ``artifacts[]`` on the root's last ``completed`` event payload
-         (kanban_complete(artifacts=...) promoted by complete_task).
-      2. ``metadata[\"artifacts\"]`` on the root's closing run row.
-      3. ``task_attachments`` rows for the root (files attached via
-         kanban_attach / kanban_attach_url).
-
-    Every candidate is verified to exist on disk; missing files are dropped
-    with a warning (the spec explicitly allows skipping nonexistent paths so
-    delivery of the text is never dropped).  Returns only files that
-    ``validate_media_delivery_path`` would also accept.
-    """
-    from hermes_cli import kanban_db as _kb
-    import json as _json
-
-    root_id = plan.get("root_id")
-    if not root_id:
-        return []
-    paths: list[str] = []
-    seen: set[str] = set()
-
-    def _add(raw) -> None:
-        if not isinstance(raw, str) or not raw.strip():
-            # F-4.4 (K1 red team H-4): a non-string/blank artifact entry is
-            # excluded from the OWUI→TG artifact list.  It was silently
-            # dropped — now it is observable at warn level so a missing
-            # attachment is diagnosable (the entry is still NOT delivered;
-            # only the diagnostic changes).
-            if not isinstance(raw, str):
-                logger.warning(
-                    "kanban branch summary: OWUI→TG artifact entry for root "
-                    "%s is non-string (%s) — skipped (was silent)",
-                    root_id, repr(raw)[:200],
-                )
-            return
-        try:
-            check = Path(os.path.expanduser(raw.strip()))
-        except (OSError, ValueError):
-            logger.warning(
-                "kanban branch summary: OWUI→TG artifact %r for root %s has "
-                "an invalid path — skipped (was silent)",
-                raw.strip(), root_id,
-            )
-            return
-        if not check.is_absolute():
-            logger.warning(
-                "kanban branch summary: OWUI→TG artifact %r for root %s is "
-                "not an absolute path — skipped (was silent)",
-                raw.strip(), root_id,
-            )
-            return
-        resolved = str(check.resolve(strict=False))
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        if not check.is_file():
-            logger.warning(
-                "kanban branch summary: OWUI→TG artifact %s for root %s "
-                "missing on disk — skipped",
-                raw.strip(), root_id,
-            )
-            return
-        try:
-            if check.stat().st_size > _OWUI_TG_ARTIFACT_MAX_BYTES:
-                logger.warning(
-                    "kanban branch summary: OWUI→TG artifact %s for root %s "
-                    "exceeds 25MB cap — skipped",
-                    raw.strip(), root_id,
-                )
-                return
-        except OSError:
-            pass
-        paths.append(resolved)
-
-    try:
-        conn = _kb.connect(board=plan.get("board"))
-        try:
-            row = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id=? "
-                "AND kind='completed' ORDER BY id DESC LIMIT 1",
-                (root_id,),
-            ).fetchone()
-            if row and row[0]:
-                try:
-                    payload = _json.loads(row[0])
-                except (TypeError, ValueError):
-                    payload = None
-                if isinstance(payload, dict):
-                    for p in payload.get("artifacts") or ():
-                        _add(p)
-            run = conn.execute(
-                "SELECT metadata FROM task_runs "
-                "WHERE task_id=? AND outcome='completed' "
-                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-                (root_id,),
-            ).fetchone()
-            if run is not None and run["metadata"]:
-                try:
-                    m = _json.loads(run["metadata"])
-                except (TypeError, ValueError):
-                    m = None
-                if isinstance(m, dict):
-                    for p in m.get("artifacts") or ():
-                        _add(p)
-            # task_attachments rows — durable per-task attachment blobs.
-            for att in _kb.list_attachments(conn, root_id):
-                _add(att.stored_path)
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning(
-            "kanban branch summary: could not enumerate root artifacts for "
-            "%s: %s", root_id, exc,
-        )
-        return paths
-    return paths
-
-
-def _branch_summary_owui_tg_lane(sub, plan: dict, msg: str, allowed_users: list,
-                                 *, home_channel: str = "") -> Optional[tuple]:
-    """Complementary OWUI→Telegram mirror for a kanban branch итог.
-
-    F7 do-implementation (t_ebc0a351): the branch-summary watcher delivers the
-    итог to every subscribed channel of a branch root.  For an OWUI mission the
-    root is subscribed ONLY via ``api_server`` (0 native telegram rows, verified
-    live in t_2a586264) — so the terminal итог never reached Telegram even when
-    the OWUI owner was server-bound via ``openwebui_telegram_users``.  This
-    lane mirrors F6 semantics: when the branch итог is TERMINAL (the whole
-    mission/root tree is closed, ``plan["terminal"]``), the SAME итог is also
-    sent to the owner's bound Telegram chat; when it is INTERMEDIATE (a
-    [split N/M] or one-off daughter branch whose ancestor mission is still
-    running), the Telegram mirror is suppressed with a journal entry
-    (reason=..., owui_to_tg=True).  The OWUI api_server PRIMARY lane is never
-    touched.
-
-    Returns:
-      * ``None`` — no Telegram lane: not an api_server subscription, policy
-        disabled, policy module unavailable (fail-closed), no binding for the
-        owner, or bound chat not in ALLOWED/home.  Mission stays OWUI-only.
-      * ``(decision, bound_chat, content)`` — ``decision.delivered`` → send
-        ``content["msg"]`` to Telegram ``bound_chat`` and attach
-        ``content["artifacts"]`` as files; ``decision.suppressed`` → already
-        journaled, do NOT send.  ``content`` always carries the enriched итог
-        message (summary, F1) and the root's artifact paths (empty when
-        suppressed).  ``verify_recipient`` enforces recipient == initiator
-        (ИНВ1); a foreign recipient is never delivered.  A TERMINAL итог with
-        NO summary and NO artifacts (the bare ``✅ Задача выполнена``) is
-        suppressed (F1) — never a contentless ping.
-    """
-    if str(sub.get("platform") or "").lower() != "api_server":
-        return None
-    try:
-        from hermes_cli.delivery_policy import (
-            InitiatorRef,
-            TargetRef,
-            classify,
-            default_context,
-            log_suppression,
-            owui_telegram_users,
-            policy_enabled,
-            verify_recipient,
-        )
-    except Exception as exc:
-        # Fail-closed: a broken policy module must not open a new lane.
-        logger.error(
-            "delivery-policy: module import failed (%s) — kanban branch summary "
-            "OWUI→TG lane FAIL-CLOSED (no lane)", exc,
-        )
-        return None
-    try:
-        if not policy_enabled():
-            return None
-        binding = owui_telegram_users() or {}
-    except Exception as exc:
-        # Fail-closed: конфиг/модуль недоступен — TG-ленту не добавляем.
-        logger.error(
-            "delivery-policy: policy_enabled()/owui_telegram_users() raised "
-            "(%s) — kanban branch summary OWUI→TG lane FAIL-CLOSED (no lane)",
-            exc,
-        )
-        return None
-    owner_id = str(_sub_owui_owner_id(sub)).strip()
-    if not owner_id:
-        return None
-    bound_chat = str(binding.get(owner_id) or "").strip()
-    if not bound_chat:
-        # Нет серверной привязки у владельца → OWUI-only (§8.3/V8).
-        return None
-    if not home_channel:
-        home_channel = os.environ.get("TELEGRAM_HOME_CHANNEL", "") or ""
-    # H-5 (red team t_d0bcecda): серверная привязка openwebui_telegram_users
-    # сама по себе — авторизация зеркала в СОБСТВЕННЫЙ bound-чат владельца
-    # подписки (allowed_users/home здесь НЕ используются как гейт — иначе
-    # второй/последующие привязанные пользователи голодают, когда ALLOWED/home
-    # настроены только на инициатора).  Изоляция остаётся в verify_recipient:
-    # доставляется только в exact bound-chat и только при реальной привязке.
-    initiator = InitiatorRef.from_origin({
-        "platform": "api_server",
-        "chat_id": sub.get("chat_id") or "",
-        "user_id": owner_id,
-        "thread_id": sub.get("thread_id") or "",
-    })
-    target = TargetRef.from_dict({
-        "platform": "telegram",
-        "chat_id": bound_chat,
-        "thread_id": None,
-    })
-    root_id = plan.get("root_id")
-    terminal = bool(plan.get("terminal"))
-    # F6-style terminal gate applied to the branch итог (t_ebc0a351): the
-    # OWUI→TG mirror carries ONLY the terminal итог of the whole mission/root
-    # tree.  An intermediate branch close ([split N/M], one-off daughter card,
-    # sub-branch of a still-running mission) is suppressed — journaled, never
-    # sent to the owner's Telegram — while the OWUI api_server PRIMARY lane is
-    # unaffected.  Same reason/detail as F6 (routine status close) so the
-    # suppression journal stays a single consistent audit stream.
-    if not terminal:
-        _suppr = _suppress_decision(
-            "routine status close",
-            detail=(
-                "intermediate branch summary — non-terminal mission tree "
-                "suppressed in OWUI→TG lane"
-            ),
-        )
-        log_suppression(
-            app="kanban",
-            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-            target=f"telegram:{bound_chat}",
-            decision=_suppr,
-            snippet=(msg or "")[:200],
-            extra={
-                "task_id": root_id,
-                "event_kind": "branch_summary",
-                "event_id": plan.get("marker_id") or 0,
-                "owui_to_tg": True,
-            },
-        )
-        logger.info(
-            "delivery-policy: OWUI→TG lane suppressed intermediate branch "
-            "summary for %s to telegram:%s (non-terminal mission tree)",
-            root_id, bound_chat,
-        )
-        return (_suppr, bound_chat, {"msg": msg, "artifacts": []})
-    ctx = default_context(
-        kind="kanban",
-        initiator=initiator,
-        target=target,
-        home_channel=home_channel,
-        allowed_users=allowed_users,
-        owui_to_tg=binding,
-        event_kind="branch_summary",
-        artifacts=[],
-        has_media=False,
-        completed_terminal=True,
-        no_agent=False,
-    )
-    # F1 do-implementation (tg-delivery-contract): a TERMINAL branch итог must
-    # carry CONTENT in the OWUI→TG mirror — a short summary (~2000 chars) from
-    # the root's completed event / kanban_complete.summary plus the root's
-    # artifacts attached as files.  The legacy baked one-liner ``✅ Задача
-    # выполнена`` (no summary, no artifacts) is exactly the "голый итог" the
-    # owner banned: it is SUPPRESSED entirely (silence in TG) and journaled,
-    # never sent as a contentless ping.  Failure итоги (❌ …нужен фикс) carry
-    # the failing ids and stay usable — they are delivered with the summary
-    # enrichment when available.
-    deliver_msg = _owui_root_final_summary(plan, msg)
-    root_artifacts = _owui_root_artifact_paths(plan)
-    # Payload rider (t_f659bef2, D0 D2/A4): the branch_summary marker may also
-    # carry an explicit artifact list (``plan['artifacts']``, currently None
-    # on the marker; sources that may be added later).  Merge any plan-level
-    # artifact paths so the OWUI→TG mirror honours paths riders put directly
-    # on the plan payload — parity with the native-TG lane.  Every candidate
-    # is re-validated (absolute, exists, 25MB cap) so nothing unverified ever
-    # reaches `_deliver_kanban_artifacts`.
-    _plan_arts = plan.get("artifacts") or []
-    if isinstance(_plan_arts, (list, tuple)):
-        for _pa in _plan_arts:
-            if not isinstance(_pa, str) or not _pa.strip():
-                continue
-            if _pa.strip() in root_artifacts:
-                continue
-            try:
-                _check = Path(os.path.expanduser(_pa.strip()))
-            except (OSError, ValueError):
-                continue
-            if not _check.is_absolute() or not _check.is_file():
-                logger.warning(
-                    "kanban branch summary: OWUI→TG plan artifact %s for root %s "
-                    "missing on disk — skipped",
-                    _pa.strip(), root_id,
-                )
-                continue
-            try:
-                if _check.stat().st_size > _OWUI_TG_ARTIFACT_MAX_BYTES:
-                    logger.warning(
-                        "kanban branch summary: OWUI→TG plan artifact %s for "
-                        "root %s exceeds 25MB cap — skipped",
-                        _pa.strip(), root_id,
-                    )
-                    continue
-            except OSError:
-                pass
-            root_artifacts.append(str(_check.resolve(strict=False)))
-    # Bare = the delivered text is still the contentless one-liner (no summary
-    # was found to enrich it — ``_owui_root_final_summary`` returns ``msg``
-    # verbatim) AND there are no file artifacts to attach.  A short-but-real
-    # summary (``deliver_msg != msg``) always counts as content.
-    bare_itog = (
-        deliver_msg == msg
-        and _owui_tg_is_bare_itog(msg)
-        and not root_artifacts
-    )
-    if bare_itog:
-        _suppr = _suppress_decision(
-            "bare terminal итог without content",
-            detail=(
-                "terminal branch summary has no summary and no artifacts — "
-                "suppressed in OWUI→TG lane (owner contract F1)"
-            ),
-        )
-    else:
-        _suppr = None
-    decision = _suppr or classify(
-        deliver_msg, {**ctx, "artifacts": root_artifacts},
-    )
-    if not decision.suppressed:
-        if verify_recipient(
-            initiator, target,
-            home_channel=home_channel,
-            allowed_users=allowed_users,
-            owui_to_tg=binding,
-        ):
-            return (decision, bound_chat, {
-                "msg": deliver_msg,
-                "artifacts": root_artifacts,
-            })
-        decision = _suppress_decision(
-            "recipient mismatch",
-            detail=f"cross-platform api_server→telegram target={bound_chat}",
-        )
-    log_suppression(
-        app="kanban",
-        who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-        target=f"telegram:{bound_chat}",
-        decision=decision,
-        snippet=(deliver_msg or "")[:200],
-        extra={
-            "task_id": root_id,
-            "event_kind": "branch_summary",
-            "event_id": plan.get("marker_id") or 0,
-            "owui_to_tg": True,
-            "artifact_count": len(root_artifacts),
-        },
-    )
-    # Suppressed — no content for the owner's Telegram.  Return the enriched
-    # message and artifact list so the caller CANNOT deliver a bare ping: if
-    # ``bare_itog`` the message stays the short one-liner but the decision is
-    # suppressed, and the caller only sends when the decision is NOT suppressed.
-    return (decision, bound_chat, {
-        "msg": deliver_msg,
-        "artifacts": root_artifacts,
-    })
-
-
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
@@ -1956,6 +654,13 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+
+        # R2 fix (t_702c62f2): the claim set must match the engine's own
+        # ENGINE_CLAIM_KINDS (which adds ``spawned``/``claimed`` for
+        # live-status).  The legacy TERMINAL_KINDS below filtered those out,
+        # so live-status events were never delivered to DeliveryEngine and
+        # delivery_live_status stayed empty.
+        from gateway.delivery_engine import ENGINE_CLAIM_KINDS as _ENGINE_CLAIM_KINDS
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -2190,7 +895,6 @@ class GatewayKanbanWatchersMixin:
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
-                            replace_summary = _kanban_branch_summary_replace()
                             subscribed_ids = {str(sub.get("task_id")) for sub in subs}
                             for sub in subs:
                                 try:
@@ -2216,7 +920,7 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=_ENGINE_CLAIM_KINDS,
                                     )
                                     if not events:
                                         continue
@@ -2228,7 +932,7 @@ class GatewayKanbanWatchersMixin:
                                     # wake. The events stay CLAIMED so the
                                     # cursor advances past them below (same
                                     # non-replay semantics as the `silent`
-                                    # branch_summary_replace skip) — they can
+                                    # descendant replace-mode skip) — they can
                                     # never wedge the subscription.
                                     do_not_deliver = _task_do_not_deliver(task)
                                     # K1 RF2/RF3: expose branch-root marker and
@@ -2282,20 +986,19 @@ class GatewayKanbanWatchersMixin:
                                             task_tg_owner = _kanban_branch_tg_owner(
                                                 conn, _kb, _top,
                                             )
-                                    # branch_summary_replace mode: tasks that
-                                    # are a strict descendant of a subscribed
-                                    # branch root have their individual pings
+                                    # branch_summary_replace semantics are the
+                                    # SINGLE behavior (R0(в) 10): tasks that are
+                                    # a strict descendant of a subscribed branch
+                                    # root have their individual pings
                                     # suppressed — the whole-branch итог
                                     # (delivered by
                                     # _kanban_branch_summary_watcher) is the
-                                    # single channel message. compute once per
+                                    # single channel message. computed once per
                                     # subscription.
-                                    silent = False
-                                    if replace_summary:
-                                        silent = any(
-                                            pid in subscribed_ids
-                                            for pid in _kb.parent_ids(conn, sub["task_id"])
-                                        )
+                                    silent = any(
+                                        pid in subscribed_ids
+                                        for pid in _kb.parent_ids(conn, sub["task_id"])
+                                    )
                                     # P2 (t_ecab4990): does the completing card
                                     # still have NON-terminal descendants
                                     # (children/sub-branches alive)? When yes,
@@ -2320,7 +1023,7 @@ class GatewayKanbanWatchersMixin:
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
-                                        " (silent: branch_summary_replace)" if silent else "",
+                                        " (silent: descendant replace-mode)" if silent else "",
                                     )
                                     deliveries.append({
                                         "sub": sub,
@@ -2330,7 +1033,6 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "silent": silent,
-                                        "replace_summary": replace_summary,
                                         "do_not_deliver": do_not_deliver,
                                         "task_is_root": task_is_root,
                                         "mission_live": mission_live,
@@ -2410,7 +1112,7 @@ class GatewayKanbanWatchersMixin:
                         wake_agent = False
                         send_passive = False
                     elif d.get("silent"):
-                        # silent (branch_summary_replace): the branch итог is
+                        # silent (replace-mode descendant): the branch итог is
                         # the single channel MESSAGE, so no per-event text
                         # ping. Human-action kinds (blocked+provider_route,
                         # block_loop_detected, triage, terminal failures) are
@@ -2424,851 +1126,290 @@ class GatewayKanbanWatchersMixin:
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
-                    # exists on the board.
+                    # exists on the board. The engine's [final]/[needs-decision]
+                    # wake callback reuses this surface.
                     wake_handoff = ""
-                    # TG delivery-policy gate (D0 F1): allowed users and the
-                    # set of event ids suppressed for THIS subscription, so the
-                    # wake computation below never wakes on a suppressed event.
-                    _tg_allowed = _tg_delivery_policy_allowed_users()
-                    _tg_suppressed_event_ids: set = set()
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        # Legacy branch_summary_replace suppression: a strict
-                        # DESCENDANT of a subscribed branch root is claimed +
-                        # silent in the notifier — the whole-branch итог (from
-                        # _kanban_branch_summary_watcher) is the single channel
-                        # message. This legacy rule is deliberately kept OUT of
-                        # the api_server lane: there the canonical predicate
-                        # below is the sole suppression authority, so loud
-                        # human-action kinds (blocked+provider_route,
-                        # block_loop_detected, review_requested, triage) on
-                        # api_server descendants are NOT blanket-dropped here.
-                        # For the telegram lane the SAME wake-worthy human-action
-                        # events must still reach the per-event wake path below:
-                        # they skip the silent-descendant text suppression (their
-                        # channel message stays suppressed — branch итог owns
-                        # it) but are NOT skipped outright, so the creator is
-                        # woken for "needs you now" events (see
-                        # should_wake_agent_for_event).
-                        if ((d.get("silent")
-                             and kind in TERMINAL_KINDS
-                             and platform_str != "api_server"
-                             and not should_wake_agent_for_event(
-                                 ev,
-                                 card=task,
-                                 parent=None,
-                                 branch_summary_replace=bool(
-                                     d.get("replace_summary")
-                                 ),
-                             ))
-                                or d.get("do_not_deliver")):
-                            # silent (branch_summary_replace): routine
-                            # intermediate closes have no channel message and
-                            # no wake — the branch итог owns the single
-                            # message+wake. do_not_deliver: synthetic readback
-                            # cards are never delivered. Either way the event
-                            # is claimed so the cursor advances below and it
-                            # can never replay/wedge the sub.
-                            continue
-                        # api_server lane in branch_summary_replace mode: the
-                        # canonical predicate is the sole suppression
-                        # authority. An intermediate state change (plain
-                        # completed/status/archived/unblocked, self-resolving
-                        # blocked on ANY card — child, root, or unsubscribed)
-                        # stays claimed+silent — the branch итог from
-                        # _kanban_branch_summary_watcher is the single channel
-                        # message, and human-action kinds (blocked with
-                        # provider_route / needs_input / capability,
-                        # block_loop_detected, review_requested, triage) are
-                        # kept loud by the predicate. Nothing is staged to the
-                        # OWUI outbox and the OWUI→TG mirror is skipped (the
-                        # same event must not leak to TG either). ``task`` (the
-                        # subscribed card, loaded above) is passed as ``card``
-                        # so the card-status==triage rule is meaningful;
-                        # ``parent`` is not needed at this call site (the
-                        # predicate decides on kind/payload/card-status alone
-                        # in replace mode).
-                        if (platform_str == "api_server"
-                                and should_suppress_api_server_event(
-                                    ev,
-                                    card=task,
-                                    parent=None,
-                                    branch_summary_replace=bool(
-                                        d.get("replace_summary")
-                                    ),
-                                )):
-                            continue
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                try:
-                                    # RESULT-BLOCK: показать первую FACTS-строку
-                                    # (компактная сводка) вместо сырого "RESULT-BLOCK v1".
-                                    from hermes_cli.handoff_result_block import chat_line as _hrb_chat
-                                    h = _hrb_chat(payload_summary) or payload_summary
-                                except Exception:
-                                    h = payload_summary
-                                if len(h) > 200:
-                                    h = h[:200]
-                                handoff = f"\n{h}"
-                                wake_handoff = h
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                                wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                if ev.payload.get("provider_route"):
-                                    # A provider outage requires an actual
-                                    # operator choice. Never truncate the
-                                    # question before the alternative is shown.
-                                    reason = f": {str(ev.payload['reason'])[:500]}"
-                                    wake_handoff = str(ev.payload["reason"])[:500]
-                                else:
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        elif kind == "review_requested":
-                            # Implementation complete; task moved to the
-                            # first-class review lane. Wake the origin thread.
-                            handoff = ""
-                            if ev.payload and ev.payload.get("summary"):
-                                try:
-                                    # RESULT-BLOCK: компактная сводка из FACTS.
-                                    from hermes_cli.handoff_result_block import chat_line as _hrb_chat
-                                    handoff = f"\n{(_hrb_chat(str(ev.payload['summary'])) or str(ev.payload['summary']))[:200]}"
-                                except Exception:
-                                    handoff = f"\n{str(ev.payload['summary'])[:200]}"
-                            msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "block_loop_detected":
-                            # A task re-blocked for the same cause past the
-                            # recurrence limit and was routed to `triage` for a
-                            # human decision. This is the ONE transition that
-                            # exists to force human attention, yet it emits no
-                            # `blocked`/`status` event — so before adding it to
-                            # TERMINAL_KINDS it produced zero notification and
-                            # the task stalled in triage silently. Ping loudly.
-                            reason = ""
-                            recurrences = None
-                            if ev.payload:
-                                if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
-                                recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
-                            msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
-                            )
-                        else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
-                            continue
 
-                        # Reasoning / interim hygiene (F1): strip model-internal
-                        # reasoning_content and condense long "сейчас сделаю…"
-                        # interim plans from the text that reaches OWUI (api_server)
-                        # and Telegram — the generic notifier message is the shared
-                        # payload for BOTH lanes. Pure, non-throwing; normal short
-                        # summaries pass through untouched.
-                        from hermes_cli.delivery_policy import sanitize_delivery_text
-                        msg = sanitize_delivery_text(msg, max_chars=1600)
-
-                        # TG delivery-policy gate (D0 F1, ИНВ1/ИНВ2): skip
-                        # recipient-mismatched and routine telegram events
-                        # (text send AND wake). api_server events are handled
-                        # in their own branch below — the gate never applies
-                        # to them (server-owned registry verifies them).
-                        _tg_policy = _tg_notify_policy_decision(
-                            sub, ev, kind, msg, task, _tg_allowed,
-                            task_is_root=d.get("task_is_root"),
-                            mission_live=bool(d.get("mission_live")),
-                            task_tg_owner=d.get("task_tg_owner") or "",
+                    # -------- R1 delivery engine wiring (single policy) --------
+                    # The engine owns classification, render, dual-lane dispatch
+                    # and wake decisions for every claimed event. The notifier
+                    # keeps only cursor mechanics (claim/rewind/advance) and the
+                    # per-sub push-failure budget.
+                    from gateway.delivery_engine import (
+                        DeliveryEngine as _DeliveryEngine,
+                        ENGINE_CLAIM_KINDS as _ENGINE_CLAIM_KINDS,
+                    )
+                    from gateway.config import Platform as _Platform
+                    # Instance-level hooks (NOT class-dict lambdas): a lambda
+                    # declared in the class dict binds as an instance method,
+                    # so ``resolve_tg_adapter(sub)`` receives two positional
+                    # args (self+sub) and raises TypeError on every live-status
+                    # tick.  Assigning to the instance keeps the 1-arg shape
+                    # and lets ``ensure_live_status`` resolve the TG adapter
+                    # (and thus reuse the saved message_id after a restart).
+                    # Empty class: all hooks are assigned per-instance below
+                    # (never in the class dict, which would bind lambdas as
+                    # instance methods and break the 1-arg call shape).
+                    _engine_hooks = type("EngineHooks", (), {})()
+                    _engine_hooks.resolve_tg_adapter = (
+                        lambda _sub: self._authorization_adapter(
+                            _Platform.TELEGRAM,
+                            (_sub or {}).get("notifier_profile") or sub_profile or None,
                         )
-                        if _tg_policy is not None and _tg_policy.suppressed:
-                            _tg_suppressed_event_ids.add(getattr(ev, "id", None))
-                            logger.info(
-                                "kanban notifier: telegram event %s for %s suppressed by delivery policy (%s)",
-                                kind, sub["task_id"],
-                                _tg_policy.reason or "unspecified",
-                            )
-                            continue
+                    )
+                    engine = _DeliveryEngine(hooks=_engine_hooks)
+                    engine._tg_adapter = self._authorization_adapter(
+                        _Platform.TELEGRAM, sub_profile or None,
+                    )
+                    try:
+                        from hermes_cli.delivery_policy import owui_telegram_users
+                        engine.owui_to_tg = dict(owui_telegram_users()) or {}
+                    except Exception:
+                        engine.owui_to_tg = {}
+                    ENGINE_CLAIM_KINDS = _ENGINE_CLAIM_KINDS
 
-                        delivery_metadata = sub.get("delivery_metadata")
-                        metadata: dict[str, Any] = (
-                            dict(delivery_metadata)
-                            if isinstance(delivery_metadata, dict)
-                            else {}
-                        )
-
-                        if sub.get("thread_id") and not metadata.get("thread_id"):
-                            metadata["thread_id"] = sub["thread_id"]
-                        if platform_str == "api_server":
-                            if kind == "completed":
-                                # The persisted chat message is the ONLY surface
-                                # for the api_server result — embed the full
-                                # summary + report artifact inline instead of the
-                                # short notifier excerpt.
-                                msg = _owui_completed_text(
-                                    sub["task_id"], title, ev.payload or {}, msg,
-                                )
-                            # A claimed cursor is only provisional. Stage one
-                            # exact event and wait for server-owned chat readback
-                            # before letting the cursor move. Repeated ticks
-                            # never create another message/agent turn.
-                            from hermes_constants import get_hermes_home
-                            from gateway.kanban_origin_delivery import stage_terminal
-                            _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
-                            _state = "unbound"
-                            if _registry and (not sub_profile or sub_profile == notifier_profile):
-                                _state, _delivery_id = await asyncio.to_thread(
-                                    stage_terminal,
-                                    get_hermes_home() / "delivery-outbox.sqlite",
-                                    _registry, sub, sub_profile or notifier_profile,
-                                    board_slug or "default", ev.id, msg,
-                                )
-                            if _state != "acknowledged":
-                                _stage_key = (sub["task_id"], ev.id)
-                                _stage_fails = api_stage_counts.get(_stage_key, 0) + 1
-                                api_stage_counts[_stage_key] = _stage_fails
-                                # Every non-acknowledged result counts toward
-                                # one budget — pending (staged, awaiting
-                                # server-owned readback that normally lands next
-                                # tick) AND failed/unbound. Dropping past a
-                                # pending event is lossless: the row is already
-                                # persisted in the outbox and the delivery
-                                # worker performs the actual chat-write/ack
-                                # independently of this notifier cursor.
-                                if _stage_fails >= MAX_API_STAGE_RETRIES:
-                                    logger.warning(
-                                        "kanban notifier: exact api_server event %s/%s "
-                                        "stuck at delivery %s after %d ticks; dropping "
-                                        "event (cursor advances, row stays in outbox)",
-                                        sub["task_id"], ev.id, _state, _stage_fails,
-                                    )
-                                    api_stage_counts.pop(_stage_key, None)
-                                    await _to_thread_process_service(
-                                        self._kanban_advance, sub, d["cursor"], board_slug,
-                                    )
-                                else:
-                                    logger.warning(
-                                        "kanban notifier: exact api_server event %s/%s "
-                                        "delivery %s; cursor retained (attempt %d/%d)",
-                                        sub["task_id"], ev.id, _state,
-                                        _stage_fails, MAX_API_STAGE_RETRIES,
-                                    )
-                                    await _to_thread_process_service(
-                                        self._kanban_rewind, sub, d["cursor"],
-                                        d.get("old_cursor", 0), board_slug,
-                                    )
-                                break
-                            api_stage_counts.pop((sub["task_id"], ev.id), None)
-                            # Non-RGZ/OWUI mission (T2 parity, спека §8.2.2/
-                            # §8.3): the exact-owner api_server staging above
-                            # is the PRIMARY lane.  When the OWUI owner is
-                            # server-bound to a Telegram chat in ALLOWED/HOME,
-                            # ALSO evaluate a Telegram delivery of the SAME
-                            # text to the bound chat through the SAME RGZ
-                            # classifier.  Routine/status-flip events are
-                            # suppressed with a journal entry; the lane is
-                            # fail-closed and never delivers to a foreign
-                            # recipient (verify_recipient ИНВ1).
-                            try:
-                                _tg_lane = _tg_owui_dual_lane(
-                                    sub, ev, kind, msg, task, _tg_allowed,
-                                    task_is_root=d.get("task_is_root"),
-                                    mission_live=bool(d.get("mission_live")),
-                                    has_open_descendants=bool(
-                                        d.get("has_open_descendants")
-                                    ),
-                                )
-                            except Exception as _lane_exc:
-                                logger.warning(
-                                    "kanban notifier: OWUI→TG lane for %s/%s failed: %s",
-                                    sub["task_id"], ev.id, _lane_exc,
-                                )
-                                _tg_lane = None
-                            if _tg_lane is not None:
-                                _tg_decision, _tg_bound_chat = _tg_lane
-                                if not _tg_decision.suppressed:
-                                    # F2 (t_a14f7e23): for human-action block
-                                    # events (blocked / needs_input /
-                                    # capability / block_loop_detected) the
-                                    # OWUI→TG mirror carries the owner-facing
-                                    # «требует решения: <заголовок> + краткая
-                                    # причина» text AND is deduped by
-                                    # (task, kind, cause) with a cooldown — a
-                                    # worker re-blocking the same task for the
-                                    # same cause must not spam the owner's TG.
-                                    # The dedup gate runs BEFORE the send; the
-                                    # marker is written only after a real
-                                    # delivery so a transient send failure can
-                                    # retry next tick.
-                                    _is_human_block = (
-                                        kind in _OWUI_TG_HUMAN_BLOCK_KINDS
-                                    )
-                                    _f2_due = True
-                                    if _is_human_block:
-                                        # The DB connection used during
-                                        # collection is closed before the async
-                                        # delivery loop; open a short-lived
-                                        # board-scoped connection for the dedup
-                                        # marker (F2). Best-effort: if the DB is
-                                        # unavailable, fail-open and deliver
-                                        # (dedup is a hygiene nicety, never a
-                                        # delivery blocker).
-                                        _f2_conn = None
-                                        try:
-                                            from hermes_cli import kanban_db as _f2_kb
-                                            _f2_conn = _f2_kb.connect(
-                                                board=board_slug or "default"
-                                            )
-                                            _f2_due = _owui_tg_block_mirror_due(
-                                                _f2_conn, sub, ev, kind,
-                                            )
-                                        except Exception as _f2_exc:
-                                            logger.debug(
-                                                "kanban notifier: F2 block-dedup "
-                                                "probe failed for %s: %s",
-                                                sub["task_id"], _f2_exc,
-                                            )
-                                            _f2_due = True
-                                        finally:
-                                            if _f2_conn is not None:
-                                                try:
-                                                    _f2_conn.close()
-                                                except Exception:
-                                                    pass
-                                    if not _f2_due:
-                                        logger.info(
-                                            "kanban notifier: OWUI→TG block "
-                                            "mirror for %s suppressed (already "
-                                            "mirrored within cooldown, kind=%s)",
-                                            sub["task_id"], kind,
-                                        )
-                                    else:
-                                        _tg_adapter = self._authorization_adapter(
-                                            _Platform.TELEGRAM, sub_profile or None,
-                                        )
-                                        if _tg_adapter is not None:
-                                            try:
-                                                if _is_human_block:
-                                                    _tg_msg = _owui_tg_block_mirror_text(
-                                                        sub, ev, kind, task, msg,
-                                                    )
-                                                else:
-                                                    _tg_msg = msg
-                                                _tg_send_res = await _tg_adapter.send(
-                                                    _tg_bound_chat, _tg_msg, metadata={},
-                                                )
-                                                if getattr(_tg_send_res, "success", True) is False:
-                                                    # Complementary best-effort lane:
-                                                    # a TG transport failure must NOT
-                                                    # rewind the OWUI cursor (the
-                                                    # primary lane already staged and
-                                                    # ACKed) — log for observability.
-                                                    logger.warning(
-                                                        "kanban notifier: OWUI→TG lane send to telegram:%s reported failure: %s",
-                                                        _tg_bound_chat,
-                                                        getattr(_tg_send_res, "error", None) or "unknown error",
-                                                    )
-                                                else:
-                                                    logger.debug(
-                                                        "kanban notifier: OWUI→TG lane delivered %s event for %s to telegram:%s on board %s",
-                                                        kind, sub["task_id"],
-                                                        _tg_bound_chat, board_slug,
-                                                    )
-                                                    if _is_human_block:
-                                                        # Record the once-per-
-                                                        # cooldown claim (F2).
-                                                        # Open a short-lived
-                                                        # board-scoped connection
-                                                        # (collection conn is
-                                                        # closed before the
-                                                        # delivery loop).
-                                                        _mk_conn = None
-                                                        try:
-                                                            from hermes_cli import kanban_db as _f2_kb
-                                                            _mk_conn = _f2_kb.connect(
-                                                                board=board_slug or "default"
-                                                            )
-                                                            _owui_tg_mark_block_mirror(
-                                                                _mk_conn, sub, ev, kind,
-                                                                chat=_tg_bound_chat,
-                                                            )
-                                                        except Exception as _mk_exc:
-                                                            logger.debug(
-                                                                "kanban notifier: OWUI→TG block mirror marker for %s failed: %s",
-                                                                sub["task_id"], _mk_exc,
-                                                            )
-                                                        finally:
-                                                            if _mk_conn is not None:
-                                                                try:
-                                                                    _mk_conn.close()
-                                                                except Exception:
-                                                                    pass
-                                                if kind == "completed":
-                                                    # Native artifact upload for the
-                                                    # TG lane, mirroring the telegram
-                                                    # branch below. Best-effort: a
-                                                    # failure must not fail the send.
-                                                    try:
-                                                        await self._deliver_kanban_artifacts(
-                                                            adapter=_tg_adapter,
-                                                            chat_id=_tg_bound_chat,
-                                                            metadata={},
-                                                            event_payload=getattr(ev, "payload", None),
-                                                            task=task,
-                                                        )
-                                                    except Exception as _art_exc:
-                                                        logger.debug(
-                                                            "kanban notifier: OWUI→TG artifact delivery for %s failed: %s",
-                                                            sub["task_id"], _art_exc,
-                                                        )
-                                            except Exception as _tg_exc:
-                                                logger.warning(
-                                                    "kanban notifier: OWUI→TG send failed for %s to telegram:%s: %s",
-                                                    sub["task_id"], _tg_bound_chat, _tg_exc,
-                                                )
-                            continue
-                        # Adapters with no push channel (the API server —
-                        # ``supports_async_delivery = False``) can NEVER
-                        # satisfy a text-send: ``send()`` always reports
-                        # SendResult(success=False) by design (see
-                        # ApiServerAdapter.send()). Treating that as a
-                        # delivery failure would rewind/drop the subscription
-                        # forever and — because the wake dispatch below lives
-                        # in this loop's ``else`` clause — would also make the
-                        # wake-on-completion path (the actual fix for the
-                        # api_server wrong-session bug) unreachable. So for
-                        # non-push adapters, skip the doomed send attempt
-                        # entirely: there is nothing to text-notify, the
-                        # creator is woken via the self-post below instead.
-                        from gateway.wake import adapter_supports_push
-
-                        if not adapter_supports_push(adapter) and wake_agent:
-                            logger.debug(
-                                "kanban notifier: adapter %s has no push "
-                                "channel; skipping text ping for %s, relying "
-                                "on wake self-post instead",
-                                platform_str, sub["task_id"],
-                            )
-                            # Do NOT reset the failure counter here: on this
-                            # path the wake self-post below IS the delivery,
-                            # so the counter is resolved (reset or bumped) by
-                            # the self-post outcome, not by skipping the send.
-                            continue
+                    # Push send with the subscription's failure budget.
+                    async def _engine_send_tg(tg_adapter, chat_id, text):
+                        nonlocal sub_fail_counts
                         if not send_passive:
-                            # Wake-only subscriptions intentionally skip the
-                            # visible platform message. The retained wake path
-                            # below is the sole delivery — the failure counter
-                            # is resolved (reset or bumped) by the wake
-                            # outcome there, not by skipping the send here.
-                            continue
+                            return None
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _res = await tg_adapter.send(
+                                chat_id, text, metadata={},
                             )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
-                            if getattr(_send_res, "success", True) is False:
-                                raise RuntimeError(
-                                    "adapter send() reported failure: "
-                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
-                                )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                        except Exception as _send_exc:
+                            logger.warning(
+                                "kanban notifier: TG send for %s to telegram:%s failed: %s",
+                                sub["task_id"], chat_id, _send_exc,
                             )
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
-                                try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
-                                    )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
-                        except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
-                            )
+                            return None
+                        if not getattr(_res, "success", True):
+                            fails = sub_fail_counts.get(sub_key, 0) + 1
+                            sub_fail_counts[sub_key] = fails
                             if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
-                                    sub["task_id"], platform_str, fails,
+                                logger.error(
+                                    "kanban notifier: dropping subscription %s on telegram:%s after %d consecutive failures",
+                                    sub["task_id"], chat_id, fails,
                                 )
-                                await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
-                            else:
                                 await _to_thread_process_service(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
+                                    self._kanban_unsub, sub, board_slug,
                                 )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
-                            break
-                    else:
-                        # All text pings delivered (or intentionally skipped
-                        # for non-push adapters, whose delivery is the wake
-                        # self-post below). Whether the cursor may advance now
-                        # depends on the adapter class:
-                        #
-                        # * push-capable: the text send WAS the delivery, so
-                        #   advance immediately (pre-existing behavior); the
-                        #   wake injection below stays best-effort.
-                        # * non-API adapters without a push channel retain the
-                        #   historical best-effort wake path. API server events
-                        #   are handled above: only outbox readback ACK advances
-                        #   their claimed cursor, never an HTTP self-post.
-                        task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = (
+                                sub_fail_counts.pop(sub_key, None)
+                            return None
+                        sub_fail_counts.pop(sub_key, None)
+                        return _res
+
+                    async def _engine_edit_tg(tg_adapter, chat_id, msg_id, text):
+                        try:
+                            return await tg_adapter.edit_message(
+                                chat_id, msg_id, text,
+                            )
+                        except Exception as _edit_exc:
+                            logger.debug(
+                                "delivery engine: TG edit of %s/%s failed: %s",
+                                chat_id, msg_id, _edit_exc,
+                            )
+                            return None
+
+                    # Hooks for the live-status path (engine.ensure_live_status
+                    # falls back to hooks when it is not given explicit
+                    # send/edit callables).  Same functions handle_event uses
+                    # for the publish lanes, so the first-send message_id is
+                    # recorded and later ticks edit it in place.
+                    _engine_hooks.edit_tg = _engine_edit_tg
+                    _engine_hooks.send_tg = _engine_send_tg
+
+                    def _engine_stage_owui(msg_text: str = ""):
+                        # api_server lane: stage the exact event into the
+                        # persisted outbox. Only a bound registry may ack.
+                        from hermes_constants import get_hermes_home
+                        from gateway.kanban_origin_delivery import stage_terminal
+                        _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                        if (
+                            not _registry
+                            or (sub_profile and sub_profile != notifier_profile)
+                            or not ev_id
+                        ):
+                            return "unbound", None
+                        return stage_terminal(
+                            get_hermes_home() / "delivery-outbox.sqlite",
+                            _registry, sub, sub_profile or notifier_profile,
+                            board_slug or "default", int(ev_id),
+                            msg_text or "✅ Задача выполнена",
+                        )
+
+                    def _engine_render_owui(task_id: str, title_text: str, msg_text: str) -> str:
+                        """Render the OWUI-lane staging text: title + summary + artifacts."""
+                        return _owui_completed_text(
+                            task_id, title_text, getattr(ev, "payload", None) or {}, msg_text,
+                        )
+
+                    async def _engine_wake(*, text: str = "") -> None:
+                        """Wake the creator on [final]/[needs-decision] (engine rule)."""
+                        # Reuse the graph-safe wake surface: for push adapters
+                        # deliver_wake builds the session scope from the sub row.
+                        from gateway.wake import adapter_supports_push as _adapter_push_ok2
+                        if not _adapter_push_ok2(adapter):
+                            return  # api_server: outbox persist is the wake
+                        _WAKE_KINDS = (ev.kind,) if ev.kind in (
                             "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "block_loop_detected", "review_requested",
+                            "blocked", "needs_input", "capability",
+                            "block_loop_detected", "review_requested",
+                        ) else ()
+                        if not _WAKE_KINDS:
+                            return
+                        await _engine_push_wake()
+                    # TG delivery-policy gate (D0 F1): allowed users, used by
+                    # the wake computation below so it never wakes on a
+                    # suppressed event.  Recipient policy itself lives in the
+                    # platform authz layer (TELEGRAM_ALLOWED_USERS) — the
+                    # legacy per-event gate was absorbed by the delivery
+                    # engine.
+                    try:
+                        _tg_allowed = [
+                            p.strip()
+                            for p in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+                            if p.strip()
+                        ]
+                    except Exception:
+                        _tg_allowed = []
+                    _tg_suppressed_event_ids: set = set()
+                    async def _engine_push_wake() -> None:
+                        from gateway.session import SessionSource
+                        from gateway.wake import deliver_wake
+                        _chat_type = str(sub.get("chat_type") or "").strip()
+                        if not _chat_type:
+                            _delivery_meta = sub.get("delivery_metadata")
+                            if isinstance(_delivery_meta, dict):
+                                _chat_type = str(
+                                    _delivery_meta.get("chat_type") or ""
+                                ).strip()
+                        _chat_type = _chat_type or "group"
+                        _source = SessionSource(
+                            platform=plat,
+                            chat_id=sub["chat_id"],
+                            chat_type=_chat_type,
+                            thread_id=sub.get("thread_id") or None,
+                            user_id=sub.get("user_id"),
+                            user_id_alt=sub.get("user_id_alt"),
+                            profile=sub_profile or None,
+                            scope_id=_wake_scope_id(adapter, sub),
                         )
-                        # Wake gate (branch_summary_replace): only terminal
-                        # branch итоги and genuine human-action events wake the
-                        # creator. Intermediate closes of a mission tree (child
-                        # completions, [split N/M], routine status/blocked) are
-                        # claimed+advanced but NEVER wake the agent — the single
-                        # trunk message for the mission is the branch_summary
-                        # wake delivered by _kanban_branch_summary_watcher.
-                        _wake_kinds = (
-                            {
-                                ev.kind
-                                for ev in d["events"]
-                                if ev.kind in _WAKE_KINDS
-                                and should_wake_agent_for_event(
-                                    ev,
-                                    card=task,
-                                    parent=None,
-                                    branch_summary_replace=bool(
-                                        d.get("replace_summary")
-                                    ),
-                                )
-                                and getattr(ev, "id", None) not in _tg_suppressed_event_ids
-                            }
-                            if wake_agent
-                            else set()
+                        _status_ev = ev.kind
+                        _status_map = {
+                            "completed": "gateway.kanban.wake.completed",
+                            "gave_up": "gateway.kanban.wake.gave_up",
+                            "crashed": "gateway.kanban.wake.crashed",
+                            "timed_out": "gateway.kanban.wake.timed_out",
+                        }
+                        _status = t(
+                            _status_map.get(_status_ev, "gateway.kanban.wake.status_default")
                         )
-                        from gateway.wake import adapter_supports_push as _adapter_push_ok
-
-                        _is_push_adapter = _adapter_push_ok(adapter)
-                        _session_key = ""
-                        _synth = ""
-                        if _wake_kinds:
-                            if _is_push_adapter:
-                                _session_key = getattr(task, "session_id", None) or ""
-                            else:
-                                # Non-push (api_server) wakes go to the
-                                # subscription's delivery destination —
-                                # sub["chat_id"] IS the raw session id the
-                                # subscriber registered with. task.session_id
-                                # is worker/creator provenance and may point
-                                # at a WORKER session for child tasks with
-                                # inherited subscriptions; falling back to it
-                                # only when chat_id is empty (legacy rows).
-                                _session_key = (
-                                    sub["chat_id"]
-                                    or getattr(task, "session_id", None)
-                                    or ""
-                                )
-                        if _wake_kinds:
-                            _title = (task.title if task else sub["task_id"])[:120]
-                            _assignee = task.assignee if task else ""
-                            _parts = []
-                            if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                            if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                            if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                            if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            if "block_loop_detected" in _wake_kinds:
-                                _parts.append(t("gateway.kanban.wake.blocked"))
-                            if "review_requested" in _wake_kinds:
-                                _parts.append(t("gateway.kanban.wake.review_requested"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
+                        _title = (task.title if task else sub["task_id"])[:120]
+                        _assignee = task.assignee if task else ""
+                        _synth2 = t(
+                            "gateway.kanban.wake.message",
+                            task_id=sub["task_id"],
+                            status=_status,
+                            title=_title,
+                            assignee=_assignee,
+                            board=board_slug,
+                        )
+                        if wake_handoff:
+                            _synth2 += "\n" + t(
+                                "gateway.kanban.wake.handoff",
+                                summary=wake_handoff,
                             )
-                            # Graph-safe wake turn (#70752): carry the worker's
-                            # completion handoff into the synthetic turn and
-                            # label it as an automatic notification so the woken
-                            # creator inspects the board instead of
-                            # re-decomposing work that already exists.
-                            if wake_handoff:
-                                _synth += "\n" + t(
-                                    "gateway.kanban.wake.handoff",
-                                    summary=wake_handoff,
-                                )
-                            _synth += "\n\n" + t(
-                                "gateway.kanban.wake.guidance"
-                            )
-
-                        if not _is_push_adapter and _wake_kinds and _session_key:
-                            # Wake self-post IS the delivery on this path —
-                            # it must succeed BEFORE the cursor advances.
-                            from gateway.wake import deliver_wake
-
-                            try:
-                                await deliver_wake(
-                                    adapter,
-                                    text=_synth,
-                                    session_id=_session_key,
-                                )
-                                logger.info(
-                                    "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                    sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
-                                )
-                                sub_fail_counts.pop(sub_key, None)
-                            except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
-                                logger.warning(
-                                    "kanban notifier: wake self-post failed "
-                                    "for %s (attempt %d/%d): %s",
-                                    sub["task_id"], fails,
-                                    MAX_SEND_FAILURES, _wk_err, exc_info=True,
-                                )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.error(
-                                        "kanban notifier: delivery pending for %s on %s after %d wake failures; "
-                                        "subscription and cursor retained for retry/operator inspection",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                # Never drop the sole delivery path for a
-                                # blocked model-choice question. The event is
-                                # durable in task_events; rewind the claim on
-                                # every failure, including after the threshold.
-                                await _to_thread_process_service(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
-                                )
-                                continue
-
-                        async def _push_wake() -> None:
-                            """Wake the creator session behind a push adapter.
-
-                            Shared by the wake-only (pre-advance, delivery)
-                            and notify+wake (post-advance, best-effort)
-                            branches below; raises on failure so the caller
-                            decides whether to rewind or merely log.
-                            """
-                            from gateway.session import SessionSource
-                            from gateway.wake import deliver_wake
-                            # Rebuild the creator's real session scope from
-                            # the chat_type persisted on the subscription
-                            # row (#56580). build_session_key() keys DMs
-                            # (":dm:<chat_id>") on a wholly different shape
-                            # from group/thread, so the old hardcoded
-                            # "group" mis-routed DM/thread creators into a
-                            # fresh session. Legacy rows written before the
-                            # column existed may still carry chat_type in
-                            # delivery_metadata (#60600 rows) — fall back
-                            # to that, then to "group" (the historical
-                            # default that suits the dashboard/group flows).
-                            # handle_message() get_or_create_session's the
-                            # target, so a mismatch only ever degrades to a
-                            # fresh session, never an exception.
-                            _chat_type = str(sub.get("chat_type") or "").strip()
-                            if not _chat_type:
-                                _delivery_meta = sub.get("delivery_metadata")
-                                if isinstance(_delivery_meta, dict):
-                                    _chat_type = str(
-                                        _delivery_meta.get("chat_type") or ""
-                                    ).strip()
-                            _chat_type = _chat_type or "group"
-                            _source = SessionSource(
-                                platform=plat,
-                                chat_id=sub["chat_id"],
-                                chat_type=_chat_type,
-                                thread_id=sub.get("thread_id") or None,
-                                user_id=sub.get("user_id"),
-                                user_id_alt=sub.get("user_id_alt"),
-                                profile=sub_profile or None,
-                                scope_id=_wake_scope_id(adapter, sub),
-                            )
-                            # deliver_wake preserves the synthetic
-                            # MessageEvent/handle_message path for
-                            # push-capable adapters (the non-push /
-                            # self-post branch is handled BEFORE the
-                            # cursor advance above).
+                        _synth2 += "\n\n" + t("gateway.kanban.wake.guidance")
+                        _session_key = (
+                            sub["chat_id"] or getattr(task, "session_id", None) or ""
+                        )
+                        try:
                             await deliver_wake(
                                 adapter,
-                                text=_synth,
+                                text=_synth2,
                                 session_id=_session_key,
                                 source=_source,
                             )
                             logger.info(
-                                "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
+                                "kanban notifier: woke agent for %s on %s/%s profile=%s event=%s",
+                                sub["task_id"], platform_str, sub["chat_id"],
+                                sub_profile or "default", _status_ev,
                             )
-
-                        if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
-                            # text ping was intentionally skipped above, so
-                            # the wake IS the sole delivery. It must succeed
-                            # BEFORE the cursor advances — advancing first
-                            # would let a failed wake (previously swallowed
-                            # by the best-effort except below) permanently
-                            # lose the event. Mirrors the non-push
-                            # (api_server) self-post ordering above.
-                            try:
-                                await _push_wake()
-                                sub_fail_counts.pop(sub_key, None)
-                            except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
-                                logger.warning(
-                                    "kanban notifier: wake-only delivery failed "
-                                    "for %s (attempt %d/%d): %s",
-                                    sub["task_id"], fails,
-                                    MAX_SEND_FAILURES, _wk_err, exc_info=True,
-                                )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    await _to_thread_process_service(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the wake — the event is
-                                    # NOT lost.
-                                    await _to_thread_process_service(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
-                                continue
-
-                        # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push, wake injection for wake-only
-                        # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
-                        # event on subsequent ticks.
+                        except Exception as _wk_err:
+                            logger.warning(
+                                "kanban notifier: wake injection failed for %s: %s",
+                                sub["task_id"], _wk_err, exc_info=True,
+                            )
+                    for ev in d["events"]:
+                        kind = ev.kind
+                        # -------- single delivery decision (R1 engine) --------
+                        # The engine owns ALL classification/render/dispatch now.
+                        # Everything that is not [live-status]/[final]/
+                        # [needs-decision]/[aborted] is silenced in ONE place
+                        # (gateway/delivery_engine.py). The notifier only keeps
+                        # the cursor mechanics (claim/rewind/advance) driven by
+                        # the engine's returned action.
+                        if kind not in ENGINE_CLAIM_KINDS:
+                            # Event is outside the engine's claimed set (e.g.
+                            # the legacy non-claimed statuses). Advance so it
+                            # never replays.
+                            await _to_thread_process_service(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        # Wake path for non-push api_server: the outbox persist
+                        # below IS the delivery/wake. Wake on human-action kinds
+                        # for push adapters happens inside the engine callback.
+                        _engine_res = await engine.handle_event(
+                            sub=sub,
+                            ev=ev,
+                            task=task,
+                            adapter=adapter,
+                            sub_profile=sub_profile or "",
+                            board=board_slug,
+                            cursor=d["cursor"],
+                            old_cursor=d.get("old_cursor", 0),
+                            task_is_root=bool(d.get("task_is_root")),
+                            mission_live=bool(d.get("mission_live")),
+                            has_open_descendants=bool(d.get("has_open_descendants")),
+                            do_not_deliver=bool(d.get("do_not_deliver")),
+                            silent=bool(d.get("silent")),
+                            platform_str=platform_str,
+                            notifier_profile=sub_profile or "",
+                            send_tg=_engine_send_tg,
+                            edit_tg=_engine_edit_tg,
+                            stage_owui=_engine_stage_owui,
+                            render_owui=_engine_render_owui,
+                            wake=_engine_wake,
+                            deliver_artifacts=self._deliver_kanban_artifacts,
+                            task_tg_owner=d.get("task_tg_owner") or "",
+                            tg_allowed=_tg_allowed,
+                        )
+                        if _engine_res.action == "rewind":
+                            # Send/stage failed transiently: drop the claim so a
+                            # later tick retries; MAX_SEND_FAILURES budget below
+                            # still governs the terminal drop.
+                            logger.info(
+                                "kanban notifier: %s/%s rewound by delivery engine (%s)",
+                                sub["task_id"], kind, _engine_res.reason,
+                            )
+                            break
+                        # action == "advance" (or "noop") — cursor handled in the
+                        # for-else below (advance unless we broke on rewind).
+                    else:
+                        # No event in this batch needed a rewind — the engine
+                        # delivered (or deliberately silenced) every claimed
+                        # event, so the subscription cursor may advance. The
+                        # engine's dual-lane dispatch (OWUI outbox + TG) is the
+                        # single delivery surface; the wake callback it invoked
+                        # already handled both push and non-push wake paths.
+                        task_terminal = task and task.status == "archived"
                         await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
-                        if not _is_push_adapter:
-                            # Nothing left to deliver on this path (the wake,
-                            # if any, already succeeded above).
-                            sub_fail_counts.pop(sub_key, None)
-                        # Unsubscribe only on archive. Completion (``done``)
-                        # remains reversible: controllers reopen completed
-                        # work for review corrections and continuation. The
-                        # retained cursor prevents replay while preserving the
-                        # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
-                            # notify+wake: the text ping above was the
-                            # delivery and the cursor has advanced; the wake
-                            # injection stays best-effort.
-                            try:
-                                await _push_wake()
-                            except Exception as _wk_err:
-                                # Best-effort: the notification itself already
-                                # delivered and the cursor has advanced, so a
-                                # broken wake path must not wedge the tick — but
-                                # log at WARNING with a traceback rather than
-                                # DEBUG so a persistently-failing wake is visible
-                                # in normal logs instead of silently no-op'ing.
-                                logger.warning(
-                                    "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err, exc_info=True,
-                                )
                         if task_terminal:
                             await _to_thread_process_service(
                                 self._kanban_unsub, sub, board_slug,
@@ -3338,10 +1479,9 @@ class GatewayKanbanWatchersMixin:
         branch non-terminal again → the marker is cleared and the next full
         close re-sends a fresh итог.
 
-        Default semantics: the итог is ADDITIVE — the existing per-task
-        terminal pings keep flowing. With ``kanban.branch_summary_replace:
-        true`` the notifier suppresses the individual descendant pings and the
-        итог is the single channel message.
+        Single behavior (R0(в) 10): the notifier suppresses the individual
+        descendant per-task terminal pings (replace semantics) and the итог
+        is the single channel message.
 
         Cadence is a separate ~45s supervised tick (deliberately NOT inside
         the 5s notifier loop: the per-subscription cursor machinery stays
@@ -3459,9 +1599,10 @@ class GatewayKanbanWatchersMixin:
                                 if _task_do_not_deliver(_root_task):
                                     continue
                                 # A channel subscribed to ANY task of the
-                                # branch must receive the итог — in
-                                # ``kanban.branch_summary_replace`` mode its
-                                # individual per-node pings are suppressed, so
+                                # branch must receive the итог — since replace
+                                # semantics (R0(в) 10) are the single behavior, a
+                                # node's individual per-node pings are
+                                # suppressed, so
                                 # the whole-branch message is its only
                                 # notification. Collect the subs of the root's
                                 # subtree whose channel the root OWNS, deduped
@@ -3740,18 +1881,19 @@ class GatewayKanbanWatchersMixin:
         if platform_str == "api_server":
             from hermes_constants import get_hermes_home
             from gateway.kanban_origin_delivery import stage_terminal
+            from gateway.delivery_engine import (
+                DeliveryEngine as _BranchEngine,
+                owui_root_final_summary,
+            )
             _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
             _state = "unbound"
             marker_id = plan.get("marker_id") or 0
-            # In branch_summary_replace mode the individual completed pings
-            # are suppressed — the branch итог must then carry the report
-            # inline itself, or the api_server channel never sees it.
-            _msg = _owui_branch_result_text(plan, msg)
             if (
                 _registry
                 and (not sub_profile or sub_profile == notifier_profile)
                 and int(marker_id or 0) > 0
             ):
+                _msg = owui_root_final_summary(plan, msg)
                 _state, _delivery_id = await asyncio.to_thread(
                     stage_terminal,
                     get_hermes_home() / "delivery-outbox.sqlite",
@@ -3765,289 +1907,103 @@ class GatewayKanbanWatchersMixin:
                     root_id, _state,
                 )
                 return False
-            # F7 do-implementation (t_ebc0a351): complement the OWUI api_server
-            # PRIMARY lane with the OWUI→Telegram mirror.  An OWUI mission root
-            # is subscribed ONLY via api_server (0 native telegram rows), so the
-            # terminal branch итог previously never reached Telegram even when
-            # the owner was server-bound via openwebui_telegram_users.  The
-            # mirror sends the SAME terminal итог to the owner's bound TG chat
-            # (F6 gate: only a fully-closed mission/root tree; intermediate
-            # splits are journaled, never sent).  Best-effort: a TG send /
-            # mirror failure is logged but NEVER blocks or re-queues the OWUI
-            # channel (the api_server primary lane is acked below regardless),
-            # and the mirror never touches the marker's delivered list, so a
-            # later delivery of the OWUI итог can't be suppressed by it.
+            # F7: the complementary OWUI→Telegram mirror now lives in the
+            # delivery engine (handle_branch_final -> _tg_bound_chat_for ->
+            # owui_to_tg[owner]).  The engine is the single dual-lane surface,
+            # so the mirror is dispatched there, not here.
+            _bs_engine_title = (sub.get("notifier_profile") or sub_profile or "")
+            _bs_engine = _BranchEngine()
+            _bs_engine._tg_adapter = self._authorization_adapter(
+                _Platform.TELEGRAM, sub_profile or None,
+            )
             try:
-                _tg_lane = _branch_summary_owui_tg_lane(
-                    sub, plan, msg, _tg_delivery_policy_allowed_users(),
+                from hermes_cli.delivery_policy import owui_telegram_users
+                _bs_engine.owui_to_tg = dict(owui_telegram_users()) or {}
+            except Exception:
+                _bs_engine.owui_to_tg = {}
+            async def _bs_send_tg(_tg_adapter, _chat_id, _text):
+                return await _tg_adapter.send(
+                    _chat_id, _text, metadata={},
                 )
-            except Exception as _lane_exc:
+            try:
+                await _bs_engine.handle_branch_final(
+                    plan=plan, sub=sub, msg=msg, adapter=adapter,
+                    sub_profile=_bs_engine_title,
+                    send_tg=_bs_send_tg,
+                    deliver_artifacts=self._deliver_kanban_artifacts,
+                    terminal=bool(plan.get("terminal", True)),
+                    board_override=board,
+                )
+            except Exception as _bs_engine_exc:
                 logger.warning(
-                    "kanban branch summary: OWUI→TG mirror for %s/%s failed: %s",
-                    platform_str, root_id, _lane_exc,
+                    "kanban branch summary: engine mirror for %s/%s failed: %s",
+                    platform_str, root_id, _bs_engine_exc,
                 )
-                _tg_lane = None
-            if _tg_lane is not None:
-                _tg_decision, _tg_bound_chat, _tg_content = _tg_lane
-                if not _tg_decision.suppressed:
-                    _tg_adapter = self._authorization_adapter(
-                        _Platform.TELEGRAM, sub_profile or None,
+            if plan.get("terminal", True) and (
+                sub.get("delivery_mode") in ("notify+wake", "wake")
+            ):
+                try:
+                    await self._wake_branch_summary_sub(
+                        plan, sub, sub_profile, adapter, plat,
                     )
-                    if _tg_adapter is not None:
-                        try:
-                            _tg_msg = _tg_content.get("msg", msg)
-                            _tg_send_res = await _tg_adapter.send(
-                                _tg_bound_chat, _tg_msg, metadata={},
-                            )
-                            if getattr(_tg_send_res, "success", True) is False:
-                                raise RuntimeError(
-                                    "branch summary OWUI→TG mirror send() "
-                                    f"reported failure: "
-                                    f"{getattr(_tg_send_res, 'error', None) or 'unknown error'}"
-                                )
-                            logger.info(
-                                "kanban branch summary: OWUI→TG mirror terminal "
-                                "итог for %s delivered to telegram:%s",
-                                root_id, _tg_bound_chat,
-                            )
-                            # F1 (tg-delivery-contract): the terminal итог's
-                            # artifacts ride as native Telegram file
-                            # attachments (send_document/send_video/images)
-                            # via the existing artifact helper — same path the
-                            # per-event OWUI→TG completed lane uses.  A
-                            # failure must never fail the already-delivered
-                            # text (best-effort, logged).
-                            try:
-                                await self._deliver_kanban_artifacts(
-                                    adapter=_tg_adapter,
-                                    chat_id=_tg_bound_chat,
-                                    metadata={},
-                                    event_payload={
-                                        "artifacts": _tg_content.get("artifacts") or [],
-                                    },
-                                    task=None,
-                                )
-                            except Exception as _tg_art_exc:
-                                logger.warning(
-                                    "kanban branch summary: OWUI→TG mirror "
-                                    "artifact upload for %s to telegram:%s "
-                                    "failed: %s",
-                                    root_id, _tg_bound_chat, _tg_art_exc,
-                                )
-                        except Exception as _tg_send_exc:
-                            logger.warning(
-                                "kanban branch summary: OWUI→TG mirror send "
-                                "failed for %s to telegram:%s: %s",
-                                root_id, _tg_bound_chat, _tg_send_exc,
-                            )
-                    else:
-                        logger.debug(
-                            "kanban branch summary: OWUI→TG mirror telegram "
-                            "adapter disconnected for %s; deferred",
-                            root_id,
-                        )
+                except Exception as _bs_wake_exc:
+                    logger.warning(
+                        "kanban branch summary: terminal wake for %s on %s/%s "
+                        "failed: %s",
+                        root_id, platform_str, sub.get("chat_id"), _bs_wake_exc,
+                    )
             await _to_thread_process_service(
                 self._ack_branch_summary, board, root_id,
                 platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
             )
             return True
-        # F6-style terminal gate (t_f285cb14): the branch итог reaches the
-        # Telegram mirror ONLY when it is the TERMINAL close of the whole
-        # mission/root tree (plan["terminal"]).  Intermediate closes —
-        # [split N/M], one-off daughter cards, any sub-branch with a still-
-        # open ancestor mission — are suppressed for telegram while OWUI
-        # api_server (above) is unaffected.  The channel is acked so the
-        # marker completes and the tick stops retrying; only the terminal
-        # root close ever mirrors to TG.
-        if platform_str == "telegram" and not plan.get("terminal", True):
-            _suppr = _suppress_decision(
-                "routine status close",
-                detail=(
-                    "intermediate branch summary — non-terminal mission tree "
-                    "suppressed in TG mirror"
-                ),
-            )
-            try:
-                from hermes_cli.delivery_policy import log_suppression
-
-                log_suppression(
-                    app="kanban",
-                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-                    target=f"telegram:{sub.get('chat_id')}",
-                    decision=_suppr,
-                    snippet=(msg or "")[:200],
-                    extra={
-                        "task_id": root_id,
-                        "event_kind": "branch_summary",
-                        "event_id": plan.get("marker_id") or 0,
-                        "owui_to_tg": True,
-                    },
+        # Native-TG lane: the branch итог is handled by the delivery engine —
+        # the single place that renders [final] (F1 content: summary+artifacts,
+        # bare итог never delivered) and gates the TG mirror on terminality
+        # (F6: intermediate closes are OWUI-only).  A non-terminal branch keeps
+        # the channel pending so a later terminal close still mirrors.
+        if platform_str == "telegram":
+            from gateway.delivery_engine import DeliveryEngine as _NativeEngine
+            async def _native_send_tg(_tg_adapter, _chat_id, _text):
+                return await _tg_adapter.send(
+                    _chat_id, _text, metadata=metadata,
                 )
-            except Exception as exc:  # journal must never break delivery
-                logger.debug(
-                    "delivery-policy: branch summary suppression journal failed: %s",
-                    exc,
-                )
-            logger.info(
-                "delivery-policy: intermediate branch summary suppressed for "
-                "%s to telegram:%s (non-terminal mission tree)",
-                root_id, sub.get("chat_id"),
-            )
-            await _to_thread_process_service(
-                self._ack_branch_summary, board, root_id,
-                platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
-            )
-            return True
-        # F1 (tg-delivery-contract, native telegram lane): the TERMINAL branch
-        # итог to a native telegram subscription must carry CONTENT — a short
-        # summary (~2000 chars) from the root's completed event /
-        # kanban_complete.summary plus the root's artifacts attached as files.
-        # The baked one-liner ``✅ Задача выполнена`` with no summary and no
-        # artifacts (the "голый итог") is suppressed entirely (silence in TG)
-        # and journaled, never sent as a contentless ping.  Failure итоги (❌
-        # …нужен фикс) carry the failing ids and stay usable.  All gated by
-        # the existing ``telegram_delivery_policy`` flag (rollback).  The
-        # enrichment helpers are the same generic root-branch helpers the
-        # OWUI→TG mirror uses; artifact upload rides the existing helper.
-        deliver_msg = msg
-        root_artifacts: list[str] = []
-        if (
-            platform_str == "telegram"
-            and plan.get("terminal", True)
-        ):
+            _ne_title = (sub.get("notifier_profile") or sub_profile or "")
+            _ne = _NativeEngine()
+            _ne._tg_adapter = adapter
             try:
-                from hermes_cli.delivery_policy import policy_enabled
-
-                if policy_enabled():
-                    deliver_msg = _owui_root_final_summary(plan, msg)
-                    root_artifacts = _owui_root_artifact_paths(plan)
-                    # The branch_summary marker payload may also carry an
-                    # explicit artifact list (``payload['artifacts']``,
-                    # currently None on the marker; sources that may be added
-                    # later).  Merge any plan-level artifacts so the helper
-                    # also sees paths riders put directly on the plan payload.
-                    _plan_arts = plan.get("artifacts") or []
-                    if isinstance(_plan_arts, (list, tuple)):
-                        for _pa in _plan_arts:
-                            if (
-                                isinstance(_pa, str)
-                                and _pa.strip()
-                                and _pa not in root_artifacts
-                            ):
-                                root_artifacts.append(_pa.strip())
-                    bare_itog = (
-                        deliver_msg == msg
-                        and _owui_tg_is_bare_itog(msg)
-                        and not root_artifacts
-                    )
-                    if bare_itog:
-                        _suppr = _suppress_decision(
-                            "bare terminal итог without content",
-                            detail=(
-                                "terminal branch summary has no summary and "
-                                "no artifacts — suppressed in native telegram "
-                                "lane (owner contract F1)"
-                            ),
-                        )
-                        from hermes_cli.delivery_policy import log_suppression
-
-                        log_suppression(
-                            app="kanban",
-                            who=str(
-                                sub.get("user_id") or sub.get("chat_id") or ""
-                            ),
-                            target=f"telegram:{sub.get('chat_id')}",
-                            decision=_suppr,
-                            snippet=(msg or "")[:200],
-                            extra={
-                                "task_id": root_id,
-                                "event_kind": "branch_summary",
-                                "event_id": plan.get("marker_id") or 0,
-                                "native_tg": True,
-                                "artifact_count": 0,
-                            },
-                        )
-                        logger.info(
-                            "delivery-policy: bare terminal branch summary "
-                            "suppressed for %s to telegram:%s "
-                            "(no summary, no artifacts)",
-                            root_id, sub.get("chat_id"),
-                        )
-                        await _to_thread_process_service(
-                            self._ack_branch_summary, board, root_id,
-                            platform_str, sub.get("chat_id"),
-                            sub.get("thread_id") or "",
-                        )
-                        return True
-            except Exception as _tg_content_exc:
+                await _ne.handle_branch_final(
+                    plan=plan, sub=sub, msg=msg, adapter=adapter,
+                    sub_profile=_ne_title,
+                    send_tg=_native_send_tg,
+                    deliver_artifacts=self._deliver_kanban_artifacts,
+                    terminal=bool(plan.get("terminal", True)),
+                    board_override=board,
+                )
+            except Exception as _ne_exc:
                 logger.warning(
-                    "kanban branch summary: native TG content enrichment for "
-                    "%s/%s failed (%s) — falling back to legacy message",
-                    platform_str, root_id, _tg_content_exc,
-                )
-                deliver_msg = msg
-                root_artifacts = []
-        try:
-            _send_res = await adapter.send(
-                sub["chat_id"], deliver_msg, metadata=metadata,
-            )
-            if getattr(_send_res, "success", True) is False:
-                raise RuntimeError(
-                    f"adapter send() reported failure: "
-                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
-                )
-        except Exception as exc:
-            logger.warning(
-                "kanban branch summary: send failed for %s on %s/%s: %s",
-                root_id, platform_str, sub.get("chat_id"), exc,
-            )
-            return False
-        # F1 (tg-delivery-contract, native telegram lane): the terminal итог's
-        # artifacts ride as native Telegram file attachments
-        # (send_document/send_video/images) via the existing artifact helper —
-        # same path the per-event telegram lane and the OWUI→TG mirror use.
-        # Best-effort: an upload failure must never fail the already-delivered
-        # text (logged only).  Only the native-TG terminal branch-итог carries
-        # files here (root_artifacts stays empty for other platforms).
-        if root_artifacts:
-            try:
-                await self._deliver_kanban_artifacts(
-                    adapter=adapter,
-                    chat_id=sub["chat_id"],
-                    metadata=metadata,
-                    event_payload={"artifacts": root_artifacts},
-                    task=None,
-                )
-            except Exception as _tg_art_exc:
-                logger.warning(
-                    "kanban branch summary: native TG artifact upload for %s "
-                    "to telegram:%s failed: %s",
-                    root_id, sub.get("chat_id"), _tg_art_exc,
-                )
-        # Terminal branch итог wake: the mission root finished and the creator
-        # must be woken to collect the result. This is the ONLY wake a mission
-        # yields under branch_summary_replace mode — the intermediate child
-        # events were claimed+silent in the notifier loop (see
-        # should_wake_agent_for_event). Best-effort: an injected wake failure
-        # must never fail the (already delivered) итог channel.
-        if plan.get("terminal", True) and (
-            sub.get("delivery_mode") in ("notify+wake", "wake")
-        ):
-            try:
-                await self._wake_branch_summary_sub(
-                    plan, sub, sub_profile, adapter, plat,
-                )
-            except Exception as _bs_wake_exc:
-                logger.warning(
-                    "kanban branch summary: terminal wake for %s on %s/%s "
+                    "kanban branch summary: engine native-TG итог for %s/%s "
                     "failed: %s",
-                    root_id, platform_str, sub.get("chat_id"), _bs_wake_exc,
+                    platform_str, root_id, _ne_exc,
                 )
-        await _to_thread_process_service(
-            self._ack_branch_summary, board, root_id,
-            platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
-        )
-        return True
+            if plan.get("terminal", True) and (
+                sub.get("delivery_mode") in ("notify+wake", "wake")
+            ):
+                try:
+                    await self._wake_branch_summary_sub(
+                        plan, sub, sub_profile, adapter, plat,
+                    )
+                except Exception as _bs_wake_exc:
+                    logger.warning(
+                        "kanban branch summary: terminal wake for %s on %s/%s "
+                        "failed: %s",
+                        root_id, platform_str, sub.get("chat_id"), _bs_wake_exc,
+                    )
+            await _to_thread_process_service(
+                self._ack_branch_summary, board, root_id,
+                platform_str, sub.get("chat_id"), sub.get("thread_id") or "",
+            )
+            return True
 
     async def _wake_branch_summary_sub(
         self, plan: dict, sub: dict, sub_profile: str,
@@ -4056,7 +2012,7 @@ class GatewayKanbanWatchersMixin:
         """Wake the creator session for a delivered terminal branch итог.
 
         Only the TERMINAL branch итог may wake the originating agent session
-        under ``kanban.branch_summary_replace: true``.  The intermediate
+        (replace semantics — R0(в) 10).  The intermediate
         per-child events were claimed+advanced silently by the notifier, so
         this single wake is what lets the creator collect the итог + report
         artifacts.  Push-capable adapters (Telegram) receive a synthetic
@@ -4229,8 +2185,8 @@ class GatewayKanbanWatchersMixin:
             # up front with an explicit warning instead of being handed to the
             # adapter, whose channel can't accept it — the old path sent it to
             # send_document and the delivery was silently lost (or failed).
-            # Mirrors the root-lane 25MB ceiling (_OWUI_TG_ARTIFACT_MAX_BYTES
-            # at :1293, applied in _owui_root_artifact_paths :1478).  The text
+            # Mirrors the root-lane 25MB ceiling (_OWUI_TG_ARTIFACT_MAX_BYTES,
+            # applied in delivery_engine.owui_root_artifact_paths).  The text
             # delivery is never dropped: only this one oversized attachment is
             # skipped, observable in the logs.
             try:

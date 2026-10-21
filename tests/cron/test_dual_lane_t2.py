@@ -296,8 +296,12 @@ def test_dual_lane_owui_owner_gets_final_report_in_tg(monkeypatch):
     assert results and all(a is True for _, a in results)
 
 
-def test_dual_lane_routine_suppressed_even_with_binding(monkeypatch):
-    # Рутина/no-delta → TG suppressed независимо от привязки (§8.3).
+def test_dual_lane_routine_like_content_delivers_owner_with_binding(monkeypatch):
+    # R1 (REFACTOR-DESIGN.md §(в)): content-based routine suppression
+    # (is_routine_report) is GONE — the cron gate verifies the RECIPIENT, not
+    # the content.  With a server binding the owner's TG lane is added and
+    # routine-shaped stdout reaches the owner (structural event typing in the
+    # engine now owns content-type suppression, not the cron TG gate).
     _ctx_owner_home_with_binding(monkeypatch)
     job = {
         "id": "t2-3",
@@ -306,10 +310,10 @@ def test_dual_lane_routine_suppressed_even_with_binding(monkeypatch):
                    "user_id": OWNER_OWUI},
     }
     results = _run_dual_gate(job, ROUTINE, no_agent=True)
-    assert results, "dual-lane добавил TG, но рутина должна пройти гейт"
+    assert results, "dual-lane добавил TG, но лента не прошла гейт"
     for chat_id, allowed in results:
         assert chat_id == OWNER_TG
-        assert allowed is False, "рутина не должна попасть в TG даже владельцу"
+        assert allowed is True, "владелец получает контент (verify-only gate)"
 
 
 def test_dual_lane_foreign_owui_suppressed_even_artifact(monkeypatch):
@@ -342,8 +346,12 @@ def test_dual_lane_no_binding_keeps_owui_only(monkeypatch):
     assert results == [], "без привязки dual-lane не должен добавлять TG-таргет"
 
 
-def test_dual_lane_policy_off_keeps_owui_only(monkeypatch):
-    # Policy off → augmentation не добавляет TG-ленту (§8.2.2 требует policy on).
+def test_dual_lane_binding_adds_lane_regardless_of_old_policy_flag(monkeypatch):
+    # R1 (REFACTOR-DESIGN.md §(в)): the `telegram_delivery_policy` off-flag
+    # and `policy_enabled()` are GONE — one engine, no rollback gate.  The
+    # dual-lane augmentation now keys ONLY on the server binding; the old
+    # "policy off -> OWUI-only" branch no longer exists, so the owner's TG
+    # lane is added whenever the binding resolves.
     from hermes_cli.delivery_policy import owui_telegram_users
 
     _ctx_owner_home_with_binding(monkeypatch)
@@ -356,7 +364,10 @@ def test_dual_lane_policy_off_keeps_owui_only(monkeypatch):
     }
     assert owui_telegram_users()  # привязка на месте
     results = _run_dual_gate(job, ARTIFACT)
-    assert results == [], "policy off → без TG-ленты (dual-lane выключен)"
+    assert any(p == "telegram" for p, _, _ in results), (
+        "R1: привязка добавляет TG-ленту (policy-flag отката удалён): "
+        f"фактически {results}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +522,10 @@ def test_dual_lane_second_bound_user_receives_nothing(monkeypatch):
     ) is False
 
 
-def test_dual_lane_routine_journal_exactly_one_entry(monkeypatch):
-    # Приёмка 3+4: рутина/no-delta подавляется в TG даже при привязке —
-    # и журнал подавлений получает РОВНО одну запись (без дублей/лишних
-    # строк от guest-лент).
+def test_dual_lane_routine_like_content_no_journal_entry(monkeypatch):
+    # R1: routine-like content now DELIVERS to the owner (verify-only gate,
+    # no content classifier) — so the suppression journal correctly receives
+    # NO entries for this delivery.
     _ctx_owner_home_with_binding(monkeypatch)
     job = {
         "id": "t2-full-3",
@@ -524,11 +535,14 @@ def test_dual_lane_routine_journal_exactly_one_entry(monkeypatch):
     }
     results = _run_all_targets_gate(job, ROUTINE, no_agent=True)
     tg_entries = [(c, allowed) for p, c, allowed in results if p == "telegram"]
-    assert tg_entries == [(OWNER_TG, False)], "рутина должна быть подавлена в TG"
-    journal = _read_suppression_journal()
-    assert len(journal) == 1, f"журнал должен содержать ровно 1 запись: {journal}"
-    assert journal[0]["target"] == f"telegram:{OWNER_TG}"
-    assert journal[0]["app"] == "cron"
+    assert tg_entries == [(OWNER_TG, True)], (
+        "R1: владелец получает routine-like контент в TG: фактически "
+        f"{tg_entries}"
+    )
+    assert _read_suppression_journal() == [], (
+        "доставленный контент не должен оставлять записей в журнале "
+        f"подавлений: {_read_suppression_journal()}"
+    )
 
 
 def test_dual_lane_artifact_delivered_journal_has_no_extra_entries(monkeypatch):

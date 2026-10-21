@@ -385,6 +385,216 @@ def _cron_failure_alert_class(error: Optional[str]) -> Optional[str]:
     return None
 
 
+def _cron_alert_engine_class(
+    *,
+    failure_alert_class: Optional[str],
+    blocked_config: bool,
+    drift_skip: bool,
+) -> Optional[str]:
+    """Map a structurally-classified cron anomaly to an engine alert class.
+
+    R1 (owner decision 2026-10-18, REFACTOR-DESIGN.md §(в) 20 / §(г)-4):
+    cron anomaly alerts are NOT content-detected any more (detect_system_alert
+    removed) — the scheduler already knows the class structurally, and the
+    engine delivers it on the [aborted]/[needs-decision] lane with its own
+    persisted ``delivery_dedup`` marker (the cron-side ``failure_alerted``
+    persisted bit stays as the cross-restart alert-once guard).
+
+      * blocked_config / drift_skip  -> [needs-decision]  (operator must act)
+      * provider/script failure     -> [aborted]          (run aborted)
+      * anything else               -> None (no engine alert lane)
+
+    Imports the engine constants locally (self-contained; scheduler module
+    import must never hard-depend on the gateway engine at load time).
+    """
+    try:
+        from gateway.delivery_engine import ABORTED, NEEDS_DECISION
+    except Exception:
+        return None
+    if blocked_config or drift_skip:
+        return NEEDS_DECISION
+    if failure_alert_class:
+        return ABORTED
+    return None
+
+
+async def _deliver_cron_alert_through_engine(
+    *,
+    engine: Any,
+    alert_class: str,
+    job: dict,
+    content: str,
+    owner_chat: Optional[str],
+    allowed_users: Optional[list],
+    send_tg: Any,
+    tg_adapter: Any,
+    cause_hash: str = "",
+) -> bool:
+    """Deliver one cron anomaly alert via the engine (single [aborted]/
+    [needs-decision] lane).  Returns True when delivered or already seen.
+
+    ``engine`` is a ``gateway.delivery_engine.DeliveryEngine`` instance the
+    caller has already wired (its ``handle_cron_alert`` needs explicit
+    ``send_tg`` / ``tg_adapter`` injected per call).  Fail-closed: returns
+    False (no delivery) when there is no TG lane/adapter; never raises into
+    the caller (the run's own delivery continues independently).
+
+    ``cause_hash`` must be UNIQUE PER RUN (the run's ``execution_id``), NOT
+    a constant job id: the cron-side ``failure_alerted`` bit is the real
+    alert-once guard and it HEALS on a successful run (mark_job_run pops it),
+    so a job that recovers and fails again MUST re-alert the owner.  A
+    constant per-job dedup key would make the engine's persisted
+    ``delivery_dedup`` row immortal and swallow the post-heal re-alert —
+    alert-once degenerates into alert-forever.  Per-run ``cause_hash`` keeps
+    the engine dedup scoped to exactly one run (replaying the same run must
+    not double-send) while every fresh failing run delivers.
+    """
+    try:
+        return await engine.handle_cron_alert(
+            alert_class=alert_class,
+            job=job,
+            content=content,
+            owner_chat=owner_chat,
+            allowed_users=allowed_users,
+            send_tg=send_tg,
+            tg_adapter=tg_adapter,
+            cause_hash=cause_hash,
+        )
+    except Exception as exc:  # engine must never break the run's delivery
+        logger.warning(
+            "Job '%s': cron alert via engine (%s) failed: %s",
+            job.get("id", "?"), alert_class, exc,
+        )
+        return False
+
+
+def _route_cron_alert_via_engine(
+    *,
+    job: dict,
+    alert_text: str,
+    engine_class: Optional[str],
+    adapters: Any,
+    loop: Any,
+    cause_hash: str = "",
+) -> bool:
+    """Sync bridge: route one cron anomaly alert through the delivery engine.
+
+    Resolves the Telegram transport (live adapter first, standalone fallback —
+    same as ``_deliver_result``), builds a minimal ``DeliveryEngine`` and calls
+    ``handle_cron_alert`` on the owner's home TG chat (single cron lane).
+
+    ``cause_hash`` is the run-scoped engine dedup key (``execution_id``) — see
+    ``_deliver_cron_alert_through_engine``: it must be unique per run so a
+    post-heal re-failure re-alerts instead of being swallowed by an immortal
+    ``delivery_dedup`` row.
+
+    Returns True when the alert was delivered (or already seen by the engine's
+    ``delivery_dedup``); False when no TG lane/adapter exists or the class is
+    not an engine alert.  Never raises into the caller.
+    """
+    if not engine_class or not alert_text:
+        return False
+    try:
+        from gateway.config import load_gateway_config, Platform
+        from gateway.delivery import resolve_delivery_transport
+        from gateway.delivery_engine import DeliveryEngine
+    except Exception as exc:
+        logger.debug("Job '%s': engine alert unavailable (%s)", job.get("id", "?"), exc)
+        return False
+    try:
+        config = load_gateway_config()
+    except Exception as exc:
+        logger.debug("Job '%s': engine alert config load failed (%s)", job.get("id", "?"), exc)
+        return False
+    try:
+        home = _get_home_target_chat_id("telegram")
+    except Exception:
+        home = None
+    if not home:
+        logger.debug("Job '%s': no telegram home channel — engine alert skipped", job.get("id", "?"))
+        return False
+    transport = resolve_delivery_transport(Platform.TELEGRAM, config, adapters)
+    if transport is not None and transport.adapter is not None:
+        tg_adapter = transport.adapter
+        live_loop = loop is not None and getattr(loop, "is_running", lambda: False)()
+    else:
+        # Standalone path: no live adapter/loop — the engine alert cannot be
+        # delivered to TG (no adapter). Keep fail-closed (no silent pass).
+        logger.debug(
+            "Job '%s': no live telegram adapter — engine alert not routed", job.get("id", "?"),
+        )
+        return False
+    if not live_loop:
+        # The engine's handle_cron_alert needs a running loop for its async
+        # send. Standalone cron ticks (manual `hermes cron run`) run the
+        # blocking _send_to_platform path instead — the engine lane applies
+        # only when the gateway loop is live.
+        logger.debug(
+            "Job '%s': no running event loop — engine alert not routed (standalone tick)", job.get("id", "?"),
+        )
+        return False
+
+    allowed = []
+    try:
+        allowed = [
+            p.strip() for p in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+            if p.strip()
+        ]
+    except Exception:
+        allowed = []
+
+    async def _send_tg(_adapter, chat_id, text):
+        try:
+            res = await _adapter.send(chat_id, text, metadata={})
+            return res
+        except Exception as exc:
+            logger.warning(
+                "Job '%s': engine alert send to telegram:%s failed: %s",
+                job.get("id", "?"), chat_id, exc,
+            )
+            return None
+
+    engine = DeliveryEngine(hooks=None)
+    try:
+        from hermes_cli.delivery_policy import owui_telegram_users
+
+        engine.owui_to_tg = dict(owui_telegram_users()) or {}
+    except Exception:
+        engine.owui_to_tg = {}
+
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(
+            _deliver_cron_alert_through_engine(
+                engine=engine,
+                alert_class=engine_class,
+                job=job,
+                content=alert_text,
+                owner_chat=home,
+                allowed_users=allowed,
+                send_tg=_send_tg,
+                tg_adapter=tg_adapter,
+                cause_hash=cause_hash,
+            ),
+            loop,
+        )
+        if future is None:
+            return False
+        try:
+            return bool(future.result(timeout=60))
+        except TimeoutError:
+            logger.warning(
+                "Job '%s': engine alert timed out waiting for the gateway loop", job.get("id", "?"),
+            )
+            return False
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': engine alert scheduling failed: %s", job.get("id", "?"), exc,
+        )
+        return False
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -2898,25 +3108,28 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
                                 allowed_users: Optional[Sequence[str]]):
     """Build the delivery-policy context for one cron job (D0 F1).
 
+    Since R1 (REFACTOR-DESIGN.md §(в) 136) the ``telegram_delivery_policy``
+    flag/policy_enabled() is GONE — the engine is the single policy.  This
+    context now carries only the RECIPIENT-verification primitives (ИНВ1:
+    recipient == initiator, fail-closed) that the per-target gate
+    ``_tg_gate_target`` applies to normal cron reports.  Content
+    classification (classify/default_context/detect_system_alert) no longer
+    exists here: cron ANOMALY alerts are classified structurally at the F4
+    point and routed to ``gateway.delivery_engine.handle_cron_alert``.
+
     Return value semantics (K1 RF1 — fail-open закрыт):
-      * dict without ``policy_disabled`` — gate ACTIVE: per-target decisions
-        via ``_tg_gate_target``.
-      * ``{"policy_disabled": True}`` — gate OFF (policy disabled / no
-        telegram channel): ``_tg_gate_target`` returns True for every target
-        (historical, byte-identical behaviour).
-      * ``None`` — policy UNAVAILABLE (module import failed or
-        ``policy_enabled()`` raised): ``_tg_gate_target`` FAILS CLOSED
-        (suppress + journal + ERROR log).  NEVER falls back to "deliver".
+      * dict — gate ACTIVE: per-target recipient decisions via
+        ``_tg_gate_target`` (verify_recipient).
+      * ``None`` — policy UNAVAILABLE (module import failed):
+        ``_tg_gate_target`` FAILS CLOSED (suppress + journal + ERROR log).
+        NEVER falls back to "deliver".
     """
     try:
         from hermes_cli.delivery_policy import (
             InitiatorRef,
             TargetRef,
-            classify,
-            default_context,
             log_suppression,
             owui_telegram_users,
-            policy_enabled,
             verify_recipient,
         )
     except Exception as exc:  # policy module must never break delivery
@@ -2925,27 +3138,6 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
             "targets FAIL-CLOSED (suppressed)", exc,
         )
         return None
-    try:
-        if not policy_enabled():
-            # Gate off: historical behaviour (fail-open is NOT applied here —
-            # disabled is a deliberate operator choice, not an error).
-            return {"policy_disabled": True}
-    except Exception as exc:
-        logger.error(
-            "delivery-policy: policy_enabled() raised (%s) — telegram cron "
-            "targets FAIL-CLOSED (suppressed)", exc,
-        )
-        return None
-
-    from hermes_cli.delivery_policy import (  # noqa: F811  (re-import ok)
-        InitiatorRef,
-        TargetRef,
-        classify,
-        default_context,
-        log_suppression,
-        owui_telegram_users,
-        verify_recipient,
-    )
 
     try:
         # T2 (спека §8.1): серверная привязка OWUI⇄TG читается ТОЛЬКО
@@ -2962,9 +3154,6 @@ def _tg_delivery_policy_context(job: dict, delivery_content: str, media_files,
         "media_files": media_files,
         "no_agent": bool(job.get("no_agent")),
         "owui_to_tg": _owui_tg,
-        "policy_disabled": False,
-        "classify": classify,
-        "default_context": default_context,
         "log_suppression": log_suppression,
         "verify_recipient": verify_recipient,
     }
@@ -2977,11 +3166,10 @@ def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
     / target is not telegram).  Returns False when the target must be
     skipped (suppression), logging the reason to the policy journal.
 
-    K1 RF1: ``policy_ctx is None`` (policy module unavailable / policy_enabled
-    raised) is FAIL-CLOSED — the telegram target is suppressed and journaled
-    with ``suppress("policy unavailable")`` + ERROR log.  It NEVER degrades to
-    "deliver".  ``{"policy_disabled": True}`` is the only "gate off" path and
-    returns True (historical behaviour).
+    K1 RF1: ``policy_ctx is None`` (policy module unavailable) is
+    FAIL-CLOSED — the telegram target is suppressed and journaled with
+    ``suppress("policy unavailable")`` + ERROR log.  It NEVER degrades to
+    "deliver".
     """
     platform_name = str(target.get("platform") or "").lower()
     if platform_name != "telegram":
@@ -2991,83 +3179,32 @@ def _tg_gate_target(target: dict, delivery_content: str, policy_ctx) -> bool:
         # FAIL-CLOSED (K1 RF1 CRITICAL): a broken/unavailable policy must
         # suppress, never silently pass a telegram delivery through.
         logger.error(
-            "delivery-policy: context unavailable (module/policy_enabled "
-            "failed) — telegram target %s FAIL-CLOSED (suppressed)", chat_id,
+            "delivery-policy: context unavailable (module import failed) — "
+            "telegram target %s FAIL-CLOSED (suppressed)", chat_id,
         )
         _journal_policy_unavailable("cron", chat_id, delivery_content)
         return False
-    if policy_ctx.get("policy_disabled"):
-        return True  # gate disabled -> historical behaviour
     from hermes_cli.delivery_policy import TargetRef  # noqa: F811 (re-import ok)
     target_ref = TargetRef.from_dict({
         "platform": platform_name, "chat_id": chat_id,
         "thread_id": target.get("thread_id"),
     })
-    ctx = policy_ctx["default_context"](
-        kind="cron",
-        initiator=policy_ctx["initiator"],
-        target=target_ref,
+    # R1: content classification is GONE (engine.classify_event is the single
+    # decision; cron anomaly alerts route through engine.handle_cron_alert at
+    # the F4 point).  This gate applies the kept ИНВ1 recipient check only.
+    if policy_ctx["verify_recipient"](
+        policy_ctx["initiator"], target_ref,
         home_channel=policy_ctx["home_channel"],
         allowed_users=policy_ctx["allowed_users"],
         owui_to_tg=policy_ctx.get("owui_to_tg"),
-        no_agent=policy_ctx.get("no_agent", False),
-        completed_terminal=True,  # _deliver_result carries the final output
-        has_media=policy_ctx["has_media"],
-    )
-    decision = policy_ctx["classify"](delivery_content, ctx)
-    if not decision.suppressed:
-        # F4: системные тревоги (cron failure / blocked_config / drift) —
-        # alert-once контракт владельца — доставляются в чат владельца
-        # (home / ALLOWED) БЕЗ требования verify_recipient.  root D5:
-        # api_server-cron-джобы без user_id в origin (cg / ostrov) иначе
-        # гасятся как recipient mismatch, и владелец не видит аномалию.
-        # Fail-closed: адресуются ТОЛЬКО home/ALLOWED — чужой TG-чат
-        # системный алерт по-прежнему не получает.
-        if decision.reason == "system_alert":
-            allowed = {
-                str(u).strip()
-                for u in (policy_ctx.get("allowed_users") or ())
-                if str(u).strip()
-            }
-            home = policy_ctx.get("home_channel") or ""
-            if chat_id in allowed or (home and chat_id == home):
-                return True
-            policy_ctx["log_suppression"](
-                app="cron",
-                who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
-                target=f"telegram:{chat_id}",
-                decision=_suppress_decision(
-                    "recipient mismatch",
-                    detail=(
-                        f"system_alert to non-owner chat={chat_id} "
-                        "(fail-closed: alerts go only to home/ALLOWED)"
-                    ),
-                ),
-                snippet=(delivery_content or "")[:200],
-            )
-            return False
-        # Content is acceptable; enforce recipient == initiator (ИНВ1).
-        if policy_ctx["verify_recipient"](
-            policy_ctx["initiator"], target_ref,
-            home_channel=policy_ctx["home_channel"],
-            allowed_users=policy_ctx["allowed_users"],
-            owui_to_tg=policy_ctx.get("owui_to_tg"),
-        ):
-            return True
-        policy_ctx["log_suppression"](
-            app="cron",
-            who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
-            target=f"telegram:{chat_id}",
-            decision=_suppress_decision("recipient mismatch",
-                                        detail=f"chat={chat_id}"),
-            snippet=(delivery_content or "")[:200],
-        )
-        return False
+    ):
+        return True
     policy_ctx["log_suppression"](
         app="cron",
         who=str(getattr(policy_ctx["initiator"], "chat_id", "") or ""),
         target=f"telegram:{chat_id}",
-        decision=decision,
+        decision=_suppress_decision("recipient mismatch",
+                                    detail=f"chat={chat_id}"),
         snippet=(delivery_content or "")[:200],
     )
     return False
@@ -3096,7 +3233,7 @@ def _journal_policy_unavailable(app: str, chat_id: str, delivery_content: str) -
             who=f"cron:{chat_id}",
             target=f"telegram:{chat_id}",
             decision=_suppress(
-                "policy unavailable", detail="module import / policy_enabled() failed"
+                "policy unavailable", detail="module import / classify_event() failed"
             ),
             snippet=(delivery_content or "")[:200],
         )
@@ -3109,7 +3246,6 @@ def _augment_owui_telegram_lane(job: dict, origin: dict, targets: List[dict]) ->
 
     Условия добавления telegram-таргета ``telegram:<bound_chat>`` (если его
     ещё нет в ``targets``):
-      * policy on (``policy_enabled()``);
       * известный authoritative owner из серверного реестра OWUI
         (``origin.owner_id``);
       * серверная привязка ``openwebui_telegram_users[owner_id]`` существует
@@ -3120,14 +3256,12 @@ def _augment_owui_telegram_lane(job: dict, origin: dict, targets: List[dict]) ->
 
     Иначе возвращает ``targets`` без изменений (флаг-фейл: «нет привязки —
     OWUI-only», поведение V8).  Добавленный target проходит тот же
-    пер-таргетный гейт ``_tg_gate_target`` (classify + verify), что и все
-    остальные: артефакты/финал → deliver, рутина/нет-дельты → suppress+журнал.
+    пер-таргетный гейт ``_tg_gate_target`` (recipient verify), что и все
+    остальные: доставляется при ИНВ1, иначе suppress+журнал.
     """
     try:
-        from hermes_cli.delivery_policy import owui_telegram_users, policy_enabled
+        from hermes_cli.delivery_policy import owui_telegram_users
 
-        if not policy_enabled():
-            return targets
         binding = owui_telegram_users() or {}
     except Exception:
         # Fail-closed: при ошибке конфига/модуля TG-ленту не добавляем.
@@ -7401,6 +7535,40 @@ def _run_one_job_body(
                             job["id"], _fail_alert_exc,
                         )
                         failure_already_alerted = False
+            # F4/R1: cron anomaly alerts ALSO go through the delivery engine's
+            # [aborted]/[needs-decision] lane (owner decision 2026-10-18 —
+            # REFACTOR-DESIGN.md §(в) 20, §(г)-4).  Content-detection is gone;
+            # the class is structural here.  The engine delivers to the owner's
+            # TG home lane with its own persisted delivery_dedup; the cron-side
+            # failure_alerted bit (H-1 below) keeps the cross-restart alert-once
+            # contract.  The engine lane does NOT replace _deliver_result: the
+            # run's normal delivery (OWUI/non-TG lanes) continues untouched.
+            _engine_alert_route_done = False
+            if (
+                not success
+                and not blocked_config_silent
+                and not drift_skip_silent
+                and not failure_already_alerted
+            ):
+                _engine_alert_class = _cron_alert_engine_class(
+                    failure_alert_class=failure_alert_class,
+                    blocked_config=blocked_config,
+                    drift_skip=drift_skip,
+                )
+                if _engine_alert_class is not None:
+                    _engine_alert_route_done = _route_cron_alert_via_engine(
+                        job=job,
+                        alert_text=deliver_content,
+                        engine_class=_engine_alert_class,
+                        adapters=adapters,
+                        loop=loop,
+                        cause_hash=str(execution_id or "") or str(job.get("id") or "cron"),
+                    )
+                    if _engine_alert_route_done:
+                        logger.info(
+                            "Job '%s': cron anomaly (%s) routed via delivery engine [%s]",
+                            job["id"], failure_alert_class or "config/drift", _engine_alert_class,
+                        )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.

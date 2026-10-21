@@ -3805,6 +3805,20 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        # RGZ mechanical guarantee (owner decision 2026-10-20): when an
+        # OWUI/PWA/API request carries an RGZ plan trigger («гигантский
+        # план/задача/миссия/проект»), this request runs at reasoning=max.
+        # The APIServerAdapter has no session-state handle here, so the
+        # per-request config is the mechanical guarantee; explicit client
+        # reasoning (request_reasoning_config) is never overridden.
+        try:
+            from agent.rgz_reasoning import rgz_trigger_detected
+
+            if request_reasoning_config is None and rgz_trigger_detected(user_message or ""):
+                reasoning_config = {"enabled": True, "effort": "max"}
+        except Exception:
+            logger.debug("rgz_reasoning: api trigger check skipped", exc_info=True)
+
         # --- Fast-lane decision + fast-path activation (t_ae312f32) ------
         # Slice A3(1) computed slow_mode; this slice (t_ae312f32) ACTIVATES
         # the fast path (design §4.2 Track S): for fast requests (slow_mode=

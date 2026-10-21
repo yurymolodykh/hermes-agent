@@ -1,9 +1,23 @@
 """
-Telegram delivery policy gate (D0 ``tg-delivery-hygiene``, задача F1).
+Telegram delivery-policy primitives (D0 ``tg-delivery-hygiene``, задача F1).
 
-ЕДИНАЯ точка принятия решения о том, доставлять ли сообщение в Telegram
-из общего кода Hermes (cron-доставка и kanban-уведомления).  Классификатор
-НЕ-LLM: чистые эвристики по содержимому + проверка получателя (fail-closed).
+После удаления контент-классификатора (R0(в), REFACTOR-DESIGN.md §(в)):
+КЛАССИФИКАЦИИ в этом модуле больше нет — единственная точка решения
+«доставлять или молчать» теперь ``gateway/delivery_engine.classify_event()``
+(4 типа: live-status / final / needs-decision / aborted; всё прочее —
+молчание + журнал).  Здесь остаётся только то, что движок и cron
+потребляют как ПРИМИТИВЫ:
+
+  * ``sanitize_delivery_text`` / ``_strip_mission_slang`` — санитизация
+    исходящего текста (reasoning/interim-шум, служебный слой);
+  * ``log_suppression`` — ЕДИНСТВЕННАЯ точка записи журнала подавлений
+    (вызывается из gateway/delivery_engine.py и из временных fail-closed
+    путей cron);
+  * ``owui_telegram_users`` + tg-привязки (F3) — серверный реестр
+    «OWUI-пользователь ⇄ TG-чат» (dual-lane);
+  * ``verify_recipient`` / ``verify_subscription_recipient`` — ИНВ1
+    (получатель == инициатор, fail-closed);
+  * ``TargetRef`` / ``InitiatorRef`` / ``PolicyDecision`` — типы-примитивы.
 
 Инварианты (NIGHT-PLAN.md §1–§5, спека `research/delivery-policy.md`):
   ИНВ1 — recipient == initiator: в TG-чат человека попадает только то,
@@ -15,9 +29,10 @@ Telegram delivery policy gate (D0 ``tg-delivery-hygiene``, задача F1).
   ИНВ3 — не ломать существующее: api_server/OWUI exact-origin, ``[SILENT]``,
          alert-once (blocked_config/drift) остаются как есть.
 
-Политика включается конфиг-флагом ``telegram_delivery_policy: on|off``
-(по умолчанию ``on``).  Все подавления ОБЯЗАНЫ логироваться с reason —
-и в logger, и в файл журнала подавлений (grep-доступно).
+Крон-алерты (F4, alert-once контракт владельца 2026-10-18) больше НЕ
+детектируются по тексту: scheduler классифицирует сбой структурно и
+передаёт уже готовый класс в ``engine.handle_cron_alert`` ([aborted] /
+[needs-decision]), персистентные alert-once биты остаются в cron.jobs.
 """
 
 from __future__ import annotations
@@ -26,8 +41,8 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Sequence, Set
 
 from tools.ansi_strip import sanitize_display_text
 
@@ -299,52 +314,6 @@ def _condense_interim(text: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Конфиг-флаг
-# --------------------------------------------------------------------------
-
-#: Ключи, в которых ищется ``telegram_delivery_policy`` (в порядке приоритета).
-_FLAG_KEYS: Sequence[str] = ("telegram_delivery_policy",)
-_ENV_FLAG = "HERMES_TELEGRAM_DELIVERY_POLICY"
-
-
-def policy_enabled(cfg: Optional[dict] = None) -> bool:
-    """Read the ``telegram_delivery_policy`` flag (default ON).
-
-    Precedence (first decisive value wins):
-      1. Env ``HERMES_TELEGRAM_DELIVERY_POLICY`` — override allows tests and
-         operators to flip the gate deterministically without touching config.
-      2. Per-call ``cfg`` dict (``telegram_delivery_policy``).
-      3. ``load_config()`` (same key at top level).
-      4. Default ON.
-
-    Any value other than a case-insensitive ``"off"`` means the policy is
-    active (default on, per requirement).
-    """
-    env_val = os.environ.get(_ENV_FLAG, "").strip().lower()
-    if env_val:
-        return env_val != "off"
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config
-
-            cfg = load_config() or {}
-        except Exception:
-            cfg = {}
-    if isinstance(cfg, dict):
-        for key in _FLAG_KEYS:
-            val = cfg.get(key)
-            if val is not None:
-                # YAML 1.1 parsers turn an unquoted ``off`` into boolean False
-                # (and ``on`` into True): handle both the literal strings and
-                # the parsed booleans so ``telegram_delivery_policy: off`` in
-                # config.yaml really disables the gate.
-                if val is False:
-                    return False
-                return str(val).strip().lower() != "off"
-    return True
-
-
-# --------------------------------------------------------------------------
 # Серверная привязка OWUI-пользователь ⇄ TG-чат (T2, спека §8.1)
 # --------------------------------------------------------------------------
 
@@ -551,129 +520,6 @@ def _utc_now_iso() -> str:
 
 
 # --------------------------------------------------------------------------
-# Эвристика "рутинный отчёт без дельты" (спека §6а)
-# --------------------------------------------------------------------------
-
-#: Дешёвые текстовые штампы no-delta (распознаются после JSON-попытки).
-_LOW_STAMPS: Sequence[str] = (
-    "copied: 0",
-    "nothing to do",
-    "no changes",
-    "похоже в норме",
-    "0 changed",
-    "already up to date",
-)
-
-
-def is_routine_report(content: Optional[str]) -> bool:
-    """True для дешёвых рутинных отчётов без дельты (mirror-rag и подобные).
-
-    Сначала пробуем распарсить как JSON счётчика (скрипты-зеркала печатают
-    ``{"copied": N, "missing_in_kb": M, "errors": E}``): если всё нулевое —
-    рутина.  Иначе — текстовые штампы (§6а спеки).
-    """
-    if not content:
-        return False
-    try:
-        obj = json.loads(content)
-        if isinstance(obj, dict):
-            if (
-                obj.get("copied", 0) == 0
-                and obj.get("missing_in_kb", 0) == 0
-                and obj.get("errors", 0) == 0
-            ):
-                return True
-    except Exception:
-        pass
-    low = content.lower()
-    return any(stamp in low for stamp in _LOW_STAMPS)
-
-
-# --------------------------------------------------------------------------
-# Детекторы системных алертов (согласовано с cron/scheduler.py)
-# --------------------------------------------------------------------------
-
-_BLOCKED_CONFIG_MARKER = "[blocked_config]"
-_DRIFT_SKIP_MARKER = "[drift_skip]"
-_BLOCKED_CONFIG_SILENT = "[blocked_config_silent]"
-_DRIFT_SKIP_SILENT = "[drift_skip_silent]"
-
-#: Маркеры, которыми scheduler помечает финальный текст системной тревоги.
-_ALERT_PREFIXES: Sequence[str] = (
-    "⛔ Cron",       # blocked_config (scheduler.py ~6920–6926)
-    "⚠️ Cron",       # drift_skip (scheduler.py ~6940–6943)
-)
-_FAIL_TEXT_STAMPS: Sequence[str] = (
-    "cron job failed",
-    "cron failed",
-    "job failed after",
-    "run failed",
-    "delivery failed",
-)
-
-#: Cron-failure фразы, где между «Cron»/'cron' и «failed»/«skipped»/«script
-#: failed» стоит ИМЯ джоба (реальный формат summarizer scheduler.py:
-#: «⚠️ Cron 'cg-...' failed: Script not found: …»).  Штампы выше требуют
-#: непрерывности, поэтому имя в середине ломало детект (F4/D4-D8 root).
-#: Паттерн опционален: и «cron failed» и «cron '<name>' failed» ловятся.
-_FAIL_STAMP_RE: re.Pattern[str] = re.compile(
-    r"\bcron(?:job)?\s+(?:'[^']*'|\"[^\"]*\")?\s+("
-    r"failed|skipped|script\s+failed)\b",
-    re.IGNORECASE,
-)
-
-#: Обёртка _deliver_result (scheduler.py ~3216-3222) ставит «Cronjob
-#: Response: <name>…» ПЕРЕД failure-текстом → не-startswith.  Узнаём её и
-#: ищем failure-штамп ВНУТРИ после заголовка.
-_CRON_WRAP_RE: re.Pattern[str] = re.compile(
-    r"^cronjob\s+response:.*?(?:\n|$)", re.IGNORECASE | re.DOTALL
-)
-
-
-def detect_system_alert(content: Optional[str]) -> Optional[str]:
-    """Вернуть имя системной тревоги в ``content`` или None.
-
-    Согласовано с фактическими маркерами scheduler.py: блокировки конфига,
-    drift-пропуски и тексты провалов cron, которые ДОЛЖНЫ доставляться
-    (alert-once контракт) независимо от прочих эвристик.
-
-    F4: покрывает реальную cron-обёртку и failure-фразы с именем джоба
-    между «Cron» и «failed» (иначе аномалия классифицируется как
-    final_report и гасится по recipient mismatch — root аномалии
-    cg-report-early-tg-watcher).
-    """
-    if not content:
-        return None
-    for marker in (_BLOCKED_CONFIG_MARKER, _DRIFT_SKIP_MARKER):
-        if marker in content:
-            return "blocked_config" if "blocked" in marker else "drift_skip"
-    low = content.strip().lower()
-    for prefix in _ALERT_PREFIXES:
-        if low.startswith(prefix.lower()):
-            return "cron_alert"
-    head = low[:400]
-    for stamp in _FAIL_TEXT_STAMPS:
-        if stamp in head:
-            return "cron_failure"
-    # Обёрнутый cron-заголовок: «Cronjob Response: <name>» с failure-телом
-    # после него — всё равно системная тревога (детект не должен зависеть
-    # от того, обернул ли scheduler текст заголовком).
-    wrapped = low if _CRON_WRAP_RE.match(low) else None
-    if wrapped is not None:
-        for stamp in _FAIL_TEXT_STAMPS:
-            if stamp in wrapped[:400]:
-                return "cron_failure"
-        if _FAIL_STAMP_RE.search(wrapped[:400]):
-            return "cron_failure"
-    # Cron-фраза с именем джоба между «cron» и «failed/skipped» — тоже
-    # системная тревога (напр. «⚠️ Cron 'cg-...' failed: Script not found»).
-    # Ограничено началом текста, чтобы не срабатывать на цитатах в отчёте.
-    if _FAIL_STAMP_RE.search(head):
-        return "cron_failure"
-    return None
-
-
-# --------------------------------------------------------------------------
 # Проверка получателя (спека §3)
 # --------------------------------------------------------------------------
 
@@ -867,125 +713,3 @@ def verify_subscription_recipient(
         # любому allow-пользователю. Fail-closed.
         return sub_user == owner
     return True
-
-
-# --------------------------------------------------------------------------
-# Классификатор контента (спека §2 — порядок веток критичен)
-# --------------------------------------------------------------------------
-
-#: События, требующие действий человека — доставлять всегда (§2).
-HUMAN_ACTION_KINDS: Set[str] = {
-    "blocked",
-    "needs_input",
-    "capability",
-    "review_requested",
-    "crashed",
-    "gave_up",
-    "block_loop_detected",
-    "timed_out",
-}
-
-#: Рутинные статусные закрытия — подавлять без дельты (§2 п.5).
-ROUTINE_EVENT_KINDS: Set[str] = {"completed", "status", "unblocked", "archived"}
-
-
-def classify(content: Optional[str], context: Optional[dict] = None) -> PolicyDecision:
-    """Вернуть решение для ``content`` с учётом ``context``.
-
-    ``context`` (опциональные ключи):
-      kind            "cron" | "kanban" | ... (по умолчанию "cron")
-      event_kind      для kanban-событий (completed/blocked/status/...)
-      no_agent        bool: джоб без LLM (mirror-rag, watchdog)
-      completed_terminal  bool: явный маркер ФИНАЛА (task.status=="archived"
-                            либо закрытие корня/ветки). НЕ «есть summary»:
-                            промежуточная суб-задача с summary — НЕ терминал
-                            (K1 RF2). Вычисляет вызывающий (kanban_watchers).
-      artifacts       list[str]: артефакты, заявленные в payload (kanban)
-      has_media       bool: в контенте есть MEDIA:/attachment (extract_media)
-      initiator       InitiatorRef | None
-      target          TargetRef | None
-      home_channel    str | None
-      allowed_users   list[str] | None
-      system_alert    str | None (предвычисленный детект)
-    """
-    ctx = context or {}
-    content = (content or "").strip()
-    kind = ctx.get("kind", "cron")
-    event_kind = ctx.get("event_kind")
-    artifacts: List[str] = list(ctx.get("artifacts") or ())
-
-    # ---- 0. Каноническая тишина (подавление; уже частично обработана) ----
-    if not content:
-        return suppress("empty stdout/content")
-
-    # ---- 1. Жёсткие системные алерты - доставка БЕЗ условий ----
-    system_alert = ctx.get("system_alert") or detect_system_alert(content)
-    if system_alert:
-        return deliver("system_alert", detail=f"alert={system_alert}")
-
-    # ---- 2. Класс «требует действий человека» - всегда ----
-    if event_kind in HUMAN_ACTION_KINDS:
-        return deliver("human_action", detail=f"event_kind={event_kind}")
-
-    # ---- 3. Артефакты (файлы/отчёты) - всегда по ИНВ2 ----
-    has_media = bool(ctx.get("has_media")) or bool(
-        re.search(r"\bMEDIA\s*[:：]\s*\S+", content or "", re.IGNORECASE)
-    )
-    if has_media or artifacts:
-        return deliver("artifacts", detail=f"media={has_media} artifacts={len(artifacts)}")
-
-    # ---- 6. Дешёвый рутинный отчёт без дельты (no_agent watchdogs) ----
-    # Вынесено ВЫШЕ §2.4 (final reports): для no_agent-джобов (mirror-rag,
-    # limits-monitor) рутинный no-delta должен подавляться, а не проходить
-    # как «final report» только потому, что джоб завершился терминально.
-    # Спека §5 допускает «при отсутствии артефактов отсечку “без дельты” по
-    # решению F1-реализации».  Для агентных джобов это не мешает: у них
-    # флаг no_agent=False и рутина не удаляется этим правилом.
-    if ctx.get("no_agent") and is_routine_report(content):
-        return suppress("routine no-delta report")
-
-    # ---- 4. Финальные (итоговые) отчёты - ИНВ2 ----
-    if kind == "cron":
-        if ctx.get("completed_terminal"):
-            return deliver("final_report")
-        if not ctx.get("no_agent"):
-            return deliver("agent_final_response")
-
-    # ---- 5. Рутинное закрытие/статус без дельты - подавить (ИНВ2) ----
-    if event_kind in ROUTINE_EVENT_KINDS:
-        if not ctx.get("completed_terminal"):
-            return suppress("routine status close", detail=f"event_kind={event_kind}")
-
-    # ---- 7. Всё остальное - доставлять только при выполненном verify ----
-    if verify_recipient(
-        ctx.get("initiator"),
-        ctx.get("target"),
-        ctx.get("home_channel"),
-        ctx.get("allowed_users"),
-        owui_to_tg=ctx.get("owui_to_tg"),
-    ):
-        return deliver("default")
-    return suppress("recipient mismatch")
-
-
-def default_context(
-    *,
-    kind: str = "cron",
-    initiator: Optional[InitiatorRef] = None,
-    target: Optional[TargetRef] = None,
-    home_channel: Optional[str] = None,
-    allowed_users: Optional[Sequence[str]] = None,
-    owui_to_tg: Optional[Mapping] = None,
-    **extra: Any,
-) -> dict:
-    """Собрать базовый context с общими полями для классификатора."""
-    ctx: Dict[str, Any] = {
-        "kind": kind,
-        "initiator": initiator,
-        "target": target,
-        "home_channel": home_channel,
-        "allowed_users": allowed_users,
-        "owui_to_tg": owui_to_tg,
-    }
-    ctx.update(extra)
-    return ctx

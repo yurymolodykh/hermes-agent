@@ -9036,6 +9036,18 @@ class AIAgent:
                         relay_turn,
                         outcome=relay_outcome,
                     )
+                # RGZ mechanical guarantee (owner decision 2026-10-20):
+                # release the kanban_create reasoning-raise at the end of the
+                # run so it never leaks into a later turn of a reused cached
+                # agent. Best-effort — teardown must never raise.
+                try:
+                    from agent.rgz_reasoning import release_agent_max
+
+                    release_agent_max(self)
+                except Exception:  # pragma: no cover
+                    logger.debug(
+                        "rgz_reasoning: kanban_create release skipped", exc_info=True
+                    )
             finally:
                 try:
                     if relay_lease is not None:

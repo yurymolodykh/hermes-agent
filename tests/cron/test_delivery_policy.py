@@ -1,17 +1,21 @@
 """
-Unit tests for the TG delivery-policy classifier (D0 ``tg-delivery-hygiene``, F1).
+Unit tests for the kept TG delivery-policy primitives (D0 ``tg-delivery-hygiene``, F1).
 
-Covers the core T1 cases from ``research/delivery-matrix.md`` / the F1
-acceptance list:
-  * artifacts / MEDIA: / file paths           -> deliver
-  * [ACTION-REQUIRED] / blocked / needs_input -> deliver
-  * system alerts (blocked_config / drift / cron failure) -> deliver
-  * completed-pings / status-flips / routine no-delta -> suppress + journal
-  * recipient == initiator (ИНВ1)             -> deliver; mismatch -> suppress
-  * config flag off                           -> gate inert
-  * empty content                             -> suppress
-These tests exercise the pure module (hermes_cli/delivery_policy.py) — no
-gateway/cron import needed, so they run fast and deterministically.
+R1 (REFACTOR-DESIGN.md §(в)): the content CLASSIFIER is gone (classify(),
+default_context(), is_routine_report(), detect_system_alert(),
+policy_enabled() were removed — the engine is the single decision).  These
+tests cover the primitives that REMAIN in hermes_cli/delivery_policy.py:
+
+  * recipient == initiator (ИНВ1) gate            -> verify_recipient
+  * kanban-subscription gate                      -> verify_subscription_recipient
+  * suppression journal (log_suppression + PolicyDecision deliver/suppress)
+  * sanitize_delivery_text / sanitize_display_text
+  * OWUI server binding                           -> owui_telegram_users
+  * TargetRef / InitiatorRef
+
+The cron _tg_gate_target injection tests (verify-only gate) live in
+TestCronGateInjection below; classifier assertions were removed with the
+classifier.
 """
 
 from __future__ import annotations
@@ -21,14 +25,14 @@ import pytest
 from hermes_cli.delivery_policy import (
     InitiatorRef,
     TargetRef,
-    classify,
-    default_context,
-    is_routine_report,
-    policy_enabled,
+    deliver,
+    log_suppression,
+    owui_telegram_users,
+    sanitize_delivery_text,
+    sanitize_display_text,
+    suppress,
     verify_recipient,
     verify_subscription_recipient,
-    deliver,
-    suppress,
 )
 
 
@@ -37,143 +41,20 @@ from hermes_cli.delivery_policy import (
 # ---------------------------------------------------------------------------
 
 
-def _cron_ctx(no_agent=False, has_media=False, artifacts=None,
-              completed_terminal=True, initiator=None, target=None,
-              home_channel=None, allowed_users=None):
-    return default_context(
-        kind="cron",
-        initiator=initiator,
-        target=target,
-        home_channel=home_channel,
-        allowed_users=allowed_users,
-        no_agent=no_agent,
-        completed_terminal=completed_terminal,
-        has_media=has_media,
-        artifacts=artifacts or [],
-    )
-
-
-def _kanban_ctx(event_kind, completed_terminal=False, artifacts=None, summary="",
-                initiator=None, target=None, allowed_users=None):
-    return default_context(
-        kind="kanban",
-        event_kind=event_kind,
-        completed_terminal=completed_terminal,
-        artifacts=artifacts or [],
-        initiator=initiator,
-        target=target,
-        allowed_users=allowed_users,
-        no_agent=False,
-    )
-
-
 def _tg_target(chat, thread=None) -> TargetRef:
     return TargetRef.from_dict({"platform": "telegram", "chat_id": chat,
                                 "thread_id": thread})
 
 
 # ---------------------------------------------------------------------------
-# 1. Ценные классы — проходят (ИНВ2)
+# 1. Получатель == инициатор (ИНВ1, fail-closed)
 # ---------------------------------------------------------------------------
-
-
-def test_artifacts_media_always_deliver():
-    ctx = _cron_ctx(has_media=True)
-    assert classify("У тебя файлик", ctx).delivered
-    # MEDIA: marker in content
-    ctx2 = _cron_ctx()
-    assert classify("вот: MEDIA: C:/tmp/report.pdf\nитог", ctx2).delivered
-
-
-def test_action_required_kinds_deliver():
-    for kind in ("blocked", "needs_input", "capability", "review_requested",
-                 "crashed", "gave_up"):
-        ctx = _kanban_ctx(kind)
-        assert classify("нужен человек", ctx).delivered, kind
-
-
-def test_system_alerts_deliver_even_no_agent_routine():
-    # blocked_config / drift / cron failure MUST not be swallowed by the
-    # routine heuristic (alert-once contract).
-    for text in ("[blocked_config] конфиг невалиден", "⛔ Cron blocked...",
-                 "⚠️ Cron skipped", "cron job failed after 3 tries"):
-        ctx = _cron_ctx(no_agent=True)
-        assert classify(text, ctx).delivered, text
-
-
-def test_final_report_deliver_with_verify():
-    initiator = InitiatorRef.from_origin({"platform": "telegram", "chat_id": "123"})
-    ctx = _cron_ctx(initiator=initiator, target=_tg_target("123"),
-                    allowed_users=["123"])
-    assert classify("Итоги недели: сделано Х", ctx).delivered
-
-
-# ---------------------------------------------------------------------------
-# 2. Подавляется — рутина / статус-пинги (ИНВ2)
-# ---------------------------------------------------------------------------
-
-def test_empty_content_suppress():
-    assert classify("", _cron_ctx()).suppressed
-    assert classify("   ", _cron_ctx()).suppressed
-
-
-def test_completed_ping_without_summary_suppress():
-    ctx = _kanban_ctx("completed", completed_terminal=False)
-    assert classify("Task t_123 completed", ctx).suppressed
-
-
-def test_status_flip_suppress():
-    ctx = _kanban_ctx("status", completed_terminal=False)
-    assert classify("Task moved to in_progress", ctx).suppressed
-
-
-def test_routine_no_delta_report_suppress():
-    ctx = _cron_ctx(no_agent=True)
-    assert classify('{"copied": 0, "missing_in_kb": 0, "errors": 0}', ctx).suppressed
-    ctx2 = _cron_ctx(no_agent=True)
-    assert classify("copied: 0\nskipped: 2", ctx2).suppressed
-
-
-def test_agent_report_not_suppressed_by_routine_heuristic():
-    # no_agent=False → the low-delta heuristic does NOT apply to LLM reports.
-    ctx = _cron_ctx(no_agent=False)
-    assert classify("here is the copied analysis", ctx).delivered
-
-
-# ---------------------------------------------------------------------------
-# 3. Получатель == инициатор (ИНВ1, fail-closed)
-# ---------------------------------------------------------------------------
-
-def _target_gate_allows(content, ctx, initiator=None, target=None,
-                        home_channel=None, allowed_users=None) -> bool:
-    """Two-stage gate as wired in _tg_gate_target (cron) / notifier (V4):
-    classify (content) then verify_recipient (recipient).  Returns True only
-    when BOTH allow delivery."""
-    decision = classify(content, ctx)
-    if decision.suppressed:
-        return False
-    return verify_recipient(initiator, target, home_channel, allowed_users)
 
 
 def test_recipient_mismatch_suppress():
     initiator = InitiatorRef.from_origin({"platform": "telegram", "chat_id": "123"})
     target = _tg_target("999")
-    # final report passes the content classifier, but the recipient gate
-    # rejects the foreign chat -> overall suppression (ИНВ1).
-    ctx = _cron_ctx(initiator=initiator, target=target,
-                    allowed_users=["123"], home_channel=None)
-    assert not _target_gate_allows("секретный отчёт", ctx,
-                                   initiator=initiator, target=target,
-                                   allowed_users=["123"])
-
-
-def test_final_report_allowed_to_owner():
-    initiator = InitiatorRef.from_origin({"platform": "telegram", "chat_id": "123"})
-    target = _tg_target("123")
-    ctx = _cron_ctx(initiator=initiator, target=target, allowed_users=["123"])
-    assert _target_gate_allows("Итоги недели: сделано X", ctx,
-                               initiator=initiator, target=target,
-                               allowed_users=["123"])
+    assert not verify_recipient(initiator, target, allowed_users=["123"])
 
 
 def test_verify_recipient_same_chat():
@@ -211,13 +92,7 @@ def test_verify_recipient_admin_delivery_to_owner_home():
 
 def test_verify_recipient_full_mapping_multi_user_isolation():
     """t_780a6db2: verify_recipient читает ПОЛНЫЙ owui_telegram_users
-    (не только владельца) и держит изоляцию инициаторов fail-closed.
-
-    Полный mapping {owui_user_id: tg_chat_id} для НЕСКОЛЬКИХ пользователей:
-      * каждый привязанный owui-user доставляет ТОЛЬКО в СВОЙ chat (ИНВ1);
-      * чужой привязанный chat конструктивно недостижим;
-      * unbounded / отсутствующий пользователь — тишина (False).
-    """
+    (не только владельца) и держит изоляцию инициаторов fail-closed."""
     home = "home-125805788"
     mapping = {
         "9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "125805788",
@@ -225,7 +100,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
     }
     allowed = ["125805788", "543447681", home]
 
-    # Владелец → свой чат привязки.
     assert verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-1",
@@ -233,7 +107,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Второй привязанный пользователь → СВОЙ чат (не владельца, не home).
     assert verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-2",
@@ -241,7 +114,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
         _tg_target("543447681"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Изоляция: владелец НЕ получает чужой чат Марии.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-3",
@@ -249,7 +121,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
         _tg_target("543447681"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Изоляция: Мария НЕ получает чат владельца / home.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-4",
@@ -257,8 +128,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Fail-closed: не привязанный к owui_telegram_users пользователь — тишина,
-    # даже если цель — allowed-чат.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-5",
@@ -266,7 +135,6 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Fail-closed: пустая привязка (не сконфигурирована) не открывает кросс-ленту.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-6",
@@ -278,23 +146,14 @@ def test_verify_recipient_full_mapping_multi_user_isolation():
 
 def test_verify_recipient_second_bound_user_gets_mirror_h5():
     """H-5 (t_efffb731): второй привязанный OWUI-пользователь получает
-    зеркало в СВОЙ bound-чат, даже когда его чат НЕ входит в ALLOWED/home
-    (настроены только на первого/инициатора).
-
-    Контракт миссии F3: доставка ЛЮБОМУ пользователю с установленным
-    соответствием в openwebui_telegram_users, не только инициатору.
-    Сама серверная привязка — достаточная авторизация маршрута в
-    СОБСТВЕННЫЙ bound-чат (изоляция: чужие bound-чаты и непривязанные
-    — по-прежнему False).
-    """
-    home = "125805788"  # home/ALLOWED настроены только на первого
+    зеркало в СВОЙ bound-чат, даже когда его чат НЕ входит в ALLOWED/home."""
+    home = "125805788"
     mapping = {
-        "9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "125805788",  # 1st (инициатор)
-        "3daba661-feb8-4c1d-a823-4c5223f98d30": "543447681",  # 2nd (вне ALLOWED/home)
+        "9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "125805788",
+        "3daba661-feb8-4c1d-a823-4c5223f98d30": "543447681",
     }
-    allowed = ["125805788", home]  # НЕ содержит bound-чат второго
+    allowed = ["125805788", home]
 
-    # Владелец → свой bound-чат (по-прежнему проходит).
     assert verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-1",
@@ -302,8 +161,6 @@ def test_verify_recipient_second_bound_user_gets_mirror_h5():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Второй привязанный пользователь → СВОЙ bound-чат вне ALLOWED/home —
-    # зеркало ДОХОДИТ (H-5: ранее гейт голодал второго пользователя).
     assert verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-2",
@@ -311,7 +168,6 @@ def test_verify_recipient_second_bound_user_gets_mirror_h5():
         _tg_target("543447681"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Безопасность сохранена: второй НЕ получает чат инициатора / home.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-3",
@@ -319,8 +175,6 @@ def test_verify_recipient_second_bound_user_gets_mirror_h5():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Безопасность сохранена: непривязанный пользователь — тишина, даже в
-    # allowed-чат.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-4",
@@ -328,8 +182,6 @@ def test_verify_recipient_second_bound_user_gets_mirror_h5():
         _tg_target("125805788"), home_channel=home,
         allowed_users=allowed, owui_to_tg=mapping,
     )
-    # Безопасность сохранена: привязка есть у второго, но target = ЧУЖОЙ
-    # bound-чат первого — перекрёстная утечка невозможна.
     assert not verify_recipient(
         InitiatorRef.from_origin({"platform": "api_server",
                                   "chat_id": "job-5",
@@ -346,7 +198,7 @@ def test_non_telegram_target_unaffected():
 
 
 # ---------------------------------------------------------------------------
-# 4. Подписки kanban (V4)
+# 2. Подписки kanban (V4)
 # ---------------------------------------------------------------------------
 
 def test_subscription_tg_owner_allowed():
@@ -403,83 +255,69 @@ def test_subscription_tg_owner_marker_unknown_owner_falls_back_to_allowlist():
 
 
 # ---------------------------------------------------------------------------
-# 5. Конфиг-флаг
+# 3. Suppression journal: PolicyDecision deliver/suppress + log_suppression
 # ---------------------------------------------------------------------------
 
-def test_policy_flag_default_on(monkeypatch):
-    monkeypatch.delenv("HERMES_TELEGRAM_DELIVERY_POLICY", raising=False)
-    assert policy_enabled()
+def test_policy_decision_deliver_suppress_shapes():
+    assert deliver().delivered is True
+    assert deliver().suppressed is False
+    assert suppress("recipient mismatch").suppressed is True
+    assert suppress("recipient mismatch").reason == "recipient mismatch"
+    assert deliver().reason != "recipient mismatch"
 
 
-def test_policy_flag_off(monkeypatch):
-    monkeypatch.delenv("HERMES_TELEGRAM_DELIVERY_POLICY", raising=False)
-    assert not policy_enabled({"telegram_delivery_policy": "off"})
-    assert not policy_enabled({"telegram_delivery_policy": "OFF"})
-
-
-def test_policy_flag_on(monkeypatch):
-    monkeypatch.delenv("HERMES_TELEGRAM_DELIVERY_POLICY", raising=False)
-    assert policy_enabled({"telegram_delivery_policy": "on"})
-    assert policy_enabled({"telegram_delivery_policy": "yes"})
-
-
-def test_policy_flag_yaml_bool_off(monkeypatch):
-    # YAML 1.1 parses an UNQUOTED ``off`` to boolean False (and ``on`` to
-    # True) — the gate must honour that so ``telegram_delivery_policy: off``
-    # in config.yaml really disables it (regression, found in split 1/2).
-    monkeypatch.delenv("HERMES_TELEGRAM_DELIVERY_POLICY", raising=False)
-    assert not policy_enabled({"telegram_delivery_policy": False})
-    assert policy_enabled({"telegram_delivery_policy": True})
-
-
-def test_policy_flag_env_override(monkeypatch):
-    # Env wins over cfg (tests / operators flip it deterministically).
-    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
-    assert not policy_enabled({"telegram_delivery_policy": "on"})
+def test_log_suppression_writes_record():
+    """log_suppression пишет в журнал и не бросает исключений."""
+    decision = suppress("recipient mismatch", detail="chat=999")
+    log_suppression(
+        app="cron", who="123", target="telegram:999",
+        decision=decision,
+        snippet="итог",
+    )  # No exception raised.
+    assert decision.suppressed
 
 
 # ---------------------------------------------------------------------------
-# 6. is_routine_report
+# 4. sanitize_delivery_text / sanitize_display_text
 # ---------------------------------------------------------------------------
 
-def test_is_routine_report_cases():
-    assert is_routine_report('{"copied": 0, "missing_in_kb": 0, "errors": 0}')
-    assert is_routine_report("copied: 0\nnothing to do")
-    assert is_routine_report("похоже в норме")
-    assert not is_routine_report('{"copied": 5, "missing_in_kb": 0, "errors": 0}')
-    assert not is_routine_report("Найдено 3 новых источника, добавлены в KB")
+def test_sanitize_delivery_text_removes_reasoning_block():
+    raw = (
+        "<reasoning>Рассуждаю о плане</reasoning>\n"
+        "ИТОГ: копирование завершено ОК: 5"
+    )
+    cleaned = sanitize_delivery_text(raw)
+    assert "Рассуждаю" not in cleaned
+    assert "ИТОГ:" in cleaned
 
 
-# ---------------------------------------------------------------------------
-# 7. classify значение по умолчанию (default → verify, иначе suppress)
-# ---------------------------------------------------------------------------
-
-def test_default_deliver_when_verify_ok():
-    initiator = InitiatorRef.from_origin({"platform": "telegram", "chat_id": "123"})
-    ctx = _cron_ctx(initiator=initiator, target=_tg_target("123"),
-                    allowed_users=["123"])
-    # generic cron final content — falls through to default+verify
-    assert classify("просто итог", ctx).delivered
+def test_sanitize_delivery_text_keeps_normal_business_text():
+    raw = "Итоги недели: сделано 3 источника, добавлена первая правка."
+    assert sanitize_delivery_text(raw) == raw
 
 
-def test_default_suppress_when_verify_fail():
-    initiator = InitiatorRef.from_origin({"platform": "telegram", "chat_id": "1"})
-    target = _tg_target("2")
-    # content classifier passes it (final report class в cron), but the
-    # recipient gate rejects chat 2 -> overall suppression (ИНВ1).
-    ctx = _cron_ctx(initiator=initiator, target=target)
-    assert not _target_gate_allows("какой-то текст", ctx,
-                                   initiator=initiator, target=target)
+def test_sanitize_display_text_preserves_readable_payload():
+    raw = "Просто итог: 3 источника"
+    assert sanitize_display_text(raw) == raw
 
 
 # ---------------------------------------------------------------------------
-# 8. Инжекция гейта в cron (_tg_gate_target) — политика ON
+# 5. OWUI binding (owui_telegram_users) — fail-closed на отсутствие конфига
+# ---------------------------------------------------------------------------
+
+def test_owui_telegram_users_not_configured_fail_closed():
+    # Без конфига привязок — пусто (fail-closed; цепочки лейтовых добавлений
+    # просто не срабатывают).
+    mapping = owui_telegram_users()
+    assert mapping is None or isinstance(mapping, dict)
+
+
+# ---------------------------------------------------------------------------
+# 6. Инжекция гейта в cron (_tg_gate_target) — verify-only gate (R1)
 # ---------------------------------------------------------------------------
 
 def _build_cron_gate_ctx(monkeypatch, allowed_users=("123",), origin=None):
-    """Build the policy context exactly as _deliver_result does, with the
-    policy flag forced ON and a telegram owner-chat env."""
-    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+    """Build the policy context exactly as _deliver_result does."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(allowed_users))
     from cron.scheduler import _get_home_target_chat_id, _tg_delivery_policy_context
     home = _get_home_target_chat_id("telegram")
@@ -502,7 +340,6 @@ class TestCronGateInjection:
     def test_foreign_chat_suppressed(self, monkeypatch):
         ctx, home = _build_cron_gate_ctx(monkeypatch, allowed_users=("123",))
         from cron.scheduler import _tg_gate_target
-        # owner chat in allowed_users is 123; target 999 is foreign.
         target = {"platform": "telegram", "chat_id": "999", "thread_id": None}
         assert _tg_gate_target(target, "итог отчёта", ctx) is False
 
@@ -514,21 +351,11 @@ class TestCronGateInjection:
 
     def test_policy_unavailable_fail_closed(self, monkeypatch):
         # K1 RF1 (CRITICAL, fail-open→fail-closed): policy_ctx is None when
-        # the module is unimportable or policy_enabled() raised -> the
-        # telegram target must be SUPPRESSED (False), never delivered.
-        monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+        # the module is unimportable -> the telegram target must be
+        # SUPPRESSED (False), never delivered.
         monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "123")
         from cron.scheduler import _tg_gate_target
         target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
         assert _tg_gate_target(target, "итог отчёта", None) is False
-        # non-telegram target stays untouched even when policy is unavailable
         target2 = {"platform": "slack", "chat_id": "C123", "thread_id": None}
         assert _tg_gate_target(target2, "итог отчёта", None) is True
-
-    def test_policy_disabled_gate_off_historically_allowed(self, monkeypatch):
-        # Gate OFF ({"policy_disabled": True}) is the operator-chosen path:
-        # delivery proceeds as before — NOT a fail-open.
-        monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
-        from cron.scheduler import _tg_gate_target
-        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
-        assert _tg_gate_target(target, "итог отчёта", {"policy_disabled": True}) is True

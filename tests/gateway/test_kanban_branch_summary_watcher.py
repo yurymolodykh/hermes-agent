@@ -12,9 +12,6 @@ import os
 import pytest
 
 from gateway.config import Platform
-from gateway.kanban_watchers import (
-    _kanban_branch_summary_replace,
-)
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -347,19 +344,19 @@ async def test_summary_api_server_delivery_and_ack(board_env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# branch_summary_replace: notifier suppresses descendant pings
+# Replace-mode descendant suppression (R0(в) 10): the flag was removed — a
+# terminal DESCENDANT event is always silent in the notifier (its ping is
+# claimed+advanced, not rendered); the whole-branch итог is the single
+# channel message and arrives only once the branch fully closes.
 # ---------------------------------------------------------------------------
 
-def test_replace_flag_reads_config_default_false(monkeypatch):
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
-    assert _kanban_branch_summary_replace() is False
-
-
 @pytest.mark.asyncio
-async def test_replace_flag_suppresses_descendant_notifier_pings(board_env, monkeypatch):
-    """With replace enabled a terminal DESCENDANT event is silent in the notifier
-    (its ping is claimed+advanced, not rendered) — the whole-branch итог is the
-    single channel message, and it arrives only once the branch fully closes."""
+async def test_replace_mode_suppresses_descendant_notifier_pings(board_env, monkeypatch):
+    """A terminal DESCENDANT event is silent in the notifier (its ping is
+    claimed+advanced, not rendered) — the whole-branch итог is the single
+    channel message, and it arrives only once the branch fully closes.
+    Replace-mode is the SINGLE behavior since the `branch_summary_replace`
+    flag was removed (R0(в) 10)."""
 
     root = _mk(board_env, "root")
     a = _mk(board_env, "a")
@@ -367,11 +364,8 @@ async def test_replace_flag_suppresses_descendant_notifier_pings(board_env, monk
     kb.add_notify_sub(board_env, task_id=root, platform="telegram", chat_id="chat-1")
     kb.add_notify_sub(board_env, task_id=a, platform="telegram", chat_id="chat-2")
 
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     # The TG delivery-policy gate (7ea1a5ff943, default ON, fail-closed) is
-    # ORTHOGONAL to what this test asserts (branch_summary_replace suppression
+    # ORTHOGONAL to what this test asserts (replace-mode suppression
     # of descendant pings): with an empty TELEGRAM_ALLOWED_USERS allowlist the
     # gate suppresses even the root's own completion ping as "recipient
     # mismatch", which predates and masks the replace-mode behaviour under
