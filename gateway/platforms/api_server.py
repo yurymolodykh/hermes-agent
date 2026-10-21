@@ -6200,6 +6200,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 durable_model = agent_overrides.get("requested_model") or None
                 durable_provider = agent_overrides.get("requested_provider") or None
             try:
+                # A4: hand the server-verified OWUI origin binding into the
+                # durable create so its subscription carries the real owner
+                # user_id (previously user_id=None → "unbound" → итог dropped).
+                # The value is the module ContextVar produced ONLY by the
+                # origin-binding middleware from the WebUI-signed claim; it is
+                # re-verified server-side inside the create path before use.
+                durable_origin_binding = None
+                try:
+                    _raw_binding = _api_request_origin_binding.get() or ""
+                    if _raw_binding:
+                        durable_origin_binding = json.loads(_raw_binding)
+                except Exception:
+                    durable_origin_binding = None
                 durable_result = await asyncio.to_thread(
                     execute_durable_chat_command,
                     durable_command,
@@ -6208,6 +6221,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     notifier_profile=self._transport_owner_profile,
                     model_override=durable_model,
                     provider_override=durable_provider,
+                    origin_binding=durable_origin_binding,
                 )
             except Exception as exc:
                 logger.exception("Durable chat command failed")

@@ -40,6 +40,77 @@ def active_chain(messages: dict, current: str) -> list[str] | None:
     return None
 
 
+def append_target_ok(messages: dict, current: str) -> bool:
+    """True when a new assistant message may be appended under ``current``.
+
+    The full ancestor chain is NOT required to be intact: Open WebUI prunes /
+    trims old turns as chat history grows (a broken chain above the current
+    tip is legitimate and must not block the terminal итог from landing).
+    We only require that the append target ``current`` itself exists as a
+    well-formed message so the new message has a real parent:
+
+    - ``current`` must be a key of ``messages`` whose dict ``id`` matches it
+      and whose ``role`` is user/assistant/system;
+    - the ``parentId`` key must be present (OWUI messages always carry it);
+    - a ``parentId`` that is missing from ``messages`` (broken/trimmed
+      ancestor) is ALLOWED — that is exactly the A1 scenario;
+    - a self-loop ``parentId == current`` is structural corruption, not
+      history trimming, and fails closed.
+
+    The exact appended message is validated separately on readback.
+    """
+    if not isinstance(messages, dict) or not isinstance(current, str):
+        return False
+    message = messages.get(current)
+    if (not isinstance(message, dict) or message.get("id") != current):
+        return False
+    if "parentId" not in message:
+        return False
+    parent = message["parentId"]
+    if parent is None:
+        return True
+    if parent == current:
+        # Self-loop is never produced by OWUI trimming — reject it.
+        return False
+    return isinstance(parent, str)
+
+
+def current_tip_ok(messages: dict, current: str, event_id: str,
+                   expected_content: str) -> bool:
+    """Validate an appended delivery is the CURRENT tip with exact content.
+
+    This is the A1 readback gate: the event must sit at ``currentId`` and be
+    an exact assistant receipt for ``expected_content``.  The ancestor chain
+    ABOVE the receipt's parent may be pruned/broken (legitimate OWUI history
+    trimming) — the integrity property that matters is that THIS receipt is
+    the current tip, owned by this chat, with the exact content we staged.
+    The receipt's PARENT must still be a structurally valid append target
+    (a self-loop / wrong-id / missing-parentId parent is corruption, not
+    trimming, and fails closed), while that parent's own ancestor may be
+    missing.  Anything that breaks the receipt at the tip (wrong id/role/
+    done/content, or the event is no longer the tip because a human
+    re-branched) also fails closed.
+    """
+    if not isinstance(messages, dict) or not isinstance(current, str):
+        return False
+    if current != event_id:
+        return False
+    message = messages.get(event_id)
+    if (not isinstance(message, dict) or message.get("id") != event_id
+            or message.get("role") != "assistant"
+            or message.get("done") is not True
+            or message.get("content") != expected_content):
+        return False
+    parent = message.get("parentId")
+    if parent is None:
+        return True
+    # The receipt's parent must be a valid append target (allows THAT
+    # parent's own ancestor chain to be trimmed/broken).
+    if not append_target_ok(messages, parent):
+        return False
+    return True
+
+
 def resolve_origin(db_path: str | Path, profile: str, source: Mapping[str, object]) -> dict | None:
     """Resolve exact OWUI chat ownership; fail closed for missing DB/owner."""
     if not isinstance(source, Mapping) or source.get("platform") != "api_server":
@@ -111,13 +182,11 @@ def acknowledge_visible(outbox_path: str | Path, db_path: str | Path,
         if not isinstance(messages, dict):
             return False
         current = history.get("currentId")
-        chain = active_chain(messages, current)
-        if chain is None or event_id not in chain:
-            return False
-        message = messages[event_id]
-        if (message.get("id") != event_id or message.get("role") != "assistant"
-                or message.get("done") is not True
-                or message.get("content") != pending["content"]):
+        # A1 readback gate: the receipt must be the CURRENT tip with exact
+        # staged content.  The ancestor chain above it may be pruned by OWUI
+        # history trimming — that is legitimate and no longer blocks ACK (it
+        # previously forced the channel into 12-failures → drop).
+        if not current_tip_ok(messages, current, event_id, pending["content"]):
             return False
         return ack(outbox_path, event_id, resolved, f"openwebui:{event_id}")
     except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):

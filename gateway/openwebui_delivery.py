@@ -13,7 +13,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Mapping
 
-from gateway.openwebui_origin import _CHAT_ID, active_chain, acknowledge_visible, resolve_origin
+from gateway.openwebui_origin import (_CHAT_ID, append_target_ok,
+                                      acknowledge_visible, resolve_origin)
 from gateway.origin_outbox import get_pending
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,13 @@ def persist_pending(outbox_path: str | Path, db_path: str | Path,
                 return False
             messages = history.get("messages")
             current = history.get("currentId")
-            if active_chain(messages, current) is None:
+            # A1: do NOT require the full ancestor chain to append.  OWUI
+            # prunes/trims old turns, so a broken chain above the current tip
+            # is legitimate and previously forced every terminal итог into the
+            # 12-failures → channel-drop path for such chats (analysis A §2.3).
+            # We only need a well-formed append target under which the receipt
+            # can be parented; exact-tip validation happens on readback.
+            if not append_target_ok(messages, current):
                 return False
             if event_id not in messages:
                 message = {"id": event_id, "parentId": current, "role": "assistant",

@@ -77,10 +77,10 @@ def test_crash_after_write_before_ack_is_recovered_without_duplicate(fixture, mo
 @pytest.mark.parametrize("invalid_parent", [
     {"id": "DIFFERENT", "parentId": None, "role": "user"},
     {"id": "user-1", "role": "user"},
-    {"id": "user-1", "parentId": "missing", "role": "user"},
     {"id": "user-1", "parentId": "user-1", "role": "user"},
 ])
 def test_malformed_active_parent_is_never_written_or_acknowledged(fixture, invalid_parent):
+    """Structural corruption of the append target still fails closed (A1)."""
     db_path, outbox, origin, event = fixture
     with sqlite3.connect(db_path) as db:
         chat = read_chat(db_path)
@@ -89,6 +89,23 @@ def test_malformed_active_parent_is_never_written_or_acknowledged(fixture, inval
     assert not persist_pending(outbox, db_path, origin, event)
     assert read_chat(db_path) == chat
     assert status(outbox, event) == "pending"
+
+
+def test_trimmed_broken_ancestor_does_not_block_append(fixture):
+    """A1: a parentId pointing at a missing (pruned) ancestor above the tip is
+    legitimate OWUI history trimming — the terminal итог is still written and
+    ACKed (previously this blocked the write → channel dropped after 12 fails).
+    """
+    db_path, outbox, origin, event = fixture
+    with sqlite3.connect(db_path) as db:
+        chat = read_chat(db_path)
+        chat["history"]["messages"]["user-1"]["parentId"] = "pruned-turn"
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert persist_pending(outbox, db_path, origin, event)
+    updated = read_chat(db_path)
+    assert updated["history"]["currentId"] == event
+    assert updated["history"]["messages"][event]["parentId"] == "user-1"
+    assert status(outbox, event) == "acknowledged"
 
 
 def test_corrupt_or_divergent_history_fails_closed(fixture):

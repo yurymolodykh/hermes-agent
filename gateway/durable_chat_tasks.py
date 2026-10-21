@@ -218,8 +218,19 @@ def execute_durable_chat_command(
     notifier_profile: Optional[str] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    origin_binding: Optional[dict] = None,
 ) -> DurableChatResult:
-    """Execute a parsed command against the persistent Kanban board."""
+    """Execute a parsed command against the persistent Kanban board.
+
+    ``origin_binding`` is an optional server-verified Open WebUI origin
+    (``{chat_id, session_id, user_id, profile}``) produced ONLY by the
+    gateway's origin-binding middleware from the WebUI-signed identity claim.
+    It is re-verified against the server-owned chat registry before any
+    subscription is written, so a durable task created from a real OWUI chat
+    carries a correct ``user_id`` (A4) — previously the durable path wrote
+    ``user_id=None`` subscriptions, which ``stage_terminal`` refuses as
+    "unbound" and the terminal итог was silently dropped.
+    """
     _ensure_board()
 
     if command.action == "help":
@@ -267,11 +278,42 @@ def execute_durable_chat_command(
             # conversation that created the task. add_notify_sub is an
             # idempotent upsert, so deduplicated/retried creates remain safe.
             if session_id:
+                # A4: when a server-verified OWUI origin binding is available,
+                # write the subscription with the real owner user_id so
+                # stage_terminal resolves it as bound (previously these rows
+                # carried user_id=None → "unbound" → terminal итог dropped).
+                # The binding is re-verified against the server-owned registry
+                # here — never taken from client-supplied parameters.
+                verified_user_id = None
+                verified_platform = "api_server"
+                verified_chat_id = session_id if session_id.startswith("owui-") else None
+                try:
+                    from gateway.openwebui_origin import resolve_origin
+                    import os as _os
+                    _registry = _os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                    if _registry and verified_chat_id and origin_binding:
+                        _resolved = resolve_origin(_registry, notifier_profile or assignee, {
+                            "platform": "api_server",
+                            "chat_id": origin_binding.get("chat_id"),
+                            "thread_id": None,
+                            "user_id": origin_binding.get("user_id"),
+                        })
+                        if (
+                            _resolved
+                            and _resolved.get("chat_id") == verified_chat_id
+                            and _resolved.get("owner_id") == origin_binding.get("user_id")
+                        ):
+                            verified_user_id = _resolved["owner_id"]
+                except Exception:
+                    # Never fail the durable create because origin verification
+                    # broke — the row just lands without a verified user_id.
+                    verified_user_id = None
                 kb.add_notify_sub(
                     conn,
                     task_id=task_id,
                     platform="api_server",
                     chat_id=session_id,
+                    user_id=verified_user_id,
                     chat_type="dm",
                     # The worker can run under a routed runtime profile while
                     # the API listener belongs to another multiplex profile.

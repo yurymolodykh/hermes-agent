@@ -862,3 +862,55 @@ async def test_wave_filter_skips_old_root_before_planning(
     )
     # Wave roots were still planned+delivered.
     assert "tg-old" not in {s["chat_id"] for s in adapter.sent}
+
+
+@pytest.mark.asyncio
+async def test_a2_drop_persists_reason_comment(board_env, monkeypatch):
+    """A2 (t_5d3bc199): when an api_server channel hits the 12-failure drop,
+    the last delivery reason is persisted as a comment on the branch root so
+    an operator can triage without grepping logs."""
+    from gateway import kanban_origin_delivery as _kod
+
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc123",
+        user_id="sess-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    def broken_stage(outbox, registry, sub, profile, board, event_id, message):
+        # Simulates a permanently-broken OWUI chat (e.g. missing registry):
+        # enqueue succeeds but stays pending forever -> never acknowledged.
+        return ("pending", None)
+
+    monkeypatch.setattr(_kod, "stage_terminal", broken_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    for _ in range(12):
+        runner = _make_runner(adapter)
+        runner.adapters = {Platform.API_SERVER: adapter}
+        # 11 prior failures already accumulated on this same channel.
+        runner._kanban_branch_summary_fail_counts = {
+            (root, "api_server", "owui-abc123", ""): 11,
+        }
+        await _run_one_branch_tick(monkeypatch, runner)
+
+    # After 12 failures the channel is dropped -> drop-reason comment on root.
+    conn2 = kb.connect(board="default")
+    try:
+        comments = kb.list_comments(conn2, root)
+    finally:
+        conn2.close()
+    assert comments, "expected a drop-reason comment on the root"
+    drop = [c for c in comments if c.body.startswith("[delivery-drop]")]
+    assert drop, f"expected [delivery-drop] comment; got {[c.body for c in comments]}"
+    body = drop[-1].body
+    assert "owui-abc123" in body, body
+    assert "причина" in body, body

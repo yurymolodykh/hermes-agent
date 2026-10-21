@@ -1509,6 +1509,14 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_branch_summary_fail_counts", {}
         )
         self._kanban_branch_summary_fail_counts = fail_counts
+        # A2: per-(root, channel) last delivery error string, persisted as a
+        # task comment when the channel is dropped so an operator can triage
+        # WHY without grepping logs (analysis A §2.3 / §2.5: previously only
+        # "dropping channel …" was logged, the reason stayed invisible).
+        drop_reasons: dict[tuple, str] = getattr(
+            self, "_kanban_branch_summary_drop_reasons", {}
+        )
+        self._kanban_branch_summary_drop_reasons = drop_reasons
 
         # Let the gateway finish wiring adapters + the notifier take its first
         # pass before branch scanning starts.
@@ -1691,6 +1699,9 @@ class GatewayKanbanWatchersMixin:
                             ok = await self._deliver_branch_summary(
                                 plan, sub, notifier_profile,
                             )
+                            last_error = getattr(self, "_kanban_last_branch_error", None)
+                            if not ok and last_error:
+                                drop_reasons[sub_key] = last_error
                         except Exception as exc:
                             logger.warning(
                                 "kanban branch summary: delivery failed for %s on "
@@ -1698,8 +1709,10 @@ class GatewayKanbanWatchersMixin:
                                 root_id, sub.get("platform"), sub.get("chat_id"), exc,
                             )
                             ok = False
+                            drop_reasons[sub_key] = str(exc)[:300]
                         if ok:
                             fail_counts.pop(sub_key, None)
+                            drop_reasons.pop(sub_key, None)
                         else:
                             n = fail_counts.get(sub_key, 0) + 1
                             fail_counts[sub_key] = n
@@ -1714,6 +1727,15 @@ class GatewayKanbanWatchersMixin:
                                     (sub.get("platform") or "").lower(),
                                     sub.get("chat_id"),
                                     sub.get("thread_id") or "",
+                                )
+                                await _to_thread_process_service(
+                                    self._persist_branch_drop_reason,
+                                    board_slug, root_id,
+                                    (sub.get("platform") or "").lower(),
+                                    sub.get("chat_id"),
+                                    sub.get("thread_id") or "",
+                                    drop_reasons.pop(sub_key, None)
+                                    or "unknown delivery failure",
                                 )
                                 logger.error(
                                     "kanban branch summary: dropping channel "
@@ -1901,6 +1923,19 @@ class GatewayKanbanWatchersMixin:
                     board or "default", int(marker_id), _msg,
                 )
             if _state != "acknowledged":
+                reason_map = {
+                    "unbound": (
+                        "no verified-origin binding (subscription has no "
+                        "user_id or chat missing from registry)"
+                    ),
+                    "failed": "outbox enqueue failed",
+                    "pending": "outbox item pending (write/readback not yet "
+                               "persisted to Open WebUI chat)",
+                }
+                self._kanban_last_branch_error = (
+                    f"api_server stage_terminal -> {_state}: "
+                    + reason_map.get(_state, "unknown delivery failure")
+                )
                 logger.warning(
                     "kanban branch summary: api_server delivery for %s state=%s; "
                     "channel kept pending",
@@ -2099,6 +2134,44 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _persist_branch_drop_reason(
+        self,
+        board: Optional[str],
+        root_id: str,
+        platform: str,
+        chat_id: str,
+        thread_id: str,
+        reason: str,
+    ) -> None:
+        """Sync helper (A2): persist WHY a channel was dropped onto the root.
+
+        Writes a durable comment on the branch root so the reason survives log
+        rotation and is visible to an operator/worker beside the task — not
+        just an ERROR line.  Best-effort: a comment failure must never break
+        or re-enter the drop path.
+        """
+        from hermes_cli import kanban_db as _kb
+        try:
+            conn = _kb.connect(board=board)
+            try:
+                _kb.add_comment(
+                    conn,
+                    root_id,
+                    "delivery",
+                    ("[delivery-drop] канал не доставил итог ветки: "
+                     f"{platform}/{chat_id}"
+                     + (f"/{thread_id}" if thread_id else "")
+                     + f" — причина: {reason or 'unknown delivery failure'}"),
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "kanban branch summary: failed to persist drop reason for "
+                "%s/%s: %s",
+                platform, chat_id, exc,
+            )
 
     def _kanban_rewind(
         self,

@@ -75,10 +75,10 @@ def test_visible_receipt_requires_exact_owned_current_branch_and_content(chat_db
 @pytest.mark.parametrize("broken", [
     {"id": "WRONG", "parentId": None},
     {"id": "user-1"},
-    {"id": "user-1", "parentId": "missing"},
     {"id": "user-1", "parentId": "user-1"},
 ])
-def test_receipt_refuses_broken_active_ancestor(chat_db, tmp_path, broken):
+def test_receipt_refuses_malformed_active_ancestor(chat_db, tmp_path, broken):
+    """Structural corruption of the append target still fails closed (A1)."""
     origin = resolve_origin(chat_db, "01-orchestrator", {
         "platform": "api_server", "chat_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
     })
@@ -93,6 +93,28 @@ def test_receipt_refuses_broken_active_ancestor(chat_db, tmp_path, broken):
         }}),))
     assert not acknowledge_visible(outbox, chat_db, origin, event)
     assert status(outbox, event) == "pending"
+
+
+def test_receipt_tolerates_trimmed_broken_ancestor(chat_db, tmp_path):
+    """A1: a parentId that points at a missing (pruned) message above the
+    delivered tip is legitimate OWUI history trimming — the current-tip exact
+    receipt is still ACKed (previously this drove channels to 12-failure drop).
+    """
+    origin = resolve_origin(chat_db, "01-orchestrator", {
+        "platform": "api_server", "chat_id": "owui-98d69f26-8263-4e1c-84a5-6d9fcdbf593d",
+    })
+    outbox = tmp_path / "outbox.sqlite"
+    event = enqueue(outbox, "cron:broken-ancestor", origin, "expected")
+    with sqlite3.connect(chat_db) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps({"history": {
+            "messages": {"user-1": {"id": "user-1", "parentId": "pruned"},
+                         event: {
+                             "id": event, "parentId": "user-1", "role": "assistant",
+                             "content": "expected", "done": True,
+                         }}, "currentId": event,
+        }}),))
+    assert acknowledge_visible(outbox, chat_db, origin, event)
+    assert status(outbox, event) == "acknowledged"
 
 
 def test_client_claimed_owner_or_thread_cannot_rebind_another_user(chat_db):
