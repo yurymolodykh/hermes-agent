@@ -1227,16 +1227,17 @@ class GatewayKanbanWatchersMixin:
                         from hermes_constants import get_hermes_home
                         from gateway.kanban_origin_delivery import stage_terminal
                         _registry = os.environ.get("HERMES_OPENWEBUI_DB_PATH")
+                        _ev_id = getattr(ev, "id", None)
                         if (
                             not _registry
                             or (sub_profile and sub_profile != notifier_profile)
-                            or not ev_id
+                            or not _ev_id
                         ):
                             return "unbound", None
                         return stage_terminal(
                             get_hermes_home() / "delivery-outbox.sqlite",
                             _registry, sub, sub_profile or notifier_profile,
-                            board_slug or "default", int(ev_id),
+                            board_slug or "default", int(_ev_id),
                             msg_text or "✅ Задача выполнена",
                         )
 
@@ -1915,7 +1916,11 @@ class GatewayKanbanWatchersMixin:
                 and (not sub_profile or sub_profile == notifier_profile)
                 and int(marker_id or 0) > 0
             ):
-                _msg = owui_root_final_summary(plan, msg)
+                # OWUI primary lane carries the bare baked one-liner (F1/R1:
+                # the enriched composite is the TELEGRAM lane's message; the
+                # OWUI stage keeps the same one-line итог the owner sees in
+                # the server, no summary/sanitize drift).
+                _msg = msg
                 _state, _delivery_id = await asyncio.to_thread(
                     stage_terminal,
                     get_hermes_home() / "delivery-outbox.sqlite",
