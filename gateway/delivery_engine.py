@@ -201,10 +201,19 @@ def render_final(msg: str, plan: Optional[dict] = None,
     is what the dual lane delivers, so a bare итог never rides through on its
     own (F1 convention preserved inside the engine render, not as a side gate).
     """
-    parts: List[str] = [(msg or "").strip() or "✅ Задача выполнена"]
+    h = (msg or "").strip() or "✅ Задача выполнена"
+    parts: List[str] = [h]
     s = (summary or "").strip()
     if s:
-        parts.append(s)
+        # Render-zone dedup: the composed summary often already carries the
+        # identical baked header (owui_root_final_summary / the F1 итог), so
+        # appending it verbatim would double the ✅ header.  Skip the first
+        # occurrence and keep the body — final output stays `✅ …\n\ndone`,
+        # never `✅ …\n\n✅ …\n\ndone`.
+        if s.startswith(h):
+            s = s[len(h):].strip("\n")
+        if s:
+            parts.append(s)
     if artifacts:
         ok = [a for a in artifacts if isinstance(a, str) and a.strip()]
         if ok:
