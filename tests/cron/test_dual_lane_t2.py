@@ -364,8 +364,15 @@ def test_dual_lane_binding_adds_lane_regardless_of_old_policy_flag(monkeypatch):
     }
     assert owui_telegram_users()  # привязка на месте
     results = _run_dual_gate(job, ARTIFACT)
-    assert any(p == "telegram" for p, _, _ in results), (
+    assert results, (
         "R1: привязка добавляет TG-ленту (policy-flag отката удалён): "
+        f"фактически {results}"
+    )
+    # ``_run_dual_gate`` returns (chat_id, allowed) 2-tuples (telegram-only
+    # targets); the R1 rewrite of this test unpacked (platform, *, allowed)
+    # 3-tuples as if it were ``_run_all_targets_gate`` — a leftover drift.
+    assert all(c == OWNER_TG and a is True for c, a in results), (
+        "R1: TG-лента должна вести в bound-чат владельца и быть разрешена: "
         f"фактически {results}"
     )
 

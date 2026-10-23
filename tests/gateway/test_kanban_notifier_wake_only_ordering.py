@@ -107,7 +107,9 @@ def _subs(tid):
         conn.close()
 
 
-def test_wake_only_success_advances_cursor_single_wake(tmp_path, monkeypatch):
+def test_wake_only_success_advances_cursor_single_wake(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     """Wake succeeds: exactly one wake, no text ping, cursor advanced."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-ok.db"))
     kb.init_db()
@@ -125,7 +127,9 @@ def test_wake_only_success_advances_cursor_single_wake(tmp_path, monkeypatch):
     assert runner._kanban_sub_fail_counts == {}
 
 
-def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
+def test_wake_only_failure_rewinds_and_redelivers(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     """Wake fails: cursor rewound, counter bumped, event retried next tick."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-fail.db"))
     kb.init_db()
@@ -155,7 +159,9 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     assert list(runner2._kanban_sub_fail_counts.values()) == [2]
 
 
-def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
+def test_notify_wake_failure_stays_best_effort(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     """notify+wake: text ping IS the delivery; failed wake must NOT rewind."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake.db"))
     kb.init_db()
@@ -178,7 +184,9 @@ def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
     # pre-existing task_terminal behavior, unrelated to the wake outcome.)
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
+def test_wake_only_failure_cap_drops_subscription(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()

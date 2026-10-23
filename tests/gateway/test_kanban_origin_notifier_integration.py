@@ -43,7 +43,9 @@ def test_registry_path_alone_does_not_enable_chat_writes(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_notifier_stages_then_advances_only_after_owned_readback(tmp_path, monkeypatch):
+def test_notifier_stages_then_advances_only_after_owned_readback(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     registry = tmp_path / "webui.db"
@@ -88,7 +90,9 @@ def test_notifier_stages_then_advances_only_after_owned_readback(tmp_path, monke
     assert counts(outbox)["acknowledged"] == 1
 
 
-def test_provider_question_requires_owner_bound_outbox_ack(tmp_path, monkeypatch):
+def test_provider_question_requires_owner_bound_outbox_ack(
+    tmp_path, monkeypatch, isolated_kanban_assignee_registry,
+):
     """A blocked provider choice never self-posts; only exact chat readback ACKs."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
