@@ -1119,6 +1119,50 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _content_text_for_probe(content: Any) -> str:
+    """Extract the text payload from a message content (str or list-of-parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if isinstance(part, dict):
+                ptype = str(part.get("type") or "").strip().lower()
+                if ptype in _TEXT_PART_TYPES:
+                    t = str(part.get("text") or "")
+                    if t:
+                        chunks.append(t)
+        return "\n".join(chunks)
+    return ""
+
+
+def _build_fast_lane_probe(messages: Any) -> Optional[str]:
+    """Build the fast-lane marker probe from a list of conversation messages.
+
+    Aggregates the text of every user message (multimodal list-of-parts
+    content is reduced to its text view) into a newline-joined probe string.
+    The fast-lane marker predicates split the probe back into per-message
+    fragments, so a «подумай»/«думай» that opens ANY user message fires —
+    even when OWUI/PWA split a text+attachment post into separate user
+    messages and the marker lands in a later one, or when the marker sits in
+    an earlier stored message of a continued session. Returns ``None`` when
+    the input is empty / yields no user text.
+    """
+    if not messages:
+        return None
+    parts: list = []
+    for _cm in messages:
+        if not isinstance(_cm, dict) or _cm.get("role") != "user":
+            continue
+        _t = _content_text_for_probe(_cm.get("content", ""))
+        if _t:
+            parts.append(_t)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -3514,6 +3558,7 @@ class APIServerAdapter(BasePlatformAdapter):
         fast_budget_notice_callback=None,
         confirmed_runtime_lock: bool = False,
         user_message: Optional[str] = None,
+        fast_lane_probe: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3848,14 +3893,15 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             _fast_lane_config = (user_config or {}).get("fast_lane") or {}
             _fast_lane_active = _fast_lane_enabled(user_config or {})
+            _fast_probe = fast_lane_probe or user_message or ""
             _fast_decision = _fast_lane_evaluate(
-                user_message or "",
+                _fast_probe,
                 model_options=model_options,
                 config=_fast_lane_config,
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
-                    _fast_decision, user_message or ""
+                    _fast_decision, _fast_probe
                 )
             # OWUI/PWA text marker (A6 §4.2): the «подумай»/«думай» prefix in
             # the request body must be STRIPPED from the text the model runs
@@ -6075,6 +6121,15 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
 
+        # Marker probe for fast-lane routing: aggregate the text of ALL user
+        # messages in THIS request. This guarantees «подумай»/«гигантская
+        # задача» still fire when Open WebUI splits a text+attachment post
+        # into separate user messages and the marker ends up in an earlier
+        # one (fast-lane otherwise reads only the last user message). The
+        # probe is rebuilt once more AFTER session-history load below so a
+        # marker stored in a continued session also fires.
+        fast_lane_probe = _build_fast_lane_probe(conversation_messages)
+
         if not _content_has_visible_payload(user_message):
             return web.json_response(
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
@@ -6136,6 +6191,17 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+            # Rebuild the marker probe AFTER session-history load: a
+            # «подумай»/«думай» stored in an earlier message of a continued
+            # session must still fire (owner regression: «в начале своего
+            # сообщения, но не сработало»). The probe now spans the stored
+            # history PLUS this request's own user messages.
+            _stored_probe = _build_fast_lane_probe(history)
+            _request_probe = _build_fast_lane_probe(conversation_messages)
+            if _stored_probe or _request_probe:
+                fast_lane_probe = "\n".join(
+                    _p for _p in (_stored_probe, _request_probe) if _p
+                )
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -6337,6 +6403,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
+                fast_lane_probe=fast_lane_probe,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
@@ -6363,6 +6430,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
+                fast_lane_probe=fast_lane_probe,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
@@ -8429,6 +8497,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
         fast_lane_route: Optional[bool] = None,
+        fast_lane_probe: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -8500,12 +8569,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     else fast_lane_route
                 )
                 if _fl_route_enabled:
+                    # Marker probe: prefer the caller-supplied aggregated text
+                    # (all user messages in THIS request) so «подумай» /
+                    # «гигантская задача» still fire when OWUI splits a
+                    # text+attachment post into separate user messages and the
+                    # marker lands in an earlier one. Falls back to the last
+                    # user message (original behaviour).
+                    _fl_probe = fast_lane_probe or user_message or ""
                     _fl_decision = _fl_decide(
-                        user_message or "",
+                        _fl_probe,
                         model_options=model_options,
                         config=_fl_cfg,
                     )
-                    _fl_decision = _fl_resolve(_fl_decision, user_message or "")
+                    _fl_decision = _fl_resolve(_fl_decision, _fl_probe)
                     _fl_profile = _fl_route(_fl_decision)
                     if _fl_profile:
                         fast_lane_execute_profile = _fl_profile
@@ -8564,6 +8640,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                         user_message=user_message,
+                        fast_lane_probe=fast_lane_probe,
                     )
                     if confirmed_runtime_lock:
                         locked_provider = self._clean_runtime_id(
@@ -8925,6 +9002,25 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        # Marker probe: aggregate all user messages in this request so
+        # «подумай»/«гигантская задача» still fire when the text and an
+        # attachment arrive as separate messages (fast-lane reads only the
+        # last one otherwise).
+        fast_lane_probe = None
+        if isinstance(raw_input, list):
+            parts = []
+            for _m in raw_input:
+                if isinstance(_m, dict) and _m.get("role") in ("user", "user."):
+                    c = _m.get("content", "")
+                    if isinstance(c, str):
+                        parts.append(c)
+                    elif isinstance(c, list):
+                        for p in c:
+                            if isinstance(p, dict) and str(p.get("type") or "").lower() in _TEXT_PART_TYPES:
+                                parts.append(str(p.get("text") or ""))
+            if parts:
+                fast_lane_probe = "\n".join(parts)
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -9075,6 +9171,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                         user_message=user_message,
+                        fast_lane_probe=fast_lane_probe,
                     )
                 self._active_run_agents[run_id] = agent
 

@@ -28886,7 +28886,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile's secret scope (never the process-global ``os.environ``). When
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
+
+        Track M (design fast-lane-design.md §4.2) — fast-lane profile
+        routing for the gateway/run.py (PWA/yadisk_bridge) path. When
+        ``fast_lane.route_to_profile`` is enabled and the inbound marker-less
+        request is a fast-lane candidate, the whole turn executes under the
+        fast profile (``11-fast-answers``); slow requests („подумай“ /
+        „гигантская задача“ / OWUI deepthink) stay on the current profile
+        (full lane). Best-effort: any routing failure degrades to the current
+        profile, never breaking the turn (§6.1).
         """
+        fast_exec_profile = self._resolve_fast_lane_execute_profile(
+            message=message,
+            source=source,
+        )
+        if fast_exec_profile:
+            plat = getattr(source, "platform", None)
+            plat_name = getattr(plat, "value", None) or ""
+            from agent.fast_lane import decide_slow_mode as _fl_decide_debug
+            try:
+                _decision = _fl_decide_debug(message)
+                _slow = getattr(_decision, "slow_mode", None)
+                _src = getattr(_decision, "source", None)
+            except Exception:
+                _slow, _src = None, None
+            logger.info(
+                "fast_lane=ROUTE run.py session=%s key=%s platform=%s target=%s "
+                "slow=%s source=%s message=%r",
+                session_id or "", session_key or "", plat_name, fast_exec_profile,
+                _slow, _src, (message or "")[:120],
+            )
+            from hermes_cli.profiles import get_profile_dir
+
+            try:
+                fast_profile_home = get_profile_dir(fast_exec_profile)
+            except Exception:
+                fast_profile_home = None
+            if fast_profile_home is not None:
+                from gateway.run import _profile_runtime_scope as _fl_scope
+
+                try:
+                    with _fl_scope(fast_profile_home):
+                        return await self._run_agent_inner(
+                            message, context_prompt, history, source, session_id,
+                            session_key=session_key, run_generation=run_generation,
+                            _interrupt_depth=_interrupt_depth,
+                            event_message_id=event_message_id,
+                            channel_prompt=channel_prompt, moa_config=moa_config,
+                            persist_user_message=persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            message_type=message_type,
+                            tool_resume=tool_resume,
+                            has_attachments=has_attachments,
+                        )
+                except Exception:
+                    logger.warning(
+                        "fast_lane=ROUTE fallback run.py session=%s target=%s "
+                        "-> current profile (degraded to full lane)",
+                        session_id or "", fast_exec_profile,
+                        exc_info=True,
+                    )
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -28915,6 +28976,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tool_resume=tool_resume,
                 has_attachments=has_attachments,
             )
+
+    def _resolve_fast_lane_execute_profile(
+        self,
+        message: Optional[str],
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Resolve the Track M executor profile for one gateway/run.py turn.
+
+        Returns ``11-fast-answers`` for a marker-less fast-lane candidate
+        when ``fast_lane.route_to_profile`` is enabled; ``None`` otherwise
+        (use the current/source profile — the full lane). Slow requests
+        („подумай“ / „гигантская задача“ / RGZ-plan phrases) stay on the
+        current profile exactly as before.
+
+        Only the gateway/run.py (PWA/yadisk_bridge and other messenger)
+        path goes through this point: api_server already implements Track M
+        in its own ``_run_agent`` (route_profile -> 11-fast-answers). Gated
+        on the SAME ``agent.fast_lane`` decision the fast-path overrides use,
+        so the trigger contract (fast_lane markers + RGZ) is identical.
+
+        Optional ``fast_lane.route_platforms`` (list of platform names)
+        restricts profile routing to the listed platforms only; when unset
+        (None/empty) routing applies to every messenger source. The PWA
+        fast-request task (t_b0b406ad) enables Track M for the
+        ``yadisk_bridge`` platform specifically, leaving all other
+        messengers on the current full-lane behavior.
+
+        Best-effort by contract: any decision/config failure returns None
+        (no routing), so a broken decision can never change the lane.
+        """
+        try:
+            if not source or not message:
+                return None
+            user_config = _load_gateway_config()
+            fl_cfg = (user_config or {}).get("fast_lane") or {}
+            if not fl_cfg.get("enabled"):
+                return None
+            if not fl_cfg.get("route_to_profile"):
+                return None
+            # Optional platform allow-list gate: when ``route_platforms`` is
+            # set, only those platforms may be fast-lane routed. Anything else
+            # (including a malformed/empty list) keeps the current profile.
+            route_platforms = fl_cfg.get("route_platforms")
+            if route_platforms:
+                plat = getattr(source, "platform", None)
+                plat_value = getattr(plat, "value", None)
+                plat_name = (
+                    plat_value
+                    if isinstance(plat_value, str)
+                    else str(plat or "").lower()
+                )
+                allowed = {str(p).strip().lower() for p in route_platforms if p}
+                if plat_name not in allowed:
+                    return None
+            from agent.fast_lane import (
+                decide_slow_mode,
+                resolve_fast_path,
+                route_profile,
+            )
+
+            # Marker probe: the raw inbound text of THIS request. OWUI/PWA
+            # split text+attachment posts; yadisk_bridge hands us the joined
+            # user text, so the marker either fires here or not at all.
+            decision = decide_slow_mode(message, config=fl_cfg)
+            decision = resolve_fast_path(decision, message)
+            return route_profile(decision)
+        except Exception:
+            logger.debug(
+                "fast_lane profile routing skipped (run.py) — staying on "
+                "current profile",
+                exc_info=True,
+            )
+            return None
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

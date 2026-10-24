@@ -66,6 +66,55 @@ _TG_SLOW_PREFIXES = ("подумай", "думай")
 _ALWAYS_SLOW_SUBJECTS = ("план", "задача", "миссия", "проект")
 
 
+def _text_view(content: Any) -> str:
+    """Best-effort plain-text view of message content for marker checks.
+
+    api_server multimodal messages (OWUI/PWA with an attached file/image)
+    yield ``content`` as a *list* of parts (``{type: text|file|image_url}``)
+    rather than a plain string. The RGZ/fast-lane markers must still fire on
+    such messages, so every marker predicate normalises its input through this
+    helper. Mirrors ``context_compressor._content_text_for_contains`` semantics
+    (string passthrough, list -> concat of text parts, else str()).
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _probe_fragments(text: str) -> list[str]:
+    """Split a fast-lane marker probe into message fragments.
+
+    api_server aggregates the texts of ALL user messages in a multi-message
+    request (OWUI/PWA split a text+attachment post into separate user
+    messages) into a single newline-joined probe string. A marker predicate
+    that only checks the very START of that joined string loses every
+    marker that opens a LATER message («подумай …» after an earlier plain
+    message or a file message) — the exact owner regression. Splitting the
+    probe back into per-message fragments and checking the prefix on *each*
+    fragment restores «в начале своего сообщения, но не сработало».
+
+    A single-fragment probe (normal TG/CLI message) returns ``[text]`` and
+    behaves exactly as before.
+    """
+    if not text:
+        return []
+    return [f for f in str(text).split("\n") if f.strip()]
+
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -168,10 +217,24 @@ _TG_SLOW_RE = re.compile(
 
 
 def telegram_prefix_marks_slow(text: Optional[str]) -> bool:
-    """Marker 2: True when ``text`` opens with the TG «подумай» marker."""
+    """Marker 2: True when a user message opens with the TG «подумай» marker.
+
+    Checks the prefix on EVERY message fragment of the probe, not just the
+    very start of the joined string. api_server aggregates all user messages
+    of a multi-message request (OWUI/PWA text+attachment split) into one
+    newline-joined probe; a «подумай» that opens a LATER message must still
+    fire (owner regression: «в начале своего сообщения, но не сработало»).
+    A single-message probe behaves exactly as before (strict prefix only —
+    «я подумаю», «надо подумать» never fire).
+
+    Multimodal content (list of parts) is normalised to its text view first,
+    so a «подумай» prefix in a message that also carries an attachment still
+    fires.
+    """
     if not text:
         return False
-    return bool(_TG_SLOW_RE.match(text))
+    view = _text_view(text)
+    return any(bool(_TG_SLOW_RE.match(f)) for f in _probe_fragments(view))
 
 
 def strip_telegram_slow_prefix(text: Optional[str]) -> str:
@@ -180,11 +243,12 @@ def strip_telegram_slow_prefix(text: Optional[str]) -> str:
     Also consumes an optional trailing ``:`` or ``,`` so the cleaned text
     reads naturally («подумай: разбери это» -> «разбери это»). When the
     marker is absent, returns the input unchanged (stripped). Used so the
-    model never sees the UI directive.
+    model never sees the UI directive. Multimodal content is normalised to
+    its text view before stripping (the marker can only live in a text part).
     """
     if not text:
         return (text or "").strip()
-    cleaned = _TG_SLOW_RE.sub("", text).lstrip()
+    cleaned = _TG_SLOW_RE.sub("", _text_view(text)).lstrip()
     if cleaned[:1] in (":", ","):
         cleaned = cleaned[1:].lstrip()
     return cleaned
@@ -197,10 +261,14 @@ _ALWAYS_SLOW_RE = re.compile(
 
 
 def contains_always_slow_phrase(text: Optional[str]) -> bool:
-    """Marker 3: True when ``text`` contains a NIGHT-PLAN always-slow phrase."""
+    """Marker 3: True when ``text`` contains a NIGHT-PLAN always-slow phrase.
+
+    Multimodal content (list of parts) is normalised to its text view first,
+    so an RGZ phrase in a message that also carries an attachment still fires.
+    """
     if not text:
         return False
-    return bool(_ALWAYS_SLOW_RE.search(text))
+    return bool(_ALWAYS_SLOW_RE.search(_text_view(text)))
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +486,11 @@ def decide_slow_mode(
             reasons.append("OWUI deepthink (reasoning enabled + effort>=high)")
 
         if text:
+            # Normalise multimodal content (list of parts) to its plain-text
+            # view so «подумай»/«гигантская задача» markers fire on messages
+            # that also carry attachments (api_server). `_text_view` is a
+            # no-op for plain strings.
+            text = _text_view(text)
             lowered = text.lower()
             # Extra configured always-slow phrases (optional; NIGHT-PLAN base
             # is always evaluated).

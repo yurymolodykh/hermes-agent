@@ -3760,9 +3760,17 @@ DEFAULT_CONFIG = {
     # default (full-lane) profile. Off = Track S (same profile, fast overrides
     # applied in place). Requires the fast profile to exist; any routing error
     # degrades to the current profile.
+    #
+    # ``route_platforms`` (optional, default None): when set to a non-empty
+    # list of platform names (e.g. ["yadisk_bridge"]), Track M profile routing
+    # is restricted to inbound requests from those platforms only — all other
+    # platforms keep the current full-lane behavior unchanged. When unset
+    # (None/empty), routing applies to every platform passing through the
+    # run.py/run_agent seam (design parity with api_server).
     "fast_lane": {
         "enabled": False,
         "route_to_profile": False,
+        "route_platforms": None,
     },
 
     # Config schema version - bump this when adding new required fields
