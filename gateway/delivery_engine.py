@@ -1123,7 +1123,21 @@ class DeliveryEngine:
             msg = sanitize_delivery_text(msg, max_chars=8000)
 
         # ---- OWUI lane (api_server): stage exact event into outbox --------
+        # Rule-4 decoupling (t_637df501): the OWUI ack gate owns ONLY the OWUI
+        # cursor (rewind-to-retry until the server readback ACKs the outbox
+        # row).  It must NEVER starve the complementary TG lane or the wake —
+        # «[needs-decision] всегда в обе лейны, немедленно» and «карточка в
+        # triage часами без уведомления недопустима».  A ``pending`` outbox
+        # stage (normal for open blocked/triage cards) previously returned
+        # early with ``rewind`` BEFORE the Telegram lane and wake ran, so the
+        # author never got the phone ping while OWUI awaited readback.  Now:
+        # OWUI pending/error → TG+Wake still fire this tick, and the final
+        # result re-claims (rewind) so the OWUI row can be acked on a later
+        # drain — bounded by the watcher's MAX_API_STAGE_RETRIES.  The TG
+        # dedup marker already written makes the re-claim idempotent (no
+        # double ping).
         owui_delivered = False
+        owui_rewind: Optional[str] = None   # reason when OWUI needs a re-claim
         if platform_str == "api_server" and stage_owui is not None and ev_id:
             _owui_msg = msg
             if render_owui is not None:
@@ -1137,19 +1151,18 @@ class DeliveryEngine:
                 _state, _ = stage_owui(_owui_msg)
                 owui_delivered = _state == "acknowledged"
                 if not owui_delivered:
-                    return self.HandleResult(
-                        action="rewind", decision_type=et,
-                        reason="owui stage pending", event_id=ev_id,
-                    )
+                    # pending: retry-to-ack; unbound/failed: nothing to ack
+                    # (advance — no point re-claiming an unwritable row).
+                    if _state in ("failed", "unbound", ""):
+                        owui_delivered = True
+                    else:
+                        owui_rewind = f"owui stage {_state or 'pending'}"
             except Exception as exc:
                 logger.warning(
                     "delivery engine: OWUI stage failed for %s/%s: %s",
                     sub.get("task_id"), ev_id, exc,
                 )
-                return self.HandleResult(
-                    action="rewind", decision_type=et,
-                    reason="owui stage error", event_id=ev_id,
-                )
+                owui_rewind = "owui stage error"
 
         # ---- Telegram lane (dual-lane rule 1/4/5) -------------------------
         # native-TG sub: the channel of record IS the TG lane (one message —
@@ -1231,6 +1244,19 @@ class DeliveryEngine:
                         action="rewind", decision_type=et,
                         reason="wake failed (wake-only)", event_id=ev_id,
                     )
+
+        # ---- OWUI cursor decision (t_637df501) ----------------------------
+        # TG lane + wake already ran (decoupled from the OWUI ack gate).  Now
+        # the OWUI lane's own cursor contract: a ``pending`` stage must re-claim
+        # the event so a later drain can ACK the outbox row (bounded by the
+        # watcher's MAX_API_STAGE_RETRIES — a permanently-stuck row is dropped
+        # there, never pinned forever).  If OWUI was acked (or there was no
+        # OWUI lane — native-TG sub, or the sub couldn't stage at all), advance.
+        if owui_rewind:
+            return self.HandleResult(
+                action="rewind", decision_type=et,
+                reason=owui_rewind, event_id=ev_id,
+            )
         return r
 
     def _root_completed_empty_summary(self, plan: dict) -> bool:
