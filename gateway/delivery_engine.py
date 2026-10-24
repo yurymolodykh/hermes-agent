@@ -719,6 +719,62 @@ class LaneCtx:
     tg_allowed: bool = False
 
 
+def resolve_author_telegram(
+    task: Any,
+    sub: Optional[dict] = None,
+    owui_to_tg: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve the Telegram chat bound to a task's author/owner (OWUI→TG).
+
+    ЕДИНСТВЕННАЯ точка маппинга «автор/владелец канала постановки
+    (api_server-подписка) → его Telegram» (карточка 1, AUDIT-PLAN
+    §5; критерий 4 — не дублируем OWUI-цепочку). Источник прав —
+    серверная привязка ``owui_to_tg`` (delivery_policy.owui_telegram_users(),
+    T2 §8.1), которая инжектится в движок watcher'ом
+    (kanban_watchers.py:1202-1206). Все вызовы (включая legacy
+    ``_tg_bound_chat_for``) идут через этот хелпер.
+
+    Автор = владелец канала постановки = ``kanban_notify_subs.user_id``
+    (verified-origin), fallback ``delivery_metadata[owui_user_id_attr]``
+    (F3, t_cdb88a42) — НЕ ``tasks.created_by``/``assignee`` (профильные
+    слэги несравнимы с TG-идентификаторами, аудит §3.3). ``task``
+    принимается для сигнатуры будущей интеграции [needs-decision] и
+    как контекст вызывающего; само разрешение параметризовано подпиской,
+    как в ``_tg_bound_chat_for``.
+
+    Fail-closed (OWUI-only): policy=off / отсутствие owner / отсутствие
+    привязки → None. Адрес никогда не фабрикуется и доставляется только
+    верифицированному владельцу (H-5, t_efffb731; П.4, t_6692dd10).
+    """
+    if not isinstance(sub, dict):
+        return None
+    # F6 (T2 §8.2.2): policy off → OWUI stays OWUI-only; the OWUI→TG mirror
+    # lane is never opened (fail-closed).  Mirrors the R1 helper
+    # ``_run_branch_lane`` gate so the real production path behaves
+    # identically to the unit-tested decision surface.
+    if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
+        return None
+    owner = str(sub.get("user_id") or "").strip()
+    if not owner:
+        meta = sub.get("delivery_metadata")
+        if isinstance(meta, dict):
+            from hermes_cli.kanban_db import _OWUI_ATTR_META_KEY
+            owner = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
+    if not owner:
+        return None
+    tg_lane = (owui_to_tg or {}).get(owner)
+    if not tg_lane:
+        return None
+    # The OWUI→TG mirror lane is resolved purely by the verified owner
+    # binding (``owui_to_tg[owner]``): a user who bound their OWUI
+    # session/server to a Telegram chat is authorized for that chat
+    # (H-5, t_efffb731) — the allowlist must not starve a bound owner of
+    # their own итог (П.4, t_6692dd10).  The platform authz layer
+    # (TELEGRAM_ALLOWED_USERS) gates the FALLBACK-to-home path, not a
+    # user's own verified bound chat, so the two deltas stay consistent.
+    return str(tg_lane)
+
+
 class DeliveryEngine:
     """Single delivery engine: classify -> render -> dispatch (one place)."""
 
@@ -1224,15 +1280,12 @@ class DeliveryEngine:
 
         native-TG sub -> its own chat (single message, rule: «для native-TG
         подписок TG-лейна == каналу постановки»); api_server -> the owner's
-        server-bound chat via owui_to_tg.
+        server-bound chat via ``resolve_author_telegram`` (the single owner→TG
+        mapping surface; F6 policy-off gate and F3 owner fallback live there).
 
-        F3 (t_cdb88a42): an api_server (PWA) subscription without ``user_id``
-        may carry a server-side ownership marker in
-        ``delivery_metadata[owui_user_id_attr]`` (written by
-        ``kanban_db.set_notify_sub_owui_owner`` / the verified-origin subscribe
-        path).  ``user_id`` takes priority; the marker is the fallback so a
-        marker-only PWA subscription routes to its bound owner's TG chat.
-        Absence of both = no owner -> OWUI-only (fail-closed).
+        Delegates to the module-level helper so the author/owner resolution
+        is ONE implementation shared with the [needs-decision] lane
+        (карточка 1, критерий 4 — без дублей с OWUI-цепочкой).
         """
         if platform_str == "telegram":
             return str(sub.get("chat_id") or "")
@@ -1244,25 +1297,7 @@ class DeliveryEngine:
         # identically to the unit-tested decision surface.
         if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
             return None
-        owner = str(sub.get("user_id") or "").strip()
-        if not owner:
-            meta = sub.get("delivery_metadata")
-            if isinstance(meta, dict):
-                from hermes_cli.kanban_db import _OWUI_ATTR_META_KEY
-                owner = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
-        if not owner:
-            return None
-        tg_lane = self.owui_to_tg.get(owner)
-        if not tg_lane:
-            return None
-        # The OWUI→TG mirror lane is resolved purely by the verified owner
-        # binding (``owui_to_tg[owner]``): a user who bound their OWUI
-        # session/server to a Telegram chat is authorized for that chat
-        # (H-5, t_efffb731) — the allowlist must not starve a bound owner of
-        # their own итог (П.4, t_6692dd10).  The platform authz layer
-        # (TELEGRAM_ALLOWED_USERS) gates the FALLBACK-to-home path, not a
-        # user's own verified bound chat, so the two deltas stay consistent.
-        return tg_lane
+        return resolve_author_telegram(task=None, sub=sub, owui_to_tg=self.owui_to_tg)
 
     async def handle_branch_final(
         self,
