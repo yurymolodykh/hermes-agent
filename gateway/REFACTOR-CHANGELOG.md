@@ -84,3 +84,115 @@ rm -f gateway/delivery_engine.py
 - Тест-простыни не писались; проверка — py_compile/import + grep + эмпирическая проверка идемпотентности рестарта (задача t_a008a64b).
 - R1-набор не закоммичен; коммит + ревью точной ревизии — следующий шаг (15-sre-qa).
 - **Уточнение changed-files (проверка R1-родителя 2026-10-21):** `gateway/run.py` и `gateway/platforms/api_server.py` в рабочем дереве имеют diffs СМЕЖНОЙ миссии RGZ (reasoning= max, `agent/rgz_reasoning.py`, untracked) — НЕ R1. Спайка движка целиком в `gateway/kanban_watchers.py` (дизайн §(г) «run.py не трогаем»). Откат R1 их не включает (таблица выше).
+
+---
+
+## Продолжение миссии: [needs-decision] → TG автора (t_637df501, 2026-10-24)
+
+**Задача:** правило 4 владельца — «Ситуации, где пользователю нужно что-то решить,
+всегда доводятся до пользователя — и в канал постановки, и в Telegram; карточка
+в triage часами без уведомления недопустима». Остаток миссии после R0/R1/R2:
+достроить TG-ноку для [needs-decision] автору задачи.
+
+### Найденная первопричина (по живым данным, 2026-10-24)
+
+Движок (R1) уже имел dual-lane для [needs-decision] и «Требует решения»-рендер
+(`render_needs_decision`). Но в `DeliveryEngine.handle_event` OWUI-лейна была
+**жёстко связана с гейтом ACK**: при `stage_owui` → `"pending"` (нормальное
+состояние для открытой blocked/triage карточки — outbox-строка ждёт серверный
+readback, который для открытой карточки может приходить с задержкой или не
+приходить вовсе) движок делал `return action="rewind"` **ДО** выполнения
+TG-лейны и wake. Живой след в production-логах:
+
+```
+2026-10-24 03:32:38 INFO gateway.run: kanban notifier: t_4bff16dc/blocked rewound by delivery engine (owui stage pending)
+2026-10-23 23:38:00 INFO gateway.run: kanban notifier: t_b7928d99/block_loop_detected rewound by delivery engine (owui stage pending)
+2026-10-23 22:04:10 INFO gateway.run: kanban notifier: t_b7928d99/blocked rewound by delivery engine (owui stage pending)
+```
+
+Пока OWUI-плечо не заACKилось, TG-нока автору НЕ уходила — карточка могла висеть
+в triage часами без уведомления (прямое нарушение правила 4). Существующие F2-тесты
+этот путь не покрывали: их `_staged_sink` всегда возвращал `"acknowledged"`.
+
+### Изменение (gateway/delivery_engine.py)
+
+**Принцип:** гейт ACK OWUI-плеча владеет ТОЛЬКО курсором OWUI (rewind-to-retry
+до readback), но никогда не голодает комплементарные лейны (TG + wake). Логика
+`handle_event`:
+
+1. OWUI-стейдж выполняется; `pending`/`error` больше **не** делают ранний return —
+   фиксируется `owui_rewind` (причина для re-claim).
+2. TG-лейна и wake выполняются безусловно (как и для acked-пути).
+3. В конце: если `owui_rewind` установлен — возвращается `action="rewind"`
+   (событие переустанавливается, outbox-строка дожидается ACK на следующем drain;
+   bounded by MAX_API_STAGE_RETRIES=8 в watcher — permanently stuck дропается).
+   Иначе — `action="advance"`.
+4. `failed`/`unbound` (постоянные: нет сервер-авторизованного origin / битый контент;
+   `enqueue` бросает детерминированный ValueError) трактуются как `advance`
+   (fail-closed сохранён: никакой доставки чужим; повтор бесполезен — не спин).
+   Раньше они тоже возвращали rewind и крутились до дропа через 8 попыток.
+
+**Идемпотентность retry-цикла:** на следующем переустановленном тике TG проверяет
+`dedup_seen` (уже помечен после первого успешного send → повтор не шлётся), wake
+для api_server — no-op («outbox persist IS the wake», возвращает True). Повторный
+`stage_owui` idempotenten (`INSERT OR IGNORE` возвращает ту же pending-строку).
+
+**Точка классификации НЕ изменилась:** `classify_event()` остаётся единственной
+точкой решения «доставлять или молчать»; изменился только порядок внутри
+`handle_event` (движок доставляет [needs-decision] всегда, немедленно, в обе лейны).
+
+### Тест (tests/gateway/test_kanban_needs_decision_tg_while_pending_t637df501.py)
+
+- `test_needs_decision_reaches_author_tg_while_owui_pending` — регрессионный тест:
+  api_server-подписка, bound-автор, OWUI-стейдж возвращает `"pending"` → TG-лейна
+  ДОЛЖНА сработать (отправить «Требуется решение» с заголовком+причиной). До фикса
+  тест падал (`tg_texts == []`) — точное воспроизведение production-гэпа.
+
+### Откат (t_637df501)
+
+| Файл | Откат |
+|---|---|
+| `gateway/delivery_engine.py` | удалить `owui_rewind`-блоки и вернуть ранние `return` на `pending`/`error` в OWUI-лейне `handle_event` |
+| `tests/gateway/test_kanban_needs_decision_tg_while_pending_t637df501.py` | `git rm` (новый файл) |
+
+### Статус приёмки (критерии карточки t_637df501)
+
+| № | Критерий | Статус |
+|---|---|---|
+| 1 | [needs-decision] доставляется автору в Telegram (живой след) | ✅ движок доставляет TG-ноку немедленно; регресс-тест зелёный; F2-зеркало для bound-авторов подтверждено |
+| 2 | И в канал постановки, и в Telegram (правило 4) — оба плеча | ✅ OWUI-плечо (outbox) + TG-плечо идут независимо; pending OWUI не блокирует TG |
+| 3 | Существующая доставка владельцу и live-status/final НЕ регрессировали (smoke) | ✅ независимый QA-замер (т_388325e4, 2026-10-24 06:15 MSK): regress-тест 1 + resolve_author 10 + mission-silence + completion + origin + wake_only_ordering + delivery + ledger + silence_filter + telegram_final_delivery + restart_rededup = **132 passed**; тот же пред-существующий фейл-набор, что и на родителе f79bc08d7a (wake-scope x4, wake_mechanics terminal, 2 assignee-ValueError, 2 collection-broken) — не регрессия карточек 1-2 |
+| 4 | Код без дублей с цепочкой OWUI (не пересекайся) | ✅ правка только в `gateway/delivery_engine.py` + новый тест; `kanban_watchers.py` (горячая точка OWUI-цепочки) НЕ тронут |
+| 5 | REFACTOR-CHANGELOG.md дополнен; классификация осталась единственной | ✅ этот раздел; `classify_event` не изменён |
+
+### Инструментальная приёмка (карточка t_388325e4 QA, 2026-10-24 06:15 MSK)
+
+- **Живой след (правило 4) — end-to-end на боевой подписке.** Реальный боевой
+  сабскрипшн `kanban_notify_subs` (t_4bff16dc, platform=api_server, owner
+  9ae3eca0-...) + реальная серверная привязка `openwebui_telegram_users`
+  (01-orchestrator/config.yaml: 9ae3eca0→125805788) пропущены через
+  `DeliveryEngine.handle_event` на закоммиченном HEAD (68ebcb91c0) с OWUI-стаджем
+  `pending` (реалистичное состояние открытой blocked/triage-карточки):
+  - `classify_event` → `needs-decision`;
+  - OWUI-лейна (канал постановки): outbox-строка staged (`pending`);
+  - TG-лейна: сообщение **«⛔ Требуется решение: [blocked] …» отправлено в
+    telegram:125805788** (боевой канал автора);
+  - wake: сработал (1);
+  - cursor: `rewind` (OWUI cursor repin, bounded MAX_API_STAGE_RETRIES=8).
+  Итог: PASS. Вторая боевая привязка (d0390fe5→267988228) также резолвится.
+- **Единственность классификации.** Правки карточек 1-2 (`f79bc08d7a..68ebcb91c0`)
+  не трогают `classify_event` (diff=0); в репозитории 1 call-site классификации
+  событий доставки — `gateway/delivery_engine.py:1050`. Дубли с OWUI-цепочкой
+  отсутствуют: diff карточек = `delivery_engine.py` + 2 теста; `kanban_watchers.py`,
+  fast-lane, api_server НЕ изменены. Резолвер автора — единая точка
+  `resolve_author_telegram`, все вызовы (вкл. legacy `_tg_bound_chat_for`) через него.
+- **Smoke-регрессии:** 132 passed широкого affected-набора (список выше).
+  Пред-существующие фейлы подтверждены идентичными на родителе f79bc08d7a
+  (независимый прогон в worktree C:/tmp/rereview-f79bc08d7a) — не регрессия карточек.
+- **Замечание внедрения (manual_review для SRE):** боевой gateway 01-orchestrator
+  (PID 9676/9872) запущен 2026-10-23 13:20 MSK — до коммитов карточек 1-2
+  (05:48/06:04 MSK). Активный процесс работает со старым кодом; для активации
+  фикса требуется рестарт gateway (релизный шаг 15-sre-qa). Живых
+  needs-decision-событий после 06:04 в prod-БД нет (последнее t_4bff16dc 03:32 —
+  до фикса), поэтому end-to-end-доказательство выполнено на боевой подписке
+  программно, а не по реальному prod-сообщению.
