@@ -47,12 +47,14 @@ logger = logging.getLogger("gateway.delivery_engine")
 # Event types
 # ---------------------------------------------------------------------------
 
-#: Valid engine event types (the ONLY four that may ever be delivered).
+#: Valid engine event types (the only delivery families + the reopen status
+#: update ping).
 LIVE_STATUS = "live-status"
 FINAL = "final"
 NEEDS_DECISION = "needs-decision"
 ABORTED = "aborted"
-EVENT_TYPES = (LIVE_STATUS, FINAL, NEEDS_DECISION, ABORTED)
+STATUS_UPDATE = "status-update"
+EVENT_TYPES = (LIVE_STATUS, FINAL, NEEDS_DECISION, ABORTED, STATUS_UPDATE)
 
 #: Notifier claim kinds the engine consumes.  Supersedes the legacy
 #: ``TERMINAL_KINDS`` 11-kind list: adds the three live-status transitions
@@ -163,11 +165,21 @@ def render_needs_decision(task: Any, ev: Any) -> str:
         r = payload.get("reason")
         if isinstance(r, str) and r.strip():
             reason = str(r).strip()
-    head = f"⛔ Требуется решение: {ttl[:200]}" if ttl else "⛔ Требуется решение"
+    # Human-action marker for the OWUI primary lane (R1 keeps the owner-facing
+    # «Требуется решение» headline; the marker preserves the block semantics
+    # the acceptance tests and operators read: a provider-route blocker shows
+    # `[blocked]`, a triage / block_loop_detected card shows `[TRIAGE]`).
+    ev_kind = getattr(ev, "kind", "") or ""
+    card_status = str((getattr(task, "status", None) if task else None) or "").strip().lower()
+    marker = ""
+    if ev_kind == "block_loop_detected" or card_status == "triage":
+        marker = "[TRIAGE] "
+    elif ev_kind in ("blocked", "needs_input") and isinstance(payload, dict) and payload.get("provider_route"):
+        marker = "[blocked] "
+    head = f"⛔ Требуется решение: {marker}{ttl[:200]}" if ttl else f"⛔ Требуется решение {marker}".rstrip()
     if reason:
         # provider_route reasons may be long: keep the whole question
         # (the operator must see the alternatives).  Others cap at 160.
-        ev_kind = getattr(ev, "kind", "") or ""
         cap = 500 if ev_kind == "blocked" and payload.get("provider_route") else 160
         head = f"{head}\n{reason[:cap]}"
     return head
@@ -232,7 +244,9 @@ def render_final(msg: str, plan: Optional[dict] = None,
 # single place that renders [final].
 # ---------------------------------------------------------------------------
 
-def owui_root_final_summary(plan: dict, msg: str) -> str:
+def owui_root_final_summary(plan: dict, msg: str,
+                            *,
+                            inline_report: bool = True) -> str:
     """Full итог text for the [final] branch mirror (F1, tg-delivery-contract).
 
     ``msg`` is the short baked one-liner (``✅ Задача выполнена`` or the ❌
@@ -322,11 +336,17 @@ def owui_root_final_summary(plan: dict, msg: str) -> str:
     parts.append(msg.strip() or "✅ Задача выполнена")
     if summary_text:
         parts.append(summary_text[:_OWUI_TG_SUMMARY_MAX_CHARS])
-    else:
-        # No handoff summary — inline the root's first report artifact text
-        # (the api_server-lane convention) so the TG message still has meat.
-        from hermes_cli.delivery_policy import sanitize_delivery_text
-
+    # F1/terminal-итог contract: the итог text carries the handoff summary;
+    # artifact FILES ride ``deliver_artifacts`` (send_document) — never
+    # inlined into the text, so a report is uploaded as a native file on both
+    # lanes instead of duplicating its content into the message body.
+    #
+    # OWUI-stage-only exception (``inline_report=True``): api_server has no
+    # attachment channel, so when the root attached a report file that text
+    # must ride inside the staged chat message itself (R1 convention) — the
+    # OWUI stage is the sole consumer of the inline form.
+    if inline_report:
+        from hermes_cli.delivery_policy import sanitize_delivery_text as _sane_inl
         for raw in artifacts:
             try:
                 p = Path(raw)
@@ -335,7 +355,7 @@ def owui_root_final_summary(plan: dict, msg: str) -> str:
                 if p.stat().st_size > _OWUI_ARTIFACT_MAX_BYTES:
                     continue
                 text = p.read_text(encoding="utf-8", errors="replace")[:_OWUI_ARTIFACT_MAX_CHARS]
-                text = sanitize_delivery_text(text)
+                text = _sane_inl(text)
                 if text:
                     parts.append(f"📄 Отчёт <b>{p.name}</b>:\n\n{text}")
                     break
@@ -344,8 +364,8 @@ def owui_root_final_summary(plan: dict, msg: str) -> str:
     full = "\n\n".join(parts).strip()
     if not full or full == (msg or "").strip():
         return msg
-    from hermes_cli.delivery_policy import sanitize_delivery_text
-    return sanitize_delivery_text(full, max_chars=8000)
+    from hermes_cli.delivery_policy import sanitize_delivery_text as _sane
+    return _sane(full, max_chars=8000)
 
 
 def owui_root_artifact_paths(plan: dict) -> list[str]:
@@ -469,17 +489,30 @@ def owui_root_artifact_paths(plan: dict) -> list[str]:
 def _cause_hash(ev: Any, kind: str) -> str:
     """Stable hash of the transition cause for dedup.
 
-    For blocked/needs_input events the reason text + block kinds are the
-    cause; for aborted the payload error.  Same cause after a real delivery
-    is suppressed (drift_alerted-style once-only, design §2b).
+    For blocked/needs_input events the cause signature is the NORMALIZED FIRST
+    NON-EMPTY LINE of the reason (``_tg_block_mirror_cause_sig`` semantics): a
+    re-wrapped or tail-extended version of the same human cause still dedups,
+    and two blocks sharing a first line are treated as the same cause (D3) —
+    the worth-of-attention question is the first line the owner reads.  For
+    aborted the payload error; everything else hashes the payload verbatim.
+    Same cause after a real delivery is suppressed (drift_alerted-style
+    once-only, design §2b).
     """
+    from hermes_cli.kanban_db import _tg_block_mirror_cause_sig as _cause_sig
     payload = getattr(ev, "payload", None)
+    ev_kind = getattr(ev, "kind", "") or ""
     raw: Any = ""
+    if ev_kind in ("blocked", "needs_input"):
+        reason = ""
+        if isinstance(payload, dict):
+            reason = str(payload.get("reason") or "")
+        return hashlib.sha256(
+            f"{ev_kind}|{kind}|block|{_cause_sig(reason)}".encode("utf-8")
+        ).hexdigest()[:24]
     if isinstance(payload, dict):
         raw = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, default=str,
         )
-    ev_kind = getattr(ev, "kind", "") or ""
     return hashlib.sha256(f"{ev_kind}|{kind}|{raw}".encode("utf-8")).hexdigest()[:24]
 
 
@@ -617,16 +650,28 @@ def classify_event(
         return EngineDecision(NEEDS_DECISION, "card-status triage",
                               "tasks.status=triage (human decision)")
     if kind in _NEEDS_DECISION_KINDS:
+        # Prefer the block kind recorded ON the event (the reason the block
+        # happened) over the task's CURRENT block_kind: a later transition
+        # (e.g. ``completed``) clears tasks.block_kind to NULL, but a claimed
+        # ``blocked`` event still describes its own kind.  A self-resolving
+        # block (dependency/transient) must stay silent regardless of what the
+        # card looks like now; a human-action block stays loud.
         pk = ctx.get("block_kind") or ""
         if kind in ("blocked", "needs_input"):
-            if pk in _BLOCK_SILENT:
+            ev_payload = getattr(ev, "payload", None)
+            ev_kind = (
+                str((ev_payload or {}).get("kind") or "").strip().lower()
+                if isinstance(ev_payload, dict) else ""
+            )
+            block_kind = ev_kind or pk or ""
+            if block_kind in _BLOCK_SILENT:
                 return EngineDecision(
-                    None, "auto-resolve block", f"block_kind={pk or '?'}",
+                    None, "auto-resolve block", f"block_kind={block_kind or '?'}",
                 )
-            if pk in _BLOCK_NEEDS_DECISION or not pk:
+            if block_kind in _BLOCK_NEEDS_DECISION or not block_kind:
                 # un-typed block == human decision (branch_state semantics)
-                return EngineDecision(NEEDS_DECISION, "blocked", f"block_kind={pk}")
-            return EngineDecision(None, "auto-resolve block", f"block_kind={pk}")
+                return EngineDecision(NEEDS_DECISION, "blocked", f"block_kind={block_kind}")
+            return EngineDecision(None, "auto-resolve block", f"block_kind={block_kind}")
         # capability / block_loop_detected / review_requested / triage
         return EngineDecision(NEEDS_DECISION, kind, f"event_kind={kind}")
 
@@ -862,6 +907,7 @@ class DeliveryEngine:
         task_is_root: bool = False,
         mission_live: bool = False,
         has_open_descendants: bool = False,
+        has_subscribed_descendant: bool = False,
         replace_summary: bool = False,
         task_tg_owner: str = "",
         do_not_deliver: bool = False,
@@ -890,12 +936,60 @@ class DeliveryEngine:
         ev_id = getattr(ev, "id", None)
 
         # Tree context the classifier needs.
+        # F9 (t_85a095e0): a card whose OWN subscription is a Terminal event
+        # is a branch ROOT — its `completed` is the root's own close and is
+        # terminal for the notifier lane when no live goal_mode mission
+        # controller keeps the tree in flight.  This mirrors the legacy
+        # `root_closing` rule (RF2) and the F9 `_run_f9_owui_lane` decision
+        # surface (`branch_terminal = task_is_root and not mission_live`).
+        # Descendant cards (silent=True, task_is_root=False) stay
+        # intermediate/claimed+silent — the whole-branch итог from the
+        # branch-summary watcher is their single channel message.
+        #
+        # P2 / rule 3 (t_ecab4990, REFACTOR-CHANGELOG R2): for an api_server
+        # (OWUI) subscription the PER-EVENT closes of a branch are never the
+        # branch итог — the whole-branch итог is delivered exclusively by the
+        # branch-summary watcher once the tree fully closes, so the notifier
+        # stays silent for api_server roots (no OWUI→TG mirror spam).  A
+        # native-TG root subscription delivers its own completion directly
+        # (one message per channel, no mirror to suppress).
+        #
+        # P2 refinement (standalone-OWUI-root, notifier-integration fix): the
+        # delegation to the branch-summary watcher only makes sense when the
+        # root's subtree actually carries MORE subscribed channels to collapse.
+        # A root with NO subscribed descendant (and no open descendant) is the
+        # sole subscription of its branch — the branch watcher has nothing to
+        # collapse, so the notifier itself stages the root's OWN terminal
+        # completion to the OWUI outbox (cursor pinned until the OWUI ACKs).
+        # This restores the legacy exact-origin api_server staging behavior
+        # (root_closing RF2) without re-opening the per-child mirror spam the
+        # P2 rule was added to close: per-child still stays silent because a
+        # subscribing child is by definition a subscribed descendant.
+        branch_terminal = (
+            bool(task_is_root)
+            and not bool(mission_live)
+            and (
+                # Native-TG root: its OWN completion is a real terminal ping
+                # for the subscribed channel (one message per channel) — open
+                # descendants do not suppress the root's own close; the branch
+                # watcher collapses only the DESCENDANT pings.  api_server
+                # roots keep P2 semantics: a root-with-open-children close is
+                # NOT the branch итог, so the notifier stays silent on both
+                # lanes (the branch watcher owns the single terminal итог).
+                platform_str != "api_server"
+                or not bool(has_open_descendants)
+            )
+            and (
+                platform_str != "api_server"
+                or not bool(has_subscribed_descendant)
+            )
+        )
         tree_ctx = {
             "card_status": getattr(task, "status", None) if task else None,
             "block_kind": getattr(task, "block_kind", None) if task else None,
             "is_root": task_is_root,
             "mission_live": mission_live,
-            "branch_terminal": False,  # filled by [final] callers
+            "branch_terminal": branch_terminal,
         }
         dec = classify_event(
             task, ev, tree_ctx,
@@ -950,12 +1044,25 @@ class DeliveryEngine:
             msg = render_aborted(task, ev)
         else:  # FINAL
             from hermes_cli.delivery_policy import sanitize_delivery_text
+            # F1 (tg-delivery-contract): the итог must carry CONTENT.  The
+            # handoff summary is written to the ``completed`` event payload
+            # (``payload["summary"]``) by ``kanban_db.complete_task``; an
+            # ``Event`` row carries no ``.summary`` attribute, so read it from
+            # the payload or the legacy extracted field.  A completed event
+            # with a real summary must render it (e.g. a reopened card's
+            # second close), never a bare contentless ping.
+            _ev_payload = getattr(ev, "payload", None)
+            _ev_summary = getattr(ev, "summary", "") or ""
+            if not _ev_summary and isinstance(_ev_payload, dict):
+                _ev_summary = str(_ev_payload.get("summary") or "").strip()
+            _ev_artifacts = (
+                _ev_payload.get("artifacts")
+                if isinstance(_ev_payload, dict) else None
+            )
             msg = render_final(
-                getattr(ev, "summary", "") or "✅ Задача выполнена",
-                summary=getattr(ev, "summary", ""),
-                artifacts=(
-                    getattr(ev, "payload", None) or {}
-                ).get("artifacts") if isinstance(getattr(ev, "payload", None), dict) else None,
+                _ev_summary or "✅ Задача выполнена",
+                summary=_ev_summary,
+                artifacts=_ev_artifacts,
             )
             msg = sanitize_delivery_text(msg, max_chars=8000)
 
@@ -1047,14 +1154,70 @@ class DeliveryEngine:
         if wake is not None:
             want_wake = et in (FINAL, NEEDS_DECISION)
             if want_wake and not do_not_deliver:
+                # ``delivery_mode='wake'`` on a push adapter: the wake IS the
+                # sole delivery (the text ping was skipped), so a failed wake
+                # must rewind the claim — retry next tick instead of losing
+                # the event forever (pre-R1 wake-only contract). notify+wake
+                # keeps the failed wake best-effort: the text ping already
+                # delivered and the cursor may advance.
+                _mode = (sub.get("delivery_mode") or "notify").lower()
+                _push = getattr(adapter, "supports_async_delivery", True)
                 try:
-                    await wake(text=msg)
+                    _wake_ok = await wake(text=msg)
                 except Exception as exc:
                     logger.warning(
                         "delivery engine: wake for %s failed: %s",
                         sub["task_id"], exc,
                     )
+                    _wake_ok = False
+                if _wake_ok is False and _mode == "wake" and _push:
+                    return self.HandleResult(
+                        action="rewind", decision_type=et,
+                        reason="wake failed (wake-only)", event_id=ev_id,
+                    )
         return r
+
+    def _root_completed_empty_summary(self, plan: dict) -> bool:
+        """True when the branch root has a recorded ``completed`` event whose
+        handoff summary is empty (a genuinely contentless closure: no summary
+        text and no first-line preview).  Used by the F1 bare-итог gate to
+        distinguish a REAL contentless completion (suppress) from a root with
+        no completed record at all (raw SQL close / synthetic readback /
+        unknown id — deliver the bare one-liner so the closure is observed).
+        """
+        from hermes_cli import kanban_db as _kb
+        import json as _json
+
+        root_id = plan.get("root_id")
+        if not root_id:
+            return False
+        try:
+            conn = _kb.connect(board=plan.get("board"))
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? "
+                    "AND kind='completed' ORDER BY id DESC LIMIT 1",
+                    (root_id,),
+                ).fetchone()
+                if row is None or not row[0]:
+                    return False
+                try:
+                    payload = _json.loads(row[0])
+                except (TypeError, ValueError):
+                    return False
+                if not isinstance(payload, dict):
+                    return False
+                summary = payload.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    return False
+                preview = payload.get("summary_preview") or payload.get("summary_short")
+                if isinstance(preview, str) and preview.strip():
+                    return False
+                return True
+            finally:
+                conn.close()
+        except Exception:
+            return False
 
     def _tg_bound_chat_for(self, sub: dict, platform_str: str) -> Optional[str]:
         """Resolve the Telegram lane chat for a subscription.
@@ -1062,15 +1225,44 @@ class DeliveryEngine:
         native-TG sub -> its own chat (single message, rule: «для native-TG
         подписок TG-лейна == каналу постановки»); api_server -> the owner's
         server-bound chat via owui_to_tg.
+
+        F3 (t_cdb88a42): an api_server (PWA) subscription without ``user_id``
+        may carry a server-side ownership marker in
+        ``delivery_metadata[owui_user_id_attr]`` (written by
+        ``kanban_db.set_notify_sub_owui_owner`` / the verified-origin subscribe
+        path).  ``user_id`` takes priority; the marker is the fallback so a
+        marker-only PWA subscription routes to its bound owner's TG chat.
+        Absence of both = no owner -> OWUI-only (fail-closed).
         """
         if platform_str == "telegram":
             return str(sub.get("chat_id") or "")
         if platform_str != "api_server":
             return None
+        # F6 (T2 §8.2.2): policy off → OWUI stays OWUI-only; the OWUI→TG
+        # mirror lane is never opened (fail-closed).  Mirrors the R1 helper
+        # ``_run_branch_lane`` gate so the real production path behaves
+        # identically to the unit-tested decision surface.
+        if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
+            return None
         owner = str(sub.get("user_id") or "").strip()
         if not owner:
+            meta = sub.get("delivery_metadata")
+            if isinstance(meta, dict):
+                from hermes_cli.kanban_db import _OWUI_ATTR_META_KEY
+                owner = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
+        if not owner:
             return None
-        return self.owui_to_tg.get(owner)
+        tg_lane = self.owui_to_tg.get(owner)
+        if not tg_lane:
+            return None
+        # The OWUI→TG mirror lane is resolved purely by the verified owner
+        # binding (``owui_to_tg[owner]``): a user who bound their OWUI
+        # session/server to a Telegram chat is authorized for that chat
+        # (H-5, t_efffb731) — the allowlist must not starve a bound owner of
+        # their own итог (П.4, t_6692dd10).  The platform authz layer
+        # (TELEGRAM_ALLOWED_USERS) gates the FALLBACK-to-home path, not a
+        # user's own verified bound chat, so the two deltas stay consistent.
+        return tg_lane
 
     async def handle_branch_final(
         self,
@@ -1110,18 +1302,45 @@ class DeliveryEngine:
         # pass pre-built summary/artifacts (it has the DB context); the engine
         # falls back to its own root helpers so branch [final] is rendered
         # here, in the single place that renders [final].
+        #
+        # Watcher path (no caller-supplied summary/artifacts): resolve the
+        # root's own content and decide between the composite and the bare
+        # one-liner.  Real artifact files ⇒ the composite итог (header +
+        # summary/report) with the files riding ``deliver_artifacts``; no
+        # artifacts ⇒ the baked one-liner ``msg`` is the message.  A terminal
+        # итог that HAS a completed record but is genuinely contentless
+        # (empty summary, no artifacts) is suppressed below with a journal
+        # entry; a root with no completed record at all (raw close /
+        # synthetic) still delivers the bare one-liner so the closure is
+        # observed.
         if summary == "" and artifacts is None:
             try:
-                summary = owui_root_final_summary(plan, msg)
-                artifacts = owui_root_artifact_paths(plan)
+                root_paths = owui_root_artifact_paths(plan)
+            except Exception as exc:
+                logger.warning(
+                    "delivery engine: branch final artifact build for %s failed: %s",
+                    root_id, exc,
+                )
+                root_paths = []
+            try:
+                # F1 (tg-delivery-contract): the terminal итог carries the
+                # root's summary/report content.  ``owui_root_final_summary``
+                # composes the composite (header + handoff summary / inline
+                # report) and degrades to the bare one-liner only when the
+                # root is genuinely contentless, so a completed event with a
+                # real summary always rides it even without artifact files.
+                final_msg = owui_root_final_summary(plan, msg, inline_report=False)
             except Exception as exc:
                 logger.warning(
                     "delivery engine: branch final content build for %s failed: %s",
                     root_id, exc,
                 )
-                summary = msg
-                artifacts = []
-        final_msg = render_final(msg, plan=plan, summary=summary, artifacts=artifacts)
+                final_msg = msg
+            artifacts = root_paths
+        else:
+            final_msg = render_final(
+                msg, plan=plan, summary=summary, artifacts=artifacts,
+            )
 
         # OWUI lane (api_server): the caller already stages the итог into the
         # OWUI outbox before calling us (its own stage path) — nothing extra
@@ -1133,12 +1352,78 @@ class DeliveryEngine:
             if not terminal:
                 # intermediate итог: OWUI only, no TG mirror (F6).  Journaled
                 # suppression lives ONLY in this module — nothing delivered to
-                # TG for a non-terminal branch close.
+                # TG for a non-terminal branch close.  The single journal
+                # record uses the F6/F7-consistent reason (``routine status
+                # close``) and the owner-context markers so the audit stream
+                # matches the legacy OWUI→TG lane behaviour.
+                from hermes_cli.delivery_policy import PolicyDecision
+                log_suppression(
+                    app="kanban",
+                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+                    target=f"telegram:{tg_lane}",
+                    decision=PolicyDecision(
+                        action="suppress", reason="routine status close",
+                        detail=(
+                            "intermediate branch summary — non-terminal "
+                            "mission tree suppressed in TG lane"
+                        ),
+                    ),
+                    snippet=(final_msg or "")[:200],
+                    extra={
+                        "task_id": root_id,
+                        "event_kind": "branch_summary",
+                        "event_id": plan.get("marker_id") or 0,
+                        "owui_to_tg": True,
+                    },
+                )
                 logger.info(
                     "delivery engine: intermediate branch итог %s — OWUI only "
                     "(no TG mirror for non-terminal tree close)",
                     root_id,
                 )
+                return res
+            # F1 bare-итог gate: a TERMINAL итог that recorded a completion
+            # but carries NO content (empty handoff summary AND no artifacts)
+            # is the contentless ping the owner banned — it is suppressed in
+            # the TG lane and journaled, while the channel is still acked so
+            # the branch watcher stops retrying.  A root with no completed
+            # record at all (raw SQL close, synthetic readback, unknown id)
+            # still delivers the bare one-liner — the closure is real and
+            # must be observed (F9 leaf-without-controller acceptance).
+            bare_itog = (
+                (final_msg or "").strip() == (msg or "").strip()
+                and (msg or "").strip() == "✅ Задача выполнена"
+                and not artifacts
+                and self._root_completed_empty_summary(plan)
+            )
+            if bare_itog:
+                from hermes_cli.delivery_policy import PolicyDecision
+                log_suppression(
+                    app="kanban",
+                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+                    target=f"telegram:{tg_lane}",
+                    decision=PolicyDecision(
+                        action="suppress", reason="bare terminal итог without content",
+                        detail=(
+                            "terminal branch summary has no summary and no "
+                            "artifacts — suppressed in TG lane (owner contract F1)"
+                        ),
+                    ),
+                    snippet=(final_msg or "")[:200],
+                    extra={
+                        "task_id": root_id,
+                        "event_kind": "branch_summary",
+                        "event_id": plan.get("marker_id") or 0,
+                        "owui_to_tg": True,
+                    },
+                )
+                logger.info(
+                    "delivery engine: bare terminal итог %s suppressed in TG "
+                    "lane telegram:%s (no summary, no artifacts)",
+                    root_id, tg_lane,
+                )
+                # Channel is acked regardless — nothing to deliver now nor on
+                # a later tick (the bare итог cannot become content later).
                 return res
             try:
                 resx = await send_tg(tg_adapter, tg_lane, final_msg)

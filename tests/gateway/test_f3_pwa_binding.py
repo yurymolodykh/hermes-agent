@@ -205,9 +205,6 @@ async def test_pwa_marker_only_sub_receives_itog_and_artifacts_to_own_tg(
     """Второй пользователь (Мария) через PWA-подписку получает итог + артефакт
     в СВОЙ TG-чат (не home/Юрия): маркер ``owui_user_id_attr`` без ``user_id``.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     import tempfile
 
     conn = pwa_env
@@ -253,9 +250,6 @@ def _make_adapter_pair():
 @pytest.mark.asyncio
 async def test_pwa_marker_only_blocked_routes_to_own_tg(pwa_env, monkeypatch):
     """blocked (нужно действие) PWA-подписчика уходит в ЕГО TG-чат."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     conn = pwa_env
     root = _mk(conn, "mission-maria-block-pwa")
     _pwa_sub(conn, root, "pwa-maria-block",
@@ -288,9 +282,6 @@ async def test_pwa_marker_only_blocked_routes_to_own_tg(pwa_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_pwa_marker_no_binding_stays_silent(pwa_env, monkeypatch):
     """Маркер привязан к пользователю БЕЗ записи в mapping -> TG-тишина."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     conn = pwa_env
     root = _mk(conn, "mission-unmapped-pwa")
     # Ксения (k_owui) — НЕ в mapping pwa_env (только owner+maria).
@@ -320,9 +311,6 @@ async def test_pwa_marker_no_binding_stays_silent(pwa_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_pwa_no_marker_at_all_stays_owui_only(pwa_env, monkeypatch):
     """Совсем без маркера и без user_id -> OWUI-only, TG-тишина."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     conn = pwa_env
     root = _mk(conn, "mission-nomarker-pwa")
     _pwa_sub(conn, root, "pwa-nomarker", user_id=None, metadata=None)
@@ -353,9 +341,6 @@ async def test_legacy_user_id_sub_unaffected_by_marker(pwa_env, monkeypatch):
     приоритетнее.  Подписка с чужим маркером, но СВОИМ user_id доставляет в СВОЙ
     чат (маркер игнорируется): существующие подписки остаются валидными.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     conn = pwa_env
     root = _mk(conn, "mission-legacy-pwa")
     # user_id = OWNER_OWUI, но маркер (ошибочно) = FOREIGN_OWUI.  Приоритет

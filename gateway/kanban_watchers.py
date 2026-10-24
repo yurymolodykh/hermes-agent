@@ -1020,6 +1020,31 @@ class GatewayKanbanWatchersMixin:
                                             has_open_desc = True
                                             break
                                         _scan = list(_kb.child_ids(conn, _cid)) + _scan
+                                    # P2 refinement (standalone OWUI root): a
+                                    # root whose subtree carries NO subscribed
+                                    # descendant is the only subscription in its
+                                    # branch — the branch-summary watcher has
+                                    # nothing else to collapse, so the notifier
+                                    # must stage the root's OWN terminal
+                                    # completion to the OWUI outbox itself
+                                    # (cursor stays pinned until the OWUI ACKs).
+                                    # A root that OWNS subscribed descendants
+                                    # delegates the whole-tree итог to the
+                                    # branch-summary watcher and the notifier
+                                    # stays silent here (replace-mode, R0(в) 10).
+                                    has_subscribed_desc = False
+                                    if subscribed_ids:
+                                        _scan2 = list(
+                                            _kb.child_ids(conn, sub["task_id"])
+                                        )
+                                        while _scan2 and not has_subscribed_desc:
+                                            _cid2 = _scan2.pop()
+                                            if _cid2 in subscribed_ids:
+                                                has_subscribed_desc = True
+                                                break
+                                            _scan2 = list(
+                                                _kb.child_ids(conn, _cid2)
+                                            ) + _scan2
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -1037,6 +1062,7 @@ class GatewayKanbanWatchersMixin:
                                         "task_is_root": task_is_root,
                                         "mission_live": mission_live,
                                         "has_open_descendants": has_open_desc,
+                                        "has_subscribed_descendant": has_subscribed_desc,
                                         "task_tg_owner": task_tg_owner,
                                     })
                                 except Exception as sub_exc:
@@ -1122,7 +1148,19 @@ class GatewayKanbanWatchersMixin:
                         # creator without spamming their channel. The per-event
                         # predicate inside _wake_kinds decides which events
                         # qualify; routine intermediate closes wake nothing.
-                        send_passive = False
+                        #
+                        # F2 (t_03af6568): the api_server OWUI→TG block mirror
+                        # is a complementary F2 channel that must stay live for
+                        # silent descendants too (a needs_input/provider_route/
+                        # triage block on a child must reach the owner's bound
+                        # TG chat).  It is SAFE because the delivery engine's
+                        # classifier already gates dispatch: an intermediate
+                        # child `completed` is silenced and never reaches the
+                        # TG send, while human-action needs-decision blocks do.
+                        # Only NON-api_server (native push) silent subs drop
+                        # the per-event text-ping entirely here.
+                        if platform_str != "api_server":
+                            send_passive = False
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -1247,21 +1285,29 @@ class GatewayKanbanWatchersMixin:
                             task_id, title_text, getattr(ev, "payload", None) or {}, msg_text,
                         )
 
-                    async def _engine_wake(*, text: str = "") -> None:
-                        """Wake the creator on [final]/[needs-decision] (engine rule)."""
+                    async def _engine_wake(*, text: str = "") -> bool:
+                        """Wake the creator on [final]/[needs-decision] (engine rule).
+
+                        Returns True when the wake delivered (or was a no-op that
+                        must not rewind, e.g. api_server outbox-persist wake or a
+                        non-wake kind), False when a PUSH wake failed.  The
+                        engine turns a False return into ``action=rewind`` ONLY
+                        for ``delivery_mode='wake'`` push subs (where the wake is
+                        the sole delivery); notify+wake keeps best-effort.
+                        """
                         # Reuse the graph-safe wake surface: for push adapters
                         # deliver_wake builds the session scope from the sub row.
                         from gateway.wake import adapter_supports_push as _adapter_push_ok2
                         if not _adapter_push_ok2(adapter):
-                            return  # api_server: outbox persist is the wake
+                            return True  # api_server: outbox persist is the wake
                         _WAKE_KINDS = (ev.kind,) if ev.kind in (
                             "completed", "gave_up", "crashed", "timed_out",
                             "blocked", "needs_input", "capability",
                             "block_loop_detected", "review_requested",
                         ) else ()
                         if not _WAKE_KINDS:
-                            return
-                        await _engine_push_wake()
+                            return True
+                        return await _engine_push_wake()
                     # TG delivery-policy gate (D0 F1): allowed users, used by
                     # the wake computation below so it never wakes on a
                     # suppressed event.  Recipient policy itself lives in the
@@ -1277,7 +1323,8 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         _tg_allowed = []
                     _tg_suppressed_event_ids: set = set()
-                    async def _engine_push_wake() -> None:
+                    async def _engine_push_wake() -> bool:
+                        """Deliver one push wake; return True on success, False on failure."""
                         from gateway.session import SessionSource
                         from gateway.wake import deliver_wake
                         _chat_type = str(sub.get("chat_type") or "").strip()
@@ -1339,11 +1386,13 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"],
                                 sub_profile or "default", _status_ev,
                             )
+                            return True
                         except Exception as _wk_err:
                             logger.warning(
                                 "kanban notifier: wake injection failed for %s: %s",
                                 sub["task_id"], _wk_err, exc_info=True,
                             )
+                            return False
                     for ev in d["events"]:
                         kind = ev.kind
                         # -------- single delivery decision (R1 engine) --------
@@ -1376,6 +1425,7 @@ class GatewayKanbanWatchersMixin:
                             task_is_root=bool(d.get("task_is_root")),
                             mission_live=bool(d.get("mission_live")),
                             has_open_descendants=bool(d.get("has_open_descendants")),
+                            has_subscribed_descendant=bool(d.get("has_subscribed_descendant")),
                             do_not_deliver=bool(d.get("do_not_deliver")),
                             silent=bool(d.get("silent")),
                             platform_str=platform_str,
@@ -1390,12 +1440,101 @@ class GatewayKanbanWatchersMixin:
                             tg_allowed=_tg_allowed,
                         )
                         if _engine_res.action == "rewind":
-                            # Send/stage failed transiently: drop the claim so a
-                            # later tick retries; MAX_SEND_FAILURES budget below
-                            # still governs the terminal drop.
+                            # Send/stage failed transiently: restore the OLD
+                            # cursor (drop the atomic claim) so a later tick
+                            # retries.  The engine only returns ``rewind`` for
+                            # recoverable transient failures (api_server outbox
+                            # ``pending`` awaiting server-owned readback, or a
+                            # stage error); it is the R1 re-implementation of
+                            # the pre-R1 ``_kanban_rewind`` on non-ACK'd stage.
+                            # ``enqueue`` is idempotent (INSERT OR IGNORE), so
+                            # re-claiming and re-staging the same event NEVER
+                            # duplicates the outbox row.
+                            _rewind_ev_id = _engine_res.event_id or getattr(ev, "id", None)
+                            if _rewind_ev_id and platform_str == "api_server":
+                                # Per-source-event staging retry budget: a
+                                # permanently undeliverable event (missing
+                                # registry / stuck outbox row) must not rewind
+                                # and re-claim the SAME event every 5s tick
+                                # forever (incident 2026-10-08/09, 12,689
+                                # identical WARNING lines in ~24h).  After
+                                # MAX_API_STAGE_RETRIES consecutive
+                                # non-acknowledged results, advance past the
+                                # event (the row stays in the outbox for
+                                # independent drain) and log the drop once.
+                                _stage_key = (sub["task_id"], _rewind_ev_id)
+                                _stage_fails = api_stage_counts.get(_stage_key, 0) + 1
+                                api_stage_counts[_stage_key] = _stage_fails
+                                if _stage_fails >= MAX_API_STAGE_RETRIES:
+                                    logger.warning(
+                                        "kanban notifier: exact api_server event %s/%s "
+                                        "stuck at delivery (%s) after %d ticks; dropping "
+                                        "event (cursor advances, row stays in outbox)",
+                                        sub["task_id"], _rewind_ev_id,
+                                        _engine_res.reason, _stage_fails,
+                                    )
+                                    api_stage_counts.pop(_stage_key, None)
+                                    await _to_thread_process_service(
+                                        self._kanban_advance, sub, d["cursor"],
+                                        board_slug,
+                                    )
+                                else:
+                                    logger.info(
+                                        "kanban notifier: %s/%s rewound by delivery "
+                                        "engine (%s); cursor retained (attempt %d/%d)",
+                                        sub["task_id"], _rewind_ev_id,
+                                        _engine_res.reason,
+                                        _stage_fails, MAX_API_STAGE_RETRIES,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind, sub, d["cursor"],
+                                        d.get("old_cursor", 0), board_slug,
+                                    )
+                                break
+                            # Non-api_server / non-traceable rewind: restore the
+                            # old cursor and retry next tick.
+                            if _engine_res.reason == "wake failed (wake-only)":
+                                # wake-only (delivery_mode='wake') push sub: the
+                                # wake IS the sole delivery, so consecutive
+                                # failures share the SAME MAX_SEND_FAILURES
+                                # budget as text sends (pre-R1 contract). Below
+                                # cap: bump + rewind so the next tick retries.
+                                # At cap: drop the subscription permanently.
+                                _wk_fails = sub_fail_counts.get(sub_key, 0) + 1
+                                sub_fail_counts[sub_key] = _wk_fails
+                                if _wk_fails >= MAX_SEND_FAILURES:
+                                    logger.warning(
+                                        "kanban notifier: dropping subscription "
+                                        "%s on %s after %d consecutive wake failures",
+                                        sub["task_id"], platform_str, _wk_fails,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_unsub, sub, board_slug,
+                                    )
+                                    sub_fail_counts.pop(sub_key, None)
+                                    await _to_thread_process_service(
+                                        self._kanban_advance, sub, d["cursor"],
+                                        board_slug,
+                                    )
+                                else:
+                                    logger.info(
+                                        "kanban notifier: %s/%s rewound by delivery "
+                                        "engine (%s); wake retry (attempt %d/%d)",
+                                        sub["task_id"], kind, _engine_res.reason,
+                                        _wk_fails, MAX_SEND_FAILURES,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind, sub, d["cursor"],
+                                        d.get("old_cursor", 0), board_slug,
+                                    )
+                                break
                             logger.info(
                                 "kanban notifier: %s/%s rewound by delivery engine (%s)",
                                 sub["task_id"], kind, _engine_res.reason,
+                            )
+                            await _to_thread_process_service(
+                                self._kanban_rewind, sub, d["cursor"],
+                                d.get("old_cursor", 0), board_slug,
                             )
                             break
                         # action == "advance" (or "noop") — cursor handled in the
@@ -1916,11 +2055,24 @@ class GatewayKanbanWatchersMixin:
                 and (not sub_profile or sub_profile == notifier_profile)
                 and int(marker_id or 0) > 0
             ):
-                # OWUI primary lane carries the bare baked one-liner (F1/R1:
-                # the enriched composite is the TELEGRAM lane's message; the
-                # OWUI stage keeps the same one-line итог the owner sees in
-                # the server, no summary/sanitize drift).
-                _msg = msg
+                # OWUI primary lane: the baked one-liner goes bare when the
+                # root carried no report artifact; when the root DID attach a
+                # report file, api_server has no attachment channel, so the
+                # report content rides inline in the staged message (R1
+                # convention) instead of a bare contentless ping.
+                from gateway.delivery_engine import owui_root_artifact_paths
+                try:
+                    _root_artifacts = owui_root_artifact_paths(plan)
+                except Exception:
+                    _root_artifacts = []
+                if _root_artifacts:
+                    try:
+                        from gateway.delivery_engine import owui_root_final_summary
+                        _msg = owui_root_final_summary(plan, msg, inline_report=True)
+                    except Exception:
+                        _msg = msg
+                else:
+                    _msg = msg
                 _state, _delivery_id = await asyncio.to_thread(
                     stage_terminal,
                     get_hermes_home() / "delivery-outbox.sqlite",

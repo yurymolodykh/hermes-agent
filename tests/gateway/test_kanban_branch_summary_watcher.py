@@ -914,3 +914,199 @@ async def test_a2_drop_persists_reason_comment(board_env, monkeypatch):
     body = drop[-1].body
     assert "owui-abc123" in body, body
     assert "причина" in body, body
+
+
+@pytest.mark.asyncio
+async def test_a1_valid_owui_initiator_channel_not_dropped_after_12_ticks(
+    board_env, monkeypatch,
+):
+    """A1 (t_9944a3ba): валидный OWUI-канал инициатора НЕ помечается dropped
+    после 12 запусков доставки.
+
+    Сценарий: подписка api_server несёт верифицированный user_id инициатора
+    (A4) и `stage_terminal` возвращает ``acknowledged`` для его чата. Каждый
+    тик завершается успешно, `_deliver_branch_summary` возвращает True,
+    счётчик неудач сбрасывается.  Даже если канал остаётся в pending между
+    тиками (транзиентная задержка дренажа), канал НЕ должен дойти до
+    12-неудачного дропа: на root не должно появиться [delivery-drop]-коммента,
+    а маркер не должен быть acked-принудительно без доставки.
+    """
+    from gateway import kanban_origin_delivery as _kod
+
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc456",
+        user_id="sess-initiator-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    # ВАЛИДНЫЙ канал: stage_terminal ACK-ает (как после A1/A4 — канал с
+    # верифицированным user_id и рабочим append-target больше не уходит в
+    # вечные pending).
+    calls = []
+
+    def ok_stage(outbox, registry, sub, profile, board, event_id, message):
+        calls.append((sub.get("chat_id"), message, event_id))
+        return ("acknowledged", event_id)
+
+    monkeypatch.setattr(_kod, "stage_terminal", ok_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    for _ in range(12):
+        runner = _make_runner(adapter)
+        runner.adapters = {Platform.API_SERVER: adapter}
+        await _run_one_branch_tick(monkeypatch, runner)
+
+    # 12 тиков — доставка каждый раз успешна (ACK), канал НЕ дропнут.
+    assert calls, "валидный канал доставляется в outbox"
+    assert len(calls) >= 1, f"ожидали как минимум одну успешную доставку: {calls}"
+    assert calls[0][0] == "owui-abc456", f"доставка идёт в канал инициатора: {calls[0]}"
+    # Повторные тики не должны дублировать доставку (маркер acked).
+    assert len(calls) <= 2, f"после ack повторные тики не шлют заново: {calls}"
+
+    conn2 = kb.connect(board="default")
+    try:
+        comments = kb.list_comments(conn2, root)
+        marker = kb.has_branch_summary(conn2, root)
+    finally:
+        conn2.close()
+    drop = [c for c in comments if c.body.startswith("[delivery-drop]")]
+    assert drop == [], (
+        "валидный канал инициатора не должен дропаться после 12 тиков; "
+        f"найден [delivery-drop]: {[c.body for c in comments]}"
+    )
+    # Маркер существует и канал в нём acked (доставлен, а не принудительно сброшен).
+    assert marker is not None, "маркер branch-итога должен существовать"
+    pending = kb.branch_summary_pending_subs(
+        marker,
+        [{"platform": "api_server", "chat_id": "owui-abc456", "thread_id": ""}],
+    )
+    assert pending == [], (
+        "валидный канал инициатора после успешной доставки не должен "
+        f"остаться pending: {pending}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a1_valid_initiator_channel_not_dropped_after_12_failures(
+    board_env, monkeypatch,
+):
+    """A1 (t_b8bd2fe3): валидный OWUI-канал инициатора НЕ помечается dropped
+    после 12 неудачных попыток доставки, и остаётся пригодным для успешной
+    доставки следом.
+
+    Сценарий: подписка api_server несёт верифицированный user_id инициатора
+    (A4) и её чат валиден. `stage_terminal` возвращает ``pending`` — транзиентная
+    задержка (дренаж outbox / чтение из Open WebUI ещё не подтверждено), которая
+    НЕ является неисправимой поломкой канала.  После 12 таких тиков канал НЕ
+    должен быть дропнут: на root не появляется [delivery-drop]-коммента, маркер
+    сохраняется, а канал остаётся в pending (может быть доставлен позже).
+    Затем доставка восстанавливается (``acknowledged``) — канал получает итог,
+    маркер ACKится, pending пуст: канал остался пригодным.
+    """
+    from gateway import kanban_origin_delivery as _kod
+
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc789",
+        user_id="sess-initiator-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    calls = []
+    mode = {"state": "pending"}
+
+    def flaky_stage(outbox, registry, sub, profile, board, event_id, message):
+        calls.append((mode["state"], sub.get("chat_id"), message, event_id))
+        return (mode["state"], event_id if mode["state"] == "acknowledged" else None)
+
+    monkeypatch.setattr(_kod, "stage_terminal", flaky_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+
+    adapter = RecordingAdapter()
+    # 12 НЕУДАЧНЫХ попыток доставки валидному каналу инициатора (pending).
+    for _ in range(12):
+        runner = _make_runner(adapter)
+        runner.adapters = {Platform.API_SERVER: adapter}
+        await _run_one_branch_tick(monkeypatch, runner)
+
+    assert len(calls) == 12, (
+        "каждая из 12 попыток должна обратиться к stage_terminal: "
+        f"calls={len(calls)}"
+    )
+    assert all(state == "pending" for state, _, _, _ in calls), (
+        "все 12 попыток должны быть неудачными (pending)"
+    )
+
+    conn2 = kb.connect(board="default")
+    try:
+        comments = kb.list_comments(conn2, root)
+        marker = kb.has_branch_summary(conn2, root)
+    finally:
+        conn2.close()
+    drop = [c for c in comments if c.body.startswith("[delivery-drop]")]
+    assert drop == [], (
+        "валидный канал инициатора не должен дропаться после 12 неудачных "
+        f"попыток; найден [delivery-drop]: {[c.body for c in comments]}"
+    )
+    # Канал остаётся пригодным: маркер жив, канал всё ещё pending (не acked
+    # принудительно, не отброшен).
+    assert marker is not None, "маркер branch-итога должен сохраниться"
+    pending = kb.branch_summary_pending_subs(
+        marker,
+        [{"platform": "api_server", "chat_id": "owui-abc789", "thread_id": ""}],
+    )
+    assert pending, (
+        "после 12 транзиентных неудач канал должен остаться pending "
+        f"(доставка возможна позже): {pending}"
+    )
+
+    # Следующая попытка успешна — доказывает, что канал остался пригодным:
+    # итог доставляется в канал инициатора и маркер ACKится.
+    mode["state"] = "acknowledged"
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    await _run_one_branch_tick(monkeypatch, runner)
+
+    ok_calls = [c for c in calls if c[0] == "acknowledged"]
+    assert len(ok_calls) == 1, f"ожидали одну успешную доставку: {ok_calls}"
+    assert ok_calls[0][1] == "owui-abc789", (
+        f"успешная доставка идёт в канал инициатора: {ok_calls[0]}"
+    )
+
+    conn3 = kb.connect(board="default")
+    try:
+        comments_final = kb.list_comments(conn3, root)
+        marker_final = kb.has_branch_summary(conn3, root)
+    finally:
+        conn3.close()
+    drop_final = [
+        c for c in comments_final if c.body.startswith("[delivery-drop]")
+    ]
+    assert drop_final == [], (
+        "после успешной доставки канал всё ещё не дропнут: "
+        f"{[c.body for c in comments_final]}"
+    )
+    assert marker_final is not None, "маркер должен существовать после ACK"
+    pending_final = kb.branch_summary_pending_subs(
+        marker_final,
+        [{"platform": "api_server", "chat_id": "owui-abc789", "thread_id": ""}],
+    )
+    assert pending_final == [], (
+        "после успешной доставки канал acked и не остаётся в pending: "
+        f"{pending_final}"
+    )
+

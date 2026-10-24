@@ -291,7 +291,14 @@ def test_parallel_watchers_claim_exactly_once(tmp_path, monkeypatch):
 
 
 def test_reopen_after_final_result_no_stale_resend(tmp_path, monkeypatch):
-    """Done -> reopen (running) -> done again: exactly 2 sends, no replay."""
+    """Done -> reopen (running) -> done again: exactly 2 sends, no replay.
+
+    The re-open reactivates the node; the SECOND close is a NEW completed
+    event and must be delivered with its own content (H-1/R1 contract), while
+    the first completed must never be replayed.  There is no separate "reopen
+    ping" event family wired (STATUS_UPDATE is reserved, not dispatched), so
+    the channel sees exactly one message per close.
+    """
     monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
     db_path = tmp_path / "reopen.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -317,8 +324,17 @@ def test_reopen_after_final_result_no_stale_resend(tmp_path, monkeypatch):
         asyncio.run(_run_one_notifier_tick(monkeypatch, runner2))
 
         texts = [s["text"] for s in adapter.sent]
-        assert len(adapter.sent) == 3, f"expected 1st done + reopen + 2nd done = 3, got {texts}"
-        assert "second done" in texts[-1]
+        # Exactly 2 sends: one per close, no replay of the stale first and no
+        # separate reopen ping.  Each close's own content rides the итог
+        # (F1: never a bare contentless ping when summary is present).
+        assert len(adapter.sent) == 2, (
+            f"expected 1st done + 2nd done = 2 (no reopen ping, no stale "
+            f"resend), got {texts}"
+        )
+        assert texts[0] == "first done", f"first close content: {texts}"
+        assert texts[-1] == "second done", (
+            f"second close must carry its own summary, not a replay: {texts}"
+        )
     finally:
         conn.close()
 
@@ -330,9 +346,6 @@ def test_reopen_after_final_result_no_stale_resend(tmp_path, monkeypatch):
 
 def test_block_reblock_same_cause_dedup(mission_env, monkeypatch):
     """Same-cause re-block inside cooldown must NOT spam the owner's TG."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-block", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -513,9 +526,9 @@ def test_owl_root_artifact_paths_25mb_and_broken(tmp_path, monkeypatch):
         ])
         conn.close()
 
-        from gateway.kanban_watchers import _owui_root_artifact_paths
+        from gateway.delivery_engine import owui_root_artifact_paths
         plan = {"root_id": tid, "board": "default"}
-        paths = _owui_root_artifact_paths(plan)
+        paths = owui_root_artifact_paths(plan)
         assert str(ok) in paths, "existing small file must be kept"
         assert str(big) not in paths, ">25MB artifact must be skipped"
         assert str(broken) not in paths, "broken path must be skipped"
@@ -544,8 +557,8 @@ def test_artifact_catalog_path_handled(tmp_path, monkeypatch):
                   artifacts=[str(catalog), str(broken_cat)])
         conn.close()
 
-        from gateway.kanban_watchers import _owui_root_artifact_paths
-        paths = _owui_root_artifact_paths({"root_id": tid, "board": "default"})
+        from gateway.delivery_engine import owui_root_artifact_paths
+        paths = owui_root_artifact_paths({"root_id": tid, "board": "default"})
         assert str(catalog) in paths, "existing catalog file rides as an artifact"
         assert str(broken_cat) not in paths, "missing catalog path skipped"
     finally:
@@ -559,9 +572,6 @@ def test_artifact_catalog_path_handled(tmp_path, monkeypatch):
 
 def test_foreign_owner_no_binding_no_tg_mirror(mission_env, monkeypatch):
     """A second OWUI user NOT in the binding gets OWUI-only (no TG mirror)."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     foreign = "sess-foreign-user-not-bound"
     root = _mk(mission_env, "mission")
     _owui_sub(mission_env, root, "owui-foreign", user_id=foreign)
@@ -598,9 +608,6 @@ def test_foreign_owner_no_binding_no_tg_mirror(mission_env, monkeypatch):
 
 def test_pwa_sub_no_owui_user_id_fail_closed(mission_env, monkeypatch):
     """PWA (api_server) subscription with empty user_id and no owui attr -> no TG."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission-pwa")
     # PWA subscription: no user_id, no delivery_metadata owui attribute.
     _owui_sub(mission_env, root, "owui-pwa", user_id="")

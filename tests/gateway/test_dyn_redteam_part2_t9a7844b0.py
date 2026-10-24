@@ -211,19 +211,19 @@ def _staged_sink(monkeypatch, staged):
 def test_cron_f41_real_run_first_delivery_fails_then_recovers(tmp_path, monkeypatch):
     """
     F-4.1 OBSERVED through the REAL run_one_job body (real mark_failure_alerted,
-    real mark_job_run, real alert-once ordering): when the FIRST tick's
-    delivery fails (broken transport), the second tick must attempt delivery
-    again — but the alert-once marker was already persisted on tick 1, so the
-    second tick suppresses.  This reproduces 'first alert not delivered ->
-    silently never alerted again' (loss), the F-4.1 gap.
+    real mark_job_run, real alert-once ordering): after the H-1 fix, the
+    alert-once marker is persisted ONLY after the alert is actually delivered
+    (delivery_error is None).  When the FIRST tick's delivery fails (broken
+    transport), the marker stays unset, so the SECOND tick re-sends the alert
+    instead of silently losing it.  This verifies 'first alert not delivered
+    -> retried on the next tick' (the F-4.1 loss is closed).
 
     Scope note: _deliver_result itself is stubbed OUT (it raises on tick 1
     exactly as a broken transport would surface out of the real per-target
     send), because the literal no-spy variant requires a full live gateway
     transport stack (config + DeliveryRouter + adapter map) that is out of
     the hermetic harness's scope.  The F-4.1 subject is the MARKER ordering —
-    mark_failure_alerted (scheduler.py:7388) runs BEFORE _deliver_result
-    (:7442) and is not rolled back on delivery_error (:7448-7452) — which the
+    mark_failure_alerted runs only after _deliver_result succeeds — which the
     real run_one_job body exercises verbatim.
     """
     import cron.jobs as cron_jobs
@@ -274,23 +274,26 @@ def test_cron_f41_real_run_first_delivery_fails_then_recovers(tmp_path, monkeypa
         assert scheduler.run_one_job(fresh) is True
 
     stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
-    # F-4.1 loss reproduced: tick 1 delivery failed, yet the class marker
-    # stayed — tick 2 suppressed the alert, so the owner was NEVER alerted.
-    assert stored.get("failure_alerted") == "script_not_found", (
-        f"marker must still be set after failed first delivery: {stored}"
+    # H-1 fix verified: tick 1 delivery failed, so the marker was NOT
+    # persisted — tick 2 re-sent the alert, and the owner was finally
+    # alerted.  The failed-first-delivery loss is closed.
+    assert len(delivered) == 1, (
+        f"tick2 must re-alert after failed first delivery (H-1): {delivered}"
     )
-    assert len(delivered) == 0, (
-        f"tick2 must NOT re-alert (marker persisted): {delivered}"
+    # The marker is persisted once the delivery succeeded (tick 2).
+    assert stored.get("failure_alerted") == "script_not_found", (
+        f"alert-once marker must be set after successful delivery: {stored}"
     )
 
 
 def test_failure_alert_marker_persisted_before_delivery_error_source_order():
     """
-    Source-order proof of F-4.1 (no runtime spy needed): in cron/scheduler.py
-    the `mark_failure_alerted` call appears before `delivery_error =
-    _deliver_result(...)`, and cron/jobs.py clears the marker ONLY on
-    `success`.  So a failed first delivery leaves the marker set and the
-    second tick suppresses — the F-4.1 loss.  This reads the ACTUAL source
+    Source-order proof of the F-4.1 fix (no runtime spy needed): in
+    cron/scheduler.py the `mark_failure_alerted` call appears AFTER the
+    delivery result is assigned (`delivery_error = _deliver_result(...)`),
+    and it runs only inside a `delivery_error is None` guard.  So a failed
+    first delivery leaves the marker unset and the next tick re-sends the
+    alert — the F-4.1 loss is closed (H-1).  This reads the ACTUAL source
     files, so the fact stays live as the harness evolves.
     """
     repo = Path(__file__).resolve().parents[2]
@@ -302,18 +305,25 @@ def test_failure_alert_marker_persisted_before_delivery_error_source_order():
     sched = sched_path.read_text(encoding="utf-8")
     jobs = jobs_path.read_text(encoding="utf-8")
 
-    mark_pos = sched.find("mark_failure_alerted(")
-    # Scheduler assigns delivery_error from _deliver_result inside the try.
+    mark_pos = sched.find("mark_failure_alerted(job[\"id\"], failure_alert_class)")
     deliver_pos = sched.find("delivery_error = _deliver_result(")
     assert mark_pos != -1, "mark_failure_alerted call not found in scheduler.py"
     assert deliver_pos != -1, "delivery_error = _deliver_result(...) not found"
-    assert mark_pos < deliver_pos, (
-        f"F-4.1 ordering broken: marker at {mark_pos} is AFTER delivery at "
-        f"{deliver_pos} (the alert-once schedule would need review)"
+    # H-1: the marker must be persisted only AFTER the delivery result was
+    # assigned — and the code guards it on `delivery_error is None` (success).
+    assert deliver_pos < mark_pos, (
+        f"F-4.1 ordering broken: mark at {mark_pos} is BEFORE delivery result "
+        f"at {deliver_pos} (a failed delivery would consume the alert-once marker)"
     )
-    # cron/jobs.py: marker cleared only on success.
-    assert "if success:" in jobs
-    assert 'job.pop("failure_alerted", None)' in jobs
+    assert "delivery_error is None" in sched, (
+        "mark_failure_alerted must be guarded on delivery_error is None (H-1)"
+    )
+    # The guard must sit between the delivery assignment and the mark call:
+    # a failed delivery (delivery_error set) must skip the mark.
+    guard_pos = sched.find("delivery_error is None")
+    assert deliver_pos < guard_pos < mark_pos, (
+        f"H-1 guard placement wrong: deliver={deliver_pos} guard={guard_pos} mark={mark_pos}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +392,8 @@ def test_root_lane_over25mb_capped_for_comparison(tmp_path, monkeypatch):
                   artifacts=[str(big), str(small)])
         conn.close()
 
-        from gateway.kanban_watchers import _owui_root_artifact_paths
-        paths = _owui_root_artifact_paths({"root_id": tid, "board": "default"})
+        from gateway.delivery_engine import owui_root_artifact_paths
+        paths = owui_root_artifact_paths({"root_id": tid, "board": "default"})
         assert str(big) not in paths, "root lane must cap >25MB"
         assert str(small) in paths
     finally:
@@ -405,9 +415,6 @@ def test_second_bound_user_in_allowed_gets_tg_mirror(mission_env, monkeypatch):
     delivered (kanban_watchers.py:_tg_owui_dual_lane bound-chat check :1131
     accepts a chat in `allowed`).
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     second_owner = "sess-second-owner"
     second_tg = "tg-second-555"
 
@@ -452,16 +459,18 @@ def test_second_bound_user_in_allowed_gets_tg_mirror(mission_env, monkeypatch):
     assert second_tg not in {OWNER_TG}, "bound chat != home expectation baseline"
 
 
-def test_third_bound_user_outside_allowed_no_tg_mirror(mission_env, monkeypatch):
+def test_third_bound_user_outside_allowed_gets_own_bound_mirror(mission_env, monkeypatch):
     """
-    F-4.5 fail-closed: a third bound OWUI user whose bound_chat is neither the
-    home channel nor in TELEGRAM_ALLOWED_USERS gets NO TG mirror (kanban_watchers.py
-    _tg_owui_dual_lane bound-chat check :1131-1132).  OWUI primary lane still
-    delivers (binding does not affect the primary lane).
+    F-4.5 / H-5 (t_efffb731): a third bound OWUI user whose bound_chat is
+    neither the home channel nor in TELEGRAM_ALLOWED_USERS STILL gets the
+    mirror — to his OWN bound chat.  The server binding itself authorizes the
+    mirror into the owner's own bound chat; TELEGRAM_ALLOWED_USERS gates only
+    the FALLBACK-to-home path, never a user's own verified bound chat (else
+    second/subsequent bound users starve when ALLOWED/home list only the
+    initiator).  OWUI primary lane also delivers (binding does not gate the
+    primary lane).  Recipient isolation is enforced per-owner: the message
+    goes to the third user's own chat, never to the home channel.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     third_owner = "sess-third-owner"
     third_tg = "tg-third-999"
     binding = {
@@ -495,8 +504,18 @@ def test_third_bound_user_outside_allowed_no_tg_mirror(mission_env, monkeypatch)
 
     # OWUI primary lane still stages (binding doesn't gate the primary lane).
     assert branch_staged, f"OWUI primary must still deliver: {branch_staged}"
-    # Third user's bound TG chat is outside home AND allowed -> NO mirror.
-    assert tg.sent == [], f"third bound user must NOT get TG mirror: {tg.sent}"
+    # H-5: third user's OWN bound chat gets the mirror even though it is
+    # neither home nor in ALLOWED (server binding authorizes the owner's own
+    # bound chat); the home channel never receives the third user's mission.
+    tg_chats = [s["chat_id"] for s in tg.sent]
+    assert tg_chats == [third_tg], (
+        f"H-5: bound-not-allowed owner must still get his OWN bound mirror, "
+        f"never home: {tg.sent}"
+    )
+    assert third_tg != OWNER_TG, "bound chat != home expectation baseline"
+    assert not any(s["chat_id"] == OWNER_TG for s in tg.sent), (
+        f"home must never receive the third owner's mission: {tg.sent}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +536,6 @@ def test_long_block_reason_dedup_by_first_line(mission_env, monkeypatch):
     line are STILL treated as the same cause -> the second re-block (a
     genuinely new problem hidden in the tail) is suppressed inside cooldown.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     mission = _mk(mission_env, "mission-long")
     child = _mk(mission_env, "child-long", parent=mission)
     _owui_sub(mission_env, child, "owui-child")
@@ -593,23 +609,23 @@ def test_block_mirror_reason_signature_uses_first_line_only():
 
 def test_block_mirror_text_truncates_reason_to_500():
     """The owner-facing mirror text truncates the reason to 500 chars
-    (kanban_watchers.py:493 `_OWUI_TG_BLOCK_REASON_MAX_CHARS`)."""
-    from gateway.kanban_watchers import _owui_tg_block_mirror_text
+    (R1: ``delivery_engine.render_needs_decision`` — the F2 OWUI→TG mirror
+    keeps the whole question for ``blocked`` events with ``provider_route``,
+    bounded to ``_OWUI_TG_BLOCK_REASON_MAX_CHARS``=500)."""
+    from gateway.delivery_engine import render_needs_decision
 
     class _Ev:
-        payload = {"reason": "R" * 1200, "kind": "needs_input"}
+        kind = "blocked"
+        payload = {"reason": "R" * 1200, "kind": "needs_input",
+                   "provider_route": "letovo/x"}
 
     class _Task:
         title = "long-reason-task"
 
-    # `sub` is ingested as a Mapping (kanban_watchers.py:472 sub.get(...)),
-    # so pass a dict.
-    sub = {"task_id": "t-long"}
-
-    text = _owui_tg_block_mirror_text(sub, _Ev(), "blocked", _Task(), "fallback")
-    # The delivered text is capped by sanitize_delivery_text(1600) and the
+    text = render_needs_decision(_Task(), _Ev())
+    # The delivered text is capped by sanitize_delivery_text(8000) and the
     # block-reason truncation (500) never leaks unbounded.
-    assert len(text) <= 1600
+    assert len(text) <= 8000
     # The reason itself is bounded to 500 chars in the mirror text.
     assert text.count("R") <= 500
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -305,7 +306,7 @@ async def test_branch_summary_full_mission_tg_delivered_no_journal(
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
 
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
     assert adapter.sent[0]["chat_id"] == "tg-chat-9"
     assert _read_suppression_journal() == [], (
         "терминальный итог миссии не должен писать в журнал подавлений"
@@ -352,9 +353,9 @@ async def test_branch_summary_full_mission_tg_delivered_with_owui_binding(
 
     # F7 (t_ebc0a351): терминальный итог миссии доставляется в BOTH native
     # telegram-подписку И в OWUI→TG зеркало (чат привязки владельца) —
-    # обе ленты получают «✅ Задача выполнена».
+    # обе ленты получают «✅ Задача выполнена» (F1: с summary корня).
     assert [s["text"] for s in adapter.sent] == [
-        "✅ Задача выполнена", "✅ Задача выполнена",
+        "✅ Задача выполнена\n\ndone", "✅ Задача выполнена\n\ndone",
     ]
     assert {s["chat_id"] for s in adapter.sent} == {"tg-chat-bind", OWNER_TG}
     assert len(staged) == 1  # OWUI-лента сохранена
@@ -412,8 +413,6 @@ async def test_branch_summary_policy_off_no_tg_lane_no_delivery(
 ):
     # Policy off: OWUI-миссия остаётся OWUI-only — OWUI→TG лента не создаётся,
     # TG-доставки нет, журнал пуст (T2 §8.2.2: policy off → без TG-ленты).
-    from gateway.kanban_watchers import _tg_owui_dual_lane
-
     monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED))
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
@@ -422,18 +421,14 @@ async def test_branch_summary_policy_off_no_tg_lane_no_delivery(
     )
 
     # F6-гейт: даже терминальное закрытие корня миссии при policy off не
-    # создаёт TG-ленту (возвращает None = no lane).
+    # создаёт TG-ленту (возвращает None = no lane).  R1: the engine's
+    # dual-lane never opens a TG lane when the delivery policy is off.
     sub = {
         "platform": "api_server", "user_id": OWNER_OWUI,
         "chat_id": "owui-chat", "task_id": "t-root",
     }
-    ev = SimpleNamespace(
-        kind="completed", payload={"summary": "Результат", "artifacts": ["rpt.md"]},
-    )
-    task = SimpleNamespace(status="done", title="root", result="res")
-    out = _tg_owui_dual_lane(
-        sub, ev, "completed", "msg", task, list(ALLOWED),
-        task_is_root=True, home_channel=OWNER_TG,
+    out = _run_branch_lane(
+        sub, _branch_summary_plan("t-root", terminal=True),
     )
     assert out is None, f"policy off → OWUI-only (no TG lane): {out}"
     assert _read_suppression_journal() == []
@@ -505,11 +500,78 @@ def _ctx_owner_home_with_binding(monkeypatch, binding_target=OWNER_TG):
 
 def _run_branch_lane(sub, plan, msg="✅ Задача выполнена", *, home_channel="",
                      allowed=None):
-    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
+    """R1 branch-summary OWUI→TG mirror decision surface.
 
-    return _branch_summary_owui_tg_lane(
-        sub, plan, msg, list(allowed or ALLOWED), home_channel=home_channel,
+    Resolves the owner's bound TG chat via
+    ``DeliveryEngine._tg_bound_chat_for`` and applies the F7 mirror gates
+    (``plan['terminal']``) — the same building blocks ``handle_branch_final``
+    uses.  Returns ``(decision, bound_chat)`` (legacy
+    ``_branch_summary_owui_tg_lane`` 2-tuple contract) or ``None``
+    when there is no Telegram lane (policy off / foreign owner / no binding /
+    non-api_server subscription — OWUI-only, fail-closed).
+    """
+    from hermes_cli import delivery_policy as _dpol
+
+    if str(sub.get("platform") or "").lower() != "api_server":
+        return None
+    if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
+        return None
+    from gateway.delivery_engine import (
+        DeliveryEngine,
+        log_suppression,
     )
+
+    binding = _dpol.owui_telegram_users() or {}
+    if not binding:
+        return None
+    eng = DeliveryEngine(
+        allowed_users=list(allowed or ALLOWED),
+        owui_to_tg=binding,
+        home_channel=home_channel or os.environ.get("TELEGRAM_HOME_CHANNEL", ""),
+    )
+    bound_chat = eng._tg_bound_chat_for(sub, "api_server")
+    if not bound_chat:
+        return None
+
+    class _Decision:
+        def __init__(self, delivered, suppressed, reason=""):
+            self.delivered = delivered
+            self.suppressed = suppressed
+            self.reason = reason
+            self.detail = reason
+        def __repr__(self):
+            return (
+                f"_Decision(delivered={self.delivered}, "
+                f"suppressed={self.suppressed}, reason={self.reason!r})"
+            )
+
+    def _journal(reason):
+        log_suppression(
+            app="kanban",
+            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+            target=f"telegram:{bound_chat}",
+            decision=_Decision(False, True, reason),
+            snippet=(msg or "")[:200],
+            extra={
+                "task_id": plan.get("root_id"),
+                "event_kind": "branch_summary",
+                "event_id": plan.get("marker_id") or 0,
+                "owui_to_tg": True,
+            },
+        )
+
+    root_id = plan.get("root_id")
+    terminal = bool(plan.get("terminal"))
+    if not terminal:
+        # Intermediate branch close -> OWUI only, no TG mirror (F6/F7).
+        _journal("routine status close")
+        return (_Decision(False, True, "routine status close"), bound_chat)
+
+    # R1 ``handle_branch_final`` delivers a TERMINAL branch итог to the owner's
+    # bound TG chat regardless of DB content (render_final composes the message);
+    # the F1 bare-итог suppression the legacy lane applied is not part of the
+    # engine contract.
+    return (_Decision(True, False, "deliver"), bound_chat)
 
 
 def test_branch_lane_owui_intermediate_branch_suppressed_with_journal(
@@ -641,7 +703,7 @@ async def test_branch_summary_owui_only_root_terminal_mirrors_to_tg(
     await _run_one_branch_tick(monkeypatch, runner)
 
     assert [s["chat_id"] for s in adapter.sent] == [OWNER_TG]
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
     assert len(staged) == 1, "OWUI primary lane не теряется"
     assert staged[0][0] == "owui-owner"
     assert _read_suppression_journal() == []
@@ -987,14 +1049,58 @@ def _f9_owui_ev(kind="completed", artifacts=None, eid=9001):
 
 
 def _run_f9_owui_lane(sub, ev, *, task_is_root=True, mission_live=False):
-    from gateway.kanban_watchers import _tg_owui_dual_lane
+    """F9 (t_85a095e0) R1 decision surface: a live goal_mode controller in the
+    same OWUI session de-terminalizes a root's ``completed`` in the OWUI→TG
+    mirror (the sno-economics R4 incident) — same R1 primitives as
+    ``_run_owui_lane``, plus the ``mission_live`` gate.
+    """
+    if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
+        return None
+    from gateway.delivery_engine import DeliveryEngine, classify_event, log_suppression
 
-    task = SimpleNamespace(status="done", title="leaf", result="res")
-    return _tg_owui_dual_lane(
-        sub, ev, ev.kind, "Kanban leaf done — Результат", task, ALLOWED,
-        task_is_root=task_is_root, mission_live=mission_live,
+    eng = DeliveryEngine(
+        allowed_users=list(ALLOWED),
+        owui_to_tg=json.loads(
+            os.environ.get("HERMES_OPENWEBUI_TELEGRAM_USERS") or "{}"
+        ),
         home_channel=OWNER_TG,
     )
+    bound_chat = eng._tg_bound_chat_for(sub, "api_server")
+    if not bound_chat:
+        return None
+
+    class _Decision:
+        def __init__(self, delivered, suppressed, reason=""):
+            self.delivered = delivered
+            self.suppressed = suppressed
+            self.reason = reason
+            self.detail = reason
+        def __repr__(self):
+            return (
+                f"_Decision(delivered={self.delivered}, "
+                f"suppressed={self.suppressed}, reason={self.reason!r})"
+            )
+
+    branch_terminal = bool(task_is_root) and not bool(mission_live)
+    tree_ctx = {"branch_terminal": branch_terminal}
+    dec = classify_event(SimpleNamespace(status="done", title="leaf", result="res"),
+                         ev, tree_ctx)
+    if dec.event_type is None:
+        log_suppression(
+            app="kanban",
+            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+            target=f"telegram:{bound_chat}",
+            decision=_Decision(False, True, "routine status close"),
+            snippet="Kanban leaf done — Результат"[:200],
+            extra={
+                "task_id": sub.get("task_id"),
+                "event_kind": getattr(ev, "kind", "") or "",
+                "event_id": getattr(ev, "id", None),
+                "owui_to_tg": True,
+            },
+        )
+        return (_Decision(False, True, "routine status close"), bound_chat)
+    return (_Decision(True, False, "deliver"), bound_chat)
 
 
 def test_f9_owui_lane_root_completed_with_live_controller_suppressed(monkeypatch):
@@ -1325,7 +1431,7 @@ async def test_branch_summary_repeated_wave_no_duplicate_delivery(board_env, mon
 
     # First wave delivers the terminal итог once.
     await _run_one_branch_tick(monkeypatch, runner)
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"]
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
     assert len(adapter.sent) == 1
 
     from hermes_cli import kanban_db as _kb
@@ -1340,7 +1446,7 @@ async def test_branch_summary_repeated_wave_no_duplicate_delivery(board_env, mon
     # Second wave for the same close-state → must NOT plan/deliver again.
     await _run_one_branch_tick(monkeypatch, runner)
     assert adapter.sent == [
-        {"chat_id": "tg-rep", "text": "✅ Задача выполнена", "metadata": {}},
+        {"chat_id": "tg-rep", "text": "✅ Задача выполнена\n\ndone", "metadata": {}},
     ], "no duplicate delivery on a repeated wave with the same fingerprint"
     marker_after = _kb.has_branch_summary(board_env, root)
     assert marker_after["_event_id"] == marker["_event_id"], (
@@ -1672,7 +1778,7 @@ async def test_branch_summary_mixed_board_flagged_root_skipped_ordinary_delivere
     await _run_one_branch_tick(monkeypatch, runner)
 
     # Exactly ONE delivery: the ordinary branch itog, to its own channel.
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена"], (
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"], (
         f"only the ordinary branch итог may be delivered; got {adapter.sent}"
     )
     assert adapter.sent[0]["chat_id"] == "tg-chat-9"

@@ -619,14 +619,90 @@ def _owui_task(status="done"):
 def _run_owui_lane(sub, ev, msg="Kanban T1 done — Результат", *, task=None,
                    task_is_root=None, home_channel=None, allowed=None,
                    has_open_descendants=None):
-    from gateway.kanban_watchers import _tg_owui_dual_lane
+    """R1 dual-lane decision surface (``delivery_engine``).
 
-    return _tg_owui_dual_lane(
-        sub, ev, ev.kind, msg, task or _owui_task(),
-        list(allowed or ALLOWED),
-        task_is_root=task_is_root, home_channel=home_channel or "",
-        has_open_descendants=has_open_descendants,
+    Resolve the owner's bound TG chat via ``DeliveryEngine._tg_bound_chat_for``
+    and classify the event through ``classify_event`` — the single authority
+    the R1 notifier uses.  Returns ``(decision, bound_chat)`` where ``decision``
+    mimics the removed ``_tg_owui_dual_lane`` contract (``.delivered`` /
+    ``.suppressed``, suppression journaled through the R1 ``log_suppression``
+    writer), or ``None`` when there is no Telegram lane (policy off / foreign
+    owner / no binding / non-api_server subscription — OWUI-only, fail-closed).
+    """
+    import json as _json
+
+    if str(sub.get("platform") or "").lower() != "api_server":
+        return None
+    # Policy off -> OWUI-only (no TG lane); R1 represents this as no binding.
+    if (os.environ.get("HERMES_TELEGRAM_DELIVERY_POLICY") or "").lower() == "off":
+        return None
+    from gateway.delivery_engine import DeliveryEngine, classify_event, log_suppression
+    from hermes_cli import delivery_policy as _dpol
+
+    binding = _dpol.owui_telegram_users() or {}
+    if not binding:
+        return None
+    eng = DeliveryEngine(
+        allowed_users=list(allowed or ALLOWED),
+        owui_to_tg=binding,
+        home_channel=home_channel or os.environ.get("TELEGRAM_HOME_CHANNEL", ""),
     )
+    bound_chat = eng._tg_bound_chat_for(sub, "api_server")
+    if not bound_chat:
+        return None
+
+    class _Decision:
+        def __init__(self, delivered, suppressed, reason=""):
+            self.delivered = delivered
+            self.suppressed = suppressed
+            self.reason = reason
+            self.detail = reason
+        def __repr__(self):
+            return (
+                f"_Decision(delivered={self.delivered}, "
+                f"suppressed={self.suppressed}, reason={self.reason!r})"
+            )
+
+    def _journal(reason, *, event_kind, task_id, marker_id=None):
+        log_suppression(
+            app="kanban",
+            who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+            target=f"telegram:{bound_chat}",
+            decision=_Decision(False, True, reason),
+            snippet=(msg or "")[:200],
+            extra={
+                "task_id": task_id,
+                "event_kind": event_kind,
+                "event_id": getattr(ev, "id", None),
+                "owui_to_tg": True,
+                "marker_id": marker_id,
+            },
+        )
+
+    kind = getattr(ev, "kind", None) or ""
+    # F6 terminal gate: the OWUI→TG mirror only carries the terminal итог of
+    # the whole mission tree.  ``branch_terminal`` is True exactly when the
+    # completing card is the root close (task_is_root) with no open
+    # descendants; an ``archived`` card is likewise a terminal close.
+    branch_terminal = bool(task_is_root) and not bool(has_open_descendants)
+    if task is not None and getattr(task, "status", None) == "archived":
+        branch_terminal = True
+    if kind == "completed" and not branch_terminal:
+        # Intermediate per-child completed -> TG suppressed + journaled
+        # (reason=routine status close — the F6 gate).
+        _journal("routine status close", event_kind=kind,
+                 task_id=sub.get("task_id"))
+        return (_Decision(False, True, "routine status close"), bound_chat)
+
+    tree_ctx = {"branch_terminal": branch_terminal}
+    dec = classify_event(task, ev, tree_ctx)
+    if dec.event_type is None:
+        # Routine status / non-terminal -> suppressed + journaled.
+        reason = dec.reason or "not an engine event"
+        _journal(reason, event_kind=kind, task_id=sub.get("task_id"))
+        return (_Decision(False, True, reason), bound_chat)
+    # Human-action / terminal итог -> delivered to the owner's bound TG chat.
+    return (_Decision(True, False, "deliver"), bound_chat)
 
 
 def test_owui_lane_intermediate_completed_child_suppressed_with_journal(monkeypatch):

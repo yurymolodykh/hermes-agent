@@ -5,7 +5,7 @@ Covers the three silent-drop paths flagged by the red team (t_d0bcecda):
   * ``hermes_cli/kanban_db.py:6416-6417`` — a non-string/blank entry in the
     ``artifacts`` catalog passed to ``complete_task`` drops out of the
     delivered list with no diagnostic.
-  * ``gateway/kanban_watchers.py:1457-1459`` — ``_owui_root_artifact_paths``
+  * ``gateway/delivery_engine.py:342`` — ``owui_root_artifact_paths`` (R1)
     silently skips a non-string entry, and (existing) a broken/nonexistent
     or relative path returns without a warn.
   * ``gateway/kanban_watchers.py:4193`` — ``_deliver_kanban_artifacts``
@@ -128,11 +128,11 @@ def test_owui_root_broken_path_warns(tmp_path, monkeypatch, caplog):
     finally:
         conn.close()
 
-    from gateway.kanban_watchers import _owui_root_artifact_paths
+    from gateway.delivery_engine import owui_root_artifact_paths
 
     caplog.clear()
-    with caplog.at_level("WARNING", logger="gateway.run"):
-        paths = _owui_root_artifact_paths({"root_id": tid, "board": "default"})
+    with caplog.at_level("WARNING", logger="gateway.delivery_engine"):
+        paths = owui_root_artifact_paths({"root_id": tid, "board": "default"})
     warns = [r for r in caplog.records if r.levelno >= 30]
     assert warns, "expected warn for missing root artifact"
     combined = "\n".join(r.getMessage() for r in warns)
@@ -158,11 +158,11 @@ def test_owui_root_nonstring_warns(tmp_path, monkeypatch, caplog):
     finally:
         conn.close()
 
-    from gateway.kanban_watchers import _owui_root_artifact_paths
+    from gateway.delivery_engine import owui_root_artifact_paths
 
     caplog.clear()
-    with caplog.at_level("WARNING", logger="gateway.run"):
-        paths = _owui_root_artifact_paths({"root_id": tid, "board": "default"})
+    with caplog.at_level("WARNING", logger="gateway.delivery_engine"):
+        paths = owui_root_artifact_paths({"root_id": tid, "board": "default"})
     warns = [r for r in caplog.records if r.levelno >= 30]
     assert warns, "expected warn for non-string root artifact"
     combined = "\n".join(r.getMessage() for r in warns)

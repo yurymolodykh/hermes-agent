@@ -175,9 +175,6 @@ async def test_n_child_mission_no_per_child_routine_pings(board_env, monkeypatch
     visible api_server messages — the branch итог is the single channel
     message (acceptance: 'для миссии из N карточек не появляется per-child
     completed/status/blocked')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission-N3")
     children = [_mk(board_env, f"child-{i}", parent=root) for i in range(3)]
     _api_sub(board_env, root, "owui-request")
@@ -218,16 +215,16 @@ async def test_n_child_mission_no_per_child_routine_pings(board_env, monkeypatch
 
 def test_branch_summary_itog_keeps_root_report_artifact(board_env):
     """The api_server branch итог appends the root ``completed`` event's report
-    artifact inline (``_owui_branch_result_text``) — the artifact survives even
-    though the individual per-child pings were suppressed (acceptance:
-    'остаются … терминальный итог с артефактами')."""
-    from gateway.kanban_watchers import _owui_branch_result_text
+    artifact inline (R1: ``delivery_engine.owui_root_final_summary``) — the
+    artifact survives even though the individual per-child pings were
+    suppressed (acceptance: 'остаются … терминальный итог с артефактами')."""
+    from gateway.delivery_engine import owui_root_final_summary
 
     plan = {"root_id": "t_root", "board": "default"}
     msg = "✅ Задача выполнена"
 
     # No artifact -> unchanged short итог.
-    assert _owui_branch_result_text(plan, msg) == msg
+    assert owui_root_final_summary(plan, msg) == msg
 
     # With a readable .md report artifact -> appended inline.
     import os
@@ -240,10 +237,10 @@ def test_branch_summary_itog_keeps_root_report_artifact(board_env):
         with kb.write_txn(board_env):
             kb._append_event(
                 board_env, root, "completed",
-                {"summary": "done", "artifacts": [report]},
+                {"summary": "", "artifacts": [report]},
             )
         plan2 = {"root_id": root, "board": "default"}
-        out = _owui_branch_result_text(plan2, msg)
+        out = owui_root_final_summary(plan2, msg)
         assert "itog.md" in out, f"artifact filename missing: {out}"
         assert "Итоговая сводка" in out
 
@@ -260,9 +257,6 @@ async def test_child_blocked_provider_route_stays_loud(board_env, monkeypatch):
     ``provider_route``) MUST reach the OWUI session even under replace mode —
     the legacy ``silent`` blanket must not swallow it (acceptance: 'blocked с
     provider_route … остаются видимыми')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission")
     child = _mk(board_env, "child-provider", parent=root)
     _api_sub(board_env, root, "owui-root")
@@ -307,9 +301,6 @@ async def test_child_block_loop_detected_stays_loud(board_env, monkeypatch):
     for the same cause past the recurrence limit) MUST stay visible — it is
     the one transition that exists to force human attention (acceptance:
     'block_loop_detected/triage остаются видимыми')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission")
     child = _mk(board_env, "child-loop", parent=root)
     _api_sub(board_env, root, "owui-root")
@@ -350,9 +341,6 @@ async def test_child_triage_card_route_stays_loud(board_env, monkeypatch):
     routine ``completed`` event remains on it — the predicate reads the card
     status and never drops a triage card (acceptance: 'triage остаются
     видимыми')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission")
     child = _mk(board_env, "child-triage", parent=root)
     _api_sub(board_env, root, "owui-root")
@@ -387,9 +375,6 @@ async def test_split_sub_branch_close_suppressed(board_env, monkeypatch):
     """A ``[split N/M]`` style mid-tree close — one sub-branch (a child of a
     still-OPEN mission root) closes while the mission continues — must NOT
     emit a visible per-child message (acceptance: 'split N/M … подавляются')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     mission = _mk(board_env, "mission")
     # The [split N/M] card is itself a child chain under the open mission.
     split = _mk(board_env, "[split 1/2] sub-branch", parent=mission)
@@ -440,9 +425,6 @@ async def test_terminal_itog_reaches_request_session(board_env, monkeypatch):
     'остаются запрос, терминальный итог')."""
     import os
     import tempfile
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "mission-report.md")
         with open(report, "w", encoding="utf-8") as fh:

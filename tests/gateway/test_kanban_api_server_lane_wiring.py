@@ -117,9 +117,6 @@ async def test_api_server_mission_suppresses_per_child_routine_pings(
     silent; only the branch итог (branch_summary) surfaces.  The root's own
     routine completion ping is also NOT a visible message (replace mode: the
     branch_summary stage owns the single channel message)."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission")
     children = [_mk(board_env, f"child-{i}", parent=root) for i in range(3)]
     # Root + every child carry an api_server OWUI subscription (auto-subscribe).
@@ -154,9 +151,6 @@ async def test_api_server_child_blocked_needs_human_fix_stays_loud(
     """A child blocked needing a human fix (needs_input) MUST stay visible even
     on a strict descendant of a subscribed root — the legacy ``silent`` blanket
     must not swallow it (t_b9f41135 acceptance: 'блокировки при наличии')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(board_env, "mission")
     child = _mk(board_env, "child-needs-input", parent=root)
     _api_sub(board_env, root, "owui-root")

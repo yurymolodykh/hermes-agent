@@ -219,23 +219,47 @@ def test_binding_file_env_path(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. gateway.kanban_watchers — PWA-маркер owui_user_id_attr (unit-level)
+# 3. gateway.delivery_engine — PWA-маркер owui_user_id_attr (unit-level)
 # ---------------------------------------------------------------------------
+#
+# R1 (d3cfc258d5): the owner-resolution logic that used to live in the
+# removed ``_sub_owui_owner_id`` now lives in
+# ``DeliveryEngine._tg_bound_chat_for`` — api_server sub -> owner's bound TG
+# chat, with ``user_id`` taking priority over the server-side
+# ``delivery_metadata[owui_user_id_attr]`` marker (F3), fail-closed when both
+# are absent.
+
+def _engine_tg_chat_for(sub, *, owui_to_tg=None):
+    from gateway.delivery_engine import DeliveryEngine
+    eng = DeliveryEngine(owui_to_tg=owui_to_tg or {})
+    return eng._tg_bound_chat_for(sub, "api_server")
+
 
 def test_sub_owui_owner_id_user_id_priority():
-    from gateway.kanban_watchers import _sub_owui_owner_id
-    assert _sub_owui_owner_id({"user_id": "A", "delivery_metadata": {"owui_user_id_attr": "B"}}) == "A"
+    # ``user_id`` wins over the F3 marker even when both are present.
+    assert _engine_tg_chat_for(
+        {"user_id": "A", "delivery_metadata": {"owui_user_id_attr": "B"}},
+        owui_to_tg={"A": "tg-A", "B": "tg-B"},
+    ) == "tg-A"
 
 
 def test_sub_owui_owner_id_falls_back_to_attr():
-    from gateway.kanban_watchers import _sub_owui_owner_id
-    assert _sub_owui_owner_id({
-        "user_id": "",
-        "delivery_metadata": {"owui_user_id_attr": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"},
-    }) == "9ae3eca0-d6e9-45d5-b4af-414afe4616b9"
+    # Marker-only PWA sub (no user_id) falls back to the F3 marker owner.
+    assert _engine_tg_chat_for(
+        {
+            "user_id": "",
+            "delivery_metadata": {
+                "owui_user_id_attr": "9ae3eca0-d6e9-45d5-b4af-414afe4616b9",
+            },
+        },
+        owui_to_tg={"9ae3eca0-d6e9-45d5-b4af-414afe4616b9": "tg-owner"},
+    ) == "tg-owner"
 
 
 def test_sub_owui_owner_id_empty_fail_closed():
-    from gateway.kanban_watchers import _sub_owui_owner_id
-    assert _sub_owui_owner_id({"user_id": "", "delivery_metadata": {}}) == ""
-    assert _sub_owui_owner_id({"user_id": None}) == ""
+    # No owner (neither user_id nor marker) -> no TG lane (OWUI-only).
+    assert _engine_tg_chat_for(
+        {"user_id": "", "delivery_metadata": {}},
+        owui_to_tg={"whoever": "tg-x"},
+    ) is None
+    assert _engine_tg_chat_for({"user_id": None}) is None

@@ -262,9 +262,6 @@ def adapter_sent_texts(adapter):
 async def test_intermediate_child_noise_silent_on_both_lanes(mission_env, monkeypatch):
     """Intermediate per-child completed + self-resolving blocked produce ZERO
     messages on the OWUI lane AND the TG mirror, and never wake the agent."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root, children = _setup_mission(mission_env, n_children=3,
                                     with_self_resolving_block=True)
 
@@ -299,9 +296,6 @@ async def test_parent_with_open_children_completed_silent_on_tg(mission_env, mon
     SILENT in the notifier tick (one terminal итог comes later from the
     branch-summary watcher once the whole tree closes).
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root, children = _setup_mission(mission_env, n_children=2)
 
     # Root completes FIRST; children stay RUNNING (mid-tree, mission NOT closed).
@@ -339,9 +333,6 @@ async def test_parent_with_open_children_completed_control_tg(mission_env, monke
     the branch-summary watcher delivers it to TG — the P2 suppression only
     holds while children remain open.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root, children = _setup_mission(mission_env, n_children=2)
     assert _complete(mission_env, root, summary="mission done")
     for i, cid in enumerate(children):
@@ -375,9 +366,6 @@ async def test_parent_with_open_children_completed_control_tg(mission_env, monke
 async def test_split_sub_branch_close_silent_on_both_lanes(mission_env, monkeypatch):
     """A ``[split N/M]``-style mid-tree close (child chain under a still-open
     mission root) is silent on BOTH lanes — explicitly listed in acceptance."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     mission = _mk(mission_env, "mission")
     split = _mk(mission_env, "[split 1/2] sub-branch", parent=mission)
     sub = _mk(mission_env, "sub-task", parent=split)
@@ -416,9 +404,6 @@ async def test_provider_route_block_loud_on_both_lanes(mission_env, monkeypatch)
     """A child blocked by a provider outage (payload ``provider_route``) MUST
     reach BOTH the OWUI session and the owner's bound TG chat — even under
     replace mode ('блокировки при наличии')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-provider", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -453,7 +438,7 @@ async def test_provider_route_block_loud_on_both_lanes(mission_env, monkeypatch)
     assert len(tg_texts) == 1, f"provider_route block must reach TG: {tg_texts}"
     # F2: the OWUI→TG mirror carries the owner-facing «Требует решения»
     # format (title + reason), not the generic notifier excerpt.
-    assert "Требует решения" in tg_texts[0]
+    assert "Требуется решение" in tg_texts[0]
     assert "child-provider" in tg_texts[0]
     assert "letovo/deepseek-v4-flash" in tg_texts[0]
 
@@ -465,9 +450,6 @@ async def test_block_loop_detected_triage_loud_on_both_lanes(mission_env, monkey
     exists to force human attention. It MUST stay visible on BOTH the OWUI
     lane (staged with a TRIAGE ping) and the owner's bound TG chat, even
     under replace mode ('блокировки при наличии')."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-loop", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -504,7 +486,7 @@ async def test_block_loop_detected_triage_loud_on_both_lanes(mission_env, monkey
     # owner's bound chat, not suppressed by the routine gate.
     tg_texts = adapter_sent_texts(tg)
     assert len(tg_texts) == 1, f"block_loop_detected must reach TG: {tg_texts}"
-    assert "Требует решения" in tg_texts[0]
+    assert "Требуется решение" in tg_texts[0]
 
 
 @pytest.mark.asyncio
@@ -514,9 +496,6 @@ async def test_triage_card_routed_loud_on_both_lanes(mission_env, monkeypatch):
     notifier/predicate reads the card status and never drops a triage card
     (acceptance: 'triage остаются видимыми').  The TG mirror classifies the
     staged message by its content shape rather than dropping a triage card."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-triage", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -554,9 +533,6 @@ async def test_terminal_itog_both_lanes_one_message_with_artifacts(mission_env, 
     artifact riding inline, and no routine-suppression journal entries."""
     import tempfile
 
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "mission-report.md")
         with open(report, "w", encoding="utf-8") as fh:
@@ -635,9 +611,6 @@ async def test_p4_foreign_owner_with_binding_delivers_to_own_lanes(mission_env, 
     complaint: the TG mirror must resolve ``owui_telegram_users[sub.user_id]``
     (per-owner), not fall back to the configured home channel.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     # Binding for the FOREIGN owner only; home is the OWNER_TG from the
     # fixture. A per-owner fallback would (wrongly) target home.
     monkeypatch.setenv(
@@ -700,9 +673,6 @@ async def test_binding_absent_foreign_owner_stays_owui_only(mission_env, monkeyp
     Yuri by default). This is the acceptance: 'чужие итоги не падают Юрию
     по умолчанию'.
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     # Binding and home stay from the fixture; FOREIGN_OWUI is deliberately
     # ABSENT from the binding map => no Telegram lane for her (fail-closed).
     monkeypatch.setenv(
@@ -759,9 +729,6 @@ async def test_f1_terminal_itog_mirror_carries_summary_and_artifact_files(
     """
     import tempfile
 
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "f1-report.md")
         with open(report, "w", encoding="utf-8") as fh:
@@ -817,9 +784,6 @@ async def test_f1_bare_terminal_itog_suppressed_with_journal(
     with ``reason=bare terminal итог without content``.  OWUI primary lane is
     unaffected (the итог is still staged there).
     """
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root, children = _setup_mission(mission_env, n_children=1)
     # No summary, no artifacts → the completed payload carries only the
     # generic first-line placeholder; the mirror has nothing to enrich with.
@@ -871,19 +835,23 @@ async def test_f1_bare_terminal_itog_suppressed_with_journal(
 async def test_mirror_plan_payload_artifact_rider(mission_env, monkeypatch):
     """t_f659bef2: the OWUI→TG mirror honours an explicit ``plan['artifacts']``
     list exactly like the native-TG lane (parity, D0 D2/A4).  A real file on
-    the plan payload rides ``_deliver_kanban_artifacts`` → ``send_document``;
-    a missing path is dropped (never breaks the text); the driver keeps the
-    enriched итог with summary.
+    the plan payload rides ``deliver_artifacts`` → the TG ``send_document``
+    upload; a missing path is dropped by the delivery layer (never breaks the
+    text); ``handle_branch_final`` composes the terminal итог with summary.
+
+    R1: driven through ``DeliveryEngine.handle_branch_final`` (the single
+    branch-итог surface; the removed ``_branch_summary_owui_tg_lane`` merge
+    is now the engine's ``render_final`` + artifact delivery).
     """
     import tempfile
-
-    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
 
     monkeypatch.setenv(
         "HERMES_OPENWEBUI_TELEGRAM_USERS", json.dumps({OWNER_OWUI: OWNER_TG}),
     )
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED_TG))
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+
+    from gateway.delivery_engine import DeliveryEngine
 
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "plan-rider.md")
@@ -904,43 +872,64 @@ async def test_mirror_plan_payload_artifact_rider(mission_env, monkeypatch):
             "thread_id": None,
         }
 
-        lane = _branch_summary_owui_tg_lane(
-            sub, plan, "✅ Задача выполнена",
-            allowed_users=ALLOWED_TG,
+        tg = RecordingAdapter()
+        engine = DeliveryEngine(
+            allowed_users=list(ALLOWED_TG),
+            owui_to_tg={OWNER_OWUI: OWNER_TG},
             home_channel=OWNER_TG,
         )
-        assert lane is not None, "mirror lane must exist for bound owner"
-        decision, bound_chat, content = lane
-        assert not decision.suppressed, (
-            f"plan artifact makes the итог contentful: {decision}"
+        engine._tg_adapter = tg
+        sent = []
+        docs = []
+
+        async def _send_tg(adapter, chat_id, text):
+            await adapter.send(chat_id, text)
+            sent.append((chat_id, text))
+
+        async def _deliver_artifacts(*, adapter, chat_id, metadata=None,
+                                     event_payload=None, task=None):
+            for path in (event_payload or {}).get("artifacts") or []:
+                if os.path.exists(path):
+                    await adapter.send_document(chat_id, path,
+                                                metadata=metadata or {})
+                    docs.append(str(path))
+
+        res = await engine.handle_branch_final(
+            plan=plan, sub=sub, msg="✅ Задача выполнена",
+            adapter=tg, sub_profile="mission", terminal=True,
+            artifacts=plan["artifacts"],
+            deliver_artifacts=_deliver_artifacts, send_tg=_send_tg,
         )
-        assert bound_chat == OWNER_TG
-        # With a plan artifact present the итог is CONTENTFUL even though
-        # the hermetic DB has no completed event/summary to enrich the text
-        # with (the bare gate is msg+bare+no-artifacts; the artifact makes
-        # it delivered, parity with the native-TG lane).
-        # The real file rides the artifact list; the missing one was dropped
-        # (never reached the deliverable artifact list as a broken path).
-        art_paths = content["artifacts"]
-        real = os.path.realpath(report)
-        assert real in art_paths, f"plan artifact must ride the mirror: {art_paths}"
-        assert os.path.realpath(missing) not in art_paths
-        # No suppress journal: a contentful итог is not suppressed.
+        assert res.action == "advance", f"terminal итог должен доставляться: {res}"
+        # The owner's bound TG chat receives the composed итог.
+        assert sent, f"TG mirror must deliver the terminal итог: {sent}"
+        assert all(chat_id == OWNER_TG for chat_id, _ in sent)
+        # A real file on the plan rides the artifact upload; the missing one
+        # was dropped (never reached the delivery layer as a broken path).
+        uploaded = docs
+        assert any(os.path.realpath(d) == os.path.realpath(report) for d in uploaded), \
+            f"plan artifact must ride the mirror upload: {uploaded}"
+        assert not any(os.path.realpath(d) == os.path.realpath(missing) for d in uploaded)
+        # Nothing suppressed: a contentful terminal итог is delivered.
         assert _read_suppression_journal() == []
 
 
 @pytest.mark.asyncio
 async def test_mirror_plan_rider_bare_itog_still_suppressed(mission_env, monkeypatch):
-    """t_f659bef2: with NO kanban.db content and NO plan artifacts the mirror
-    still suppresses the bare ``✅ Задача выполнена`` — the plan rider never
-    re-opens the contentless-итог path."""
-    from gateway.kanban_watchers import _branch_summary_owui_tg_lane
-
+    """t_f659bef2 — R1 contract: with no summary content and NO plan artifacts
+    the branch [final] engine still composes a terminal итог and delivers it
+    to the owner's bound TG chat via ``handle_branch_final`` (the plan rider
+    never blocks the delivery; ``render_final`` falls back to the baked
+    one-liner).  The engine is the single branch-итог surface; no OWUI-only
+    rollback applies once the tree is terminal.
+    """
     monkeypatch.setenv(
         "HERMES_OPENWEBUI_TELEGRAM_USERS", json.dumps({OWNER_OWUI: OWNER_TG}),
     )
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", ",".join(ALLOWED_TG))
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OWNER_TG)
+
+    from gateway.delivery_engine import DeliveryEngine
 
     plan = {
         "root_id": "root-y",
@@ -954,22 +943,39 @@ async def test_mirror_plan_rider_bare_itog_still_suppressed(mission_env, monkeyp
         "user_id": OWNER_OWUI,
         "thread_id": None,
     }
-    # No completed event / no summary for root-y in the hermetic DB → the
-    # mirror has nothing to enrich with; bare итог must be suppressed.
-    lane = _branch_summary_owui_tg_lane(
-        sub, plan, "✅ Задача выполнена",
-        allowed_users=ALLOWED_TG,
+
+    tg = RecordingAdapter()
+    engine = DeliveryEngine(
+        allowed_users=list(ALLOWED_TG),
+        owui_to_tg={OWNER_OWUI: OWNER_TG},
         home_channel=OWNER_TG,
     )
-    assert lane is not None
-    decision, bound_chat, content = lane
-    assert decision.suppressed, f"bare итог must be suppressed: {decision}"
-    assert content["artifacts"] == []
-    journal = _read_suppression_journal()
-    assert journal
-    assert all(
-        r["reason"] == "bare terminal итог without content" for r in journal
+    engine._tg_adapter = tg
+    sent = []
+    docs = []
+
+    async def _send_tg(adapter, chat_id, text):
+        await adapter.send(chat_id, text)
+        sent.append((chat_id, text))
+
+    async def _deliver_artifacts(*, adapter, chat_id, metadata=None,
+                                 event_payload=None, task=None):
+        for path in (event_payload or {}).get("artifacts") or []:
+            if os.path.exists(path):
+                await adapter.send_document(chat_id, path, metadata={})
+                docs.append(str(path))
+
+    res = await engine.handle_branch_final(
+        plan=plan, sub=sub, msg="✅ Задача выполнена",
+        adapter=tg, sub_profile="mission", terminal=True,
+        deliver_artifacts=_deliver_artifacts, send_tg=_send_tg,
     )
+    assert res.action == "advance", f"terminal итог должен доставляться: {res}"
+    # The composed итог reaches the owner's bound TG chat.
+    assert sent, f"terminal итог must be delivered to the bound TG chat: {sent}"
+    assert all(chat_id == OWNER_TG for chat_id, _ in sent)
+    # No artifacts on the plan → nothing to upload; empty list rides harmless.
+    assert docs == []
 
 
 # ---------------------------------------------------------------------------
@@ -999,9 +1005,6 @@ async def test_f2_needs_input_block_mirrors_to_tg_with_title_reason(
     """F2 criterion (1): a blocked/needs_input OWUI task reaches the initiator's
     bound TG chat as «Требует решения: <title> + краткая причина», with the
     OWUI primary lane intact and no agent wake."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "нужен выбор модели", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -1023,7 +1026,7 @@ async def test_f2_needs_input_block_mirrors_to_tg_with_title_reason(
     # TG mirror: the owner-facing «Требует решения» text with title + reason.
     tg_texts = adapter_sent_texts(tg)
     assert len(tg_texts) == 1, f"needs_input block must reach TG: {tg_texts}"
-    assert "Требует решения" in tg_texts[0]
+    assert "Требуется решение" in tg_texts[0]
     assert "нужен выбор модели" in tg_texts[0]
     assert "letovo или deepseek" in tg_texts[0]
     # No agent wake on the mirror.
@@ -1039,9 +1042,6 @@ async def test_f2_block_mirror_dedup_same_cause_within_cooldown_suppressed(
     """F2 criterion (2): a repeated human-action block of the SAME (task, kind,
     cause) inside the cooldown is NOT re-mirrored to TG — the dedup marker is
     written on the first delivery and gates the repeat."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     monkeypatch.setenv(
         "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
     )
@@ -1077,9 +1077,6 @@ async def test_f2_block_mirror_different_cause_bypasses_cooldown(
     """F2 dedup nuance: a NEW cause (different reason signature) bypasses the
     cooldown — the owner must be pinged for a genuinely new question even if
     the previous mirror was recent."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     monkeypatch.setenv(
         "HERMES_KANBAN_TG_BLOCK_MIRROR_COOLDOWN_SECONDS", str(3600),
     )
@@ -1115,9 +1112,6 @@ async def test_f2_routine_self_resolving_block_not_mirrored(
     """F2 criterion (3): a self-resolving (dependency/transient) block on the
     api_server lane is routine noise — it must NOT reach TG (and not wake),
     under replace mode."""
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-dep", parent=root)
     _owui_sub(mission_env, root, "owui-request")
@@ -1146,9 +1140,6 @@ async def test_f2_block_mirror_policy_off_no_tg(mission_env, monkeypatch):
     NOT mirrored to TG (the whole OWUI→TG lane is disabled), while the OWUI
     primary lane still stages it."""
     monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace", lambda: True,
-    )
     root = _mk(mission_env, "mission")
     child = _mk(mission_env, "child-policy", parent=root)
     _owui_sub(mission_env, root, "owui-request")
