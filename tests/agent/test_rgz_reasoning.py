@@ -68,6 +68,35 @@ def test_trigger_detected_case_and_flexion_insensitive():
     assert rgz_trigger_detected("решаем за гигантской задачей") is False
 
 
+def test_trigger_detected_multimodal_list_with_attachment():
+    """RGZ trigger must fire on a message that also carries an attachment.
+
+    api_server normalizes a message with an attached file/image into a *list*
+    of parts ``[{type:text,...}, {type:image_url/file,...}]``. The RGZ phrase
+    lives in the text part and must still pin the session to max — this is the
+    attachment regression the owner reported.
+    """
+    multimodal = [
+        {"type": "text", "text": "Составь гигантский план внедрения"},
+        {"type": "file", "text": "[документ приложен]", "file": {"id": "f1"}},
+    ]
+    assert rgz_trigger_detected(multimodal) is True
+
+    image_msg = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "это гигантская задача, нужен декомпоз"},
+    ]
+    assert rgz_trigger_detected(image_msg) is True
+
+
+def test_trigger_detected_multimodal_list_no_phrase():
+    multimodal = [
+        {"type": "text", "text": "Обнови отчёт по прибыли"},
+        {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+    ]
+    assert rgz_trigger_detected(multimodal) is False
+
+
 # ---------------------------------------------------------------------------
 # apply_rgz_session_override
 # ---------------------------------------------------------------------------

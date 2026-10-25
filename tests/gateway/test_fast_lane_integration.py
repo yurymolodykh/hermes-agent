@@ -158,14 +158,22 @@ def test_slow_deepthink_request_untouched(monkeypatch):
 
 
 def test_slow_giant_task_phrase_untouched(monkeypatch):
-    """«гигантская задача» -> always slow: full lane, no cap, not exempt."""
+    """«гигантская задача» -> always slow AND RGZ-pinned to reasoning=max.
+
+    The RGZ mechanical guarantee (owner 2026-10-20) pins any request carrying
+    an «гигантск… + план/задача/миссия/проект» phrase to reasoning=max (full
+    lane, no budget cap on the fast path, review not exempt). So the expected
+    effort is ``max`` — NOT the gateway default ``high``. This reflects the
+    live RGZ hook in ``_create_agent`` (api_server), which deliberately
+    outranks the config default.
+    """
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="гигантская задача: спланируй миграцию базы")
 
     assert "run_budget_seconds" not in captured
     assert getattr(agent, "review_exempt", None) in (None, False)
-    # reasoning stays as the gateway config default (high here), not fast-paced
-    assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+    # RGZ trigger -> reasoning=max (not the config default high), still full lane.
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "max"}
 
 
 def test_slow_tg_prefix_phrase_untouched(monkeypatch):

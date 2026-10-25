@@ -67,12 +67,16 @@ def rgz_trigger_detected(text: Optional[str]) -> bool:
     (regex ``гигантск\\w+\\s+(план|задача|миссия|проект)``,
     case-insensitive). Any message that already triggers the slow/full lane
     for planning must also pin the session to max.
+
+    Multimodal content (a list of parts, as api_server emits for a message
+    that also carries an attachment) is normalised to its plain-text view
+    before matching, so the RGZ phrase fires on such messages too.
     """
     if not text:
         return False
     try:
-        from agent.fast_lane import contains_always_slow_phrase
-        return contains_always_slow_phrase(str(text))
+        from agent.fast_lane import contains_always_slow_phrase, _text_view
+        return contains_always_slow_phrase(_text_view(text))
     except Exception:  # pragma: no cover — fast_lane import must not break the turn
         logger.debug("rgz_reasoning: fast_lane unavailable", exc_info=True)
         return False
@@ -140,6 +144,67 @@ def ensure_max_for_agent(agent: Any) -> bool:
     except Exception:  # pragma: no cover — hook must never break the tool call
         logger.warning(
             "rgz_reasoning: kanban_create hook failed to raise effort", exc_info=True
+        )
+        return False
+
+
+def _gateway_runner_ref():
+    """Return a resolver for the live :class:`gateway.run.GatewayRunner`.
+
+    The agent runs in a worker thread spawned by the gateway; the owning
+    GatewayRunner is reachable through ``gateway.run._gateway_runner_ref``
+    (a weakref). Imported lazily so this module stays importable in
+    standalone/CLI processes with no live gateway (the resolver then yields
+    None). Exposed as a module-level seam so tests can patch it.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref as _gref
+    except Exception:  # pragma: no cover — no gateway module in standalone runs
+        return lambda: None
+    return (lambda: _gref() if callable(_gref) else None)
+
+
+def release_rgz_session_override(agent: Any) -> bool:
+    """Clear a session-level RGZ reasoning override at the end of a turn.
+
+    Called from ``run_agent.run_conversation``'s outer finally (next to
+    :func:`release_agent_max`). The RGZ trigger pins the *session* to
+    ``max`` for the trigger turn; without a release the override persists on
+    the long-lived session (e.g. a PWA/yadisk_bridge conversation) and every
+    later ordinary request keeps resolving to ``reasoning=max`` — the
+    «залипание» defect. Clearing it here means the *next* turn starts from
+    the normal per-model/global config (fast lane for markerless PWA
+    requests), while the trigger turn itself still ran at max.
+
+    The agent reaches the owning GatewayRunner through the module-level
+    :func:`_gateway_runner_ref` seam (safe when the live process has no
+    gateway — CLI/standalone runs — or when not running under a gateway).
+
+    Returns True when a session override was cleared, False otherwise.
+    Best-effort: teardown must never raise.
+    """
+    try:
+        if agent is None:
+            return False
+        session_key = getattr(agent, "_gateway_session_key", None)
+        if not session_key:
+            return False
+        resolve = _gateway_runner_ref()
+        runner = resolve() if callable(resolve) else None
+        if runner is None:
+            return False
+        setter = getattr(runner, "_set_session_reasoning_override", None)
+        if setter is None:
+            return False
+        setter(session_key, None)
+        logger.info(
+            "rgz_reasoning: released session reasoning override for %s",
+            session_key,
+        )
+        return True
+    except Exception:  # pragma: no cover — release must never break run teardown
+        logger.warning(
+            "rgz_reasoning: session override release failed", exc_info=True
         )
         return False
 

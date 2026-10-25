@@ -9041,9 +9041,20 @@ class AIAgent:
                 # run so it never leaks into a later turn of a reused cached
                 # agent. Best-effort — teardown must never raise.
                 try:
-                    from agent.rgz_reasoning import release_agent_max
+                    from agent.rgz_reasoning import (
+                        release_agent_max,
+                        release_rgz_session_override,
+                    )
 
                     release_agent_max(self)
+                    # Also clear the session-level RGZ reasoning override
+                    # pinned by apply_rgz_session_override for the trigger
+                    # turn. Without this the override sticks on a long-lived
+                    # session (e.g. PWA/yadisk_bridge) and every later
+                    # ordinary request resolves to reasoning=max (wg
+                    # t_9d4720da). Only the NEXT turn is affected — the
+                    # trigger turn itself already ran at max.
+                    release_rgz_session_override(self)
                 except Exception:  # pragma: no cover
                     logger.debug(
                         "rgz_reasoning: kanban_create release skipped", exc_info=True

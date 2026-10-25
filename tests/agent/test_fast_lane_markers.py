@@ -146,6 +146,40 @@ def test_non_matching_giant_is_not_slow():
     assert decide_slow_mode(text="гигантский шар").slow_mode is False
 
 
+def test_multimodal_list_content_still_fires_markers():
+    """api_server multimodal attachments must not swallow «подумай»/RGZ.
+
+    A message that carries an attachment arrives as a *list* of parts
+    (``{type:text, text:...}`` + ``{type:image_url/file,...}``), not a plain
+    string. The fast-lane markers must still fire on the text part, otherwise
+    «подумай» (prefix) and the RGZ «гигантская задача» phrase (both slow) are
+    silently lost on any message with an attached file/image.
+    """
+    # «подумай» prefix inside a multimodal message with an image part.
+    multimodal_podumai = [
+        {"type": "text", "text": "подумай: что тут на картинке?"},
+        {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+    ]
+    assert telegram_prefix_marks_slow(multimodal_podumai) is True
+    d = decide_slow_mode(text=multimodal_podumai, model_options={})
+    assert d.slow_mode is True, "«подумай» + attachment must be slow, not degrade to fast"
+    assert d.source == "tg-prefix"
+
+    # RGZ «гигантская задача» phrase inside a multimodal message with a file.
+    multimodal_rgz = [
+        {"type": "text", "text": "гигантская задача: спланируй миграцию"},
+        {"type": "file", "text": "[документ приложен]", "file": {"id": "f1"}},
+    ]
+    assert contains_always_slow_phrase(multimodal_rgz) is True
+    d2 = decide_slow_mode(text=multimodal_rgz, model_options={})
+    assert d2.slow_mode is True, "«гигантская задача» + attachment must be slow"
+    assert d2.source == "phrase"
+
+    # Prefix stripping must also survive a multimodal message.
+    stripped = strip_telegram_slow_prefix(multimodal_podumai)
+    assert stripped == "что тут на картинке?"
+
+
 # ---------------------------------------------------------------------------
 # No markers => fast by default
 # ---------------------------------------------------------------------------
