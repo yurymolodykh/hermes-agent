@@ -75,26 +75,13 @@ def append_target_ok(messages: dict, current: str) -> bool:
     return isinstance(parent, str)
 
 
-def current_tip_ok(messages: dict, current: str, event_id: str,
-                   expected_content: str) -> bool:
-    """Validate an appended delivery is the CURRENT tip with exact content.
+def _exact_receipt_ok(messages: dict, event_id: str, expected_content: str) -> bool:
+    """True when ``event_id`` is an exact assistant receipt for the staged content.
 
-    This is the A1 readback gate: the event must sit at ``currentId`` and be
-    an exact assistant receipt for ``expected_content``.  The ancestor chain
-    ABOVE the receipt's parent may be pruned/broken (legitimate OWUI history
-    trimming) — the integrity property that matters is that THIS receipt is
-    the current tip, owned by this chat, with the exact content we staged.
-    The receipt's PARENT must still be a structurally valid append target
-    (a self-loop / wrong-id / missing-parentId parent is corruption, not
-    trimming, and fails closed), while that parent's own ancestor may be
-    missing.  Anything that breaks the receipt at the tip (wrong id/role/
-    done/content, or the event is no longer the tip because a human
-    re-branched) also fails closed.
+    Shares the integrity checks between the at-tip readback and the
+    active-branch fallback: the receipt must exist with the exact staged
+    content, role ``assistant`` and ``done`` — any mismatch fails closed.
     """
-    if not isinstance(messages, dict) or not isinstance(current, str):
-        return False
-    if current != event_id:
-        return False
     message = messages.get(event_id)
     if (not isinstance(message, dict) or message.get("id") != event_id
             or message.get("role") != "assistant"
@@ -106,9 +93,75 @@ def current_tip_ok(messages: dict, current: str, event_id: str,
         return True
     # The receipt's parent must be a valid append target (allows THAT
     # parent's own ancestor chain to be trimmed/broken).
-    if not append_target_ok(messages, parent):
+    return append_target_ok(messages, parent)
+
+
+def current_tip_ok(messages: dict, current: str, event_id: str,
+                   expected_content: str) -> bool:
+    """Validate an appended delivery is the CURRENT tip with exact content.
+
+    This is the A1 readback gate: the event must sit at ``currentId`` and be
+    an exact assistant receipt for ``expected_content``.  The ancestor chain
+    ABOVE the receipt's parent may be pruned/broken (legitimate OWUI history
+    trimming) — the integrity property that matters is that THIS receipt is
+    the current tip, owned by this chat, with the exact content we staged.
+    Anything that breaks the receipt at the tip (wrong id/role/done/content,
+    or the event is no longer the tip because a human re-branched) also
+    fails closed.
+    """
+    if not isinstance(messages, dict) or not isinstance(current, str):
         return False
-    return True
+    if current != event_id:
+        return False
+    return _exact_receipt_ok(messages, event_id, expected_content)
+
+
+def active_branch_receipt_ok(messages: dict, current: str, event_id: str,
+                             expected_content: str) -> bool:
+    """Validate the receipt is on the ACTIVE branch even when no longer the tip.
+
+    D2 (t_8980d76e): a live owner re-branching between the exact-owner write
+    and the readback advances ``currentId`` past our receipt, so the strict
+    at-tip readback (``current_tip_ok``) repeatedly fails across the bounded
+    retries even though the write provably landed with exact content.  A
+    successfully persisted terminal итог must not be parked ``failed`` purely
+    because the user kept typing.
+
+    This fallback keeps the integrity guarantees that matter and drops only
+    the at-tip race:
+      * the receipt exists with the EXACT staged content (id/role/done/
+        content, parent structurally valid — see ``_exact_receipt_ok``);
+      * the receipt is reachable from ``currentId`` via the parent chain —
+        i.e. it sits ON the active branch the owner actually sees, not a
+        pruned/orphaned sibling;
+      * the walk is bounded to the number of messages (no unbounded loops)
+        and terminates cleanly on ``parentId is None``.
+    Anything absent / corrupted / off-branch still fails closed.
+    """
+    if not isinstance(messages, dict) or not isinstance(current, str):
+        return False
+    if not _exact_receipt_ok(messages, event_id, expected_content):
+        return False
+    # Walk from the current tip up the parent chain; the receipt must be on
+    # this active branch.  Bounded by the message count (no cycles).
+    node: str = current
+    seen: set[str] = set()
+    for _ in range(len(messages) + 1):
+        if node == event_id:
+            return True
+        if node in seen:
+            return False  # cycle in the active chain — corruption
+        seen.add(node)
+        message = messages.get(node)
+        if not isinstance(message, dict):
+            return False
+        parent = message.get("parentId")
+        if parent is None:
+            return False
+        if not isinstance(parent, str) or parent not in messages:
+            return False
+        node = parent
+    return False
 
 
 def resolve_origin(db_path: str | Path, profile: str, source: Mapping[str, object]) -> dict | None:
@@ -186,7 +239,16 @@ def acknowledge_visible(outbox_path: str | Path, db_path: str | Path,
         # staged content.  The ancestor chain above it may be pruned by OWUI
         # history trimming — that is legitimate and no longer blocks ACK (it
         # previously forced the channel into 12-failures → drop).
-        if not current_tip_ok(messages, current, event_id, pending["content"]):
+        #
+        # D2 (t_8980d76e): when the write landed with exact content but a
+        # live owner re-branched before the readback (receipt no longer at
+        # the tip), the strict at-tip check alone would exhaust the bounded
+        # retries and park a genuinely-persisted terminal итог as ``failed``.
+        # The active-branch fallback ACKs the same provably-persisted receipt
+        # when it still sits on the chain the owner sees.
+        if not (current_tip_ok(messages, current, event_id, pending["content"])
+                or active_branch_receipt_ok(
+                    messages, current, event_id, pending["content"])):
             return False
         return ack(outbox_path, event_id, resolved, f"openwebui:{event_id}")
     except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):

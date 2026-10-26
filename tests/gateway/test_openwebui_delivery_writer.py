@@ -114,3 +114,99 @@ def test_corrupt_or_divergent_history_fails_closed(fixture):
         db.execute("UPDATE chat SET chat=?", (json.dumps({"history": {"messages": {event: {"content": "foreign"}}, "currentId": event}}),))
     assert not persist_pending(outbox, db_path, origin, event)
     assert status(outbox, event) == "pending"
+
+
+def _write_and_keep_pending(fixture, monkeypatch):
+    """Land the exact-owner write but force readback to fail once (crash
+    simulation) so the outbox row stays pending with the receipt in the chat —
+    the exact state the D2 retry loop sees after a write/readback race."""
+    import gateway.openwebui_delivery as delivery
+    db_path, outbox, origin, event = fixture
+    monkeypatch.setattr(delivery, "acknowledge_visible", lambda *a: False)
+    assert not persist_pending(outbox, db_path, origin, event)
+    assert status(outbox, event) == "pending"
+    monkeypatch.undo()
+    return db_path, outbox, origin, event
+
+
+def test_active_branch_receipt_acks_when_owner_rebranched_after_write(fixture, monkeypatch):
+    """D2 (t_8980d76e): a live owner re-branching after the write must not park
+    the persisted receipt as failed.  The write lands under the old tip; the
+    owner then advances currentId with a follow-up message, so the receipt is
+    no longer the tip but IS still on the active branch with exact content —
+    the readback must still ACK it."""
+    db_path, outbox, origin, event = _write_and_keep_pending(fixture, monkeypatch)
+    chat = read_chat(db_path)
+    # Owner continues AFTER our receipt: a new user+assistant turn advances
+    # currentId past event.
+    chat["history"]["messages"]["owner-echo-user"] = {
+        "id": "owner-echo-user", "parentId": event, "role": "user",
+        "content": "continue", "done": True}
+    chat["history"]["messages"]["owner-echo-assistant"] = {
+        "id": "owner-echo-assistant", "parentId": "owner-echo-user",
+        "role": "assistant", "content": "thanks", "done": True}
+    chat["history"]["currentId"] = "owner-echo-assistant"
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    # Real readback: receipt no longer at tip but on the active branch.
+    assert persist_pending(outbox, db_path, origin, event)
+    assert status(outbox, event) == "acknowledged"
+    updated = read_chat(db_path)
+    assert updated["history"]["messages"][event]["content"] == "morning status"
+    assert updated["history"]["currentId"] == "owner-echo-assistant"
+
+
+def test_active_branch_off_branch_receipt_is_not_acked(fixture, monkeypatch):
+    """A receipt that is NOT on the active branch (an orphaned sibling the
+    owner switched away from) still fails closed — the fallback must not ACK
+    a message the owner does not see on the current chain."""
+    db_path, outbox, origin, event = _write_and_keep_pending(fixture, monkeypatch)
+    chat = read_chat(db_path)
+    receipt_parent = chat["history"]["messages"][event]["parentId"]
+    # Owner switches to a SIBLING branch that does not contain our receipt.
+    chat["history"]["messages"]["branch-alt-user"] = {
+        "id": "branch-alt-user", "parentId": receipt_parent, "role": "user",
+        "content": "alt", "done": True}
+    chat["history"]["messages"]["branch-alt-assistant"] = {
+        "id": "branch-alt-assistant", "parentId": "branch-alt-user",
+        "role": "assistant", "content": "alt", "done": True}
+    chat["history"]["currentId"] = "branch-alt-assistant"
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert not persist_pending(outbox, db_path, origin, event)
+    assert status(outbox, event) == "pending"
+
+
+def test_active_branch_receipt_with_mismatched_content_fails_closed(fixture, monkeypatch):
+    """Even on the active branch, a receipt whose content does not match the
+    staged content must never ACK (exact-content integrity preserved)."""
+    db_path, outbox, origin, event = _write_and_keep_pending(fixture, monkeypatch)
+    chat = read_chat(db_path)
+    # Owner continues, but the persisted receipt content diverges.
+    chat["history"]["messages"][event]["content"] = "TAMPERED"
+    chat["history"]["messages"]["owner-echo-user"] = {
+        "id": "owner-echo-user", "parentId": event, "role": "user",
+        "content": "continue", "done": True}
+    chat["history"]["messages"]["owner-echo-assistant"] = {
+        "id": "owner-echo-assistant", "parentId": "owner-echo-user",
+        "role": "assistant", "content": "thanks", "done": True}
+    chat["history"]["currentId"] = "owner-echo-assistant"
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert not persist_pending(outbox, db_path, origin, event)
+    assert status(outbox, event) == "pending"
+
+
+def test_active_branch_cycle_in_chain_fails_closed(fixture, monkeypatch):
+    """A cycle in the active chain (structural corruption) must terminate the
+    bounded walk without ACKing — no unbounded loop, fail closed."""
+    db_path, outbox, origin, event = _write_and_keep_pending(fixture, monkeypatch)
+    chat = read_chat(db_path)
+    # Create a cycle: a -> b -> a (event off-cycle) as the current state.
+    chat["history"]["messages"]["a"] = {"id": "a", "parentId": "b", "role": "user", "content": "a", "done": True}
+    chat["history"]["messages"]["b"] = {"id": "b", "parentId": "a", "role": "user", "content": "b", "done": True}
+    chat["history"]["currentId"] = "a"
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE chat SET chat=?", (json.dumps(chat),))
+    assert not persist_pending(outbox, db_path, origin, event)
+    assert status(outbox, event) == "pending"
