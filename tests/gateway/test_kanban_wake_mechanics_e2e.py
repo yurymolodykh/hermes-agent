@@ -93,10 +93,6 @@ def board_env(tmp_path, monkeypatch, isolated_kanban_assignee_registry):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "off")
-    monkeypatch.setattr(
-        "gateway.kanban_watchers._kanban_branch_summary_replace",
-        lambda: True,
-    )
     kb.init_db()
     conn = kb.connect(board="default")
     try:

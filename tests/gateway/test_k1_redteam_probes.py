@@ -251,12 +251,15 @@ def test_p4_control_chars_pass_through_sanitizer():
 # marker stays OWUI-only (fail-closed).  Sanity that the seam is closed.
 # --------------------------------------------------------------------------
 def test_p5_pwa_sub_without_owner_is_owui_only(board_env):
-    from gateway.kanban_watchers import _sub_owui_owner_id
+    from gateway.delivery_engine import DeliveryEngine
     tid = _mk(board_env, "pwa")
     kb.add_notify_sub(board_env, task_id=tid, platform="api_server",
                       chat_id="pwa-123", user_id="", delivery_mode="notify+wake")
     sub = kb.list_notify_subs(board_env, task_id=tid)[0]
-    assert _sub_owui_owner_id(sub) == ""
+    # R1: api_server sub without user_id and without the F3 marker resolves
+    # to no owner -> no TG lane (OWUI-only, fail-closed).
+    eng = DeliveryEngine(owui_to_tg={})
+    assert eng._tg_bound_chat_for(sub, "api_server") is None
 
 
 # --------------------------------------------------------------------------

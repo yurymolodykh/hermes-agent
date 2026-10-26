@@ -127,15 +127,6 @@ def test_run_conversation_finally_invokes_release():
     assert src.rfind("finally:", 0, ia) != -1 or src.rfind("finally:", 0, fin) != -1
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Part A WIP: execute_profile is not yet part of the live "
-        "release _agent_config_signature (sibling t_000a36a8 worktree-only, "
-        "not merged on release/t_b0291572); fails until that feature lands. "
-        "Part B release-override tests below are live-green."
-    ),
-    strict=True,
-)
 def test_gateway_cache_signature_includes_execute_profile():
     """A turn routed to a fast profile must not reuse an agent cached under
     another profile (Part A)."""
