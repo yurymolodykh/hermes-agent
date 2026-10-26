@@ -2079,6 +2079,17 @@ class GatewayKanbanWatchersMixin:
                     _registry, sub, sub_profile or notifier_profile,
                     board or "default", int(marker_id), _msg,
                 )
+            # OWUI stage result drives the ack gate, but NEVER starves the
+            # complementary OWUI→Telegram mirror (dual-lane rule 1/4/5, same
+            # decoupling the [needs-decision] path got in t_637df501).  A
+            # terminal итог must reach the owner even while the OWUI readback
+            # is pending (slow drain) or the OWUI chat is permanently dead
+            # (deleted/renamed session).  Before the fix the ``!= acknowledged``
+            # early-return ran BEFORE the TG mirror, so a slow drain (13d,
+            # 229 "channel kept pending") or a dead session (56 failed rows,
+            # 2 after A1) silently lost the итог on BOTH lanes after
+            # MAX_FAILURES.
+            _owui_state = _state
             if _state != "acknowledged":
                 reason_map = {
                     "unbound": (
@@ -2093,12 +2104,19 @@ class GatewayKanbanWatchersMixin:
                     f"api_server stage_terminal -> {_state}: "
                     + reason_map.get(_state, "unknown delivery failure")
                 )
-                logger.warning(
-                    "kanban branch summary: api_server delivery for %s state=%s; "
-                    "channel kept pending",
-                    root_id, _state,
-                )
-                return False
+                if _state != "pending":
+                    logger.warning(
+                        "kanban branch summary: api_server delivery for %s state=%s; "
+                        "falling back to the OWUI->TG mirror lane",
+                        root_id, _state,
+                    )
+                else:
+                    logger.warning(
+                        "kanban branch summary: api_server delivery for %s state=%s; "
+                        "channel kept pending (TG mirror fired independently)",
+                        root_id, _state,
+                    )
+
             # F7: the complementary OWUI→Telegram mirror now lives in the
             # delivery engine (handle_branch_final -> _tg_bound_chat_for ->
             # owui_to_tg[owner]).  The engine is the single dual-lane surface,
@@ -2117,19 +2135,67 @@ class GatewayKanbanWatchersMixin:
                 return await _tg_adapter.send(
                     _chat_id, _text, metadata={},
                 )
+            # Once-only TG mirror guard (dual-lane: OWUI is authoritative).
+            # The [needs-decision] path persists this same
+            # (task_id, kind, cause_hash) marker (t_637df501); we key the
+            # branch итог on ``branch:{root_id}:final:<marker_id>`` so a slow
+            # OWUI drain re-invoking this tick never re-pings the owner's
+            # bound TG chat.  ``delivery_dedup`` lives in the live kanban DB
+            # (ensure_dedup_table/ensure at engine init) — a missing table
+            # fails closed to a send (never silently skips the owner итог).
+            _tg_dedup_key = (
+                f"branch:{root_id}:final:{int(marker_id or 0)}"
+                if plan.get("terminal", True)
+                else f"branch:{root_id}:intermediate:{int(marker_id or 0)}"
+            )
+            _dedup_marked: Optional[str] = None
             try:
-                await _bs_engine.handle_branch_final(
-                    plan=plan, sub=sub, msg=msg, adapter=adapter,
-                    sub_profile=_bs_engine_title,
-                    send_tg=_bs_send_tg,
-                    deliver_artifacts=self._deliver_kanban_artifacts,
-                    terminal=bool(plan.get("terminal", True)),
-                    board_override=board,
+                from hermes_cli import kanban_db as _kb_dd
+                from gateway.delivery_engine import (
+                    dedup_mark as _dd_mark,
+                    dedup_seen as _dd_seen,
                 )
-            except Exception as _bs_engine_exc:
-                logger.warning(
-                    "kanban branch summary: engine mirror for %s/%s failed: %s",
-                    platform_str, root_id, _bs_engine_exc,
+                _dd_conn = _kb_dd.connect(board=board)
+                try:
+                    if not _dd_seen(_dd_conn, _tg_dedup_key, "branch_final", "mirror"):
+                        _dedup_marked = _tg_dedup_key
+                finally:
+                    _dd_conn.close()
+            except Exception:
+                # Fail open to the send: a DB/table problem must not lose the
+                # owner's terminal итог (and enqueue dedup still guards the
+                # OWUI lane).
+                _dedup_marked = _tg_dedup_key
+            if _dedup_marked is not None:
+                try:
+                    await _bs_engine.handle_branch_final(
+                        plan=plan, sub=sub, msg=msg, adapter=adapter,
+                        sub_profile=_bs_engine_title,
+                        send_tg=_bs_send_tg,
+                        deliver_artifacts=self._deliver_kanban_artifacts,
+                        terminal=bool(plan.get("terminal", True)),
+                        board_override=board,
+                    )
+                    try:
+                        from hermes_cli import kanban_db as _kb_dd2
+                        from gateway.delivery_engine import dedup_mark as _dd_mark2
+                        _dd_conn2 = _kb_dd2.connect(board=board)
+                        try:
+                            _dd_mark2(_dd_conn2, _tg_dedup_key, "branch_final", "mirror")
+                        finally:
+                            _dd_conn2.close()
+                    except Exception:
+                        pass
+                except Exception as _bs_engine_exc:
+                    logger.warning(
+                        "kanban branch summary: engine mirror for %s/%s failed: %s",
+                        platform_str, root_id, _bs_engine_exc,
+                    )
+            else:
+                logger.info(
+                    "kanban branch summary: TG mirror for %s/%s dedup'd "
+                    "(already mirrored for marker %s)",
+                    platform_str, root_id, marker_id,
                 )
             if plan.get("terminal", True) and (
                 sub.get("delivery_mode") in ("notify+wake", "wake")
@@ -2144,6 +2210,17 @@ class GatewayKanbanWatchersMixin:
                         "failed: %s",
                         root_id, platform_str, sub.get("chat_id"), _bs_wake_exc,
                     )
+            # OWUI ack gate (decoupled from the TG mirror above):
+            # - acknowledged: OWUI row persisted -> ack the channel, done.
+            # - pending: OWUI drain not acked yet -> keep the channel pending
+            #   (return False) so a later tick sees acknowledged and acks; the
+            #   TG mirror already fired once (dedup-marked) so recurring ticks
+            #   never double-ping.  Bounded by MAX_FAILURES in the caller.
+            # - failed / unbound (dead session): nothing more can ACK on the
+            #   OWUI lane; the terminal итог reached the owner via the TG
+            #   mirror, so stop retrying and close the channel (advance).
+            if _owui_state == "pending":
+                return False
             await _to_thread_process_service(
                 self._ack_branch_summary, board, root_id,
                 platform_str, sub.get("chat_id"), sub.get("thread_id") or "",

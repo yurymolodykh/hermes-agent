@@ -1110,3 +1110,169 @@ async def test_a1_valid_initiator_channel_not_dropped_after_12_failures(
         f"{pending_final}"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# OWUI ack gate must NEVER starve the OWUI→Telegram mirror (t_5d99e48d)
+# ---------------------------------------------------------------------------
+# Dead-session / slow-drain regression: a terminal branch итог whose OWUI
+# stage is pending OR failed must still reach the owner's bound Telegram chat
+# (dual-lane rule 1/4/5), exactly once across repeated ticks, and must not be
+# silently dropped after MAX_FAILURES.
+
+def _make_bs_runner(adapter, *, tg_adapter=None, profile="01-orchestrator"):
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform as _P
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {_P.API_SERVER: adapter}
+    if tg_adapter is not None:
+        runner.adapters[_P.TELEGRAM] = tg_adapter
+    runner._kanban_dispatcher_lock_handle = object()  # owns dispatcher
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_branch_summary_fail_counts = {}
+    # A secondary profile bound to the OWUI channel carries its own TG adapter.
+    runner._profile_adapters = {profile: {_P.TELEGRAM: tg_adapter}} if tg_adapter is not None else {}
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_pending_owui_still_mirrors_tg_once_and_keeps_channel(
+    board_env, monkeypatch,
+):
+    """t_5d99e48d: OWUI pending (slow drain) → the OWUI→TG mirror fires on
+    the FIRST tick (not after the drain ACK), exactly once, and the channel
+    stays pending so a later tick can ack it once the OWUI row persists."""
+    import json as _json
+    from gateway import kanban_origin_delivery as _kod
+
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc790",
+        user_id="sess-initiator-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    mode = {"state": "pending"}
+    calls = []
+
+    def flaky_stage(outbox, registry, sub, profile, board, event_id, message):
+        calls.append((mode["state"], sub.get("chat_id")))
+        return (mode["state"], event_id if mode["state"] == "acknowledged" else None)
+
+    monkeypatch.setattr(_kod, "stage_terminal", flaky_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+    monkeypatch.setenv("HERMES_OPENWEBUI_DELIVERY_WRITE_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        _json.dumps({"sess-initiator-1": "tg-owner-1"}),
+    )
+
+    owui = RecordingAdapter()
+    tg = RecordingAdapter()
+    # One persistent runner so the mirror dedup (delivery_dedup) is exercised
+    # across repeated pending ticks -> must send ONCE.
+    runner = _make_bs_runner(owui, tg_adapter=tg, profile="01-orchestrator")
+    for _ in range(3):
+        await _run_one_branch_tick(monkeypatch, runner)
+
+    # TG mirror fired exactly once across the 3 pending ticks.
+    assert len(tg.sent) == 1, (
+        f"slow-drain OWUI must mirror to TG exactly once, got {tg.sent}"
+    )
+    assert tg.sent[0]["chat_id"], f"TG mirror must target a chat: {tg.sent}"
+    # Channel stays pending (not acked, not dropped) while OWUI is pending.
+    marker = kb.has_branch_summary(kb.connect(board="default"), root)
+    assert marker is not None
+    pending = kb.branch_summary_pending_subs(
+        marker,
+        [{"platform": "api_server", "chat_id": "owui-abc790", "thread_id": ""}],
+    )
+    assert pending, "channel must stay pending while OWUI not yet acked"
+
+    # OWUI recovers on a later tick -> channel acked, still no second TG ping.
+    mode["state"] = "acknowledged"
+    await _run_one_branch_tick(monkeypatch, runner)
+    assert len(tg.sent) == 1, (
+        f"no second TG ping after OWUI ack; got {tg.sent}"
+    )
+    conn = kb.connect(board="default")
+    try:
+        marker_final = kb.has_branch_summary(conn, root)
+        pending_final = kb.branch_summary_pending_subs(
+            marker_final,
+            [{"platform": "api_server", "chat_id": "owui-abc790", "thread_id": ""}],
+        )
+    finally:
+        conn.close()
+    assert pending_final == [], f"channel should be acked after OWUI ack: {pending_final}"
+
+
+@pytest.mark.asyncio
+async def test_dead_session_owui_still_mirrors_tg_and_closes_channel(
+    board_env, monkeypatch,
+):
+    """t_5d99e48d: dead OWUI session (stage failed after bounded retries) →
+    the итог is NOT lost: the OWUI→TG mirror fires once and the channel is
+    closed (acked) with a [delivery-drop] reason — no silent double loss."""
+    import json as _json
+    from gateway import kanban_origin_delivery as _kod
+
+    root = _mk(board_env, "root")
+    a = _mk(board_env, "a")
+    kb.link_tasks(board_env, root, a)
+    kb.add_notify_sub(
+        board_env,
+        task_id=root,
+        platform="api_server",
+        chat_id="owui-abc791",
+        user_id="sess-initiator-1",
+        delivery_mode="notify+wake",
+    )
+    _complete_branch(board_env, root, [a])
+
+    def dead_stage(outbox, registry, sub, profile, board, event_id, message):
+        # enqueue fails permanently (e.g. chat deleted from registry -> unbound)
+        return ("unbound", None)
+
+    monkeypatch.setattr(_kod, "stage_terminal", dead_stage)
+    monkeypatch.setenv("HERMES_OPENWEBUI_DB_PATH", "test-registry")
+    monkeypatch.setenv("HERMES_OPENWEBUI_DELIVERY_WRITE_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TELEGRAM_DELIVERY_POLICY", "on")
+    monkeypatch.setenv(
+        "HERMES_OPENWEBUI_TELEGRAM_USERS",
+        _json.dumps({"sess-initiator-1": "tg-owner-1"}),
+    )
+
+    owui = RecordingAdapter()
+    tg = RecordingAdapter()
+    runner = _make_bs_runner(owui, tg_adapter=tg, profile="01-orchestrator")
+    for _ in range(2):
+        await _run_one_branch_tick(monkeypatch, runner)
+
+    # The terminal итог reached the owner's bound TG chat exactly once.
+    assert len(tg.sent) == 1, f"dead session must mirror итог to TG once: {tg.sent}"
+    # Channel closed (acked) — the OWUI lane is permanently broken.
+    conn = kb.connect(board="default")
+    try:
+        marker = kb.has_branch_summary(conn, root)
+        pending = kb.branch_summary_pending_subs(
+            marker,
+            [{"platform": "api_server", "chat_id": "owui-abc791", "thread_id": ""}],
+        )
+        comments = kb.list_comments(conn, root)
+    finally:
+        conn.close()
+    assert pending == [], f"dead-session channel should be closed: {pending}"
+    drop = [c for c in comments if c.body.startswith("[delivery-drop]")]
+    assert drop == [], (
+        "no forced drop needed: итог already reached the owner via TG mirror "
+        f"({[c.body for c in comments]})"
+    )
