@@ -1,4 +1,4 @@
-"""Fast-lane core, slice A3(1): slow_mode marker parsing (design §3).
+r"""Fast-lane core, slice A3(1): slow_mode marker parsing (design §3).
 
 Design contract: durable/rgz/system-speed-2x/design/fast-lane-design.md (§3).
 
@@ -27,15 +27,41 @@ The computed flag is exposed three ways so the next stages can consume it:
   * ``FastLaneDecision.slow_mode`` (bool) - primary field;
   * session ``model_config`` marker (``slow_mode`` + ``slow_mode_source``) via
     ``patch_session_fast_lane_marker`` / read back with
-    ``get_session_model_config_value(session_id, "slow_mode")``;
+    ``session_slow_mode(db, session_id)`` (or the async variant
+    ``session_slow_mode_async``; the raw key is ``model_config.slow_mode``);
   * logger line (fast_lane=SLOW/FAST ... source=...).
+
+Session stickiness (t_e0350c47)
+-------------------------------
+Once a session has been slowed by a marker, EVERY later message in that
+session runs on the slow lane even when it carries no marker of its own. The
+persisted marker is the carrier: call sites read it with ``session_slow_mode``
+and pass the value into ``decide_slow_mode(..., session_slow=...)``, where
+``apply_session_sticky`` promotes a marker-less decision to
+``slow_mode=True`` / ``source="session-sticky"``. When the request carries its
+OWN slow marker as well, the source is composite
+(``"session-sticky+tg-prefix"`` / ``"session-sticky+phrase"`` /
+``"session-sticky+api-deepthink"``) so the ``fast_lane=SLOW|ROUTE`` line always
+shows the sticky reason; the concrete marker stays in
+``debug["sticky_with_source"]``. An explicit client fast
+escape (``model_options["slow_mode"] = false``) still wins. The write side
+uses ``preserve_sticky=True`` so a later marker-less turn can never downgrade
+the session back to fast: sticky lives until the session row itself goes away
+(/reset or session expiry).
 """
 
 from __future__ import annotations
 
+import inspect
+import json
+import logging
 import re
+import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Marker constants (design §3)
@@ -118,6 +144,44 @@ def _probe_fragments(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+_MARKER_TRUE = {"true", "1", "yes", "on", "да", "slow"}
+_MARKER_FALSE = {"false", "0", "no", "off", "нет", "fast"}
+
+
+def _as_marker_bool(value: Any) -> Optional[bool]:
+    """Strictly normalize a PERSISTED marker value; ``None`` = no opinion.
+
+    Deliberately narrower than :func:`_as_bool`: that helper is a lenient
+    "is this flag on?" coercion for config/request payloads where a false-y
+    answer is harmless. For the session marker a wrong ``False`` is NOT
+    harmless — it reads as "this session explicitly wants the fast lane" and
+    silently cancels stickiness — so anything unrecognized maps to ``None``
+    (no opinion) instead of ``False``.
+
+    Accepted (card item 3): bool; ``'true'/'1'`` -> True, ``'false'/'0'`` ->
+    False (plus the equally unambiguous yes/no/on/off/slow/fast spellings and
+    their Russian pairs); ints 1/0. Every other scalar — ``2``, ``-1``, ``0.0``,
+    ``2.5``, ``'garbage'``, ``''`` — is unrecognized -> ``None``.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _MARKER_TRUE:
+            return True
+        if token in _MARKER_FALSE:
+            return False
+        return None
+    # float / proxy / dict / mock: no opinion (never a silent False).
+    return None
+
 
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -459,11 +523,383 @@ def route_profile(
     return slow_profile or None
 
 
+# ``AsyncSessionDB`` -> ``SessionDB`` unwrap bound. Real stacks are 1-2 deep;
+# a larger number means we are walking an auto-vivifying stub, so stop.
+_MAX_DB_UNWRAP_DEPTH = 4
+
+
+def _resolve_sync_db(db: Any) -> Any:
+    """Unwrap async DB doors down to the sync ``SessionDB`` (or give up).
+
+    ``gateway/run.py`` hands callers an ``AsyncSessionDB`` (a generic
+    coroutine forwarder over ``SessionDB``), while ``api_server`` hands a
+    plain ``SessionDB``. The fast-lane marker helpers are synchronous by
+    contract (they run inside sync call paths such as ``_create_agent``), so
+    an ``AsyncSessionDB`` must be unwrapped through its ``_db`` back-pointer —
+    otherwise ``getattr(db, "patch_session_model_config")`` returns an
+    un-awaited coroutine factory and the write silently vanishes
+    (t_e0350c47: 0 of 5 telegram sessions ever carried ``slow_mode`` while
+    every OWUI session did).
+
+    The unwrap is best-effort and BOUNDED: it stops after
+    ``_MAX_DB_UNWRAP_DEPTH`` hops, at the first object without a ``_db``
+    back-pointer, and at any auto-vivifying stub. The depth cap is essential —
+    an unbounded walk over a ``MagicMock`` (tests, or a hostile fake) would
+    loop forever, because every ``getattr(mock, "_db")`` returns a NEW child
+    mock with a fresh ``id()`` and the identity-cycle guard never trips.
+    """
+    seen = set()
+    current = db
+    for _ in range(_MAX_DB_UNWRAP_DEPTH):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        # unittest.mock auto-creates attribute children on access; walking
+        # those is meaningless and unbounded, so stop at the stub itself.
+        if type(current).__module__.startswith("unittest.mock"):
+            break
+        try:
+            inner = getattr(current, "_db", None)
+        except Exception:
+            break
+        if inner is None:
+            break
+        current = inner
+    return current
+
+
+def session_slow_mode(db: Any, session_id: Optional[str]) -> Optional[bool]:
+    """Read the persisted session slow_mode marker. Never raises (§6.1).
+
+    Returns:
+
+    - ``True`` when the session row carries ``slow_mode: true`` (the session
+      was slowed by a marker at some earlier point -> sticky, see
+      :func:`apply_session_sticky`);
+    - ``False`` when the row explicitly carries ``slow_mode: false``;
+    - ``None`` when there is no row, no marker key, no DB handle, no getter,
+      or the read failed. ``None`` always means "no session opinion", so the
+      per-request marker decision applies unchanged.
+
+    Reads only ``model_config.slow_mode`` — the same key
+    ``patch_session_fast_lane_marker`` writes — so writer/reader cannot drift.
+
+    Strictly best-effort by contract (card t_aca69ccc item 2): no DB handle,
+    no session id, no getter, a missing row, a ``None`` value, an
+    un-unwrappable async door, an unrecognized stored value, or ANY exception
+    all degrade to ``None`` ("no session opinion" — the per-request marker
+    decision then applies unchanged).
+
+    Logging levels (deliberate, reconciled with the parent card's AC5): the
+    benign no-opinion paths log NOTHING at all — an unmarked session is the
+    normal state of every request, so even a debug line per turn is pure noise
+    in a hot path. Only a genuinely broken read logs, and it logs at WARNING
+    (``exc_info`` included) because parent card t_e0350c47 criterion 5 requires
+    a *visible* warning when the DB read degrades. It never propagates.
+    """
+    if not session_id or db is None:
+        return None
+    try:
+        target = _resolve_sync_db(db)
+        getter = getattr(target, "get_session_model_config_value", None)
+        if not callable(getter) or inspect.iscoroutinefunction(getter):
+            return None
+        value = getter(session_id, "slow_mode", None)
+        if inspect.isawaitable(value):
+            # An async door we could not unwrap: close the coroutine so it
+            # cannot emit an "never awaited" warning, and report "no opinion".
+            close = getattr(value, "close", None)
+            if callable(close):
+                close()
+            return None
+        if value is None:
+            return None
+        return _as_marker_bool(value)
+    except Exception:  # §6.1 — a broken marker read never breaks the request
+        logger.warning(
+            "fast_lane sticky read failed session=%s — treating as no session "
+            "opinion",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def session_slow_mode_async(
+    db: Any, session_id: Optional[str]
+) -> Optional[bool]:
+    """Async-safe :func:`session_slow_mode` for loop-thread call sites.
+
+    ``api_server`` request handlers run on the aiohttp loop and must not
+    block it on SQLite (that is why ``_ensure_session_db_async`` exists), so
+    async call sites await this variant; it offloads the read to a thread via
+    ``AsyncSessionDB`` when given one, and falls back to the sync read
+    otherwise. Never raises (same contract as the sync reader).
+    """
+    if not session_id or db is None:
+        return None
+    try:
+        getter = getattr(db, "get_session_model_config_value", None)
+        if callable(getter) and inspect.iscoroutinefunction(getter):
+            value = await getter(session_id, "slow_mode", None)
+            if value is None:
+                return None
+            return _as_marker_bool(value)
+    except Exception:
+        logger.warning(
+            "fast_lane sticky read failed (async) session=%s — treating as no "
+            "session opinion",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    return session_slow_mode(db, session_id)
+
+
+def session_slow_mode_from_db_file(
+    db_path: Any, session_id: Optional[str], *, timeout: float = 1.0
+) -> Optional[bool]:
+    """Read the sticky marker straight from a ``state.db`` FILE, read-only.
+
+    The api_server request handler needs the marker BEFORE ``_create_agent``
+    runs, and at that point the profile's ``SessionDB`` may not be open yet.
+    Constructing one there is NOT acceptable: ``SessionDB(__init__)`` runs the
+    full schema init (DDL, FTS probes, pragmas) and measured ~3 s on a fresh
+    ``HERMES_HOME`` — paid on the first ``/v1/runs`` of every process for a
+    flag that reads ``None`` anyway (a session can only be sticky AFTER a
+    marker turn wrote it, which itself opens the DB). A cache-only read would
+    fix the latency but lose stickiness across restarts, so this probe reads
+    the committed row over a ``mode=ro`` URI instead: no DDL, no write lock,
+    no contention with a live backend, sub-millisecond.
+
+    Contract matches :func:`session_slow_mode`: ``True``/``False`` for a
+    persisted marker, ``None`` for a missing file, a missing table/row, a
+    missing key, an unrecognized value, or ANY exception — never raises,
+    because a broken marker read must not break the request (§6.1).
+    """
+    if not session_id or db_path is None:
+        return None
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return None
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=timeout, isolation_level=None
+        )
+        try:
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # A state.db that EXISTS but has no ``sessions`` table is a benign
+            # "no opinion" state, not a broken read: any sqlite opener (a fresh
+            # HERMES_HOME touched before SessionDB's schema init, a profile
+            # restored from a backup without schema, an unrelated *.db handed
+            # in by mistake) produces exactly this. The contract above lists
+            # "a missing table" among the no-opinion paths, and this probe runs
+            # on EVERY /v1/runs before a marker can possibly exist — logging it
+            # at WARNING with a traceback would spam the hot path with a
+            # condition that resolves itself on the first marker turn
+            # (t_ca558566). Genuinely broken files (not a database, corrupt,
+            # locked out) still fall through to the warning below.
+            if "no such table" not in str(exc).lower():
+                raise
+            return None
+        finally:
+            conn.close()
+        if not row:
+            return None
+        raw = row[0]
+        config: Dict[str, Any] = {}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                config = parsed
+        elif isinstance(raw, dict):
+            config = raw
+        value = config.get("slow_mode")
+        if value is None:
+            return None
+        return _as_marker_bool(value)
+    except Exception:
+        logger.warning(
+            "fast_lane sticky read (db file) failed session=%s — treating as no "
+            "session opinion",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
+def explicit_fast_escape(
+    model_options: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when the CLIENT explicitly asked for the fast lane this request.
+
+    The only escape hatch that exists in the codebase is the explicit
+    ``model_options["slow_mode"]`` / ``model_options["slow"]`` override
+    honoured by :func:`model_options_mark_slow` (api_server payload). When a
+    client sends one of those keys with a false-y value it is deliberately
+    overriding the lane, so a sticky session must not silently pull the
+    request back to the slow lane (t_e0350c47 §B).
+
+    An ABSENT key is not an escape: OWUI never sends these keys on ordinary
+    turns, so absence must keep sticky in force. Non-dict/None -> False.
+    """
+    if not isinstance(model_options, dict):
+        return False
+    for key in ("slow_mode", "slow"):
+        if key in model_options and model_options.get(key) is not None:
+            return not _as_bool(model_options.get(key))
+    return False
+
+
+def _isolated_debug(decision: FastLaneDecision) -> Dict[str, Any]:
+    """Deep-enough copy of ``decision.debug`` for a derived decision.
+
+    ``dict(decision.debug or {})`` is NOT enough: it shares the nested
+    ``reasons`` list, so appending to the copy also appends to the ORIGINAL
+    decision's debug (verified: a caller that logged the pre-sticky decision
+    afterwards saw ``session-sticky (already slow)`` in it). Copy every
+    mutable container one level down so applying stickiness is side-effect
+    free for the input, as the docstring promises.
+    """
+    debug: Dict[str, Any] = {}
+    for key, value in dict(decision.debug or {}).items():
+        if isinstance(value, list):
+            debug[key] = list(value)
+        elif isinstance(value, dict):
+            debug[key] = dict(value)
+        elif isinstance(value, set):
+            debug[key] = set(value)
+        else:
+            debug[key] = value
+    return debug
+
+
+def apply_session_sticky(
+    decision: FastLaneDecision,
+    session_slow: Optional[bool],
+    *,
+    model_options: Optional[Dict[str, Any]] = None,
+) -> FastLaneDecision:
+    """Promote a fast decision to slow when the SESSION was slowed before.
+
+    Sticky rule (t_e0350c47 §B) — precedence, highest first:
+
+    1. an explicit client fast escape (:func:`explicit_fast_escape`) wins over
+       sticky — the request stays as decided;
+    2. ``session_slow is True`` and the decision has no marker of its own
+       -> ``slow_mode=True`` with ``source="session-sticky"``;
+    3. ``session_slow is True`` AND the request carries its own slow marker
+       -> stays slow and the source becomes COMPOSITE
+       (``"session-sticky+api-deepthink"`` / ``"session-sticky+phrase"`` /
+       ``"session-sticky+tg-prefix"``) so every ``fast_lane=SLOW|ROUTE`` log
+       line shows BOTH reasons, not just the per-request marker. The original
+       marker stays available as ``debug["sticky_with_source"]``;
+    4. ``session_slow`` is ``False``/``None`` (or an unrecognized value) ->
+       the decision is returned unchanged (no session opinion never changes
+       behavior).
+
+    ``session_slow`` is normalised through :func:`_as_marker_bool` before the
+    rule runs, so a RAW persisted value also works: ``1`` / ``'true'`` /
+    ``'yes'`` / ``'slow'`` mean "session is slow", while ``'false'`` / ``'0'``
+    mean "no session opinion". A bare ``session_slow is True`` check used to
+    drop every non-bool truthy form, which would silently un-stick a session
+    whenever a caller passed the unparsed marker instead of going through
+    :func:`session_slow_mode` — the exact silent-failure the strict
+    ``_as_marker_bool`` contract exists to prevent.
+
+    Pure and non-mutating: no I/O, and the returned object never shares a
+    mutable ``debug`` container with the input (a shallow ``dict()`` copy would
+    keep the same ``reasons`` list, so a caller that logged the original
+    decision afterwards would silently see the sticky reason appended to it).
+    The caller reads the persisted marker (``session_slow_mode``) and passes the
+    value in, so :func:`decide_slow_mode` stays a non-I/O function.
+    """
+    if _as_marker_bool(session_slow) is not True:
+        return decision
+    if explicit_fast_escape(model_options):
+        debug = _isolated_debug(decision)
+        debug.setdefault("sticky_overridden_by", "explicit-fast-escape")
+        return FastLaneDecision(
+            slow_mode=decision.slow_mode,
+            mode=decision.mode,
+            fast_lane=decision.fast_lane,
+            source=decision.source,
+            reason=decision.reason,
+            complexity=decision.complexity,
+            reasoning_effort=decision.reasoning_effort,
+            max_iterations=decision.max_iterations,
+            run_budget_seconds=decision.run_budget_seconds,
+            review_exempt=decision.review_exempt,
+            debug=debug,
+        )
+    if decision.slow_mode:
+        # Both the session and this request say slow: the source is COMPOSITE
+        # (``session-sticky+<marker>``) so the fast_lane=SLOW/ROUTE log line
+        # shows the sticky reason as well as the per-request marker — card item
+        # 3: "источник ... session-sticky+api-deepthink, чтобы в
+        # fast_lane=ROUTE/SLOW строке было видно причину". The concrete marker
+        # stays readable as debug["sticky_with_source"].
+        debug = _isolated_debug(decision)
+        debug["sticky_with_source"] = decision.source
+        debug.setdefault("reasons", []).append("session-sticky (already slow)")
+        marker_source = decision.source or ""
+        if marker_source.startswith("session-sticky"):
+            # Idempotent: applying stickiness twice must not build
+            # "session-sticky+session-sticky".
+            composite = marker_source
+        else:
+            composite = (
+                f"session-sticky+{marker_source}"
+                if marker_source
+                else "session-sticky"
+            )
+        return FastLaneDecision(
+            slow_mode=True,
+            mode="slow",
+            fast_lane=False,
+            source=composite,
+            reason=decision.reason,
+            complexity=decision.complexity,
+            reasoning_effort=decision.reasoning_effort,
+            max_iterations=decision.max_iterations,
+            run_budget_seconds=decision.run_budget_seconds,
+            review_exempt=decision.review_exempt,
+            debug=debug,
+        )
+    reasons = list((decision.debug or {}).get("reasons") or [])
+    reasons.append("session-sticky (session was slowed by an earlier marker)")
+    # A promoted decision is a SLOW decision, so it must carry full-lane
+    # activation semantics — never the fast path's budget / iteration cap /
+    # review exemption. This mirrors resolve_fast_path's slow branch, and makes
+    # the promotion safe even if a caller applies it to an already-resolved
+    # decision (fields are normalised rather than inherited).
+    return FastLaneDecision(
+        slow_mode=True,
+        mode="slow",
+        fast_lane=False,
+        source="session-sticky",
+        reason="; ".join(reasons) or "session-sticky",
+        complexity=decision.complexity or "high",
+        reasoning_effort=FAST_REASONING_COMPLEX,
+        max_iterations=None,
+        run_budget_seconds=None,
+        review_exempt=False,
+        debug={**_isolated_debug(decision), "reasons": reasons},
+    )
+
+
 def decide_slow_mode(
     text: Optional[str] = None,
     model_options: Optional[Dict[str, Any]] = None,
     *,
     config: Optional[Dict[str, Any]] = None,
+    session_slow: Optional[bool] = None,
 ) -> FastLaneDecision:
     """Compute ``slow_mode`` from markers (design §3). Never raises.
 
@@ -472,9 +908,16 @@ def decide_slow_mode(
     phrases (``slow_phrases``) - the feature flag is NOT consulted here by
     design (that is t_09bf5ceb's gate at the call site).
 
+    ``session_slow`` is the SESSION-level sticky opinion read by the call site
+    via :func:`session_slow_mode` (``True`` = this session was slowed by an
+    earlier marker, ``False``/``None`` = no session opinion). Reading it here
+    would turn this function into an I/O function, so the caller passes the
+    value and :func:`apply_session_sticky` applies the precedence.
+
     Precedence (highest first): explicit model_options slow_mode/slow escape
     hatch > OWUI deepthink (enabled+high effort) > always-slow phrases >
-    TG «подумай» prefix. Absence of all markers => slow_mode=False.
+    TG «подумай» prefix > **session-sticky** > absence of all markers
+    (slow_mode=False). The explicit fast escape still beats session-sticky.
     """
     try:
         reasons: list[str] = []
@@ -509,13 +952,16 @@ def decide_slow_mode(
                 reasons.append("TG «подумай»")
 
         mode = "slow" if slow else "fast"
-        return FastLaneDecision(
+        decision = FastLaneDecision(
             slow_mode=slow,
             mode=mode,
             fast_lane=not slow,
             source=source,
             reason="; ".join(reasons) or "no markers",
             debug={"reasons": reasons},
+        )
+        return apply_session_sticky(
+            decision, session_slow, model_options=model_options
         )
     except Exception:  # degradation - never crash on a decision
         return FastLaneDecision(
@@ -534,10 +980,21 @@ def evaluate_request(
     model_options: Optional[Dict[str, Any]] = None,
     *,
     config: Optional[Dict[str, Any]] = None,
+    session_slow: Optional[bool] = None,
     **kwargs: Any,
 ) -> FastLaneDecision:
-    """Alias for :func:`decide_slow_mode` (name kept for call-site stability)."""
-    return decide_slow_mode(text, model_options=model_options, config=config)
+    """Alias for :func:`decide_slow_mode` (name kept for call-site stability).
+
+    ``session_slow`` is forwarded so call sites that use this historical name
+    get session stickiness too; unknown extra kwargs are still ignored, exactly
+    as before.
+    """
+    return decide_slow_mode(
+        text,
+        model_options=model_options,
+        config=config,
+        session_slow=session_slow,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +1039,11 @@ def session_is_fast_lane(marker: Optional[Dict[str, Any]]) -> bool:
 
 
 def patch_session_fast_lane_marker(
-    db: Any, session_id: str, decision: FastLaneDecision
+    db: Any,
+    session_id: str,
+    decision: FastLaneDecision,
+    *,
+    preserve_sticky: bool = False,
 ) -> None:
     """Persist the slow_mode marker onto a session row, best-effort.
 
@@ -590,14 +1051,46 @@ def patch_session_fast_lane_marker(
     (``_branched_from`` / ``_delegate_from``, ``browser_model_lock``) survive.
     No-op on any failure (missing row, locked DB, absent method) - the flag is
     advisory and must never break the request path.
+
+    ``db`` may be a plain ``SessionDB`` (api_server) or an ``AsyncSessionDB``
+    (gateway/run.py). The async door is unwrapped to its sync core first: a
+    sync call through the door returns an un-awaited coroutine, which used to
+    make this write a SILENT NO-OP on every messenger turn (t_e0350c47 — 0 of
+    5 telegram sessions carried ``slow_mode`` while OWUI sessions did).
+
+    ``preserve_sticky=True`` makes the marker MONOTONIC: a session already
+    marked slow is never downgraded back to fast by a later fast decision, so
+    the sticky state lives until the session row itself goes away (/reset or
+    session expiry — design §D). Call sites pass True; the default stays False
+    so the historical "write exactly what was decided" contract is available
+    for callers that need it.
     """
     if not session_id or db is None:
         return
     try:
-        patch = getattr(db, "patch_session_model_config", None)
-        if patch is None:
+        target = _resolve_sync_db(db)
+        patch = getattr(target, "patch_session_model_config", None)
+        if patch is None or not callable(patch):
             return
-        patch(session_id, fast_lane_marker_for_session(decision))
+        if inspect.iscoroutinefunction(patch):
+            return
+        if preserve_sticky and not decision.slow_mode:
+            if session_slow_mode(target, session_id) is True:
+                # Sticky latch: keep the session slow; only refresh the
+                # request-level diagnostics keys that do not gate the lane.
+                result = patch(session_id, {"fast_lane_last_request": "fast"})
+                if inspect.isawaitable(result):
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                return
+        result = patch(session_id, fast_lane_marker_for_session(decision))
+        if inspect.isawaitable(result):
+            # Defensive: an async door slipped through the unwrap. Closing it
+            # keeps the loop warning-free; the marker stays advisory.
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
     except Exception:
         pass
 
@@ -608,13 +1101,22 @@ def patch_session_fast_lane_degraded(db: Any, session_id: str) -> None:
     Called when a fast-path error made us fall back to the full lane, so the
     fallback is observable (design §6.1: "в сессию пишется пометка
     fast_lane_degraded=true"). Never raises, never breaks the request path.
+    Unwraps an ``AsyncSessionDB`` door to its sync core for the same reason as
+    :func:`patch_session_fast_lane_marker`.
     """
     if not session_id or db is None:
         return
     try:
-        patch = getattr(db, "patch_session_model_config", None)
-        if patch is None:
+        target = _resolve_sync_db(db)
+        patch = getattr(target, "patch_session_model_config", None)
+        if patch is None or not callable(patch):
             return
-        patch(session_id, {"fast_lane_degraded": True})
+        if inspect.iscoroutinefunction(patch):
+            return
+        result = patch(session_id, {"fast_lane_degraded": True})
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
     except Exception:
         pass

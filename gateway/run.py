@@ -5797,9 +5797,32 @@ class TurnRunner:
             )
             _fast_lane_config = (ctx.user_config or {}).get("fast_lane") or {}
             _fast_lane_active = _fast_lane_enabled(ctx.user_config or {})
+            # Session-sticky slow mode (t_e0350c47): a session slowed by an
+            # earlier marker keeps every later message on the slow lane. This
+            # block runs off-loop (run_sync in an executor), so the SYNC reader
+            # is used; it unwraps the runner's AsyncSessionDB door internally.
+            # Best-effort: no session opinion -> per-request markers decide.
+            _fast_session_slow = None
+            if ctx.session_id:
+                try:
+                    from agent.fast_lane import (
+                        session_slow_mode as _fast_session_slow_read,
+                    )
+
+                    _fast_session_slow = _fast_session_slow_read(
+                        getattr(self._runner, "_session_db", None), ctx.session_id
+                    )
+                except Exception:
+                    _fast_session_slow = None
+                    logger.warning(
+                        "fast_lane sticky read skipped (gateway TG) session=%s",
+                        ctx.session_id or "",
+                        exc_info=True,
+                    )
             _fast_decision = _fast_lane_evaluate(
                 ctx.message or "",
                 config=_fast_lane_config,
+                session_slow=_fast_session_slow,
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
@@ -5847,6 +5870,7 @@ class TurnRunner:
                     getattr(self._runner, "_session_db", None),
                     ctx.session_id,
                     _fast_decision,
+                    preserve_sticky=True,
                 )
         except Exception:
             # Degradation: marker-parse failure must never break the turn.
@@ -7198,6 +7222,13 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+
+# Sentinel for "the caller did not resolve the session-sticky slow opinion", so
+# ``_resolve_fast_lane_execute_profile`` can tell "caller passed None (= no
+# session opinion)" apart from "caller passed nothing (= read it yourself)".
+# ``None`` is a MEANINGFUL value here (no session opinion -> per-request
+# markers decide), so it cannot double as "unset". t_e305207e.
+_STICKY_UNSET = object()
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -28896,20 +28927,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (full lane). Best-effort: any routing failure degrades to the current
         profile, never breaking the turn (§6.1).
         """
+        # Session-sticky slow mode (t_e305207e / t_e0350c47): resolve the
+        # persisted session marker ONCE, here on the loop thread, and hand the
+        # value to the Track M selector below. `session_slow_mode` runs a
+        # blocking SQLite read, so it is offloaded with `asyncio.to_thread` —
+        # running it inline would freeze the event loop for every messenger
+        # turn (this is the same reason api_server uses
+        # `session_slow_mode_async`). The read happens in the ORIGIN profile
+        # scope, BEFORE the Track M executor scope switch, so a session slowed
+        # on 01 is never judged against the fast profile's store.
+        # Best-effort by contract: any failure -> None ("no session opinion"),
+        # which leaves the per-request marker decision untouched.
+        #
+        # Gated on the SAME eligibility predicate the selector uses
+        # (`_fast_lane_route_config`): with fast-lane routing off for this
+        # platform, the marker is irrelevant and a messenger turn must not
+        # touch state.db at all.
+        fast_lane_session_slow = None
+        _fl_route_cfg = self._fast_lane_route_config(source)
+        if _fl_route_cfg is not None and session_id:
+            try:
+                from agent.fast_lane import session_slow_mode as _fl_sticky_read
+
+                fast_lane_session_slow = await asyncio.to_thread(
+                    _fl_sticky_read,
+                    getattr(self, "_session_db", None),
+                    session_id,
+                )
+            except Exception:
+                fast_lane_session_slow = None
+                logger.warning(
+                    "fast_lane sticky read skipped (run.py) session=%s",
+                    session_id or "",
+                    exc_info=True,
+                )
+
+        _fl_decision_out: Dict[str, Any] = {}
         fast_exec_profile = self._resolve_fast_lane_execute_profile(
             message=message,
             source=source,
+            session_id=session_id,
+            session_slow=fast_lane_session_slow,
+            decision_out=_fl_decision_out,
         )
         if fast_exec_profile:
             plat = getattr(source, "platform", None)
             plat_name = getattr(plat, "value", None) or ""
-            from agent.fast_lane import decide_slow_mode as _fl_decide_debug
-            try:
-                _decision = _fl_decide_debug(message)
-                _slow = getattr(_decision, "slow_mode", None)
-                _src = getattr(_decision, "source", None)
-            except Exception:
-                _slow, _src = None, None
+            # Reuse the decision the selector already computed instead of
+            # re-running it: the old debug block re-read the sticky marker from
+            # SQLite a SECOND time per turn, on the event loop.
+            _decision = _fl_decision_out.get("decision")
+            _slow = getattr(_decision, "slow_mode", None)
+            _src = getattr(_decision, "source", None)
             logger.info(
                 "fast_lane=ROUTE run.py session=%s key=%s platform=%s target=%s "
                 "slow=%s source=%s message=%r",
@@ -28977,10 +29046,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 has_attachments=has_attachments,
             )
 
+    def _fast_lane_route_config(
+        self, source: Optional[SessionSource]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the effective ``fast_lane`` config for this source, or None.
+
+        Single source of truth for the Track M gate on the gateway/run.py path:
+        ``enabled`` and ``route_to_profile`` must both be truthy, and when
+        ``route_platforms`` is set only those platforms qualify (an unset or
+        empty list means "every messenger"). Returns ``None`` when this turn is
+        not eligible for fast-lane routing, else the config dict.
+
+        Extracted so ``_run_agent`` can decide WHETHER to read the sticky
+        session marker at all: with the feature off, a messenger turn must not
+        touch ``state.db`` (the previous inline gate lived inside the selector,
+        which the caller could not consult). Best-effort: any config failure ->
+        ``None`` (no routing, no marker read).
+        """
+        try:
+            user_config = _load_gateway_config()
+            fl_cfg = (user_config or {}).get("fast_lane") or {}
+            if not fl_cfg.get("enabled"):
+                return None
+            if not fl_cfg.get("route_to_profile"):
+                return None
+            route_platforms = fl_cfg.get("route_platforms")
+            if route_platforms:
+                plat = getattr(source, "platform", None) if source else None
+                plat_value = getattr(plat, "value", None)
+                plat_name = (
+                    plat_value
+                    if isinstance(plat_value, str)
+                    else str(plat or "").lower()
+                )
+                allowed = {str(p).strip().lower() for p in route_platforms if p}
+                if plat_name not in allowed:
+                    return None
+            return fl_cfg
+        except Exception:
+            logger.debug(
+                "fast_lane route config unavailable (run.py) — treating the "
+                "turn as not eligible",
+                exc_info=True,
+            )
+            return None
+
     def _resolve_fast_lane_execute_profile(
         self,
         message: Optional[str],
         source: SessionSource,
+        session_id: Optional[str] = None,
+        *,
+        session_slow: Any = _STICKY_UNSET,
+        decision_out: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Resolve the Track M executor profile for one gateway/run.py turn.
 
@@ -29009,38 +29127,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             if not source or not message:
                 return None
-            user_config = _load_gateway_config()
-            fl_cfg = (user_config or {}).get("fast_lane") or {}
-            if not fl_cfg.get("enabled"):
+            fl_cfg = self._fast_lane_route_config(source)
+            if fl_cfg is None:
                 return None
-            if not fl_cfg.get("route_to_profile"):
-                return None
-            # Optional platform allow-list gate: when ``route_platforms`` is
-            # set, only those platforms may be fast-lane routed. Anything else
-            # (including a malformed/empty list) keeps the current profile.
-            route_platforms = fl_cfg.get("route_platforms")
-            if route_platforms:
-                plat = getattr(source, "platform", None)
-                plat_value = getattr(plat, "value", None)
-                plat_name = (
-                    plat_value
-                    if isinstance(plat_value, str)
-                    else str(plat or "").lower()
-                )
-                allowed = {str(p).strip().lower() for p in route_platforms if p}
-                if plat_name not in allowed:
-                    return None
             from agent.fast_lane import (
                 decide_slow_mode,
                 resolve_fast_path,
                 route_profile,
+                session_slow_mode,
             )
 
             # Marker probe: the raw inbound text of THIS request. OWUI/PWA
             # split text+attachment posts; yadisk_bridge hands us the joined
             # user text, so the marker either fires here or not at all.
-            decision = decide_slow_mode(message, config=fl_cfg)
+            #
+            # Session-sticky (t_e305207e / t_e0350c47): a session slowed by an
+            # earlier marker keeps EVERY later message on the slow lane, so the
+            # persisted marker is fed into the decision. The VALUE is resolved
+            # by the caller (`_run_agent`, on the loop thread via
+            # `asyncio.to_thread`) and passed in, because this method is called
+            # from a coroutine and must never run a blocking SQLite read on the
+            # event loop. When no value was supplied (other callers, tests) the
+            # read is attempted here as a best-effort fallback — still guarded
+            # so a broken read degrades to "no session opinion" (None), never
+            # to an error.
+            _fl_session_slow: Optional[bool]
+            if session_slow is not _STICKY_UNSET:
+                _fl_session_slow = session_slow
+            else:
+                _fl_session_slow = None
+                if session_id:
+                    try:
+                        _fl_session_slow = session_slow_mode(
+                            getattr(self, "_session_db", None), session_id
+                        )
+                    except Exception:
+                        _fl_session_slow = None
+                        logger.warning(
+                            "fast_lane sticky read skipped (run.py) session=%s",
+                            session_id or "",
+                            exc_info=True,
+                        )
+            decision = decide_slow_mode(
+                message, config=fl_cfg, session_slow=_fl_session_slow
+            )
             decision = resolve_fast_path(decision, message)
+            if decision_out is not None:
+                # Hand the exact decision back to the caller so it can log the
+                # ROUTE/FAST line without re-running the decision (which used
+                # to make a SECOND sticky DB read per turn).
+                decision_out["decision"] = decision
+                decision_out["session_slow"] = _fl_session_slow
+            if decision.slow_mode and str(decision.source or "").startswith(
+                "session-sticky"
+            ):
+                # Make a sticky hit observable on the run.py side too: without
+                # this the turn would silently stay on the full lane with no
+                # ROUTE line at all (the ROUTE log below only fires when a
+                # fast executor is selected).
+                plat = getattr(source, "platform", None)
+                plat_name = getattr(plat, "value", None) or str(plat or "")
+                logger.info(
+                    "fast_lane=ROUTE run.py session=%s platform=%s "
+                    "target=current slow=%s source=%s",
+                    session_id or "",
+                    plat_name,
+                    decision.slow_mode,
+                    decision.source or "-",
+                )
             return route_profile(decision)
         except Exception:
             logger.debug(

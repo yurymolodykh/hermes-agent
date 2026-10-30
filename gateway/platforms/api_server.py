@@ -3084,6 +3084,98 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._session_dbs[key] = db
             return db
 
+    def _session_db_if_open(self) -> Optional[Any]:
+        """Return the active profile's SessionDB ONLY if one is already open.
+
+        Session-sticky marker reads are advisory (t_ca558566): a cold
+        ``SessionDB`` construction runs full schema init and takes seconds on
+        a fresh ``HERMES_HOME`` (measured ~3 s). Paying that *before*
+        ``_create_agent`` in a request handler delays every first run of the
+        process for a flag that cannot be set yet (a session is only sticky
+        after a marker turn has already written it), so the read path never
+        constructs: it uses the injected override or the per-profile cache
+        hit, and reports ``None`` (no session opinion) otherwise.
+
+        Any later turn that needs the marker is guaranteed to find the handle
+        cached, because the marker WRITE (``patch_session_fast_lane_marker``
+        inside ``_create_agent``) opens and caches it for the same home.
+        """
+        if self._session_db is not None:
+            return self._session_db
+        try:
+            from hermes_constants import get_hermes_home
+
+            key = str(get_hermes_home())
+        except Exception:
+            return None
+        with self._session_db_cache_lock:
+            if self._session_db_cache_closed:
+                return None
+            return self._session_dbs.get(key)
+
+    async def _session_db_if_open_async(self) -> Optional[Any]:
+        """Async face of :meth:`_session_db_if_open` (cache/lock only, no I/O)."""
+        return self._session_db_if_open()
+
+    async def _read_sticky_marker(self, session_id: Optional[str]) -> Optional[bool]:
+        """Best-effort session-sticky marker read for a coroutine handler.
+
+        Called BEFORE ``_create_agent`` decides the lane, so it must never
+        construct a ``SessionDB`` (see :meth:`_session_db_if_open`): the open
+        handle is used when there is one, otherwise the committed row is
+        probed read-only off the profile's ``state.db`` file. Any failure
+        degrades to ``None`` ("no session opinion"), which leaves the
+        per-request marker decision exactly as it was before t_ca558566.
+        """
+        if not session_id:
+            return None
+        try:
+            from agent.fast_lane import session_slow_mode_async as _fl_sticky
+
+            db = self._session_db_if_open()
+            if db is not None:
+                return await _fl_sticky(db, session_id)
+            return await asyncio.to_thread(self._read_sticky_marker_sync, session_id)
+        except Exception:
+            logger.warning(
+                "fast_lane sticky read skipped (api_server) session=%s",
+                session_id or "",
+                exc_info=True,
+            )
+            return None
+
+    def _read_sticky_marker_sync(self, session_id: Optional[str]) -> Optional[bool]:
+        """Blocking twin of :meth:`_read_sticky_marker` (~ms: ro open + SELECT).
+
+        ``_handle_runs`` needs the value BEFORE it hands control to the
+        background run task: an ``await`` before ``_create_agent`` inside that
+        task suspends it at its first suspension point, and the request path
+        deliberately reaches agent construction in one uninterrupted slice.
+        The probe is a read-only file open plus one indexed SELECT, so doing it
+        inline is cheap — and it still never constructs a ``SessionDB``.
+        """
+        if not session_id:
+            return None
+        try:
+            from agent.fast_lane import (
+                session_slow_mode as _fl_sticky,
+                session_slow_mode_from_db_file as _fl_sticky_file,
+            )
+
+            db = self._session_db_if_open()
+            if db is not None:
+                return _fl_sticky(db, session_id)
+            from hermes_constants import get_hermes_home
+
+            return _fl_sticky_file(get_hermes_home() / "state.db", session_id)
+        except Exception:
+            logger.warning(
+                "fast_lane sticky read skipped (api_server) session=%s",
+                session_id or "",
+                exc_info=True,
+            )
+            return None
+
     def _close_cached_session_dbs(self) -> None:
         """Close SessionDB handles owned by this adapter's profile cache."""
         with self._session_db_cache_lock:
@@ -3559,6 +3651,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         user_message: Optional[str] = None,
         fast_lane_probe: Optional[str] = None,
+        fast_lane_session_slow: Optional[bool] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3898,6 +3991,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _fast_probe,
                 model_options=model_options,
                 config=_fast_lane_config,
+                session_slow=fast_lane_session_slow,
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
@@ -3966,7 +4060,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # (§6.2) holds end-to-end. Best-effort; never breaks the path.
             if _fast_lane_active:
                 _patch_fast_lane_marker(
-                    self._ensure_session_db(), session_id, _fast_decision
+                    self._ensure_session_db(),
+                    session_id,
+                    _fast_decision,
+                    preserve_sticky=True,
                 )
         except Exception:
             # Degradation: marker-parse/fast-path failure must never break
@@ -8541,6 +8638,22 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         request_origin_binding = _api_request_origin_binding.get()
 
+        # --- Session-sticky slow mode (t_e0350c47) ----------------------
+        # Once a session has been slowed by a marker, later marker-less
+        # messages in the SAME session must stay on the slow lane (01). The
+        # carrier is the persisted session marker, read HERE — in the ORIGIN
+        # profile scope, i.e. BEFORE the potential Track M scope switch below.
+        # Reading it after the switch would hit the executor profile's store
+        # (11-fast-answers), which only ever holds fast markers.
+        #
+        # The read is deliberately NON-CONSTRUCTING: an open handle (test
+        # override or cache hit) is used directly, otherwise the committed row
+        # is probed read-only from the profile's state.db. Building a
+        # ``SessionDB`` here would run full schema init in front of
+        # ``_create_agent`` — measured ~3 s cold — for a flag that can only be
+        # set after a marker turn already opened the DB (t_ca558566).
+        fast_lane_session_slow = await self._read_sticky_marker(session_id)
+
         # --- Fast-lane profile routing (design §4.2 Track M, t_746614d5) ---
         # The fast-lane decision selects the EXECUTOR profile, which must be
         # settled BEFORE _profile_scope() runs (the agent home / state.db /
@@ -8580,6 +8693,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _fl_probe,
                         model_options=model_options,
                         config=_fl_cfg,
+                        session_slow=fast_lane_session_slow,
                     )
                     _fl_decision = _fl_resolve(_fl_decision, _fl_probe)
                     _fl_profile = _fl_route(_fl_decision)
@@ -8595,6 +8709,22 @@ class APIServerAdapter(BasePlatformAdapter):
                             _fl_decision.source or "-",
                             _fl_decision.reasoning_effort or "medium",
                         )
+                    else:
+                        # Slow (incl. sticky) decision -> stay on the origin
+                        # profile. Logged explicitly so a sticky hit is
+                        # visible as a ROUTE line, not just a SLOW line.
+                        if str(getattr(_fl_decision, "source", "") or "").startswith(
+                            "session-sticky"
+                        ):
+                            logger.info(
+                                "fast_lane=ROUTE api_server session=%s "
+                                "target=%s slow=%s source=%s reasoning=%s",
+                                session_id or "",
+                                request_profile or "current",
+                                _fl_decision.slow_mode,
+                                _fl_decision.source or "-",
+                                _fl_decision.reasoning_effort or "medium",
+                            )
             except Exception:
                 # Degradation: profile-routing failure must never break the
                 # turn — the request stays on the current profile (§6.1).
@@ -8641,6 +8771,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         confirmed_runtime_lock=confirmed_runtime_lock,
                         user_message=user_message,
                         fast_lane_probe=fast_lane_probe,
+                        fast_lane_session_slow=fast_lane_session_slow,
                     )
                     if confirmed_runtime_lock:
                         locked_provider = self._clean_runtime_id(
@@ -9144,6 +9275,19 @@ class APIServerAdapter(BasePlatformAdapter):
             _api_request_browser_control_transport_family.get()
         )
 
+        # Session-sticky slow mode (t_e0350c47): read the persisted marker in
+        # the ORIGIN profile scope (this handler already runs inside the
+        # middleware scope, i.e. before the Track M executor switch), so a
+        # session slowed on 01 is never judged against the fast profile's
+        # store. Done HERE, outside the background task: an await before
+        # ``_create_agent`` inside that task would suspend it at its first
+        # suspension point, and the /v1/runs fast-start contract is that agent
+        # construction is reached in one uninterrupted slice. The probe is a
+        # read-only file open + one indexed SELECT and never constructs a
+        # SessionDB (see _read_sticky_marker_sync). Best-effort: no session
+        # opinion means the per-request markers decide exactly as before.
+        runs_session_slow = self._read_sticky_marker_sync(session_id)
+
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
@@ -9172,6 +9316,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         user_message=user_message,
                         fast_lane_probe=fast_lane_probe,
+                        fast_lane_session_slow=runs_session_slow,
                     )
                 self._active_run_agents[run_id] = agent
 
