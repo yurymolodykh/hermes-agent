@@ -60,14 +60,25 @@ POLYGON_CLASS_SHARE: Dict[str, float] = {
 
 # Default routing table (M6 + M7 rollout). Values must never exceed the wire-safe
 # ladder; "ultra" is explicitly excluded.
+#
+# Grading (adaptive-reasoning-effort, letovo domain): the complex classes sit on
+# ``xhigh`` rather than all four pinning ``max``. The letovo backend serves
+# low/high/xhigh/max as distinct levels, so a flat ``max`` for code AND math AND
+# logic buys no differentiation and spends the top tier on every card. ``xhigh``
+# is the graded "hard work" default; the final-step/escalation gates in
+# reasoning_step_router still raise to ``max`` when a step actually needs it.
 DEFAULT_CLASS_EFFORT: Dict[str, str] = {
-    "code": "max",
-    "math": "max",
-    "logic": "max",
-    "multi_constraint": "max",
+    "code": "xhigh",
+    "math": "xhigh",
+    "logic": "xhigh",
+    "multi_constraint": "xhigh",
     "routine": "low",
     # ops / undef intentionally absent -> no route (leave global unchanged)
 }
+#: Levels that exist in Hermes' internal ladder and can be routed. This is the
+#: *input* vocabulary; every value is then clamped to the letovo wire domain
+#: ({none, low, high, xhigh, max}) on the way out, so ``medium``/``minimal`` are
+#: accepted in config but never reach the backend (which 400s on them).
 SAFE_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 FORBIDDEN_EFFORTS = frozenset({"ultra"})
 
@@ -165,7 +176,7 @@ def class_effort_table(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Option
         if cls in overrides:
             out[cls] = _clamp(overrides[cls])
         else:
-            out[cls] = DEFAULT_CLASS_EFFORT.get(cls)
+            out[cls] = _clamp(DEFAULT_CLASS_EFFORT.get(cls) or "")
     return out
 
 
@@ -179,7 +190,8 @@ def effort_for_class(
     overrides = _overrides(cfg)
     if cls in overrides:
         return _clamp(overrides[cls])
-    return DEFAULT_CLASS_EFFORT.get(cls)
+    default = DEFAULT_CLASS_EFFORT.get(cls)
+    return _clamp(default) if default else None
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +227,12 @@ def _clamp(effort: str) -> Optional[str]:
             "reasoning_class_efforts unknown level '%s'; dropping route", val,
         )
         return None
-    return val
+    # Route output is a letovo pin in every deployment this layer serves, and
+    # the backend rejects medium/minimal with HTTP 400. Clamp here so no caller
+    # can bypass the domain by asking this module directly.
+    from agent.reasoning_effort import LETOVO_EFFORTS, LETOVO_OVERRIDES, clamp_effort
+
+    return clamp_effort(val, LETOVO_EFFORTS, LETOVO_OVERRIDES, strict=True)
 
 
 __all__ = [

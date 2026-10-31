@@ -17,11 +17,13 @@ system stays byte-identical to the base revision:
   * :func:`effort_for_step` -> None (router inert)
   * :func:`step_routing_enabled` -> False
 
-Effort values are returned in the letovo wire domain ``{none, low, high, max}``
-(``agent.reasoning_effort.LETOVO_EFFORTS``) and clamped with
+Effort values are returned in the letovo wire domain ``{none, low, high, xhigh,
+max}`` (``agent.reasoning_effort.LETOVO_EFFORTS``) and clamped with
 :func:`clamp_to_letovo`, so a router decision can never 400 on
-deepseek-v4-flash@custom:letovo. ``medium``/``xhigh`` collapse to ``high`` per
-the W1-verified DeepSeek mapping (same as L1).
+deepseek-v4-flash@letovo. Live-verified 2026-10-31: the backend rejects
+``medium`` and ``minimal`` and serves ``xhigh`` as distinct from ``max``.
+Mapping: ``medium``/``minimal`` collapse to ``high``/``low``, ``xhigh`` is
+preserved, ``ultra`` -> ``max``.
 
 Design rules (§4, order matters — conservative policy, never below ``high``
 unless routine is proven):

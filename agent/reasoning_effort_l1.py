@@ -16,11 +16,12 @@ deepseek-v4-flash@custom:letovo (pinned at card creation), only the effort
 level may be lowered/raised.
 
 Effort values are clamped to the letovo wire domain
-``{none, low, medium, high, max}`` (agent.reasoning_effort.LETOVO_EFFORTS),
-so a mis-typed pin can never reach the wire as a 400. ``medium`` stays
-``medium`` and ``xhigh`` maps to ``max`` per the experiment-v4-verified
-DeepSeek mapping (REPORT_v4.md; W1's "medium→high" assumption was
-disproved — the wire distinguishes medium as its own step).
+``{none, low, high, xhigh, max}`` (agent.reasoning_effort.LETOVO_EFFORTS), so a
+mis-typed pin can never reach the wire as a 400. Live-verified 2026-10-31: the
+backend rejects both ``medium`` and ``minimal`` with HTTP 400 ("DeepSeek V4.1
+reasoning_effort must be low, high, xhigh, max, …"), and serves ``xhigh`` as its
+own distinct level. Mapping: ``medium`` -> ``high``, ``minimal`` -> ``low``,
+``xhigh`` stays ``xhigh``, ``ultra`` -> ``max``.
 """
 
 from __future__ import annotations
@@ -53,8 +54,10 @@ LETOVO_DOMAIN: tuple[str, ...] = LETOVO_EFFORTS
 
 #: Profiles that act as the independent gate on a writing card. A card
 #: assigned to one of these is a REVIEW card and pins ``max``; a writing
-#: card gains ``medium`` when it owns a direct child card assigned to one of
-#: these (design/medium-review-scheme-v1.md — «написание → medium, ревью → max»).
+#: card that owns a direct child card assigned to one of these is *gated*
+#: work and pins ``high`` (design/medium-review-scheme-v1.md, revised for the
+#: letovo domain: the backend has no ``medium`` level, so the writing lane sits
+#: on ``high`` — the level the writing profiles already inherit).
 REVIEWER_PROFILES: frozenset[str] = frozenset(
     {"09-independent-reviewer", "15-sre-qa"}
 )
@@ -63,12 +66,13 @@ REVIEWER_PROFILES: frozenset[str] = frozenset(
 def clamp_to_letovo(effort: Optional[str]) -> Optional[str]:
     """Clamp a requested effort onto the letovo wire domain.
 
-    ``medium`` stays ``medium``; ``minimal`` -> ``low``; ``xhigh`` -> ``max``;
-    ``ultra`` -> ``max`` (overrides from experiment v4's verified DeepSeek
-    mapping). Unknown bespoke values pass through unchanged (custom provider
-    may use its own names).
+    ``medium`` -> ``high``, ``minimal`` -> ``low``, ``xhigh`` stays ``xhigh``,
+    ``ultra`` -> ``max`` (the backend serves low/high/xhigh/max and 400s on
+    medium/minimal — verified live 2026-10-31). The domain is *closed*: an
+    unrecognized bespoke value is dropped to ``None`` with a warning rather
+    than forwarded, because forwarding it is a guaranteed 400 on this backend.
     """
-    return clamp_effort(effort, LETOVO_EFFORTS, LETOVO_OVERRIDES)
+    return clamp_effort(effort, LETOVO_EFFORTS, LETOVO_OVERRIDES, strict=True)
 
 
 def _agent_cfg(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -174,7 +178,7 @@ def resolve_card_effort(
     When on, this is the *operator* seam between the class-detector output
     (W3) and ``tasks.reasoning_effort``: it returns the clamped letovo effort
     for a detected task class. The default class->effort policy lives in
-    ``agent.reasoning_class_router.DEFAULT_CLASS_EFFORT`` (complex -> max,
+    ``agent.reasoning_class_router.DEFAULT_CLASS_EFFORT`` (complex -> xhigh,
     routine -> low); this helper stays model- and wire-agnostic and only adds
     the letovo clamp so L1 pins can never 400 on deepseek-v4-flash.
 
@@ -188,12 +192,21 @@ def resolve_card_effort(
         return None
     if not task_class:
         return None
-    from agent.reasoning_class_router import DEFAULT_CLASS_EFFORT, detect_task_class
+    from agent.reasoning_class_router import detect_task_class, effort_for_class
 
-    cls = task_class if task_class in DEFAULT_CLASS_EFFORT else detect_task_class(
+    cls = task_class if task_class in _known_classes() else detect_task_class(
         text=task_class, profile=profile
     )
-    return clamp_to_letovo(DEFAULT_CLASS_EFFORT.get(cls))
+    # effort_for_class already clamps to the letovo domain; clamp again so this
+    # helper stays safe even if the router's policy table changes.
+    return clamp_to_letovo(effort_for_class(cls, cfg))
+
+
+def _known_classes() -> frozenset[str]:
+    """Class labels the router table understands (no route side effects)."""
+    from agent.reasoning_class_router import DEFAULT_CLASS_EFFORT, POLYGON_CLASS_SHARE
+
+    return frozenset((*DEFAULT_CLASS_EFFORT, *POLYGON_CLASS_SHARE, "ops", "undef"))
 
 
 def pin_card_effort(
@@ -236,13 +249,15 @@ def _card_assignee_is_reviewer(assignee: Optional[str]) -> bool:
 def _card_graph_context(
     conn: Any,
     task_id: str,
-) -> tuple[bool, bool]:
-    """Return ``(is_review_card, has_reviewer_child)`` for one card.
+) -> tuple[bool, bool, bool]:
+    """Return ``(is_review_card, has_reviewer_child, is_container)`` for one card.
 
     ``is_review_card`` — the card's own assignee is an independent gate
     (09/15). ``has_reviewer_child`` — the card owns at least one direct child
     whose assignee is an independent gate (the «план/есть child-ревью»
-    signal the medium scheme keys on).
+    signal). ``is_container`` — the card owns exactly ONE child and that child
+    is the review card: the pure "mission container" shape (no own writing
+    work, its only purpose is carrying a lane of child cards).
 
     Distinguishes three outcomes:
 
@@ -252,7 +267,7 @@ def _card_graph_context(
       gate;
     * DB/graph exception → raised so the caller's Ж1 fallback degrades to
       ``high`` (never ``medium`` on an unknown/gated card);
-    * healthy read → ``(is_review_card, has_reviewer_child)``.
+    * healthy read → ``(is_review_card, has_reviewer_child, is_container)``.
     """
     if not conn or not task_id:
         raise LookupError("no card graph context (missing conn/task)")
@@ -262,13 +277,16 @@ def _card_graph_context(
     if task is None:
         raise LookupError(f"task {task_id} not found in board")
     is_review_card = _card_assignee_is_reviewer(task.assignee)
+    children = _kb.child_ids(conn, str(task_id))
     has_reviewer_child = False
-    for child_id in _kb.child_ids(conn, str(task_id)):
+    reviewer_children = 0
+    for child_id in children:
         child = _kb.get_task(conn, child_id)
         if child is not None and _card_assignee_is_reviewer(child.assignee):
             has_reviewer_child = True
-            break
-    return is_review_card, has_reviewer_child
+            reviewer_children += 1
+    is_container = len(children) == 1 and reviewer_children == 1
+    return is_review_card, has_reviewer_child, is_container
 
 
 def resolve_card_lane_effort(
@@ -278,21 +296,31 @@ def resolve_card_lane_effort(
     *,
     wired_effort: Optional[str] = None,
 ) -> Optional[str]:
-    """Resolve the per-card reasoning effort in the «medium-review» scheme.
+    """Resolve the per-card reasoning effort in the «review-gate» scheme.
 
     This is the new-scheme resolver (design/medium-review-scheme-v1.md,
-    table §1) that replaces the class-based card default:
+    table §1, revised for the letovo wire domain) that replaces the class-based
+    card default:
 
     * ``wired_effort`` (an explicit operator pin in ``tasks.reasoning_effort``)
       always wins and is only clamped to the letovo domain — routing never
       overrides an operator choice.
     * REVIEW card (assignee = 09-independent-reviewer / 15-sre-qa) → ``max``.
-    * Writing card that owns a direct child review card → ``medium``.
+    * Container card — the card's ONLY child is the review card → ``high``.
+      A container carries no work of its own; its single child is a gate, so it
+      must never resolve below the level its children's authoring lane uses.
+    * Writing card that owns a review-gate child AND at least one non-gate
+      child (author with a review child) → ``high``.
     * Everything else (routine/short cards without a gate child) → ``None``
       (no pin; the worker inherits its profile's ``agent.reasoning_effort``,
       which is ``high`` for the 02/03 writing profiles).
     * Uncertainty / graph-read failure → ``high`` (Ж1: never fall below high
-      for gated work; never ``medium`` on a gate or review).
+      for gated work; never a dead ``medium`` on a gate or review).
+
+    Every returned level is inside the letovo wire domain: the backend serves
+    {none, low, high, xhigh, max} and 400s on ``medium``/``minimal``, which is
+    exactly the failure the old ``medium`` resolution caused on the ~15 board
+    cards whose only child is a review card.
 
     Gated: returns ``None`` while ``agent.reasoning_class_routing`` is off —
     the whole L1 per-card layer is inert and cards run at their profile
@@ -303,10 +331,12 @@ def resolve_card_lane_effort(
     if not reasoning_class_routing_enabled(cfg):
         return None
     try:
-        is_review_card, has_reviewer_child = _card_graph_context(conn, task_id)
+        is_review_card, has_reviewer_child, is_container = _card_graph_context(
+            conn, task_id
+        )
     except Exception:  # pragma: no cover - Ж1 fallback on uncertainty
         # Graph uncertainty (missing conn/task, DB failure) degrades UP to
-        # high — never medium below a gated/review card, never an error.
+        # high — never below a gated/review card, never an error.
         _log.warning(
             "card graph uncertainty for %r; degrading lane effort to high (Ж1)",
             task_id,
@@ -314,8 +344,8 @@ def resolve_card_lane_effort(
         return "high"
     if is_review_card:
         return "max"
-    if has_reviewer_child:
-        return "medium"
+    if is_container or has_reviewer_child:
+        return "high"
     # No gate anywhere: leave the card to its profile default (NULL pin).
     return None
 

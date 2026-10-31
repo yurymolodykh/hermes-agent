@@ -129,23 +129,68 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
-#: lettovo (custom:letovo) OpenAI-compatible endpoint serving
-#: deepseek-v4-flash — live-verified wire vocabulary (adaptive-reasoning-effort
-#: mission): ``{none, low, medium, high, max}``. Experiment v4 (REPORT_v4.md,
-#: durable/rgz-exp-long/) disproved the W1 assumption "DeepSeek has no medium
-#: tier": ``--reasoning medium`` reaches the wire as its own medium step —
-#: live probe latency 102.2s / reasoning_tokens 1140 / full answer, while
-#: ``high`` on the same prompt read-timed out (>180s). ``xhigh`` maps to the
-#: top tier ``max`` (distinguishable from high), ``ultra`` is Hermes-internal
-#: and maps to ``max``, ``minimal`` -> ``low``. ``none`` fully disables
-#: chain-of-thought (the L1/L3 down-pin for routine/indexing/chat).
-LETOVO_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
+#: letovo (llm.letovo.site, OpenAI-compatible vLLM gateway) serving
+#: deepseek-v4-flash. Live-verified 2026-10-30/31 by direct POST to
+#: /openai/chat/completions: ``none``/``low``/``high``/``xhigh``/``max`` -> 200,
+#: while ``medium`` AND ``minimal`` both return
+#:
+#:     HTTP 400 "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max,
+#:     or an integer within [1, 100] in chat_template_kwargs"
+#:
+#: so the served model's accepted set is {none, low, high, xhigh, max}. The
+#: earlier reading of experiment v4 (REPORT_v4.md, ``medium`` as its own wire
+#: step) was an artifact of the router-side vocabulary: the backend rejects
+#: ``medium`` outright, which is why every ``medium`` pin surfaced as a 400.
+#: Mapping policy: ``medium`` -> ``high`` (the nearest level the backend
+#: actually serves for a mid-depth ask; it never silently weakens the request
+#: below what was asked), ``minimal`` -> ``low`` (backend floor for an enabled
+#: ask), ``xhigh`` stays ``xhigh`` (the backend serves it verbatim — do NOT
+#: collapse it into ``max``, they are distinct served levels), ``ultra`` is
+#: Hermes-internal and has no wire spelling -> ``max``.
+LETOVO_EFFORTS: tuple[str, ...] = ("none", "low", "high", "xhigh", "max")
 LETOVO_OVERRIDES: dict[str, str] = {
     "minimal": "low",
-    "medium": "medium",
-    "xhigh": "max",
+    "medium": "high",
+    "xhigh": "xhigh",
     "ultra": "max",
 }
+
+#: Hosts that serve the letovo domain above. A user-configured
+#: ``provider: letovo`` (config.yaml ``model.provider``) has no bundled
+#: provider profile, so it resolves to the generic ``custom`` profile — the
+#: domain has to be recognised by endpoint, not by profile name.
+LETOVO_HOSTS: tuple[str, ...] = ("llm.letovo.site",)
+
+
+def letovo_wire_domain(
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Optional[tuple[tuple[str, ...], dict[str, str]]]:
+    """Return ``(efforts, overrides)`` for a letovo-served endpoint, else None.
+
+    Declarative lookup used by wire emitters that cannot rely on a provider
+    profile (``custom`` fronts many endpoints). Matches on the endpoint host
+    only — the model alone is not enough, since ``deepseek-v4-flash`` is also
+    served by unrelated backends with a different vocabulary.
+    """
+    host = _host_of(base_url)
+    if not host:
+        return None
+    if any(host == h or host.endswith("." + h) for h in LETOVO_HOSTS):
+        return LETOVO_EFFORTS, LETOVO_OVERRIDES
+    return None
+
+
+def _host_of(url: Optional[str]) -> str:
+    """Extract a lowercase host from *url* without importing urllib.parse lazily."""
+    if not url:
+        return ""
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url if "//" in url else f"//{url}").hostname or "").lower()
+    except Exception:  # pragma: no cover - malformed URL
+        return ""
 
 #: Ollama Cloud /v1/chat/completions: accepts {none, low, medium, high, max};
 #: rejects ``minimal`` with HTTP 400. ``xhigh`` requests the top tier.
@@ -178,6 +223,8 @@ def clamp_effort(
     effort: Optional[str],
     supported: Optional[Sequence[str]],
     overrides: Optional[dict[str, str]] = None,
+    *,
+    strict: bool = False,
 ) -> Optional[str]:
     """Clamp a requested reasoning effort onto a wire's supported levels.
 
@@ -194,6 +241,14 @@ def clamp_effort(
     supported level, so a clamp never silently escalates cost; when nothing
     weaker exists, the weakest supported level is returned (the caller asked
     for *some* thinking and the provider's floor is the closest honest match).
+
+    ``strict=True`` closes the bespoke-name hole for **closed** domains: the
+    supported set is declared exhaustively (e.g. the letovo backend rejects
+    anything outside its five served levels), so an unrecognized name has no
+    safe spelling on this wire at all. It is dropped to ``None`` with a
+    warning instead of being forwarded verbatim. Use it wherever forwarding a
+    stray value is a guaranteed HTTP 400, never for open
+    ``custom``-provider vocabularies.
 
     The policy is monotonic: a stronger request never resolves to a weaker
     wire level than a weaker request would.
@@ -213,6 +268,16 @@ def clamp_effort(
         if mapped in supported_norm:
             return mapped
     if requested not in EFFORT_LADDER:
+        if strict:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "reasoning_effort %r is not a level this wire serves (%s); "
+                "dropping it rather than risking a 400",
+                requested,
+                "/".join(supported_norm),
+            )
+            return None
         return effort
     # "none" disables reasoning — it is never a *degradation target* for an
     # enabled ask (clamping "minimal" to "none" would silently switch

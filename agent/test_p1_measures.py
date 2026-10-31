@@ -247,16 +247,27 @@ class TestM67ClassRouting:
         for cls, effort in table.items():
             assert effort is None, f"{cls} should be unrouted when disabled"
 
-    def test_enabled_routes_complex_to_max_routine_low(self):
+    def test_enabled_routes_complex_to_xhigh_routine_low(self):
         from agent.reasoning_class_router import class_effort_table
 
         table = class_effort_table({"agent": {"reasoning_class_routing": True}})
+        # Graded policy: complex classes sit on xhigh (not a flat max), and the
+        # values are already letovo-clamped so no class can emit medium.
         for cls in ("code", "math", "logic", "multi_constraint"):
-            assert table[cls] == "max"
+            assert table[cls] == "xhigh", cls
         assert table["routine"] == "low"
         # ops/undef are NOT routed (left for the global effort)
         assert table["ops"] is None
         assert table["undef"] is None
+
+    def test_no_class_emits_a_letovo_rejected_level(self):
+        # The wire-level guarantee for this router: nothing it can return is a
+        # level the backend 400s on.
+        from agent.reasoning_class_router import class_effort_table
+
+        table = class_effort_table({"agent": {"reasoning_class_routing": True}})
+        for cls, effort in table.items():
+            assert effort not in ("medium", "minimal", "ultra"), (cls, effort)
 
     def test_never_points_to_ultra(self):
         from agent.reasoning_class_router import class_effort_table
@@ -276,6 +287,20 @@ class TestM67ClassRouting:
         assert effort_for_class("code", cfg) == "high"
         # ultra refused -> routed back to None (never applied)
         assert effort_for_class("routine", cfg) is None
+
+    def test_override_medium_is_clamped_to_served_level(self):
+        # An operator may still write "medium" in config (it is a valid Hermes
+        # level); the router must translate it to a served level, not emit it.
+        from agent.reasoning_class_router import effort_for_class
+
+        cfg = {
+            "agent": {
+                "reasoning_class_routing": True,
+                "reasoning_class_efforts": {"code": "medium", "math": "minimal"},
+            }
+        }
+        assert effort_for_class("code", cfg) == "high"
+        assert effort_for_class("math", cfg) == "low"
 
     def test_detector_classifies_known_markers(self):
         from agent.reasoning_class_router import detect_task_class
@@ -312,19 +337,28 @@ class TestLetovoLadder:
     def test_wire_domain(self):
         from agent.reasoning_effort_l1 import LETOVO_EFFORTS
 
-        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
+        assert LETOVO_EFFORTS == ("none", "low", "high", "xhigh", "max")
 
-    def test_clamp_medium_stays_medium(self):
-        # Experiment v4 (REPORT_v4.md): medium is its own wire step — it must
-        # NOT collapse to high.
+    def test_domain_excludes_rejected_levels(self):
+        # Live-verified 2026-10-31: the backend 400s on both medium and minimal
+        # ("must be low, high, xhigh, max, or an integer within [1, 100]").
+        from agent.reasoning_effort_l1 import LETOVO_EFFORTS
+
+        for forbidden in ("medium", "minimal", "ultra"):
+            assert forbidden not in LETOVO_EFFORTS
+
+    def test_clamp_maps_medium_to_high(self):
+        # medium has no wire spelling on this backend; high is the nearest
+        # served level for a mid-depth ask.
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        assert clamp_to_letovo("medium") == "medium"
+        assert clamp_to_letovo("medium") == "high"
 
-    def test_clamp_maps_xhigh_to_max(self):
+    def test_clamp_keeps_xhigh_distinct(self):
+        # xhigh is a served level — it must NOT be collapsed into max.
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        assert clamp_to_letovo("xhigh") == "max"
+        assert clamp_to_letovo("xhigh") == "xhigh"
 
     def test_clamp_maps_ultra_to_max_and_minimal_to_low(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
@@ -335,14 +369,21 @@ class TestLetovoLadder:
     def test_clamp_passes_through_wire_native(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        for level in ("none", "low", "medium", "high", "max"):
+        for level in ("none", "low", "high", "xhigh", "max"):
             assert clamp_to_letovo(level) == level
+
+    def test_clamp_drops_bespoke_value(self):
+        # Closed domain: an unknown name has no safe spelling, so it is dropped
+        # (None) rather than forwarded into a guaranteed 400.
+        from agent.reasoning_effort_l1 import clamp_to_letovo
+
+        assert clamp_to_letovo("turbo") is None
 
     def test_clamp_never_returns_unsafe_level(self):
         from agent.reasoning_effort_l1 import clamp_to_letovo
 
-        for bad in ("ultra", "xhigh", "minimal"):
-            assert clamp_to_letovo(bad) in ("low", "high", "max")
+        for bad in ("ultra", "xhigh", "minimal", "medium", "bogus"):
+            assert clamp_to_letovo(bad) in ("low", "high", "xhigh", "max", None)
 
 
 class TestGatedAuxPins:
@@ -398,8 +439,8 @@ class TestGatedAuxPins:
             }
         }
         pins = reasoning_aux_pins(cfg)
-        # medium stays medium (experiment v4); ultra -> max.
-        assert pins["web_extract"] == "medium"
+        # medium has no wire spelling -> high; ultra -> max.
+        assert pins["web_extract"] == "high"
         assert pins["compression"] == "max"
 
 
@@ -410,18 +451,28 @@ class TestGatedCardPin:
         cfg = {"agent": {"reasoning_class_routing": False}}
         assert resolve_card_effort("code", "03-software-engineer", cfg) is None
 
-    def test_card_effort_routes_complex_to_max(self):
+    def test_card_effort_routes_complex_to_xhigh(self):
         from agent.reasoning_effort_l1 import resolve_card_effort
 
         cfg = {"agent": {"reasoning_class_routing": True}}
-        assert resolve_card_effort("code", "03-software-engineer", cfg) == "max"
-        assert resolve_card_effort("logic", "01-orchestrator", cfg) == "max"
+        assert resolve_card_effort("code", "03-software-engineer", cfg) == "xhigh"
+        assert resolve_card_effort("logic", "01-orchestrator", cfg) == "xhigh"
 
     def test_card_effort_routes_routine_to_low(self):
         from agent.reasoning_effort_l1 import resolve_card_effort
 
         cfg = {"agent": {"reasoning_class_routing": True}}
         assert resolve_card_effort("routine", "07-document-producer", cfg) == "low"
+
+    def test_card_effort_never_emits_medium(self):
+        # End-to-end guard for the 400: no class may resolve to a level the
+        # letovo backend rejects.
+        from agent.reasoning_effort_l1 import resolve_card_effort
+
+        cfg = {"agent": {"reasoning_class_routing": True}}
+        for cls in ("code", "math", "logic", "multi_constraint", "routine", "ops", "undef"):
+            got = resolve_card_effort(cls, "03-software-engineer", cfg)
+            assert got not in ("medium", "minimal", "ultra"), (cls, got)
 
     def test_card_effort_wired_pin_wins(self):
         # An explicit operator pin (tasks.reasoning_effort) always wins over
@@ -430,7 +481,137 @@ class TestGatedCardPin:
 
         cfg = {"agent": {"reasoning_class_routing": True}}
         assert resolve_card_effort("code", "03", cfg, wired_effort="high") == "high"
-        assert resolve_card_effort("code", "03", cfg, wired_effort="medium") == "medium"
+        # A medium operator pin is clamped to the served level, not forwarded.
+        assert resolve_card_effort("code", "03", cfg, wired_effort="medium") == "high"
+        assert resolve_card_effort("routine", "03", cfg, wired_effort="xhigh") == "xhigh"
+
+
+class TestCardLaneEffort:
+    """«review-gate» lane scheme — the container bug that produced the 400s."""
+
+    def _tmp_kanban(self, tmp_path, monkeypatch):
+        import os
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import profiles
+
+        monkeypatch.setattr(
+            profiles,
+            "profile_exists",
+            lambda name: name
+            in {
+                "03-software-engineer",
+                "15-sre-qa",
+                "09-independent-reviewer",
+                "07-document-producer",
+            },
+        )
+        monkeypatch.setattr(kb, "_provider_route_blocker", lambda _p, _m: None)
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        os.environ["HERMES_HOME"] = str(home)
+        db_path = tmp_path / "lane_kanban.db"
+        os.environ["HERMES_KANBAN_DB"] = str(db_path)
+        kb.init_db()
+        return kb.connect(db_path=db_path), kb
+
+    def test_container_card_is_high_not_medium(self, tmp_path, monkeypatch):
+        # The exact defect: a card whose ONLY child is a review card used to
+        # resolve to "medium" -> HTTP 400 for the whole container lane.
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            parent = kb.create_task(conn, title="контейнер", assignee="03-software-engineer")
+            kb.create_task(
+                conn, title="ревью", assignee="15-sre-qa", parents=[parent]
+            )
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert resolve_card_lane_effort(conn, parent, cfg) == "high"
+        finally:
+            conn.close()
+
+    def test_review_card_is_max(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            rev = kb.create_task(conn, title="ревью", assignee="15-sre-qa")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert resolve_card_lane_effort(conn, rev, cfg) == "max"
+            rev09 = kb.create_task(conn, title="ревью2", assignee="09-independent-reviewer")
+            assert resolve_card_lane_effort(conn, rev09, cfg) == "max"
+        finally:
+            conn.close()
+
+    def test_author_with_review_child_is_high(self, tmp_path, monkeypatch):
+        # Two children: real writing work + a review gate.
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            author = kb.create_task(conn, title="автор", assignee="03-software-engineer")
+            kb.create_task(conn, title="работа", assignee="07-document-producer", parents=[author])
+            kb.create_task(conn, title="ревью", assignee="15-sre-qa", parents=[author])
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert resolve_card_lane_effort(conn, author, cfg) == "high"
+        finally:
+            conn.close()
+
+    def test_no_gate_card_inherits_profile(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            solo = kb.create_task(conn, title="одиночка", assignee="03-software-engineer")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert resolve_card_lane_effort(conn, solo, cfg) is None
+        finally:
+            conn.close()
+
+    def test_lane_is_inert_when_routing_off(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            parent = kb.create_task(conn, title="контейнер", assignee="03-software-engineer")
+            kb.create_task(conn, title="ревью", assignee="15-sre-qa", parents=[parent])
+            cfg = {"agent": {"reasoning_class_routing": False}}
+            assert resolve_card_lane_effort(conn, parent, cfg) is None
+        finally:
+            conn.close()
+
+    def test_lane_never_returns_medium(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            container = kb.create_task(conn, title="c", assignee="03-software-engineer")
+            kb.create_task(conn, title="r", assignee="15-sre-qa", parents=[container])
+            author = kb.create_task(conn, title="a", assignee="03-software-engineer")
+            kb.create_task(conn, title="w", assignee="07-document-producer", parents=[author])
+            kb.create_task(conn, title="r", assignee="15-sre-qa", parents=[author])
+            solo = kb.create_task(conn, title="s", assignee="03-software-engineer")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            for tid in (container, author, solo):
+                got = resolve_card_lane_effort(conn, tid, cfg)
+                assert got not in ("medium", "minimal", "ultra"), (tid, got)
+        finally:
+            conn.close()
+
+    def test_operator_pin_wins_over_lane(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import resolve_card_lane_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            rev = kb.create_task(conn, title="ревью", assignee="15-sre-qa")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            # Operator pinned low: the lane must not override it, only clamp.
+            assert resolve_card_lane_effort(conn, rev, cfg, wired_effort="low") == "low"
+            assert resolve_card_lane_effort(conn, rev, cfg, wired_effort="medium") == "high"
+        finally:
+            conn.close()
 
 
 class TestPinCardEffort:
@@ -468,10 +649,25 @@ class TestPinCardEffort:
             assert pin_card_effort(conn, tid, "low", cfg) is True
             t = kb.get_task(conn, tid)
             assert t.reasoning_effort == "low"
-            # medium is letovo wire-native — the pin survives unchanged
+            # medium is NOT a letovo wire level — it must be written as high,
+            # never stored as the value that 400s the worker.
             assert pin_card_effort(conn, tid, "medium", cfg) is True
             t = kb.get_task(conn, tid)
-            assert t.reasoning_effort == "medium"  # medium survives (experiment v4)
+            assert t.reasoning_effort == "high"
+        finally:
+            conn.close()
+
+    def test_pin_clamps_minimal_and_xhigh(self, tmp_path, monkeypatch):
+        from agent.reasoning_effort_l1 import pin_card_effort
+
+        conn, kb = self._tmp_kanban(tmp_path, monkeypatch)
+        try:
+            tid = kb.create_task(conn, title="t", assignee="worker")
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert pin_card_effort(conn, tid, "minimal", cfg) is True
+            assert kb.get_task(conn, tid).reasoning_effort == "low"
+            assert pin_card_effort(conn, tid, "xhigh", cfg) is True
+            assert kb.get_task(conn, tid).reasoning_effort == "xhigh"
         finally:
             conn.close()
 

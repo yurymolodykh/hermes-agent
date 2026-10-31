@@ -71,11 +71,44 @@ class CustomProfile(ProviderProfile):
                 from agent.reasoning_effort import (
                     OPENAI_COMPAT_WIRE_EFFORTS,
                     clamp_effort,
+                    letovo_wire_domain,
                 )
 
-                top_level["reasoning_effort"] = clamp_effort(
-                    _effort, OPENAI_COMPAT_WIRE_EFFORTS
+                # Endpoint-declared domains win over the generic OpenAI one.
+                # ``provider: letovo`` resolves to this generic ``custom``
+                # profile (the provider has no bundled profile), so without
+                # this branch a ``medium`` pin is forwarded as top-level
+                # reasoning_effort and the vLLM backend answers HTTP 400
+                # ("reasoning_effort must be low, high, xhigh, max, …").
+                # The domain is closed, so strict=True also refuses bespoke
+                # names instead of forwarding them.
+                _domain = letovo_wire_domain(
+                    model=ctx.get("model"), base_url=ctx.get("base_url")
                 )
+                if _domain is not None:
+                    _supported, _overrides = _domain
+                    _clamped = clamp_effort(
+                        _effort, _supported, _overrides, strict=True
+                    )
+                    if _clamped is None:
+                        # Nothing safe to send: omit the field entirely and let
+                        # the backend apply its own default rather than 400.
+                        pass
+                    else:
+                        if _clamped != _effort:
+                            import logging
+
+                            logging.getLogger(__name__).warning(
+                                "letovo wire does not serve reasoning_effort=%r; "
+                                "sent %r instead",
+                                _effort,
+                                _clamped,
+                            )
+                        top_level["reasoning_effort"] = _clamped
+                else:
+                    top_level["reasoning_effort"] = clamp_effort(
+                        _effort, OPENAI_COMPAT_WIRE_EFFORTS
+                    )
 
         return extra_body, top_level
 
