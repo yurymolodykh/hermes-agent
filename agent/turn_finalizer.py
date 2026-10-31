@@ -235,24 +235,43 @@ def _collect_budget_progress_note(
 
     Composition (cheap, no LLM, no network):
 
-    * the tail of the worker's own last visible answer in this run;
+    * the budget-exhaustion answer the model produced for this run
+      (``final_response`` — in production the toolless "what did you get done"
+      summary) — the *last* thing the worker said before stopping;
+    * the tail of the worker's last visible narration in the transcript;
     * the files it created/changed (tool-call history first, then
       ``git status --short`` of the kanban workspace);
     * the iteration counter and the stop step;
     * an explicit ``ВЫПОЛНЕНО РАНЕЕ (не переделывай)`` marker line.
 
+    ``final_response`` is carried separately from the transcript tail on
+    purpose: it is strictly fresher than the last narration row (it is
+    generated after the budget ran out) and it is the only place a worker
+    states what REMAINS. Dropping it made mid-work children inherit a note
+    that stopped one step short of the actual state.
+
     Returns ``""`` — honestly — when the run left no trace at all; an empty
     note lets the splitter fall back to its own recovery sources.
     """
-    tail = _last_assistant_text(messages)
-    if not tail and isinstance(final_response, str):
-        tail = final_response.strip()[-_PROGRESS_TAIL_LIMIT:]
+    transcript_tail = _last_assistant_text(messages)
+    final_tail = ""
+    if isinstance(final_response, str):
+        final_tail = final_response.strip()[-_PROGRESS_TAIL_LIMIT:]
+    # Do not repeat the same text twice under two labels.
+    if final_tail and transcript_tail:
+        if transcript_tail in final_tail:
+            transcript_tail = ""
+        elif final_tail in transcript_tail:
+            final_tail = ""
+    if not final_tail:
+        final_tail = transcript_tail
+        transcript_tail = ""
     paths = _run_file_mutation_paths(messages)
     path_origin = "tool-call history"
     if not paths:
         paths = _git_status_paths(os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip())
         path_origin = "git status"
-    if not tail and not paths:
+    if not final_tail and not transcript_tail and not paths:
         return ""
 
     parts: list[str] = [PROGRESS_DONE_HEADER + ": перечисленное ниже уже сделано в этом прогоне."]
@@ -260,8 +279,10 @@ def _collect_budget_progress_note(
         f"Остановка по бюджету: шаг {api_call_count}/{max_iterations} "
         f"(причина выхода: {exit_reason})."
     )
-    if tail:
-        parts.append("Последнее, что воркер успел сказать (хвост ответа):\n" + tail)
+    if final_tail:
+        parts.append("Что воркер сообщил при остановке (итог прогона):\n" + final_tail)
+    if transcript_tail:
+        parts.append("Последнее, что воркер успел сказать (хвост ответа):\n" + transcript_tail)
     if paths:
         shown = paths[:_PROGRESS_FILE_LIMIT]
         parts.append(

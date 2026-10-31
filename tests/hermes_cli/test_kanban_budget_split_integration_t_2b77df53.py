@@ -240,3 +240,97 @@ def test_iteration_budget_exit_splits_with_real_progress_note(
         print(f"- {cid}: {body.splitlines()[0] if body else ''}")
         print("  has progress block:", "Progress note from the previous worker" in body)
         print("  has reports/draft.md:", "reports/draft.md" in body)
+
+
+class _MidWorkAgent(_BudgetAgent):
+    """Same seam, but the worker's last words describe UNFINISHED work.
+
+    Reviewer reproduction on 8c4ecd0589: this exact tail used to be classified
+    close-only, so the remainder (раздел 3) got no card at all.
+
+    Uses ``_turn_exit_reason="budget_exhausted"`` — the branch where the model
+    is actually asked for a final summary and ``_handle_max_iterations`` runs.
+    (The transcript row alone says only «Готовы разделы 1 и 2», i.e. it stops
+    one step short of what remains; the summary is the fresher text and must
+    reach the children.)
+    """
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Раздел 1 и 2 готовы, осталось закрыть раздел 3."
+
+
+def test_mid_work_exit_through_the_real_seam_still_splits(
+    kanban_home, no_llm, monkeypatch, tmp_path,
+):
+    workspace = tmp_path / "ws2"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Собрать отчёт по разделам 1-4",
+            body="acceptance: all four sections present",
+            assignee="03-software-engineer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    messages = [
+        {"role": "user", "content": "собери отчёт"},
+        {
+            "role": "assistant",
+            "content": "Готовы разделы 1 и 2.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {"path": "reports/sections12.md", "content": "# 1-2"}
+                    ),
+                },
+            }],
+        },
+        {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+    ]
+
+    agent = _MidWorkAgent(max_iterations=3)
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id=tid,
+        turn_id="turn-mid",
+        user_message="собери отчёт",
+        original_user_message="собери отчёт",
+        _should_review_memory=False,
+        _turn_exit_reason="budget_exhausted",
+    )
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+        payload = events[0].payload if events else {}
+        children = [kb.get_task(conn, cid) for cid in (payload.get("child_ids") or [])]
+    assert len(events) == 1
+    assert payload.get("via") != "close_only", payload
+    child_ids = [c.id for c in children if c is not None]
+    assert len(child_ids) >= 2, f"mid-work must not collapse to one card: {child_ids}"
+    # No child may promise the work is already finished.
+    for c in children:
+        if c is None:
+            continue
+        assert "ALREADY DONE" not in (c.body or ""), c.id
+        assert "осталось закрыть раздел 3" in (c.body or ""), c.id
+    print("\n=== mid-work split (real DB rows) ===")
+    print("payload.source =", payload.get("progress_note_source"),
+          "| via =", payload.get("via"), "| children =", child_ids)

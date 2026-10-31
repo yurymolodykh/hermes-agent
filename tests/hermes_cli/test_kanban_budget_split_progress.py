@@ -400,6 +400,58 @@ def test_open_work_progress_still_splits_into_two():
     assert len(children) == 2
 
 
+# Negative controls for the close-only detector. Reviewer finding on 8c4ecd0589:
+# the bare substring pair ("остал", "закры") fired on «осталось от-КРЫ-ть раздел 3»
+# and on «осталось закрыть <работу>», collapsing UNFINISHED work into one
+# "verify and close" card — the remainder then had no card at all.
+@pytest.mark.parametrize(
+    "progress",
+    [
+        # «закры» hidden inside «открыть»
+        "Реализовал парсер, но осталось открыть вопрос с лицензией.",
+        "Раздел 1 и 2 готовы, осталось открыть раздел 3.",
+        # «осталось закрыть <работу>» — closing a WORK ITEM, not the card
+        "Раздел 1 и 2 готовы, осталось закрыть раздел 3.",
+        "Сделал парсер, осталось закрыть тестами функцию parse().",
+        "Осталось закрыть вопрос с лицензией и дописать раздел 4.",
+        "Реализовал API, осталось закрыть обработку ошибок в клиенте.",
+        "Схема БД готова, осталось закрыть миграции на прод.",
+        # explicit negation beats a positive marker in the same text
+        "Работа выполнена не полностью: раздел 3 пустой, надо дописать.",
+        "Работа завершена не полностью, осталось закрыть раздел 3.",
+        # «закрыть задачи/смену» — work items, not the card
+        "Не всё сделано: осталось закрыть задачи 5 и 6.",
+        "Ещё не готово, осталось закрыть смену и сессию.",
+    ],
+)
+def test_mid_work_progress_is_not_close_only(progress):
+    assert bsplit._progress_reports_completion(progress) is False
+    children = bsplit._fallback_children("t_p", "report", "body", progress)
+    assert len(children) == 2
+    for child in children:
+        assert "Progress note from the previous worker" in child["body"]
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        "Осталось закрыть карточку.",
+        "Отчёт готов, осталось только закрыть.",
+        "Работа уже выполнена, осталось закрыть задачу.",
+        "Всё сделано, осталось закрыть тикет.",
+        # the shape the turn_finalizer actually emits in production: the
+        # «ВЫПОЛНЕНО РАНЕЕ» header + the model's own closing sentence
+        "ВЫПОЛНЕНО РАНЕЕ (не переделывай): перечисленное ниже уже сделано.\n\n"
+        "Что воркер сообщил при остановке (итог прогона):\n"
+        "Работа выполнена, артефакт готов, осталось закрыть карточку.",
+    ],
+)
+def test_bare_close_remainder_is_close_only(progress):
+    """The owner's own shape — «выполнено, осталось закрыть» — must still fire."""
+    assert bsplit._progress_reports_completion(progress) is True
+    assert len(bsplit._fallback_children("t_p", "report", "body", progress)) == 1
+
+
 def test_run_budget_split_close_only_creates_one_card(kanban_home, no_llm):
     with kb.connect() as conn:
         tid = kb.create_task(

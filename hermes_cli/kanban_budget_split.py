@@ -36,6 +36,7 @@ behaviour).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -122,11 +123,50 @@ _BUILTIN_CLOSE_ONLY_MARKERS = (
     "не нужно переделывать",
 )
 
-# "осталось <…> закрыть" — the shape the owner used («выполнено, осталось
-# закрыть»). Matched as a combination so a note that merely mentions closing
-# something unrelated does not collapse a real split.
-_CLOSE_REMAINDER_WORDS = ("остал", "закры")
-_CLOSE_REMAINDER_NEGATIONS = ("осталось сделать", "осталось написать", "осталось реализовать")
+# "осталось (только)? закрыть <карточку|тикет|этот вопрос>" — the shape the
+# owner used («выполнено, осталось закрыть»). Anchored on the *closing
+# artifact*, not on the bare substring pair "остал"+"закры": «осталось открыть
+# раздел 3» and «осталось закрыть тестами функцию parse()» both contain those
+# substrings while describing remaining WORK — collapsing them into one
+# "verify and close" card silently drops the remainder of the task.
+#
+# Deliberately NOT accepted: «осталось закрыть задачи/смену/сессию» — those are
+# work items, not the card. The asymmetry is intentional: a false positive
+# drops unfinished work with no card at all, while a false negative only costs
+# one redundant split.
+_CLOSE_REMAINDER_RE = re.compile(
+    r"осталось\s+(?:только\s+|лишь\s+)?закрыть"
+    r"(?=$|[.,;:!?…)»\"']"
+    r"|\s+(?:карточк|тикет|вопрос\s+о\s+закрыти|этот\s+вопрос))",
+    re.IGNORECASE,
+)
+# Negation guard: a note that explicitly says work is NOT finished must never
+# resolve to the single close-only card, even if a positive marker appears in
+# the same text (e.g. "работа выполнена не полностью, осталось …").
+_CLOSE_ONLY_NEGATIONS = (
+    "не полностью",
+    "не выполнена",
+    "не выполнено",
+    "не готов",
+    "не готова",
+    "не готово",
+    "не закончена",
+    "не закончено",
+    "не завершена",
+    "не завершено",
+    "не всё сделано",
+    "не все сделано",
+    "не всё готово",
+    "не все готово",
+    "ещё не готово",
+    "еще не готово",
+    "not complete",
+    "not fully",
+    "not finished",
+    "not done",
+    "incomplete",
+    "still remaining",
+)
 
 
 def _progress_reports_completion(progress: str) -> bool:
@@ -137,15 +177,19 @@ def _progress_reports_completion(progress: str) -> bool:
     :func:`agent.turn_finalizer._collect_budget_progress_note` always emits.
     That header means "this part already landed, continue from here", so
     matching it here would collapse every real split into a single card.
+
+    Negation first: a note that says the work is NOT finished wins over any
+    positive marker in the same text, because a false "verify and close" drops
+    the remaining work entirely (worse than restarting it).
     """
     if not progress or not isinstance(progress, str):
         return False
     low = progress.lower()
+    if any(neg in low for neg in _CLOSE_ONLY_NEGATIONS):
+        return False
     if any(marker.lower() in low for marker in _BUILTIN_CLOSE_ONLY_MARKERS):
         return True
-    if any(neg in low for neg in _CLOSE_REMAINDER_NEGATIONS):
-        return False
-    return all(word in low for word in _CLOSE_REMAINDER_WORDS)
+    return _CLOSE_REMAINDER_RE.search(low) is not None
 
 
 @dataclass
