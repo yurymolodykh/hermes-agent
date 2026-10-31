@@ -8540,6 +8540,8 @@ def split_task_on_budget(
     source: str = "unknown",
     max_depth: Optional[int] = None,
     progress_note: Optional[str] = None,
+    progress_note_source: Optional[str] = None,
+    allow_single: bool = False,
 ) -> Optional[list[str]]:
     """Atomically split a ``running`` card into 2+ child cards.
 
@@ -8559,16 +8561,29 @@ def split_task_on_budget(
     * a ``budget_split`` event + audit comment is written on the card and a
       ``created`` event (``from_budget_split_of``) on each child.
 
+    ``progress_note`` is the deterministic handoff captured from the
+    exhausted run (or recovered from the card's last comment / workspace).
+    Alongside it the event records ``progress_note_source``
+    (``run_buffer`` / ``parent_comment`` / ``workspace`` / ``none``) and the
+    real ``progress_note_len``, so a note that silently went missing becomes
+    visible in board statistics instead of being invisible.
+
+    ``allow_single`` relaxes the 2+ child floor for the close-only case: the
+    progress note said the work is actually done and only the card is still
+    open, so the correct fan-out is ONE "verify and close" child — re-splitting
+    finished work is what burned 16 cards on t_2d037564.
+
     Refusals (returns ``None``, never raises): card not ``running``,
-    ``expected_run_id`` mismatch, fewer than 2 valid children, or the task
-    already sits at ``max_depth`` budget splits in its lineage
-    (infinite-fan-out guard — caller falls back to the legacy
+    ``expected_run_id`` mismatch, fewer than the allowed number of valid
+    children, or the task already sits at ``max_depth`` budget splits in its
+    lineage (infinite-fan-out guard — caller falls back to the legacy
     blocked/failure path).
 
     After the txn commits, ``recompute_ready`` promotes parent-free children
     to ``ready`` so the dispatcher picks them up on its next tick.
     """
-    if not isinstance(children, list) or len(children) < 2:
+    min_children = 1 if allow_single else 2
+    if not isinstance(children, list) or len(children) < min_children:
         return None
     cleaned: list[dict] = []
     for idx, child in enumerate(children):
@@ -8714,13 +8729,17 @@ def split_task_on_budget(
                 now,
             ),
         )
+        _note = progress_note or ""
+        _note_source = progress_note_source or ("run_buffer" if _note else "none")
         _append_event(
             conn, task_id, "budget_split",
             {
                 "child_ids": child_ids,
                 "source": source,
                 "depth": split_depth,
-                "progress_note": (progress_note or "")[:300],
+                "progress_note": _note[:300],
+                "progress_note_len": len(_note),
+                "progress_note_source": _note_source,
             },
             run_id=run_id,
         )

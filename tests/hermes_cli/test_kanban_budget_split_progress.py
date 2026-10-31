@@ -1,0 +1,424 @@
+"""Progress handoff across the automatic budget split.
+
+Regression cover for the turn_finalizer → budget_split seam: of 542 automatic
+splits in one month, 538 handed their children an EMPTY ``progress_note``
+because ``_record_kanban_budget_exhausted`` never passed the argument. Children
+then restarted the work from scratch and exhausted their own budget again
+(t_2d037564: 16 cards in 4.5h).
+
+Four contracts are pinned here:
+
+1. the finalizer collects a deterministic note from the run's own transcript /
+   tool-call history and passes it through to ``run_budget_split``;
+2. ``_fallback_children`` puts the note into the body of BOTH children;
+3. an empty note is recorded honestly as ``progress_note_source="none"`` (after
+   the comment / workspace recovery sources are tried);
+4. a note that reports the work as finished resolves to ONE "verify and close"
+   card, not 2-4.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent import turn_finalizer
+from hermes_cli import kanban_budget_split as bsplit
+from hermes_cli import kanban_db as kb
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _n: True)
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def no_llm(monkeypatch):
+    """Aux LLM unavailable → deterministic fallback path only."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", None)
+    monkeypatch.setattr(bsplit, "_load_config", lambda: {})
+
+
+@pytest.fixture
+def no_plugins(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+
+class _BudgetAgent:
+    """Minimal agent double for the iteration-limit exit path."""
+
+    def __init__(self, max_iterations=60):
+        self.max_iterations = max_iterations
+        self.iteration_budget = SimpleNamespace(
+            remaining=0, used=max_iterations, max_total=max_iterations
+        )
+        self.quiet_mode = True
+        self.model = "test-model"
+        self.provider = "test-provider"
+        self.base_url = ""
+        self.session_id = "sess-progress"
+        self.context_compressor = SimpleNamespace(last_prompt_tokens=0)
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_reasoning_tokens = 0
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+        self.session_estimated_cost_usd = 0
+        self.session_cost_status = "unknown"
+        self.session_cost_source = "test"
+        self._tool_guardrail_halt_decision = None
+        self._interrupt_message = None
+        self._response_was_previewed = False
+        self._skill_nudge_interval = 0
+        self._iters_since_skill = 0
+        self.valid_tool_names = []
+        self._completion_explainer = False
+        self.max_iterations_calls = 0
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        self.max_iterations_calls += 1
+        return "summary from extra call"
+
+    def _emit_status(self, *_a, **_kw):
+        pass
+
+    def _safe_print(self, *_a, **_kw):
+        pass
+
+    def _save_trajectory(self, *_a, **_kw):
+        pass
+
+    def _cleanup_task_resources(self, *_a, **_kw):
+        pass
+
+    def _drop_trailing_empty_response_scaffolding(self, messages):
+        pass
+
+    def _persist_session(self, messages, conversation_history):
+        pass
+
+    def _file_mutation_verifier_enabled(self):
+        return False
+
+    def _turn_completion_explainer_enabled(self):
+        return False
+
+    def _format_turn_completion_explanation(self, _r, _c=None):
+        return ""
+
+    def _drain_pending_steer(self):
+        return None
+
+    def _sync_external_memory_for_turn(self, **_kw):
+        pass
+
+    def clear_interrupt(self):
+        pass
+
+
+def _finalize_budget_exit(agent, messages, final_response=None, exit_reason="unknown"):
+    return turn_finalizer.finalize_turn(
+        agent,
+        final_response=final_response,
+        api_call_count=agent.max_iterations,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason=exit_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contract 1 — turn_finalizer passes a non-empty progress_note
+# ---------------------------------------------------------------------------
+
+def test_finalizer_passes_collected_progress_note_to_budget_split(
+    monkeypatch, no_plugins,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_progress")
+    captured = {}
+
+    def _fake_split(task_id, *, source, progress_note="", expected_run_id=None):
+        captured["task_id"] = task_id
+        captured["source"] = source
+        captured["progress_note"] = progress_note
+        return bsplit.BudgetSplitResult(True, child_ids=["c1", "c2"], via="fallback")
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_budget_split.run_budget_split", _fake_split,
+    )
+    agent = _BudgetAgent()
+    messages = [
+        {"role": "user", "content": "build the report"},
+        {
+            "role": "assistant",
+            "content": "Собрал каркас отчёта, осталось наполнить раздел 3.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": '{"path": "reports/draft.md", "content": "x"}',
+                },
+            }],
+        },
+        {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+    ]
+
+    _finalize_budget_exit(agent, messages)
+
+    note = captured["progress_note"]
+    assert note, "progress_note must be non-empty when the run left a trace"
+    assert captured["task_id"] == "t_progress"
+    assert captured["source"] == "iteration_budget"
+    # What the worker said and what it wrote both survive into the handoff.
+    assert "Собрал каркас отчёта" in note
+    assert "reports/draft.md" in note
+    # The explicit do-not-redo marker and the stop counter are present.
+    assert turn_finalizer.PROGRESS_DONE_HEADER in note
+    assert "60/60" in note
+
+
+def test_finalizer_writes_empty_note_when_run_left_no_trace(
+    monkeypatch, no_plugins,
+):
+    """No assistant text, no file mutations, no workspace → honest empty note.
+
+    Exercised through the bounded-fallback branch (``elif budget_exhausted``):
+    the iteration-limit summary path always yields *some* text (the model's own
+    summary), which is a legitimate trace. Here the turn died without an answer
+    at all, so the note must stay honestly empty.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_traceless")
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
+    captured = {}
+
+    def _fake_split(task_id, *, source, progress_note="", expected_run_id=None):
+        captured["progress_note"] = progress_note
+        return bsplit.BudgetSplitResult(True, child_ids=["c1", "c2"], via="fallback")
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_budget_split.run_budget_split", _fake_split,
+    )
+    agent = _BudgetAgent()
+    _finalize_budget_exit(
+        agent,
+        [{"role": "user", "content": "task"}],
+        final_response=None,
+        exit_reason="provider_failure",
+    )
+
+    assert captured["progress_note"] == ""
+
+
+def test_collect_progress_note_uses_final_response_fallback():
+    """When the transcript has no assistant row, the delivered response is used."""
+    note = turn_finalizer._collect_budget_progress_note(
+        messages=[{"role": "user", "content": "task"}],
+        final_response="Готово: файл out.md создан.",
+        api_call_count=12,
+        max_iterations=12,
+        exit_reason="max_iterations_reached(12/12)",
+    )
+    assert "Готово: файл out.md создан." in note
+    assert turn_finalizer.PROGRESS_DONE_HEADER in note
+
+
+# ---------------------------------------------------------------------------
+# Contract 2 — the note reaches BOTH fallback children
+# ---------------------------------------------------------------------------
+
+def test_fallback_children_put_progress_block_into_both_bodies():
+    progress = "Сделал каркас, осталось наполнить раздел 3. Файлы: reports/draft.md"
+    children = bsplit._fallback_children(
+        "t_parent", "build report", "acceptance: report renders", progress,
+    )
+    assert len(children) == 2
+    for child in children:
+        assert "Progress note from the previous worker" in child["body"]
+        assert "reports/draft.md" in child["body"]
+
+
+def test_run_budget_split_child_bodies_carry_the_note(kanban_home, no_llm):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="big work", body="acceptance: it works",
+            assignee="03-software-engineer",
+        )
+        assert kb.claim_task(conn, tid) is not None
+
+    res = bsplit.run_budget_split(
+        tid,
+        source="iteration_budget",
+        progress_note="Сделал половину: src/a.py готов, осталось src/b.py",
+        cfg={},
+    )
+    assert res.ok is True
+    assert res.child_ids and len(res.child_ids) == 2
+
+    with kb.connect() as conn:
+        bodies = [kb.get_task(conn, cid).body for cid in res.child_ids]
+    for body in bodies:
+        assert "Progress note from the previous worker" in body
+        assert "src/a.py готов" in body
+
+
+# ---------------------------------------------------------------------------
+# Contract 3 — empty progress is recorded honestly, after recovery attempts
+# ---------------------------------------------------------------------------
+
+def test_empty_progress_records_source_none(kanban_home, no_llm, monkeypatch):
+    monkeypatch.setattr(bsplit, "_recover_from_workspace", lambda _p: "")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bare work", body="body")
+        assert kb.claim_task(conn, tid) is not None
+
+    res = bsplit.run_budget_split(tid, source="iteration_budget", progress_note="", cfg={})
+    assert res.ok is True
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["progress_note_source"] == "none"
+    assert payload["progress_note_len"] == 0
+    assert payload["progress_note"] == ""
+
+
+def test_recovery_from_parent_comment_is_recorded(kanban_home, no_llm):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="work with notes", body="body")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(
+            conn, tid, "03-software-engineer",
+            "Сделал шаг 1 и 2: src/parse.py готов, тесты проходят. "
+            "Осталось подключить CLI.",
+        )
+
+    res = bsplit.run_budget_split(tid, source="iteration_budget", progress_note="", cfg={})
+    assert res.ok is True
+
+    with kb.connect() as conn:
+        payload = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"][0].payload
+        bodies = [kb.get_task(conn, cid).body for cid in res.child_ids]
+    assert payload["progress_note_source"] == "parent_comment"
+    assert payload["progress_note_len"] > 0
+    assert "src/parse.py готов" in payload["progress_note"]
+    assert any("src/parse.py готов" in b for b in bodies)
+
+
+def test_recovery_from_workspace_is_recorded(kanban_home, no_llm, monkeypatch):
+    monkeypatch.setattr(
+        bsplit, "_recover_from_workspace",
+        lambda _p: "Рабочий каталог карточки содержит изменённые файлы:\n- M src/x.py",
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ws work", body="body")
+        assert kb.claim_task(conn, tid) is not None
+
+    res = bsplit.run_budget_split(tid, source="iteration_budget", cfg={})
+    assert res.ok is True
+    with kb.connect() as conn:
+        payload = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"][0].payload
+    assert payload["progress_note_source"] == "workspace"
+    assert "- M src/x.py" in payload["progress_note"]
+
+
+def test_caller_supplied_note_is_recorded_as_run_buffer(kanban_home, no_llm):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="buffered", body="body")
+        assert kb.claim_task(conn, tid) is not None
+
+    res = bsplit.run_budget_split(
+        tid, source="iteration_budget",
+        progress_note="ВЫПОЛНЕНО РАНЕЕ: шаг 1/60. Файлы: src/a.py", cfg={},
+    )
+    assert res.ok is True
+    with kb.connect() as conn:
+        payload = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"][0].payload
+    assert payload["progress_note_source"] == "run_buffer"
+    assert payload["progress_note_len"] == len("ВЫПОЛНЕНО РАНЕЕ: шаг 1/60. Файлы: src/a.py")
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 — finished work resolves to ONE "verify and close" card
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        "Работа выполнена полностью, осталось только закрыть карточку.",
+        "The work is already done — only the card is still open.",
+        "Артефакт собран и проверен, осталось закрыть.",
+        "already completed; nothing left to implement",
+    ],
+)
+def test_close_only_progress_creates_single_card(progress):
+    children = bsplit._fallback_children("t_p", "report", "body", progress)
+    assert len(children) == 1
+    assert "Verify and close" in children[0]["title"]
+    body = children[0]["body"]
+    assert "ALREADY DONE" in body
+    assert "DO NOT" in body and "redo" in body
+    # The note itself is still attached for the closing worker.
+    assert "Progress note from the previous worker" in body
+
+
+def test_open_work_progress_still_splits_into_two():
+    """The «ВЫПОЛНЕНО РАНЕЕ» header alone must NOT collapse a real split."""
+    progress = (
+        "ВЫПОЛНЕНО РАНЕЕ (не переделывай): перечисленное ниже уже сделано в этом прогоне.\n\n"
+        "Остановка по бюджету: шаг 40/40 (причина выхода: max_iterations_reached(40/40)).\n\n"
+        "Файлы, созданные/изменённые в этом прогоне (tool-call history):\n- src/a.py"
+    )
+    assert bsplit._progress_reports_completion(progress) is False
+    children = bsplit._fallback_children("t_p", "report", "body", progress)
+    assert len(children) == 2
+
+
+def test_run_budget_split_close_only_creates_one_card(kanban_home, no_llm):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="finished report", body="acceptance: report exists",
+            assignee="03-software-engineer",
+        )
+        assert kb.claim_task(conn, tid) is not None
+
+    res = bsplit.run_budget_split(
+        tid, source="iteration_budget",
+        progress_note="Отчёт полностью готов, осталось только закрыть карточку.",
+        cfg={},
+    )
+    assert res.ok is True
+    assert res.via == "close_only"
+    assert len(res.child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, res.child_ids[0])
+        root = kb.get_task(conn, tid)
+    assert child.status == "ready"
+    assert "Verify and close" in child.title
+    assert root.status == "todo"

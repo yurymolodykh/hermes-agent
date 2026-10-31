@@ -118,11 +118,166 @@ def _append_fast_budget_footer(final_response: str, agent: Any) -> str:
         return final_response
 
 
+_PROGRESS_TAIL_LIMIT = 1500
+_PROGRESS_FILE_LIMIT = 40
+_PROGRESS_GIT_LINES = 25
+
+# Header line of every collected progress note. A following worker must treat
+# the listed work as already landed. NOTE: the budget-split completion
+# detector (``hermes_cli.kanban_budget_split._progress_reports_completion``)
+# deliberately does NOT key on this header — otherwise every split would
+# collapse into a single "close only" card. Keep the two vocabularies apart.
+PROGRESS_DONE_HEADER = "ВЫПОЛНЕНО РАНЕЕ (не переделывай)"
+
+
+def _last_assistant_text(messages, limit: int = _PROGRESS_TAIL_LIMIT) -> str:
+    """Tail of the most recent visible assistant text in the run transcript.
+
+    Walks the transcript backwards so a tool-call-only tail does not hide the
+    last narration the model actually produced. Returns ``""`` when the run
+    left no visible text at all (never invents content).
+    """
+    if not isinstance(messages, (list, tuple)):
+        return ""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        try:
+            text = flatten_message_text(msg.get("content")).strip()
+        except Exception:
+            continue
+        if text:
+            return text[-limit:] if len(text) > limit else text
+    return ""
+
+
+def _run_file_mutation_paths(messages) -> list[str]:
+    """Paths the worker passed to ``write_file`` / ``patch`` in this run.
+
+    Reads the run's own tool-call history (assistant rows carrying
+    ``tool_calls``) — no filesystem probing, no LLM. Order-preserving and
+    de-duplicated; unknown/plugin tools are ignored.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(messages, (list, tuple)):
+        return paths
+    try:
+        from agent.tool_dispatch_helpers import _extract_file_mutation_targets
+    except Exception:
+        return paths
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name") or ""
+            raw_args = fn.get("arguments")
+            args = raw_args if isinstance(raw_args, dict) else None
+            if args is None and isinstance(raw_args, str) and raw_args.strip():
+                try:
+                    import json as _json
+                    parsed = _json.loads(raw_args)
+                except Exception:
+                    parsed = None
+                args = parsed if isinstance(parsed, dict) else None
+            if not isinstance(args, dict):
+                continue
+            try:
+                targets = _extract_file_mutation_targets(str(name), args)
+            except Exception:
+                continue
+            for p in targets:
+                if p and p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+            if len(paths) >= _PROGRESS_FILE_LIMIT:
+                return paths[:_PROGRESS_FILE_LIMIT]
+    return paths
+
+
+def _git_status_paths(workspace_path: str) -> list[str]:
+    """``git status --short`` lines for the task workspace (bounded, best-effort)."""
+    if not workspace_path:
+        return []
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace_path), "status", "--short"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    return [ln.rstrip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+
+
+def _collect_budget_progress_note(
+    *,
+    messages,
+    final_response,
+    api_call_count: int,
+    max_iterations: int,
+    exit_reason,
+) -> str:
+    """Assemble the deterministic progress note handed to the budget splitter.
+
+    Composition (cheap, no LLM, no network):
+
+    * the tail of the worker's own last visible answer in this run;
+    * the files it created/changed (tool-call history first, then
+      ``git status --short`` of the kanban workspace);
+    * the iteration counter and the stop step;
+    * an explicit ``ВЫПОЛНЕНО РАНЕЕ (не переделывай)`` marker line.
+
+    Returns ``""`` — honestly — when the run left no trace at all; an empty
+    note lets the splitter fall back to its own recovery sources.
+    """
+    tail = _last_assistant_text(messages)
+    if not tail and isinstance(final_response, str):
+        tail = final_response.strip()[-_PROGRESS_TAIL_LIMIT:]
+    paths = _run_file_mutation_paths(messages)
+    path_origin = "tool-call history"
+    if not paths:
+        paths = _git_status_paths(os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip())
+        path_origin = "git status"
+    if not tail and not paths:
+        return ""
+
+    parts: list[str] = [PROGRESS_DONE_HEADER + ": перечисленное ниже уже сделано в этом прогоне."]
+    parts.append(
+        f"Остановка по бюджету: шаг {api_call_count}/{max_iterations} "
+        f"(причина выхода: {exit_reason})."
+    )
+    if tail:
+        parts.append("Последнее, что воркер успел сказать (хвост ответа):\n" + tail)
+    if paths:
+        shown = paths[:_PROGRESS_FILE_LIMIT]
+        parts.append(
+            f"Файлы, созданные/изменённые в этом прогоне ({path_origin}):\n"
+            + "\n".join(f"- {p}" for p in shown)
+        )
+    return "\n\n".join(parts)
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    *,
+    progress_note: str = "",
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
@@ -131,6 +286,12 @@ def _record_kanban_budget_exhausted(
     into 2+ child cards and the original waits on the graph — no human. Only
     when the split is disabled/refused (depth cap, task not running, DB
     error) does this fall back to the legacy failure record below.
+
+    ``progress_note`` is the deterministic handoff assembled by
+    :func:`_collect_budget_progress_note` (what the worker already landed).
+    It is passed through to ``run_budget_split`` so the children continue
+    instead of restarting — the missing argument that made 538 of 542 splits
+    hand their children an empty note.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
@@ -151,6 +312,7 @@ def _record_kanban_budget_exhausted(
         split = run_budget_split(
             kanban_task,
             source="iteration_budget",
+            progress_note=progress_note,
             expected_run_id=_expected_run_id,
         )
         if split.ok:
@@ -308,6 +470,13 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                progress_note=_collect_budget_progress_note(
+                    messages=messages,
+                    final_response=final_response,
+                    api_call_count=api_call_count,
+                    max_iterations=agent.max_iterations,
+                    exit_reason=_turn_exit_reason,
+                ),
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
@@ -322,6 +491,13 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                progress_note=_collect_budget_progress_note(
+                    messages=messages,
+                    final_response=final_response,
+                    api_call_count=api_call_count,
+                    max_iterations=agent.max_iterations,
+                    exit_reason=_turn_exit_reason,
+                ),
             )
 
     # Determine if conversation completed successfully

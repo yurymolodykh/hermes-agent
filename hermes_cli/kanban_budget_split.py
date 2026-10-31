@@ -71,6 +71,12 @@ Output a single JSON object with this exact shape:
 
 Rules:
   - Exactly 2 to 4 tasks. Each must be strictly smaller than the original.
+  - EXCEPTION — the close-only case: when the progress note states that the
+    work is actually FINISHED and only the card is still open (artifact
+    produced, tests run, nothing left to implement), do NOT decompose it.
+    Output exactly ONE task titled "verify and close: <title>" whose body says
+    the artifact already exists and must NOT be redone. Re-splitting finished
+    work into 2-4 fresh workers is the failure this rule exists to stop.
   - "parents" is a list of 0-based INDICES into this same "tasks" list.
     Tasks with no parents run in PARALLEL. Tasks with parents wait until
     every parent completes.
@@ -91,7 +97,55 @@ Body:
 
 Worker's last progress note (partial, budget ran out mid-work):
 {progress}
+
+Rule that overrides everything above: if the progress note says the work is
+actually FINISHED and only the card is still open (artifact built, tests run,
+only a verify-and-close step left), do NOT split it into parts — output
+EXACTLY ONE task titled "verify and close: <title>" that re-uses the finished
+artifact and does not redo it. Otherwise output 2-4 tasks as specified.
 """
+
+_BUILTIN_CLOSE_ONLY_MARKERS = (
+    "work is already done",
+    "already completed",
+    "already finished",
+    "only the card is still open",
+    "nothing left to implement",
+    "работа выполнена",
+    "работа уже выполнена",
+    "всё сделано",
+    "все сделано",
+    "осталось только закрыть",
+    "осталось закрыть карточку",
+    "только закрыть карточку",
+    "переделывать не нужно",
+    "не нужно переделывать",
+)
+
+# "осталось <…> закрыть" — the shape the owner used («выполнено, осталось
+# закрыть»). Matched as a combination so a note that merely mentions closing
+# something unrelated does not collapse a real split.
+_CLOSE_REMAINDER_WORDS = ("остал", "закры")
+_CLOSE_REMAINDER_NEGATIONS = ("осталось сделать", "осталось написать", "осталось реализовать")
+
+
+def _progress_reports_completion(progress: str) -> bool:
+    """True when the progress note says the work is done and only closing remains.
+
+    Deliberately narrow — it keys on explicit completion phrasing, NOT on the
+    ``ВЫПОЛНЕНО РАНЕЕ`` header that
+    :func:`agent.turn_finalizer._collect_budget_progress_note` always emits.
+    That header means "this part already landed, continue from here", so
+    matching it here would collapse every real split into a single card.
+    """
+    if not progress or not isinstance(progress, str):
+        return False
+    low = progress.lower()
+    if any(marker.lower() in low for marker in _BUILTIN_CLOSE_ONLY_MARKERS):
+        return True
+    if any(neg in low for neg in _CLOSE_REMAINDER_NEGATIONS):
+        return False
+    return all(word in low for word in _CLOSE_REMAINDER_WORDS)
 
 
 @dataclass
@@ -160,12 +214,45 @@ def _budget_split_max_depth(cfg: Optional[dict] = None) -> int:
     return max(1, val)
 
 
+def _close_only_child(task_id: str, title: str, body: str, progress: str) -> dict:
+    """The single "verify and close" card for an already-finished split."""
+    safe_title = _truncate(title or "task", 100)
+    return {
+        "title": f"[close only] Verify and close: {safe_title}",
+        "body": (
+            "Parent card: " + task_id + "\n"
+            "Original title: " + safe_title + "\n\n"
+            "Original body:\n" + (body or "(no body)")
+            + "\n\nProgress note from the previous worker (budget ran out "
+            "mid-work — continue from here, do NOT restart from scratch "
+            "unless the state is broken):\n"
+            + _truncate(progress, 2000)
+            + "\n\nYOUR JOB: the work described above is ALREADY DONE — the "
+            "artifact exists and was produced by the previous worker. DO NOT "
+            "redo it, do not rewrite the artifact, do not start from scratch. "
+            "Only verify the acceptance criteria from the original body "
+            "against what already exists, then close the card with a short "
+            "verification summary (what was checked, with what result). If "
+            "you find a genuine defect, fix exactly that defect and nothing "
+            "else."
+        ),
+        "parents": [],
+    }
+
+
 def _fallback_children(task_id: str, title: str, body: str, progress: str) -> list[dict]:
-    """Deterministic 2-card serial split — no LLM required, always succeeds.
+    """Deterministic split — no LLM required, always succeeds.
 
     Child 1 continues the remaining work (primed with the progress note);
     child 2 waits on child 1, then finishes/verifies and reports.
+
+    Exception (class C): when the progress note reports the work as actually
+    finished with only the card still open, resolve to ONE "verify and close"
+    child instead of 2-4 — re-splitting finished work is the failure mode that
+    produced 16 cards on t_2d037564.
     """
+    if _progress_reports_completion(progress):
+        return [_close_only_child(task_id, title, body, progress)]
     safe_title = _truncate(title or "task", 100)
     progress_block = ""
     if progress:
@@ -284,6 +371,87 @@ def _profile_author() -> str:
     )
 
 
+# Sources of a recovered progress note, in priority order. Recorded on the
+# ``budget_split`` event as ``progress_note_source`` so the "note went missing"
+# class of failure is measurable instead of invisible.
+PROGRESS_SOURCE_RUN_BUFFER = "run_buffer"
+PROGRESS_SOURCE_PARENT_COMMENT = "parent_comment"
+PROGRESS_SOURCE_WORKSPACE = "workspace"
+PROGRESS_SOURCE_NONE = "none"
+
+_RECOVERY_COMMENT_LIMIT = 1500
+_RECOVERY_WORKSPACE_FILES = 20
+
+
+def _recover_from_parent_comment(conn, task_id: str) -> str:
+    """Last non-trivial comment on the card (the worker's own handoff notes)."""
+    try:
+        comments = kb.list_comments(conn, task_id) or []
+    except Exception:
+        return ""
+    for comment in reversed(comments):
+        body = getattr(comment, "body", "") or ""
+        if len(body.strip()) >= 40:
+            return body.strip()[-_RECOVERY_COMMENT_LIMIT:]
+    return ""
+
+
+def _recover_from_workspace(workspace_path: Optional[str]) -> str:
+    """Recent change inventory of the card's workspace (``git status`` tail)."""
+    if not workspace_path:
+        return ""
+    import os
+    import subprocess
+
+    if not os.path.isdir(workspace_path):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace_path), "status", "--short"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    lines = [ln.rstrip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    shown = lines[:_RECOVERY_WORKSPACE_FILES]
+    return (
+        "Рабочий каталог карточки содержит изменённые/новые файлы "
+        f"({workspace_path}, git status --short, {len(lines)} записей):\n"
+        + "\n".join(f"- {ln}" for ln in shown)
+    )
+
+
+def _resolve_progress_note(task, progress_note: str) -> tuple[str, str]:
+    """Return ``(note, source)`` — the caller's note or a recovered one.
+
+    Only runs when the caller passed an empty note (the turn_finalizer seam
+    always passes one when the run left any trace). Recovery order: the card's
+    last substantive comment, then the card workspace's change inventory. An
+    exhausted card keeps splitting either way — the note is a handoff, not a
+    gate — but the recorded source makes ``"none"`` countable.
+    """
+    note = (progress_note or "").strip()
+    if note:
+        return note, PROGRESS_SOURCE_RUN_BUFFER
+    try:
+        with kb.connect_closing() as conn:
+            note = _recover_from_parent_comment(conn, task.id)
+    except Exception:
+        note = ""
+    if note:
+        return note, PROGRESS_SOURCE_PARENT_COMMENT
+    note = _recover_from_workspace(getattr(task, "workspace_path", None))
+    if note:
+        return note, PROGRESS_SOURCE_WORKSPACE
+    return "", PROGRESS_SOURCE_NONE
+
+
 def run_budget_split(
     task_id: str,
     *,
@@ -294,6 +462,11 @@ def run_budget_split(
     llm_timeout: Optional[int] = 120,
 ) -> BudgetSplitResult:
     """Try to split ``task_id`` after operation-budget exhaustion.
+
+    ``progress_note`` is the deterministic handoff captured by the caller
+    (``agent.turn_finalizer``) from the exhausted run. When it is empty this
+    function recovers one from the card's last comment or workspace before
+    splitting, and records where the note came from.
 
     Returns ``BudgetSplitResult``. On ``ok=False`` the caller MUST fall
     back to its legacy terminal path (block / failure record) — a failed
@@ -309,15 +482,32 @@ def run_budget_split(
     if not budget_split_enabled(cfg):
         return BudgetSplitResult(False, reason="budget_split disabled in config")
 
+    note, note_source = _resolve_progress_note(task, progress_note)
+    close_only = _progress_reports_completion(note)
+
     # LLM proposal first; deterministic fallback guarantees the split still
     # happens when the aux LLM is unavailable — the user asked for ALWAYS.
-    children = _llm_propose_children(task, progress_note, llm_timeout)
-    via = "llm"
+    # The close-only class skips the LLM entirely: there is nothing to
+    # decompose, and asking would risk a 2-4 card fan-out over finished work.
+    children = None
+    via = "fallback"
+    if not close_only:
+        children = _llm_propose_children(task, note, llm_timeout)
+        via = "llm"
     if not children:
         children = _fallback_children(
-            task.id, task.title or "", task.body or "", progress_note,
+            task.id, task.title or "", task.body or "", note,
         )
         via = "fallback"
+        if close_only:
+            via = "close_only"
+    # The LLM may return more than one card for an already-finished task; the
+    # close-only contract wins regardless of which path produced the proposal.
+    if _progress_reports_completion(note) and len(children) != 1:
+        children = [_close_only_child(
+            task.id, task.title or "", task.body or "", note,
+        )]
+        via = "close_only"
 
     try:
         with kb.connect_closing() as conn:
@@ -329,7 +519,9 @@ def run_budget_split(
                 expected_run_id=expected_run_id,
                 source=source,
                 max_depth=_budget_split_max_depth(cfg),
-                progress_note=progress_note,
+                progress_note=note,
+                progress_note_source=note_source,
+                allow_single=len(children) == 1,
             )
     except Exception as exc:
         logger.exception("budget_split: DB error on task %s", task_id)
@@ -342,5 +534,8 @@ def run_budget_split(
         )
     return BudgetSplitResult(
         True, child_ids=child_ids, via=via,
-        reason=f"split into {len(child_ids)} children via {via}",
+        reason=(
+            f"split into {len(child_ids)} children via {via} "
+            f"(progress source: {note_source}, {len(note)} chars)"
+        ),
     )
