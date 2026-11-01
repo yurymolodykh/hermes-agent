@@ -644,3 +644,146 @@ def test_conflicting_note_resolves_to_the_safe_side():
     assert len(children) == 2
     for child in children:
         assert "ALREADY DONE" not in child["body"]
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 boundary — r4 (23b6af0536): the closer must END its clause, and
+# nothing after it may still name open work
+# ---------------------------------------------------------------------------
+# Review r4 of 23b6af0536 found the r3 fix over-corrected: `\n` had been added
+# to the closer's clause-end character class, so a worker who wrote
+#
+#     Осталось закрыть
+#     - раздел 3
+#     - тесты
+#
+# — a bullet list of what REMAINS, the documented mid-work handoff shape —
+# collapsed to one «[close only] … ALREADY DONE — DO NOT redo» card and
+# «раздел 3» / «тесты» got no card at all. Two of the reviewer's 14 mid-work
+# tails regressed from SPLIT (correct on r1/r2) to COLLAPSE.
+#
+# The same review found the structural hole behind it: the collector appends
+# the run's last narration AFTER the post-budget summary, so a closer whose own
+# clause "ends" cleanly can still be followed by a section naming open work
+# («Осталось закрыть карточку.» + «Код готов, тесты не писал.»).
+#
+# Both are pinned below, together with the reviewer's POSITIVE control (a
+# closer followed by a completion recap must still be ONE card, not a split).
+
+_R4_MIDWORK_TAILS = [
+    # the two regressions, verbatim from the review
+    "Сделал разделы 1-2. Осталось закрыть\n- раздел 3\n- тесты",
+    "Осталось закрыть\nраздел 3 и тесты",
+    # closer whose own clause ends, remainder on the next line as a list
+    "Осталось закрыть.\n- раздел 3\n- тесты",
+    "Каркас готов. Осталось закрыть карточку.\nДальше: раздел 3.",
+    "Осталось закрыть карточку.\nНо сначала раздел 3.",
+    # closer then open work in the same paragraph
+    "Осталось закрыть карточку. Раздел 3 остаётся недоделанным.",
+    "Осталось закрыть карточку. Раздел 3 не трогал, тестов нет.",
+    "Осталось закрыть карточку. Завтра — разделы 3 и 4.",
+    "Осталось закрыть тикет. Впрочем, раздел 3 ещё висит.",
+    "Работа по разделам 1-2 принята. Осталось закрыть карточку. Раздел 3 в очереди.",
+]
+
+_R4_COMPLETION_TAILS = [
+    # the reviewer's s2 control: closer + completion recap = ONE card
+    "Собрал отчёт, прогнал тесты, всё зелёное.",
+    "Готово: разделы 1-4, тесты зелёные.",
+    "Начал работу.",
+]
+
+
+@pytest.mark.parametrize("tail", _R4_MIDWORK_TAILS)
+def test_closer_does_not_end_at_a_line_break_or_swallow_open_work(tail):
+    """A remainder written after the closer keeps its own card."""
+    assert bsplit._progress_reports_completion(tail) is False, tail
+    note = _production_note(tail)
+    assert note, "the production note must carry the summary"
+    assert bsplit._progress_reports_completion(note) is False, note
+    assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 2
+
+
+@pytest.mark.parametrize("tail", _R4_COMPLETION_TAILS)
+def test_closer_followed_by_completion_recap_stays_one_card(tail):
+    """The tail is only substantive when it still names open work."""
+    note = turn_finalizer._collect_budget_progress_note(
+        messages=[{"role": "assistant", "content": tail}],
+        final_response="Осталось закрыть карточку.",
+        api_call_count=3,
+        max_iterations=3,
+        exit_reason="max_iterations_reached(3/3)",
+    )
+    # Both the summary and the earlier narration are in the note…
+    assert "Осталось закрыть карточку" in note
+    assert tail in note
+    # …and the pair still resolves to the single closing card.
+    assert bsplit._progress_reports_completion(note) is True, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 1
+    assert "Verify and close" in children[0]["title"]
+
+
+def test_tail_veto_only_fires_on_open_work_not_on_the_collector_labels():
+    """The collector's own label lines and file inventory are not a tail."""
+    note = turn_finalizer._collect_budget_progress_note(
+        messages=[
+            {"role": "user", "content": "собери отчёт"},
+            {
+                "role": "assistant",
+                "content": "Собрал отчёт, прогнал тесты, всё зелёное.",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path": "reports/final.md", "content": "x"}',
+                    },
+                }],
+            },
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ],
+        final_response="Работа выполнена, осталось закрыть карточку.",
+        api_call_count=3, max_iterations=3,
+        exit_reason="max_iterations_reached(3/3)",
+    )
+    # The file inventory block and the labels ride along…
+    assert "reports/final.md" in note
+    assert "ВЫПОЛНЕНО РАНЕЕ" in note
+    # …and must not be mistaken for a remainder.
+    assert bsplit._progress_reports_completion(note) is True
+    assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 1
+
+
+def test_remainder_stated_before_the_closer_also_blocks_collapse():
+    """The remainder's POSITION is irrelevant — only that it is still open.
+
+    Reviewer r4 probe `detail-before-closer`: a worker that opens with an
+    unfinished section and closes by naming the card. Cutting only the text
+    after the closer left this collapsed, even though «раздел 3» was still
+    explicitly unfinished.
+    """
+    for tail in [
+        "Раздел 3 остаётся недоделанным. Осталось закрыть карточку.",
+        "Раздел 3 не начат. Осталось закрыть карточку.",
+        "Тесты не написаны; осталось закрыть карточку.",
+    ]:
+        assert bsplit._progress_reports_completion(tail) is False, tail
+        note = _production_note(tail)
+        assert bsplit._progress_reports_completion(note) is False, note
+        assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 2
+
+
+def test_closer_wins_over_completion_detail_on_the_same_line():
+    """A finished statement plus the closer is still one card.
+
+    The residual check must not turn a plain completion recap into a veto: no
+    remainder marker and no list item means nothing is left open.
+    """
+    for tail in [
+        "Сделал разделы 1-4, собрал отчёт, прогнал тесты; осталось закрыть карточку.",
+        "Готово: разделы 1-4 и тесты. Осталось закрыть карточку.",
+    ]:
+        assert bsplit._progress_reports_completion(tail) is True, tail
+        note = _production_note(tail)
+        assert bsplit._progress_reports_completion(note) is True, note
+        assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 1

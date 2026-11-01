@@ -130,12 +130,18 @@ _CLOSE_ONLY_NO_WORK_LEFT = (
 # the card artifact as the LAST word of that clause.
 #
 # What counts as the end of the clause: sentence punctuation (`.!?…`), a
-# closing bracket, a quote, a line break, or end of text. `:` and `;` are
-# deliberately EXCLUDED — they introduce an enumeration of what still remains
-# («осталось закрыть: раздел 3, тесты»), which is the single most common way a
-# worker lists unfinished work. Treating them as a clause end collapsed 6 of 14
-# realistic mid-work tails in review of c2338e94d1, so the named remainder got
-# no card at all while its child body claimed «ALREADY DONE — DO NOT redo».
+# closing bracket, a quote, or end of text. `:`, `;` AND a line break are
+# deliberately EXCLUDED:
+#
+# * `:`/`;` introduce an enumeration of what still remains («осталось закрыть:
+#   раздел 3, тесты») — the single most common way a worker lists unfinished
+#   work. Accepting them collapsed 6 of 14 realistic mid-work tails in review of
+#   c2338e94d1.
+# * a line break is where a worker starts that same list on the next line
+#   («Осталось закрыть\n- раздел 3\n- тесты»). Accepting it (review 23b6af0536)
+#   collapsed both bullet-list regressions and dropped «раздел 3» / «тесты»
+#   entirely. A trailing newline is still fine: `\s*` swallows it before the
+#   end-of-text anchor.
 #
 # Deliberately NOT accepted: closing a WORK ITEM — «осталось закрыть раздел 3»,
 # «осталось закрыть миграции», «осталось закрыть тестами функцию parse()»,
@@ -148,7 +154,7 @@ _CLOSE_ONLY_NO_WORK_LEFT = (
 _CLOSE_REMAINDER_RE = re.compile(
     r"осталось\s+(?:только\s+|лишь\s+)?закрыть"
     r"(?:\s+(?:карточк[уа]|тикет[а]?|задач[у]))?"
-    r"\s*(?:[.!?…)}\»\"']|\n|$)",
+    r"[^\S\n]*(?:[.!?…)}\»\"']|$)",
     re.IGNORECASE,
 )
 
@@ -235,6 +241,116 @@ _CLOSE_ONLY_PARTIAL_MARKERS = (
 # matched on purpose (it is not a partial-credit signal).
 _CLOSE_ONLY_PARTIAL_PERCENT_RE = re.compile(r"(?:^|[^\d])[1-9]?\d\s*%")
 
+# ---------------------------------------------------------------------------
+# Substantive tail after the closing statement
+# ---------------------------------------------------------------------------
+# Review 23b6af0536 (r4, item 2): the closer only closes the card when nothing
+# substantive follows it. The collector appends the run's last narration AFTER
+# the post-budget summary, so on a real seam the note reads
+#
+#     Что воркер сообщил при остановке (итог прогона):
+#     Осталось закрыть карточку.
+#
+#     Последнее, что воркер успел сказать (хвост ответа):
+#     Код готов, тесты не писал.
+#
+# and the closer's clause "ends" right before a section that names open work.
+#
+# Polarity, stated plainly: a tail vetoes only when it NAMES work that is still
+# open (or opens a list of it). Naming the tail as a whole "substantive" is not
+# usable as the test, because the collector also appends the run's last
+# narration — which on a genuinely finished run is ordinary earlier narration
+# («Начал работу.») or a completion recap («Собрал отчёт, прогнал тесты, всё
+# зелёное.»), and both must keep the single card (reviewer r4 s2 control).
+# What must never survive is a tail that says something is still missing.
+_TAIL_REMAINDER_RE = re.compile(
+    r"\bне\s+[а-яё]+(?:л|ла|ло|ли)\b"      # не писал / не сделал / не успел
+    r"|\bне\s+[а-яё]+(?:н|на|но|ны)\b"     # не проверен / не написано
+    r"|\bне\s+(?:трогал|касался)"          # раздел 3 не трогал
+    r"|остал[аои]?сь|оста[её]тся"           # осталось / остались / остаётся
+    r"|\bнет\b"                            # тестов нет
+    r"|предстоит|в\s+очереди|не\s+доделан|доделать|дописать|висит"
+    r"|сначала|дальше|потом|завтра|затем"
+    r"|\btodo\b|\bpending\b|\bremaining\b|\bnext\b",
+    re.IGNORECASE,
+)
+# A tail line that opens a list item is the enumeration of what remains
+# («Осталось закрыть.\n- раздел 3\n- тесты»).
+_TAIL_LIST_ITEM_RE = re.compile(r"^(?:[-*•+]|\d+[.)])\s+\S")
+
+# The collector's own service lines (see
+# :func:`agent.turn_finalizer._collect_budget_progress_note`). They are appended
+# by the seam, not written by the worker, so they never make a tail substantive.
+_COLLECTOR_LABEL_PREFIXES = (
+    "выполнено ранее (не переделывай)",
+    "остановка по бюджету:",
+    "что воркер сообщил при остановке",
+    "последнее, что воркер успел сказать",
+)
+_COLLECTOR_FILES_PREFIX = "файлы, созданные/изменённые"
+
+
+def _substantive_tail_after(text: str, start: int) -> str:
+    """The worker-written text after the closing statement at ``start``.
+
+    Drops the collector's own label lines and the file-inventory block it
+    appends (header + ``- path`` bullets), keeps everything else — including
+    worker-written bullets, which are list items of the remainder.
+    """
+    remaining: list[str] = []
+    in_files = False
+    for line in text[start:].splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if not stripped:
+            in_files = False
+            continue
+        if low.startswith(_COLLECTOR_FILES_PREFIX):
+            in_files = True
+            continue
+        if in_files and stripped.startswith("- "):
+            continue
+        in_files = False
+        if any(low.startswith(p) for p in _COLLECTOR_LABEL_PREFIXES):
+            continue
+        remaining.append(stripped)
+    return "\n".join(remaining)
+
+
+def _tail_names_open_work(tail: str) -> bool:
+    """True when the text after the closer still says something is missing."""
+    if not tail:
+        return False
+    if _TAIL_REMAINDER_RE.search(tail):
+        return True
+    return any(
+        _TAIL_LIST_ITEM_RE.match(line.strip()) for line in tail.splitlines()
+    )
+
+
+def _worker_residual(text: str, closer_spans, positive_spans) -> str:
+    """The note's own worker-written text with the closing statements removed.
+
+    Everything the note says about the CARD being the only thing left — the
+    matched closer clauses and the explicit "nothing left" phrases — is cut out,
+    together with the collector's service lines and file inventory. What
+    remains is the rest of what the worker wrote. If that residual still names
+    open work, the card is not close-only, no matter where the remainder sits
+    relative to the closer («Раздел 3 остаётся недоделанным. Осталось закрыть
+    карточку.» names it BEFORE).
+    """
+    cuts = sorted((s, e) for s, e in list(closer_spans) + list(positive_spans))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in cuts:
+        if start < cursor:
+            start = cursor
+        if start > cursor:
+            pieces.append(text[cursor:start])
+        cursor = max(cursor, end)
+    pieces.append(text[cursor:])
+    return _substantive_tail_after("".join(pieces), 0)
+
 
 def _progress_reports_completion(progress: str) -> bool:
     """True only when the note says the work is done AND just closing remains.
@@ -250,9 +366,11 @@ def _progress_reports_completion(progress: str) -> bool:
 
     Structural vetoes on top of the qualifier lists, because the remainder is
     often enumerated rather than qualified: a closer that does NOT end its
-    clause («осталось закрыть: раздел 3, тесты» — `:`/`;` introduce the list)
-    and a note that re-opens the remainder in another clause («Осталось
-    закрыть.\\nОсталось: раздел 3») are both mid-work, not close-only.
+    clause («осталось закрыть: раздел 3, тесты» — `:`/`;` introduce the list,
+    and a line break starts the same list on the next line), a note that
+    re-opens the remainder in another clause («Осталось закрыть.\\\\nОсталось:
+    раздел 3»), and a substantive tail after the closer that still names open
+    work («Осталось закрыть карточку.» + «Код готов, тесты не писал.»).
 
     Deliberately narrow — it keys on the closing remainder, NOT on completion
     phrasing and NOT on the ``ВЫПОЛНЕНО РАНЕЕ`` header that
@@ -272,11 +390,35 @@ def _progress_reports_completion(progress: str) -> bool:
         return False
     if _CLOSE_ONLY_PARTIAL_PERCENT_RE.search(low):
         return False
-    if any(phrase in low for phrase in _CLOSE_ONLY_NO_WORK_LEFT):
-        return True
+
+    # Every place the note states "the card is all that is left" — the closer
+    # clauses and the explicit no-work-left phrases — plus the end of the last
+    # such statement.
+    positive_spans: list[tuple[int, int]] = []
+    for phrase in _CLOSE_ONLY_NO_WORK_LEFT:
+        start = low.find(phrase)
+        while start != -1:
+            positive_spans.append((start, start + len(phrase)))
+            start = low.find(phrase, start + len(phrase))
+    pos_end = max((e for _s, e in positive_spans), default=0)
+    for match in _CLOSE_REMAINDER_RE.finditer(low):
+        positive_spans.append((match.start(), match.end()))
+        pos_end = max(pos_end, match.end())
+    if not positive_spans:
+        return False
+
     if _CLOSE_REMAINDER_REOPENS_RE.search(low):
         return False
-    return _CLOSE_REMAINDER_RE.search(low) is not None
+    # Nothing in the rest of the note may still name open work, wherever that
+    # remainder sits — after the closer («Осталось закрыть карточку. Раздел 3
+    # не трогал») or before it («Раздел 3 остаётся недоделанным. Осталось
+    # закрыть карточку»).
+    residual = _worker_residual(low, positive_spans, ())
+    if _tail_names_open_work(residual):
+        return False
+    # The collector's service block is not worker text, but a list right after
+    # the closer inside one worker sentence still is.
+    return not _tail_names_open_work(_substantive_tail_after(low, pos_end))
 
 
 @dataclass

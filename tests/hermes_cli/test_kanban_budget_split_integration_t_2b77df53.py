@@ -501,3 +501,61 @@ def test_class_boundary_through_the_real_seam(
     for c in children:
         print("  -", c.id, "|", (c.title or "")[:60],
               "| ALREADY_DONE:", "ALREADY DONE" in (c.body or ""))
+
+
+# ---------------------------------------------------------------------------
+# Reviewer r4 (23b6af0536) regressions, through the REAL seam
+# ---------------------------------------------------------------------------
+# `\n` had been accepted as the end of the closer's clause, so a worker whose
+# budget-exhaustion summary listed the remainder on the following lines
+#
+#     Сделал разделы 1-2. Осталось закрыть
+#     - раздел 3
+#     - тесты
+#
+# collapsed into ONE «[close only] … ALREADY DONE — DO NOT redo» card: «раздел
+# 3» and «тесты» got no card at all, while the only child was told the work was
+# finished. r1/r2 split this correctly; r3 regressed it. Pinned here on the real
+# finalize_turn → run_budget_split → SQLite path, not on bare strings.
+
+class _BulletListRemainderAgent(_BudgetAgent):
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Сделал разделы 1-2. Осталось закрыть\n- раздел 3\n- тесты"
+
+
+class _NewlinePlainRemainderAgent(_BudgetAgent):
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Осталось закрыть\nраздел 3 и тесты"
+
+
+@pytest.mark.parametrize(
+    "agent_cls,label",
+    [
+        (_BulletListRemainderAgent, "r4-bullets-after-newline"),
+        (_NewlinePlainRemainderAgent, "r4-newline-plain-list"),
+    ],
+)
+def test_r4_newline_remainder_keeps_real_cards(
+    kanban_home, no_llm, monkeypatch, tmp_path, agent_cls, label,
+):
+    tid, payload, children = _run_seam_and_read(
+        kanban_home, monkeypatch, tmp_path, agent_cls(max_iterations=3), label,
+    )
+    ids = [c.id for c in children]
+    print("\n=== %s === " % label)
+    print("summary:", repr(agent_cls(max_iterations=3)._handle_max_iterations([], 0)))
+    print("source :", payload.get("progress_note_source"),
+          "| len:", payload.get("progress_note_len"))
+    for c in children:
+        print("  child:", c.id, "|", (c.title or "")[:56],
+              "| ALREADY_DONE:", "ALREADY DONE" in (c.body or ""))
+
+    assert payload.get("progress_note_source") == "run_buffer", payload
+    assert len(ids) >= 2, (
+        f"{label}: the named remainder collapsed to {len(ids)} card(s) "
+        f"{[(c.id, (c.title or '')[:40]) for c in children]} — "
+        "«раздел 3» loses its card while the child claims ALREADY DONE"
+    )
+    for c in children:
+        assert "[close only]" not in (c.title or ""), c.id
+        assert "ALREADY DONE" not in (c.body or ""), c.id
