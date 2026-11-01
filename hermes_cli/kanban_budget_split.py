@@ -312,19 +312,39 @@ _COLLECTOR_LABEL_PREFIXES = (
     "последнее, что воркер успел сказать",
 )
 _COLLECTOR_FILES_PREFIX = "файлы, созданные/изменённые"
+# The one collector section whose content is EARLIER narration, not the run's
+# closing statement. Its content is separated from the worker body (see
+# :func:`_split_note`) because an opening line («Начал работу.») says nothing
+# about what remains — feeding it to the completion whitelist would split every
+# genuinely finished run. It is still scanned as veto-only evidence.
+_TRANSCRIPT_LABEL_PREFIX = "последнее, что воркер успел сказать"
 
 
-def _worker_lines(text: str) -> str:
-    """``text`` minus the collector's service lines and file inventory.
+def _split_note(text: str) -> tuple[str, str]:
+    """``text`` split into ``(worker_body, closing_transcript_tail)``.
 
     The collector (:func:`agent.turn_finalizer._collect_budget_progress_note`)
-    appends its own labelled sections and a ``- path`` inventory. They are
+    appends its own labelled sections and a ``- path`` inventory. Those lines are
     seam-generated, not worker-written, so they must never be read as evidence
     about remaining work. Worker-written bullets are kept — they are list items
     of the remainder.
+
+    Two sections are worker-written, and they are NOT equivalent:
+
+    * «Что воркер сообщил при остановке (итог прогона)» — the post-budget
+      summary, generated after the budget ran out. This is the only text that
+      reliably states what REMAINS, so it stays in ``worker_body`` and is graded
+      by the completion whitelist.
+    * «Последнее, что воркер успел сказать (хвост ответа)» — the last narration
+      row, i.e. a step EARLIER than that summary («Начал работу.»). It cannot
+      argue that work is still open on its own strength, so it is returned
+      separately: it only ever VETOES (see
+      :func:`_progress_reports_completion`), never grants the single card.
     """
     kept: list[str] = []
+    tail: list[str] = []
     in_files = False
+    in_transcript = False
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -333,14 +353,24 @@ def _worker_lines(text: str) -> str:
         low = stripped.lower()
         if low.startswith(_COLLECTOR_FILES_PREFIX):
             in_files = True
+            in_transcript = False
         elif in_files and stripped.startswith("- "):
             continue
         elif any(low.startswith(p) for p in _COLLECTOR_LABEL_PREFIXES):
+            in_transcript = low.startswith(_TRANSCRIPT_LABEL_PREFIX)
+            in_files = False
             continue
+        elif in_transcript:
+            tail.append(stripped)
         else:
             in_files = False
             kept.append(stripped)
-    return "\n".join(kept)
+    return "\n".join(kept), "\n".join(tail)
+
+
+def _worker_lines(text: str) -> str:
+    """The worker-written body of the note, service lines and transcript tail removed."""
+    return _split_note(text)[0]
 
 
 def _tail_names_open_work(tail: str) -> bool:
@@ -352,6 +382,146 @@ def _tail_names_open_work(tail: str) -> bool:
     return any(
         _TAIL_LIST_ITEM_RE.match(line.strip()) for line in tail.splitlines()
     )
+
+
+# ---------------------------------------------------------------------------
+# Completion whitelist — the polarity switch (review r6 of 341f55734d)
+# ---------------------------------------------------------------------------
+# Every previous round extended ``_TAIL_REMAINDER_RE``, a BLACKLIST: a note was
+# split only when a remainder word was recognised. The blacklist always leaks —
+# r4 enumerated 13 shapes, r5 another 13, and the reviewer's fresh r6 corpus
+# still collapsed 15/24 untouched shapes («раздел 3 недописан», «ждёт
+# проверки», «нужна доработка», «заглушка», «0 тестов», «позже» …) into ONE
+# «ALREADY DONE — DO NOT redo» card while the named remainder got no card at
+# all. That is the exact work-loss this module exists to prevent.
+#
+# The polarity is therefore inverted here: a close-only card is emitted only
+# when the worker-written residual is EMPTY or consists exclusively of
+# recognised completion statements. Anything unrecognised goes back to a real
+# split. The asymmetry is deliberate and matches the module's documented risk
+# model: a redundant split costs one extra card, a leak costs the work.
+#
+# Cost of the switch: a genuinely finished run whose closing summary words the
+# completion in a way not listed below splits into two cards. That is a cheap,
+# self-correcting failure (the second child verifies and closes), and it keeps
+# the r6 corpus and every later word-shape safe by construction instead of by
+# enumeration.
+_COMPLETION_CLAUSES = [
+    # no-work-left statements (the same phrases the span remover cuts out)
+    re.compile(
+        r"(?:переделывать\s+не\s+нужно|не\s+нужно\s+переделывать"
+        r"|nothing\s+left\s+to\s+\w+|only\s+the\s+card\s+(?:remains|is\s+still\s+open)"
+        r"|everything\s+landed|all\s+done)",
+        re.IGNORECASE,
+    ),
+    # the collector's own header echo, if it ever survives line filtering
+    re.compile(r"перечисленное\s+ниже.*", re.IGNORECASE),
+    # «всё готово / всё собрано / всё зелёное / всё на месте»
+    re.compile(
+        r"(?:вс[её]|все)\s+(?:уже\s+)?(?:готово|собрано|сделано|проверено"
+        r"|прогнано|написано|зел[её]н\w*|на\s+месте|в\s+порядке|работает"
+        r"|проходит|пройдено|покрыто)(?:\s+.*)?",
+        re.IGNORECASE,
+    ),
+    # «артефакт собран», «отчёт готов», «тесты зелёные», «работа выполнена
+    # (полностью)», «сборка проходит» — object first, participle second.
+    re.compile(
+        r"(?:артефакт\w*|отч[её]т\w*|отчет\w*|файл\w*|(?:[а-яё]+-)?тест\w*|код|сборк\w*"
+        r"|документ\w*|скрипт\w*|модул\w*|патч\w*|данн\w*|страниц\w*"
+        r"|презентац\w*|карточк\w*|задач\w*|работ\w*|раздел\w*|миграц\w*"
+        r"|pytest|ruff|mypy|\d+\s+тест\w*)"
+        r"\s+(?:(?:уже|полностью|целиком|весь|все|вс[её])\s+)*"
+        r"(?:готов[аоы]?|собран[аоы]?|написан[аоы]?|проверен[аоы]?"
+        r"|зел[её]н\w*|пройден\w*|прогнан\w*|сделан[аоы]?|закончен[аоы]?"
+        r"|выполнен[аоы]?|опубликован\w*|закоммичен\w*|на\s+месте|в\s+порядке)"
+        r"(?:\s+.*)?",
+        re.IGNORECASE,
+    ),
+    # «готово», «сделано», «готово: разделы 1-4, тесты зелёные»
+    re.compile(r"(?:вс[её]\s+)?(?:готово|сделано|done|landed|completed)(?:\s*:.*)?",
+               re.IGNORECASE),
+    # «собрал X», «прогнал тесты», «проверил Y» — a completed-work clause
+    re.compile(
+        r"(?:я\s+)?(?:собрал\w*|сделал\w*|написал\w*|проверил\w*|прогнал\w*"
+        r"|закончил\w*|закрыл\w*|починил\w*|исправил\w*|разобрал\w*"
+        r"|обновил\w*|переписал\w*|протестировал\w*|выполнил\w*|завершил\w*"
+        r"|добавил\w*|залил\w*|закоммитил\w*|опубликовал\w*|развернул\w*"
+        r"|сбилдил\w*)(?:\s+.*)?",
+        re.IGNORECASE,
+    ),
+    # English completion statements
+    re.compile(
+        r"(?:the\s+)?work\s+is\s+(?:already\s+)?(?:done|complete[d]?)(?:\s+.*)?"
+        r"|already\s+(?:done|completed|implemented|landed)(?:\s+.*)?",
+        re.IGNORECASE,
+    ),
+    # test counters: «129 тестов зелёные», «129 passed»
+    re.compile(r"\d+\s+(?:passed|прошл\w*|зел[её]н\w*|тест\w*\s+зел[её]н\w*)",
+               re.IGNORECASE),
+    # «документация обновлена», «проблема устранена», «патч применён» — a noun
+    # followed by a Russian SHORT passive participle is a completion statement.
+    # Guarded by the negation check in :func:`_clause_is_completion`, so
+    # «раздел 3 недописан» / «раздел 3 не проверен» can never take this branch.
+    re.compile(
+        r"(?:[а-яё\w]+\s+){1,4}"
+        r"(?:обновл[её]н\w*|устран[её]н\w*|исправлен\w*|добавлен\w*|внес[её]н\w*"
+        r"|измен[её]н\w*|переписан\w*|починен\w*|установлен\w*|настроен\w*"
+        r"|интегрирован\w*|реализован\w*|подключ[её]н\w*|удал[её]н\w*"
+        r"|перенес[её]н\w*|написан\w*|собран\w*|проверен\w*|прогнан\w*"
+        r"|сделан\w*|закончен\w*|выполнен\w*|опубликован\w*|закоммичен\w*"
+        r"|запушен\w*|зел[её]н\w*)",
+        re.IGNORECASE,
+    ),
+]
+# An explicit "nothing to redo" phrase is a completion statement even though it
+# contains «не»; checked BEFORE the blanket negation guard below.
+_NO_REDO_CLAUSE_RE = re.compile(
+    r"(?:переделывать\s+не\s+нужно|не\s+нужно\s+переделывать"
+    r"|nothing\s+left\s+to\s+\w+|redoing\s+is\s+not\s+needed)",
+    re.IGNORECASE,
+)
+# Any negation anywhere in a clause means it is NOT a clean completion
+# statement — a remainder stated as a negated participle («раздел 3 недописан»,
+# «тесты не проверены») must never be granted the single card.
+_CLAUSE_NEGATION_RE = re.compile(r"\bне\b|\bне[а-яё]|\bnot\b|\bno\b|\bwithout\b",
+                                 re.IGNORECASE)
+_CLAUSE_EDGE_STRIP = " \t.,:;!?…\"'()[]{}«»-–—"
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?…;\n]+")
+
+
+def _clause_is_completion(clause: str) -> bool:
+    """True when the whole clause is a recognised completion statement."""
+    text = clause.strip(_CLAUSE_EDGE_STRIP)
+    if not text:
+        return True
+    if _NO_REDO_CLAUSE_RE.search(text):
+        return True
+    if _CLAUSE_NEGATION_RE.search(text):
+        return False
+    return any(pattern.fullmatch(text) for pattern in _COMPLETION_CLAUSES)
+
+
+def _residual_is_completion(residual: str) -> bool:
+    """True only when EVERY clause of the residual is recognised completion.
+
+    This is the whitelist gate that makes the close-only decision fail SAFE:
+    an unrecognised clause anywhere in what the worker wrote returns ``False``,
+    which means "split" — the remainder keeps a card of its own.
+    """
+    for sentence in _SENTENCE_SPLIT_RE.split(residual):
+        sentence = sentence.strip(_CLAUSE_EDGE_STRIP)
+        if not sentence:
+            continue
+        if _clause_is_completion(sentence):
+            continue
+        # Commas chain completion clauses («Работа выполнена, артефакт готов»),
+        # so a sentence is acceptable when every comma-part is. A part that
+        # names open work («…, кроме раздела 3») fails here and forces a split.
+        parts = [p for p in sentence.split(",")]
+        if all(_clause_is_completion(p) for p in parts):
+            continue
+        return False
+    return True
 
 
 def _find_all(haystack: str, needle: str):
@@ -437,10 +607,27 @@ def _progress_reports_completion(progress: str) -> bool:
 
     if _CLOSE_REMAINDER_REOPENS_RE.search(low):
         return False
-    # Nothing else the note says may name open work, wherever that remainder
-    # sits — after the closer («Осталось закрыть карточку. Раздел 3 не трогал»)
-    # or before it («Раздел 3 остаётся недоделанным. Осталось закрыть карточку»).
-    return not _tail_names_open_work(_worker_residual(low, spans))
+    transcript_tail = _split_note(low)[1]
+
+    # (a) VETO layer, unchanged in spirit: anything that still names open work —
+    # wherever the remainder sits relative to the closer — forces a real split.
+    # The transcript tail is scanned here as veto-only evidence: on a real seam
+    # the worker's own last narration may name a remainder the post-budget
+    # summary skipped («Код готов, тесты не писал»).
+    residual = _worker_residual(low, spans)
+    if _tail_names_open_work(residual):
+        return False
+    if _tail_names_open_work(transcript_tail):
+        return False
+
+    # (b) GRANT layer, inverted polarity: the single card is allowed only when
+    # every clause the worker actually wrote is a recognised completion
+    # statement. Unrecognised wording is treated as "probably an open remainder"
+    # and goes back to a split. A blacklist of remainder words always leaks
+    # (r6 corpus: 15/24 fresh shapes collapsed), and every leak drops named work
+    # without a card — the failure this module exists to prevent. A redundant
+    # split costs one card; a leak loses work.
+    return _residual_is_completion(residual)
 
 
 @dataclass

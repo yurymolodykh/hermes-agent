@@ -930,3 +930,188 @@ def test_r5_passive_shapes_through_the_real_seam_produce_children(
     for body in bodies:
         assert "ALREADY DONE" not in body
         assert "Progress note from the previous worker" in body
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 — r6 (341f55734d): the CLASS, not another word list
+# ---------------------------------------------------------------------------
+# Review r6 of 341f55734d found the r5 fix had only extended the blacklist:
+# the reviewer's FRESH corpus of 24 mid-work remainders (never used in r5) still
+# collapsed 15 of them into ONE «[close only] … ALREADY DONE — DO NOT redo» card,
+# and the named remainder got no card at all. Through the real seam (finalize_turn
+# → run_budget_split → SQLite) 6 of 7 fresh shapes failed the same way.
+#
+# The defect was structural, not lexical: ``_TAIL_REMAINDER_RE`` is a blacklist,
+# so it only splits what it has already been taught. A blacklist always leaks —
+# r4 enumerated 13 shapes, r5 another 13, r6 found 15 more («недописан»,
+# «ждёт проверки», «нужна доработка», «заглушка», «0 тестов», «позже» …).
+#
+# The polarity is now inverted: a close-only card is granted only when the
+# worker-written residual is empty or consists exclusively of recognised
+# completion clauses. Everything unrecognised splits. These tests pin BOTH
+# polarities of that switch, through the real collector and through the seam:
+#
+#   * the reviewer's r6 corpus (20 open shapes) must produce >= 2 cards;
+#   * 6 close-only controls must still produce exactly 1;
+#   * ADVERSARIAL clauses that no round would ever enumerate («в морозилке»,
+#     «XYZ blorp 42») must also split — that is what proves the switch keys on
+#     the class (recognised completion) instead of the wording list.
+
+_R6_OPEN_TAILS = [
+    "Раздел 3 недописан.",
+    "Раздел 3 недоделан.",
+    "Тесты недописаны.",
+    "Раздел 3 недописано.",
+    "Раздел 3 недосдан.",
+    "Раздел 3 ждёт проверки.",
+    "Раздел 3 на проверке.",
+    "Разделу 3 нужна доработка.",
+    "Раздел 3 не запускался.",
+    "Раздел 3 пропущен.",
+    "Раздел 3 — заглушка.",
+    "Раздел 3 — пустой файл.",
+    "Раздел 3: 0 тестов.",
+    "Раздел 3: ожидает наполнения.",
+    "Раздел 3 позже.",
+    "Раздел 3 в морозилке.",                    # never enumerated by any round
+    "Раздел 3 ждёт уточнения у заказчика",
+    "Секция 3 отложена до следующего спринта.",  # never enumerated
+    "Раздел 3 XYZ blorp 42.",                   # content-free adversarial shape
+    "Пункт 3 в подвешенном состоянии.",
+]
+
+_R6_CLOSE_ONLY_CONTROLS = [
+    "Всё собрано, отчёт на месте. Осталось закрыть карточку.",
+    "Артефакт готов. Осталось закрыть карточку.",
+    "129 тестов зелёные. Осталось закрыть карточку.",
+    "Everything landed. Only the card remains.",
+    "Готово. Осталось только закрыть тикет.",
+    "Переделывать не нужно — артефакт готов.",
+]
+
+_R6_DONE = "Собрал разделы 1-2 в reports/s12.md."
+_R6_CLOSER = "Осталось закрыть карточку."
+
+
+@pytest.mark.parametrize("tail", _R6_OPEN_TAILS)
+def test_r6_open_remainder_shapes_keep_their_own_card(tail):
+    """Every fresh r6 shape — enumerated or not — must produce >= 2 cards.
+
+    This is the class-level assertion the previous rounds lacked: the last few
+    cases in :data:`_R6_OPEN_TAILS` were never seen by any review round, so a
+    green run here cannot be an artefact of the word list.
+    """
+    note = _production_note(f"{_R6_DONE} {_R6_CLOSER} {tail}")
+    assert tail in note, "the production note must carry the remainder"
+    assert bsplit._progress_reports_completion(note) is False, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) >= 2, f"{tail} collapsed to {len(children)} card(s)"
+    for child in children:
+        assert "ALREADY DONE" not in child["body"], tail
+        assert "Progress note from the previous worker" in child["body"], tail
+
+
+@pytest.mark.parametrize("tail", _R6_CLOSE_ONLY_CONTROLS)
+def test_r6_close_only_controls_still_resolve_to_one_card(tail):
+    """The polarity switch must not become "never collapse"."""
+    assert bsplit._progress_reports_completion(tail) is True, tail
+    note = _production_note(tail)
+    assert bsplit._progress_reports_completion(note) is True, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 1, f"{tail} split into {len(children)} cards"
+    assert "ALREADY DONE" in children[0]["body"]
+
+
+def test_r6_unrecognised_residual_defaults_to_split():
+    """The switch keys on "recognised completion", not on a remainder word list.
+
+    A close-only card may only be granted when everything the worker wrote is a
+    recognised completion clause. Both directions are asserted here so a future
+    change cannot quietly restore the blacklist polarity.
+    """
+    assert bsplit._residual_is_completion("Артефакт собран, тесты зелёные.") is True
+    assert bsplit._residual_is_completion("Работа выполнена полностью.") is True
+    # Recognised completion in one clause + an unrecognised clause -> split.
+    assert bsplit._residual_is_completion(
+        "Артефакт собран. Раздел 3 в морозилке."
+    ) is False
+    assert bsplit._residual_is_completion("Артефакт собран. XYZ blorp 42.") is False
+    # A negation anywhere disqualifies a clause, even a passive participle.
+    assert bsplit._residual_is_completion("Раздел 3 недописан.") is False
+    assert bsplit._residual_is_completion("Раздел 3 не проверен.") is False
+    # …but the explicit "nothing to redo" phrasing stays a completion.
+    assert bsplit._residual_is_completion("Переделывать не нужно.") is True
+
+
+def test_r6_finished_summaries_are_not_over_split():
+    """The known cost of the switch must stay at zero on ordinary wording.
+
+    Inverting the polarity trades a redundant split for safety. This test pins
+    the trade so it cannot silently widen: the completion shapes a real worker
+    writes when it truly finished must still resolve to ONE card.
+    """
+    finished = [
+        "Артефакт собран, тесты зелёные. Осталось закрыть карточку.",
+        "Отчёт написан. Осталось закрыть карточку.",
+        "Документация обновлена, README написан. Осталось закрыть карточку.",
+        "Патч закоммичен и запушен, сборка проходит. Осталось закрыть карточку.",
+        "Развернул на проде, проверка прошла. Осталось закрыть карточку.",
+        "Собрал отчёт, прогнал тесты, всё зелёное. Осталось закрыть карточку.",
+        "Готово: разделы 1-4, тесты зелёные. Осталось закрыть карточку.",
+        "Работа выполнена на 100%. Осталось закрыть карточку.",
+    ]
+    for tail in finished:
+        note = _production_note(tail)
+        assert bsplit._progress_reports_completion(note) is True, (tail, note)
+        assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 1, tail
+
+
+def test_r6_fresh_shape_through_the_real_seam_produces_children(
+    kanban_home, no_llm, monkeypatch
+):
+    """End-to-end on the r6 blocker shape: «недописан» must not collapse.
+
+    Pins the seam (``finalize_turn`` → ``run_budget_split`` → SQLite), not just
+    the classifier, because review r6 failed 6/7 here while the classifier was
+    already green on the enumerated shapes.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(kanban_home))
+    from hermes_cli import profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _n: True)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Собрать отчёт по разделам 1-4",
+            body="acceptance: 4 sections",
+            assignee="03-software-engineer",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = _BudgetAgent(max_iterations=3)
+    agent._handle_max_iterations = (
+        lambda messages, api_call_count:
+        "Собрал разделы 1-2. Осталось закрыть карточку. Раздел 3 недописан."
+    )
+    _finalize_budget_exit(agent, [{"role": "user", "content": "собери отчёт"}])
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+        assert len(events) == 1, events
+        payload = events[0].payload or {}
+        child_ids = payload.get("child_ids") or []
+        bodies = [(kb.get_task(conn, cid).body or "") for cid in child_ids]
+
+    assert len(child_ids) >= 2, payload
+    assert payload.get("progress_note_source") == "run_buffer", payload
+    for body in bodies:
+        assert "ALREADY DONE" not in body
+        assert "Progress note from the previous worker" in body
