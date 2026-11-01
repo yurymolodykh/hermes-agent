@@ -290,31 +290,33 @@ _COLLECTOR_LABEL_PREFIXES = (
 _COLLECTOR_FILES_PREFIX = "файлы, созданные/изменённые"
 
 
-def _substantive_tail_after(text: str, start: int) -> str:
-    """The worker-written text after the closing statement at ``start``.
+def _worker_lines(text: str) -> str:
+    """``text`` minus the collector's service lines and file inventory.
 
-    Drops the collector's own label lines and the file-inventory block it
-    appends (header + ``- path`` bullets), keeps everything else — including
-    worker-written bullets, which are list items of the remainder.
+    The collector (:func:`agent.turn_finalizer._collect_budget_progress_note`)
+    appends its own labelled sections and a ``- path`` inventory. They are
+    seam-generated, not worker-written, so they must never be read as evidence
+    about remaining work. Worker-written bullets are kept — they are list items
+    of the remainder.
     """
-    remaining: list[str] = []
+    kept: list[str] = []
     in_files = False
-    for line in text[start:].splitlines():
+    for line in text.splitlines():
         stripped = line.strip()
-        low = stripped.lower()
         if not stripped:
             in_files = False
             continue
+        low = stripped.lower()
         if low.startswith(_COLLECTOR_FILES_PREFIX):
             in_files = True
+        elif in_files and stripped.startswith("- "):
             continue
-        if in_files and stripped.startswith("- "):
+        elif any(low.startswith(p) for p in _COLLECTOR_LABEL_PREFIXES):
             continue
-        in_files = False
-        if any(low.startswith(p) for p in _COLLECTOR_LABEL_PREFIXES):
-            continue
-        remaining.append(stripped)
-    return "\n".join(remaining)
+        else:
+            in_files = False
+            kept.append(stripped)
+    return "\n".join(kept)
 
 
 def _tail_names_open_work(tail: str) -> bool:
@@ -328,7 +330,15 @@ def _tail_names_open_work(tail: str) -> bool:
     )
 
 
-def _worker_residual(text: str, closer_spans, positive_spans) -> str:
+def _find_all(haystack: str, needle: str):
+    """Every start index of ``needle`` in ``haystack`` (both already lowered)."""
+    start = haystack.find(needle)
+    while start != -1:
+        yield start
+        start = haystack.find(needle, start + len(needle))
+
+
+def _worker_residual(text: str, spans) -> str:
     """The note's own worker-written text with the closing statements removed.
 
     Everything the note says about the CARD being the only thing left — the
@@ -339,17 +349,16 @@ def _worker_residual(text: str, closer_spans, positive_spans) -> str:
     relative to the closer («Раздел 3 остаётся недоделанным. Осталось закрыть
     карточку.» names it BEFORE).
     """
-    cuts = sorted((s, e) for s, e in list(closer_spans) + list(positive_spans))
     pieces: list[str] = []
     cursor = 0
-    for start, end in cuts:
-        if start < cursor:
-            start = cursor
+    for start, end in sorted(spans):
+        if end <= cursor:
+            continue
         if start > cursor:
             pieces.append(text[cursor:start])
-        cursor = max(cursor, end)
+        cursor = end
     pieces.append(text[cursor:])
-    return _substantive_tail_after("".join(pieces), 0)
+    return _worker_lines("".join(pieces))
 
 
 def _progress_reports_completion(progress: str) -> bool:
@@ -392,33 +401,22 @@ def _progress_reports_completion(progress: str) -> bool:
         return False
 
     # Every place the note states "the card is all that is left" — the closer
-    # clauses and the explicit no-work-left phrases — plus the end of the last
-    # such statement.
-    positive_spans: list[tuple[int, int]] = []
-    for phrase in _CLOSE_ONLY_NO_WORK_LEFT:
-        start = low.find(phrase)
-        while start != -1:
-            positive_spans.append((start, start + len(phrase)))
-            start = low.find(phrase, start + len(phrase))
-    pos_end = max((e for _s, e in positive_spans), default=0)
-    for match in _CLOSE_REMAINDER_RE.finditer(low):
-        positive_spans.append((match.start(), match.end()))
-        pos_end = max(pos_end, match.end())
-    if not positive_spans:
+    # clauses and the explicit no-work-left phrases.
+    spans: list[tuple[int, int]] = [
+        (start, start + len(phrase))
+        for phrase in _CLOSE_ONLY_NO_WORK_LEFT
+        for start in _find_all(low, phrase)
+    ]
+    spans += [(m.start(), m.end()) for m in _CLOSE_REMAINDER_RE.finditer(low)]
+    if not spans:
         return False
 
     if _CLOSE_REMAINDER_REOPENS_RE.search(low):
         return False
-    # Nothing in the rest of the note may still name open work, wherever that
-    # remainder sits — after the closer («Осталось закрыть карточку. Раздел 3
-    # не трогал») or before it («Раздел 3 остаётся недоделанным. Осталось
-    # закрыть карточку»).
-    residual = _worker_residual(low, positive_spans, ())
-    if _tail_names_open_work(residual):
-        return False
-    # The collector's service block is not worker text, but a list right after
-    # the closer inside one worker sentence still is.
-    return not _tail_names_open_work(_substantive_tail_after(low, pos_end))
+    # Nothing else the note says may name open work, wherever that remainder
+    # sits — after the closer («Осталось закрыть карточку. Раздел 3 не трогал»)
+    # or before it («Раздел 3 остаётся недоделанным. Осталось закрыть карточку»).
+    return not _tail_names_open_work(_worker_residual(low, spans))
 
 
 @dataclass
