@@ -787,3 +787,146 @@ def test_closer_wins_over_completion_detail_on_the_same_line():
         note = _production_note(tail)
         assert bsplit._progress_reports_completion(note) is True, note
         assert len(bsplit._fallback_children("t_p", "report", "body", note)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 boundary — r5 (ec0b6d3e74): SHORT-form passives, absence and
+# requirement predicates also name the remainder
+# ---------------------------------------------------------------------------
+# Review r5 of ec0b6d3e74 found the tail veto blind to the way Russian reports
+# actually state what is left: short-form passives («раздел 3 не тронут»,
+# «тестирование не тронуто», «разделы 3 и 4 не тронуты», «раздел 4 не покрыт»),
+# absence predicates («тесты отсутствуют»), requirement predicates («раздел 3
+# требует доработки», «для сборки не хватает раздела 3»), «без <чего>»
+# («остался без покрытия»), «не проводил(ся/ась)» и «не всё» after a participle
+# («покрыто не всё», «завершено не всё»).
+#
+# All of them collapsed to ONE «[close only] … ALREADY DONE — DO NOT redo» card
+# and the named remainder got no card at all — the exact class of failure this
+# module exists to remove (t_2d037564). The reviewer's seam probe failed 4/5 on
+# the real finalize_turn → run_budget_split → SQLite path.
+#
+# The control block pins the opposite polarity: a genuine close-only note must
+# STILL resolve to one card, so the fix cannot be "never collapse".
+
+_R5_PASSIVE_MIDWORK_TAILS = [
+    # short-form passive participles: -т / -то / -ты
+    "Раздел 3 не тронут.",
+    "Тестирование не тронуто.",
+    "Разделы 3 и 4 не тронуты.",
+    "Раздел 4 не покрыт тестами.",
+    # «не всё» after the participle
+    "Тестами покрыто не всё.",
+    "Завершено не всё.",
+    # absence predicates
+    "Тесты отсутствуют.",
+    "Раздел 3 отсутствует.",
+    # requirement / insufficiency predicates
+    "Раздел 3 требует доработки.",
+    "Для сборки не хватает раздела 3.",
+    # «без <чего>»
+    "Раздел 3 остался без покрытия.",
+    # «не проводил(ся/ась)»
+    "Проверка не проводилась.",
+    # plural state predicate
+    "Два замечания висят.",
+]
+
+# The same 13 shapes as they arrive from production: appended to a completion
+# statement and a closer, run through the REAL collector.
+_R5_DONE = "Собрал разделы 1-2 в reports/s12.md."
+_R5_CLOSER = "Осталось закрыть карточку."
+
+_R5_CLOSE_ONLY_CONTROLS = [
+    # owner shape, both note shapes
+    "Артефакт собран, тесты зелёные. Осталось закрыть карточку.",
+    "Осталось только закрыть карточку.",
+    "Всё готово, осталось закрыть тикет.",
+    "Сделано, переделывать не нужно: артефакт готов.",
+    "Nothing left to implement.",
+    "Only the card remains.",
+]
+
+
+@pytest.mark.parametrize("tail", _R5_PASSIVE_MIDWORK_TAILS)
+def test_short_passive_tail_keeps_a_card_for_the_remainder(tail):
+    """A remainder stated passively must still get its own card(s).
+
+    Both polarities of the note shape are checked — the bare tail and the
+    production note built by :func:`_collect_budget_progress_note` — because the
+    collector appends its own «ВЫПОЛНЕНО РАНЕЕ» header and file inventory, and
+    the veto must fire on the worker's sentence, not be starved by them.
+    """
+    assert bsplit._progress_reports_completion(tail) is False, tail
+    note = _production_note(f"{_R5_DONE} {_R5_CLOSER} {tail}")
+    assert tail in note, "the production note must carry the worker's remainder"
+    assert bsplit._progress_reports_completion(note) is False, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 2, f"{tail} collapsed to {len(children)} card(s)"
+    for child in children:
+        assert "ALREADY DONE" not in child["body"], tail
+        assert "Progress note from the previous worker" in child["body"], tail
+
+
+@pytest.mark.parametrize("tail", _R5_CLOSE_ONLY_CONTROLS)
+def test_r5_close_only_controls_still_resolve_to_one_card(tail):
+    """The fix is additive: genuine close-only notes must not start splitting."""
+    assert bsplit._progress_reports_completion(tail) is True, tail
+    note = _production_note(tail)
+    assert bsplit._progress_reports_completion(note) is True, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 1, f"{tail} split into {len(children)} cards"
+    assert "ALREADY DONE" in children[0]["body"]
+
+
+def test_r5_passive_shapes_through_the_real_seam_produce_children(
+    kanban_home, no_llm, monkeypatch
+):
+    """End-to-end on one representative shape: DB gets 2 children, no ALREADY DONE.
+
+    The parametrised unit test above pins the classifier; this one pins the
+    seam (``finalize_turn`` → ``run_budget_split`` → SQLite) for the class, so a
+    future change cannot keep the classifier green while the card still
+    collapses.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(kanban_home))
+    from hermes_cli import profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _n: True)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Собрать отчёт по разделам 1-4",
+            body="acceptance: 4 sections",
+            assignee="03-software-engineer",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = _BudgetAgent(max_iterations=3)
+    agent._handle_max_iterations = (
+        lambda messages, api_call_count: "Собрал разделы 1-2. "
+        "Осталось закрыть карточку. Раздел 3 не тронут."
+    )
+    _finalize_budget_exit(agent, [{"role": "user", "content": "собери отчёт"}])
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+        assert len(events) == 1, events
+        payload = events[0].payload or {}
+        child_ids = payload.get("child_ids") or []
+        bodies = [(kb.get_task(conn, cid).body or "") for cid in child_ids]
+
+    assert len(child_ids) >= 2, payload
+    assert payload.get("progress_note_source") == "run_buffer", payload
+    assert payload.get("progress_note_len", 0) > 0, payload
+    for body in bodies:
+        assert "ALREADY DONE" not in body
+        assert "Progress note from the previous worker" in body

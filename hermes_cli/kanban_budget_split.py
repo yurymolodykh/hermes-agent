@@ -263,14 +263,38 @@ _CLOSE_ONLY_PARTIAL_PERCENT_RE = re.compile(r"(?:^|[^\d])[1-9]?\d\s*%")
 # («Начал работу.») or a completion recap («Собрал отчёт, прогнал тесты, всё
 # зелёное.»), and both must keep the single card (reviewer r4 s2 control).
 # What must never survive is a tail that says something is still missing.
+#
+# Review r5 of ec0b6d3e74 (blocking): the veto only recognised LONG-form
+# participles («не проверен», «не написано») and -л past verbs. Russian reports
+# state the same remainder with SHORT-form passives («раздел 3 не тронут»,
+# «тестирование не тронуто», «разделы 3 и 4 не тронуты», «раздел 4 не покрыт»),
+# with absence predicates («тесты отсутствуют»), with requirement predicates
+# («раздел 3 требует доработки», «для сборки не хватает раздела 3»), with
+# «без <чего>» («остался без покрытия»), with «не проводил(ся/ась)» («проверка
+# не проводилась») and with «не всё» after the participle («покрыто не всё»,
+# «завершено не всё»). All 13 shapes collapsed to a single «ALREADY DONE» card
+# and the named remainder got no card at all — the exact work-loss this module
+# exists to prevent. Every extension below is additive: no existing branch was
+# weakened, and the close-only controls stay green (see
+# tests/hermes_cli/test_kanban_budget_split_progress.py).
 _TAIL_REMAINDER_RE = re.compile(
     r"\bне\s+[а-яё]+(?:л|ла|ло|ли)\b"      # не писал / не сделал / не успел
     r"|\bне\s+[а-яё]+(?:н|на|но|ны)\b"     # не проверен / не написано
+    r"|\bне\s+[а-яё]+(?:т|то|ты)\b"        # не тронут / не покрыто / не тронуты
     r"|\bне\s+(?:трогал|касался)"          # раздел 3 не трогал
     r"|остал[аои]?сь|оста[её]тся"           # осталось / остались / остаётся
     r"|\bнет\b"                            # тестов нет
-    r"|предстоит|в\s+очереди|не\s+доделан|доделать|дописать|висит"
+    r"|предстоит|в\s+очереди|не\s+доделан|доделать|дописать|вис(?:ит|ят)"
     r"|сначала|дальше|потом|завтра|затем"
+    # absence / requirement / «без <чего>» predicates — the remainder is stated
+    # without a negated verb, so none of the branches above see it.
+    r"|отсутству"                          # тесты отсутствуют
+    r"|не\s+хватает|недоста[её]т"          # для сборки не хватает раздела 3
+    r"|требу(?:ет|ют)"                     # раздел 3 требует доработки
+    r"|без\s+(?:покрыти|тестов|проверк|доработк|завершени|реализаци|сборки)"
+    r"|не\s+проводил"                      # проверка не проводилась
+    # «не всё» after a participle: «покрыто не всё», «завершено не всё».
+    r"|не\s+вс(?:ё|е)\b"
     r"|\btodo\b|\bpending\b|\bremaining\b|\bnext\b",
     re.IGNORECASE,
 )
