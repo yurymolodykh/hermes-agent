@@ -77,6 +77,53 @@ FAST_REASONING_ROUTINE = "medium"  # routine class A -> medium (§5)
 FAST_REASONING_COMPLEX = "high"    # complex/critical/giant -> high (§5)
 # "low" is NEVER used on the fast path (D3) — medium is the floor.
 _REASONING_FLOOR = "medium"
+# Internal ladder accepted by a profile-owned fast-lane reasoning pin. A pin
+# outside this set is ignored (with a warning) so a typo can never put an
+# arbitrary string on the wire.
+_EFFORT_LADDER = (
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+)
+
+
+def resolve_fast_reasoning_pin(
+    config: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return the profile-owned fast-lane reasoning pin, or ``None``.
+
+    ``fast_lane.reasoning_effort`` is the ONLY place a profile can pin what a
+    fast request thinks at. Without it the fast path applies the design §5
+    defaults (medium routine / high complex), which silently overrode a
+    profile whose own ``agent.reasoning_effort`` was lower — profile
+    11-fast-answers is pinned at ``low`` by the owner, yet every api_server
+    turn came out ``medium``/``high`` because D3's floor replaced the profile
+    config wholesale (t_71dd1bfc).
+
+    Precedence contract: an explicit pin in THIS profile's config wins over
+    the D3 defaults, and never inherits another profile's value — the caller
+    passes the config of the profile that will actually execute the turn
+    (``_load_gateway_config()`` inside the profile runtime scope), so the
+    value is the executor's own.
+
+    Unknown values are ignored (``None``) with a warning, never forwarded.
+    """
+    if not isinstance(config, dict):
+        return None
+    raw = config.get("reasoning_effort")
+    if raw is None or isinstance(raw, bool):
+        # YAML booleans are the disable form used by agent.reasoning_effort;
+        # they are not a fast-lane pin, so leave the D3 defaults in charge.
+        return None
+    effort = str(raw).strip().lower()
+    if not effort:
+        return None
+    if effort not in _EFFORT_LADDER:
+        logger.warning(
+            "fast_lane.reasoning_effort=%r is not a known effort level; "
+            "ignoring the fast-lane pin and using the design default",
+            raw,
+        )
+        return None
+    return effort
 # Reasoning levels that must route to the SLOW lane even when other markers
 # are absent (complex/legal/irreversible work belongs to the full lane).
 _COMPLEX_ALWAYS_SLOW = frozenset({"critical", "xlarge"})
@@ -426,6 +473,7 @@ def resolve_fast_path(
     *,
     max_iterations: int = FAST_MAX_ITERATIONS,
     run_budget_seconds: Optional[float] = FAST_RUN_BUDGET_SECONDS,
+    reasoning_pin: Optional[str] = None,
 ) -> FastLaneDecision:
     """Populate the fast-path activation fields for one decision (t_ae312f32).
 
@@ -436,7 +484,16 @@ def resolve_fast_path(
     - fast requests (slow_mode=False): reasoning **medium** for routine class A
       and **high** for complex work; ``max_iterations`` capped at 16;
       ``run_budget_seconds=300``; ``review_exempt=True`` (D5). ``low`` is
-      never selected (D3).
+      never selected (D3) **unless the executing profile pins it**.
+
+    ``reasoning_pin`` is the profile-owned level from
+    :func:`resolve_fast_reasoning_pin` (``fast_lane.reasoning_effort`` of the
+    profile that will actually run the turn). It exists because the D3 floor
+    silently overrode an explicitly configured lower level: profile
+    11-fast-answers is pinned at ``low``, yet every api_server turn was
+    rewritten to medium/high (t_71dd1bfc). An explicit pin therefore beats the
+    D3 default, while ``None`` keeps the historical medium/high behaviour for
+    every profile that never asked for a pin.
 
     ``text`` is the request text used for the complexity split; when omitted
     the decision's ``complexity`` field is kept as-is.
@@ -461,6 +518,14 @@ def resolve_fast_path(
     effort = (
         FAST_REASONING_COMPLEX if complexity == "high" else FAST_REASONING_ROUTINE
     )
+    # Profile-owned pin wins over the D3 class default (t_71dd1bfc): a profile
+    # that explicitly pins its fast lane to `low` (11-fast-answers) must not be
+    # silently escalated to medium/high. No pin -> historical behaviour.
+    _pinned_effort = resolve_fast_reasoning_pin(
+        {"reasoning_effort": reasoning_pin} if reasoning_pin else None
+    )
+    if _pinned_effort:
+        effort = _pinned_effort
     # Owner decision (variant 2, 2026-10-19): the fast lane bounds fast tasks by
     # WALL-CLOCK TIME, not by LLM-call count. A hard `max_iterations` cap is what
     # caused "нелепые обрывы" of perfectly normal answers (a task that had done

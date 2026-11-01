@@ -5794,9 +5794,15 @@ class TurnRunner:
                 resolve_fast_path as _fast_lane_resolve,
                 strip_telegram_slow_prefix as _fast_lane_strip,
                 patch_session_fast_lane_marker as _patch_fast_lane_marker,
+                resolve_fast_reasoning_pin as _fast_lane_resolve_pin,
             )
             _fast_lane_config = (ctx.user_config or {}).get("fast_lane") or {}
             _fast_lane_active = _fast_lane_enabled(ctx.user_config or {})
+            # Profile-owned reasoning pin (t_71dd1bfc): ctx.user_config is the
+            # EXECUTING profile's config (Track M re-enters _run_agent_inner
+            # inside _profile_runtime_scope), so a profile pinned to `low` is
+            # never silently escalated to the D3 medium/high default.
+            _fast_reasoning_pin = _fast_lane_resolve_pin(_fast_lane_config)
             # Session-sticky slow mode (t_e0350c47): a session slowed by an
             # earlier marker keeps every later message on the slow lane. This
             # block runs off-loop (run_sync in an executor), so the SYNC reader
@@ -5826,7 +5832,8 @@ class TurnRunner:
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
-                    _fast_decision, ctx.message or ""
+                    _fast_decision, ctx.message or "",
+                    reasoning_pin=_fast_reasoning_pin,
                 )
             _fast_stripped_message = _fast_lane_strip(ctx.message or "")
             if _fast_decision.slow_mode:
@@ -29133,6 +29140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.fast_lane import (
                 decide_slow_mode,
                 resolve_fast_path,
+                resolve_fast_reasoning_pin,
                 route_profile,
                 session_slow_mode,
             )
@@ -29171,7 +29179,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision = decide_slow_mode(
                 message, config=fl_cfg, session_slow=_fl_session_slow
             )
-            decision = resolve_fast_path(decision, message)
+            # Profile-owned reasoning pin (t_71dd1bfc): the SELECTOR runs on the
+            # ORIGIN profile, but the fast turn executes under
+            # 11-fast-answers (route_profile below), so the pin that governs the
+            # wire level must come from the EXECUTOR's config — else the
+            # decision logged/handed downstream carries the origin's level.
+            _pin_profile = route_profile(decision) or ""
+            _pin_cfg = fl_cfg
+            if _pin_profile:
+                try:
+                    from hermes_cli.profiles import get_profile_dir
+
+                    _pin_cfg = _load_gateway_config(
+                        get_profile_dir(_pin_profile) / "config.yaml"
+                    ).get("fast_lane") or {}
+                except Exception:
+                    _pin_cfg = fl_cfg
+            decision = resolve_fast_path(
+                decision, message,
+                reasoning_pin=resolve_fast_reasoning_pin(_pin_cfg),
+            )
             if decision_out is not None:
                 # Hand the exact decision back to the caller so it can log the
                 # ROUTE/FAST line without re-running the decision (which used

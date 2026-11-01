@@ -3983,9 +3983,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 resolve_fast_path as _fast_lane_resolve,
                 strip_telegram_slow_prefix as _fast_lane_strip,
                 patch_session_fast_lane_marker as _patch_fast_lane_marker,
+                resolve_fast_reasoning_pin as _fast_lane_resolve_pin,
             )
             _fast_lane_config = (user_config or {}).get("fast_lane") or {}
             _fast_lane_active = _fast_lane_enabled(user_config or {})
+            # Profile-owned reasoning pin (t_71dd1bfc). ``user_config`` is read
+            # inside _profile_scope(run_profile), so this value belongs to the
+            # EXECUTING profile — never the owner's. Without it the D3 floor
+            # rewrote profile 11's `low` into medium/high on every turn.
+            _fast_reasoning_pin = _fast_lane_resolve_pin(_fast_lane_config)
             _fast_probe = fast_lane_probe or user_message or ""
             _fast_decision = _fast_lane_evaluate(
                 _fast_probe,
@@ -3995,7 +4001,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
-                    _fast_decision, _fast_probe
+                    _fast_decision, _fast_probe, reasoning_pin=_fast_reasoning_pin
                 )
             # OWUI/PWA text marker (A6 §4.2): the «подумай»/«думай» prefix in
             # the request body must be STRIPPED from the text the model runs
