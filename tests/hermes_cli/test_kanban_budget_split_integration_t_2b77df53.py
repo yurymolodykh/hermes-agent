@@ -322,15 +322,147 @@ def test_mid_work_exit_through_the_real_seam_still_splits(
         payload = events[0].payload if events else {}
         children = [kb.get_task(conn, cid) for cid in (payload.get("child_ids") or [])]
     assert len(events) == 1
-    assert payload.get("via") != "close_only", payload
+    # `via` is NOT a payload key (real keys: child_ids, depth, progress_note,
+    # progress_note_len, progress_note_source, source), so a `payload.get("via")`
+    # assertion here would be vacuously true. Collapse is caught structurally
+    # instead: no close-only title, and the remainder keeps a real card.
     child_ids = [c.id for c in children if c is not None]
     assert len(child_ids) >= 2, f"mid-work must not collapse to one card: {child_ids}"
-    # No child may promise the work is already finished.
     for c in children:
         if c is None:
             continue
+        assert "[close only]" not in (c.title or ""), c.id
         assert "ALREADY DONE" not in (c.body or ""), c.id
         assert "осталось закрыть раздел 3" in (c.body or ""), c.id
     print("\n=== mid-work split (real DB rows) ===")
     print("payload.source =", payload.get("progress_note_source"),
-          "| via =", payload.get("via"), "| children =", child_ids)
+          "| children =", child_ids,
+          "| titles =", [(c.title or "")[:48] for c in children if c is not None])
+
+
+# ---------------------------------------------------------------------------
+# The reviewer's differential case, pinned through the REAL seam
+# ---------------------------------------------------------------------------
+# On 15743759b0 this exact pair diverged: a partial-credit summary collapsed to
+# one card while the genuine close-only one also collapsed (i.e. the two were
+# indistinguishable). Both are driven through finalize_turn → run_budget_split
+# → SQLite here, so the class boundary is asserted end-to-end, not on bare
+# strings.
+
+class _PartialCreditAgent(_BudgetAgent):
+    """Worker whose post-budget summary admits the work is only partly done."""
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Работа выполнена частично, осталось доделать раздел 3."
+
+
+class _EverythingButTestsAgent(_BudgetAgent):
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Всё сделано, кроме тестов — их надо дописать и прогнать."
+
+
+class _GenuineCloseOnlyAgent(_BudgetAgent):
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Работа выполнена, артефакт собран, осталось закрыть карточку."
+
+
+def _run_seam_and_read(kanban_home, monkeypatch, tmp_path, agent, label):
+    workspace = tmp_path / ("ws_" + label)
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Собрать отчёт по разделам 1-4",
+            body="acceptance: all four sections present",
+            assignee="03-software-engineer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    messages = [
+        {"role": "user", "content": "собери отчёт"},
+        {
+            "role": "assistant",
+            "content": "Начал работу над отчётом.",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {"path": "reports/draft.md", "content": "# draft"}
+                    ),
+                },
+            }],
+        },
+        {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+    ]
+
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id=tid,
+        turn_id="turn-" + label,
+        user_message="собери отчёт",
+        original_user_message="собери отчёт",
+        _should_review_memory=False,
+        _turn_exit_reason="budget_exhausted",
+    )
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+        payload = events[0].payload if events else {}
+        children = [kb.get_task(conn, cid) for cid in (payload.get("child_ids") or [])]
+    assert len(events) == 1, f"{label}: expected exactly one budget_split event"
+    return tid, payload, [c for c in children if c is not None]
+
+
+@pytest.mark.parametrize(
+    "agent_cls,label,expect_children",
+    [
+        (_PartialCreditAgent, "partial-credit", 2),
+        (_EverythingButTestsAgent, "everything-except-tests", 2),
+        (_GenuineCloseOnlyAgent, "genuine-close-only", 1),
+    ],
+)
+def test_class_boundary_through_the_real_seam(
+    kanban_home, no_llm, monkeypatch, tmp_path,
+    agent_cls, label, expect_children,
+):
+    tid, payload, children = _run_seam_and_read(
+        kanban_home, monkeypatch, tmp_path, agent_cls(max_iterations=3), label,
+    )
+    assert payload.get("progress_note_source") == "run_buffer", payload
+    assert payload.get("progress_note_len", 0) > 0, payload
+    assert len(children) == expect_children, (
+        f"{label}: expected {expect_children} children, got "
+        f"{[(c.id, c.title) for c in children]}"
+    )
+
+    close_only = [c for c in children if "[close only]" in (c.title or "")]
+    if expect_children == 1:
+        assert len(close_only) == 1
+        assert "ALREADY DONE" in (close_only[0].body or "")
+    else:
+        # Unfinished work must keep real cards AND never claim it is done.
+        assert close_only == [], f"{label} collapsed to close-only: {close_only[0].title}"
+        for c in children:
+            assert "ALREADY DONE" not in (c.body or ""), c.id
+            assert "Progress note from the previous worker" in (c.body or ""), c.id
+
+    print("\n=== seam: %s ===" % label)
+    print("task:", tid, "| source:", payload.get("progress_note_source"),
+          "| note_len:", payload.get("progress_note_len"))
+    for c in children:
+        print("  -", c.id, "|", (c.title or "")[:60],
+              "| ALREADY_DONE:", "ALREADY DONE" in (c.body or ""))

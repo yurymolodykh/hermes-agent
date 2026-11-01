@@ -474,3 +474,124 @@ def test_run_budget_split_close_only_creates_one_card(kanban_home, no_llm):
     assert child.status == "ready"
     assert "Verify and close" in child.title
     assert root.status == "todo"
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 boundary — bare completion phrasing is NOT close-only
+# ---------------------------------------------------------------------------
+# Review of 15743759b0 (blocking): the detector accepted bare substrings
+# ("работа выполнена", "всё сделано", "already completed"). Those are exactly
+# how a worker OPENS a partial-credit summary, so 11 of 22 realistic
+# mid-work tails collapsed to one "[close only] Verify and close" card whose
+# body said both «осталось доделать раздел 3» and «ALREADY DONE — DO NOT redo».
+# The remainder then had no card at all — worse than the empty note the whole
+# task exists to fix.
+#
+# The corpus below is deliberately NOT hand-picked to the regex under test: it
+# is a spread of partial-credit qualifiers (частично / на N% / в основном /
+# кроме / наполовину / не до конца) and of "closing a work item" phrasing.
+# Both the bare tail and the note shape that `_collect_budget_progress_note`
+# actually emits in production are checked, because only the latter reaches
+# the splitter in production and only it contains the model's summary section.
+
+_PARTIAL_CREDIT_TAILS = [
+    "Сделал каркас и API. Раздел 3 не начат.",
+    "Готовы разделы 1 и 2. Осталось написать разделы 3 и 4.",
+    "Работа выполнена частично: парсер есть, валидация отсутствует.",
+    "Работа выполнена на 70%, осталось закрыть интеграцию с очередью.",
+    "Работа выполнена в основном, но раздел 4 не начат.",
+    "Работа выполнена наполовину.",
+    "Работа выполнена лишь частично; остальное в следующем прогоне.",
+    "Работа выполнена, кроме раздела 3 — его надо дописать.",
+    "Работа выполнена не до конца: миграции не написаны.",
+    "Всё сделано, кроме тестов — их надо дописать и прогнать.",
+    "Всё сделано для раздела 1, раздел 2 в работе.",
+    "Выполнено: разделы 1-2. Осталось: раздел 3.",
+    "Схема готова. Тесты не написаны, сборка не проверялась.",
+    "Реализовал 3 из 5 эндпоинтов, остальные в работе.",
+    "Черновик отчёта готов, данных за Q3 нет.",
+    "Начал рефакторинг, половина модулей переписана.",
+    "Интеграция работает на моках, реальный API не подключён.",
+    "Only the card is still open for part 1; part 2 is not started.",
+    "Работа выполнена, но сборка падает — надо чинить.",
+    "Файл отчёта создан, но данные за квартал ещё не собраны.",
+    "Готово: каркас, роутинг. Не готово: аутентификация, тесты.",
+    "Сделал первую половину, вторая требует решения владельца.",
+]
+
+_GENUINE_CLOSE_ONLY_TAILS = [
+    "Работа выполнена, артефакт собран, осталось закрыть карточку.",
+    "Всё сделано и протестировано, осталось только закрыть тикет.",
+    "Отчёт готов, тесты зелёные, осталось закрыть карточку.",
+    "Работа уже выполнена полностью, осталось закрыть.",
+    "Артефакт собран и проверен, осталось закрыть.",
+]
+
+
+def _production_note(tail: str) -> str:
+    """The exact shape ``_collect_budget_progress_note`` emits in production."""
+    return turn_finalizer._collect_budget_progress_note(
+        messages=[
+            {"role": "user", "content": "собери отчёт"},
+            {
+                "role": "assistant",
+                "content": "Начал работу.",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path": "reports/draft.md", "content": "x"}',
+                    },
+                }],
+            },
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ],
+        final_response=tail,
+        api_call_count=40,
+        max_iterations=40,
+        exit_reason="max_iterations_reached(40/40)",
+    )
+
+
+@pytest.mark.parametrize("tail", _PARTIAL_CREDIT_TAILS)
+def test_partial_credit_tail_never_collapses_to_close_only(tail):
+    """A partial-credit summary must keep a real split in BOTH note shapes."""
+    assert bsplit._progress_reports_completion(tail) is False, tail
+    note = _production_note(tail)
+    assert note, "the production note must carry the summary"
+    assert bsplit._progress_reports_completion(note) is False, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 2, f"{tail} collapsed to {len(children)} card(s)"
+    for child in children:
+        assert "ALREADY DONE" not in child["body"]
+        assert "Progress note from the previous worker" in child["body"]
+
+
+@pytest.mark.parametrize("tail", _GENUINE_CLOSE_ONLY_TAILS)
+def test_genuine_close_only_tail_still_resolves_to_one_card(tail):
+    """The owner's case must keep working, in the production note shape too."""
+    assert bsplit._progress_reports_completion(tail) is True, tail
+    note = _production_note(tail)
+    assert bsplit._progress_reports_completion(note) is True, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 1
+    assert "Verify and close" in children[0]["title"]
+    assert "ALREADY DONE" in children[0]["body"]
+
+
+def test_close_only_needs_a_closing_remainder_not_just_a_completion_claim():
+    """Completion phrasing alone is not a closing remainder.
+
+    Each of these says the work is done in one clause and names REMAINING WORK
+    in another; none may resolve to the single card.
+    """
+    for tail in [
+        "Работа выполнена. Осталось написать раздел 3.",
+        "Всё сделано: осталось проверить сборку на чистой машине.",
+        "already completed the parser; the validator is still missing",
+        "Осталось закрыть этот вопрос с заказчиком после ревью.",
+        "Осталось закрыть миграции на прод.",
+        "Работа выполнена на 100%, но раздел 4 не начат.",
+    ]:
+        assert bsplit._progress_reports_completion(tail) is False, tail
+        assert len(bsplit._fallback_children("t_p", "t", "b", tail)) == 2, tail

@@ -106,43 +106,46 @@ EXACTLY ONE task titled "verify and close: <title>" that re-uses the finished
 artifact and does not redo it. Otherwise output 2-4 tasks as specified.
 """
 
-_BUILTIN_CLOSE_ONLY_MARKERS = (
-    "work is already done",
-    "already completed",
-    "already finished",
-    "only the card is still open",
+# A note resolves to the single "verify and close" card only when it names a
+# CLOSING REMAINDER — the only thing still open is the card itself.
+#
+# Bare completion phrasing («работа выполнена», «всё сделано», «already
+# completed») is deliberately NOT sufficient. It is the normal way a worker
+# OPENS a partial-credit summary («работа выполнена частично, осталось
+# доделать раздел 3»), so treating it as close-only shipped children whose body
+# said both «осталось доделать раздел 3» and «ALREADY DONE — DO NOT redo», and
+# the remainder got no card at all (review of 15743759b0: 11 of 22 realistic
+# partial-credit tails collapsed; the pre-fix revision split them correctly).
+_CLOSE_ONLY_NO_WORK_LEFT = (
     "nothing left to implement",
-    "работа выполнена",
-    "работа уже выполнена",
-    "всё сделано",
-    "все сделано",
-    "осталось только закрыть",
-    "осталось закрыть карточку",
-    "только закрыть карточку",
+    "nothing left to do",
+    "nothing left to change",
+    "only the card is still open",
+    "only the card remains",
     "переделывать не нужно",
     "не нужно переделывать",
 )
 
-# "осталось (только)? закрыть <карточку|тикет|этот вопрос>" — the shape the
-# owner used («выполнено, осталось закрыть»). Anchored on the *closing
-# artifact*, not on the bare substring pair "остал"+"закры": «осталось открыть
-# раздел 3» and «осталось закрыть тестами функцию parse()» both contain those
-# substrings while describing remaining WORK — collapsing them into one
-# "verify and close" card silently drops the remainder of the task.
+# «осталось (только|лишь)? закрыть» followed by the end of the clause, or by
+# the card artifact being closed («карточку / задачу / тикет»).
 #
-# Deliberately NOT accepted: «осталось закрыть задачи/смену/сессию» — those are
-# work items, not the card. The asymmetry is intentional: a false positive
-# drops unfinished work with no card at all, while a false negative only costs
-# one redundant split.
+# Deliberately NOT accepted: closing a WORK ITEM — «осталось закрыть раздел 3»,
+# «осталось закрыть миграции», «осталось закрыть тестами функцию parse()»,
+# «осталось закрыть вопрос с лицензией». The asymmetry is intentional: a false
+# positive drops unfinished work with no card at all, while a false negative
+# only costs one redundant split. For the same reason «этот вопрос» / «вопрос о
+# закрытии» are not accepted — a question is work, not the card.
 _CLOSE_REMAINDER_RE = re.compile(
     r"осталось\s+(?:только\s+|лишь\s+)?закрыть"
-    r"(?=$|[.,;:!?…)»\"']"
-    r"|\s+(?:карточк|тикет|вопрос\s+о\s+закрыти|этот\s+вопрос))",
+    r"(?=$|[.,;:!?…)\»\"']"
+    r"|\s+(?:карточк[уа]|тикет[а]?|задач[у])\b)",
     re.IGNORECASE,
 )
-# Negation guard: a note that explicitly says work is NOT finished must never
-# resolve to the single close-only card, even if a positive marker appears in
-# the same text (e.g. "работа выполнена не полностью, осталось …").
+
+# Negation and partial-credit qualifiers disqualify the note OUTRIGHT, checked
+# before any positive signal: a note that says the work is not finished must
+# never resolve to the close-only card, even when a positive marker appears in
+# the same text.
 _CLOSE_ONLY_NEGATIONS = (
     "не полностью",
     "не выполнена",
@@ -168,26 +171,77 @@ _CLOSE_ONLY_NEGATIONS = (
     "still remaining",
 )
 
+# Partial-credit qualifiers. Each of these says "some of it is done" — which is
+# the opposite of close-only — and they are the qualifier class the previous
+# revision missed («частично / на 70% / в основном / кроме / наполовину»).
+_CLOSE_ONLY_PARTIAL_MARKERS = (
+    "частично",
+    "наполовину",
+    "в основном",
+    "не до конца",
+    "кроме",
+    "за исключением",
+    "в работе",
+    "не начат",
+    "не начато",
+    "не написано",
+    "не написаны",
+    "не реализовано",
+    "не реализован",
+    "не подключ",
+    "не проверял",
+    "черновик",
+    "первую половину",
+    "осталось доделать",
+    "осталось дописать",
+    "осталось написать",
+    "осталось реализовать",
+    "осталось починить",
+    "надо дописать",
+    "надо починить",
+    "требует решения",
+    "not started",
+    "in progress",
+    "partly",
+    "partially",
+    "still open for part",
+)
+# «на 70%», «70 %» — a numeric share below 100 means partial. 100% is not
+# matched on purpose (it is not a partial-credit signal).
+_CLOSE_ONLY_PARTIAL_PERCENT_RE = re.compile(r"(?:^|[^\d])[1-9]?\d\s*%")
+
 
 def _progress_reports_completion(progress: str) -> bool:
-    """True when the progress note says the work is done and only closing remains.
+    """True only when the note says the work is done AND just closing remains.
 
-    Deliberately narrow — it keys on explicit completion phrasing, NOT on the
-    ``ВЫПОЛНЕНО РАНЕЕ`` header that
-    :func:`agent.turn_finalizer._collect_budget_progress_note` always emits.
-    That header means "this part already landed, continue from here", so
-    matching it here would collapse every real split into a single card.
+    Two conditions must BOTH hold, and any negation/partial-credit qualifier
+    vetoes first:
 
-    Negation first: a note that says the work is NOT finished wins over any
-    positive marker in the same text, because a false "verify and close" drops
-    the remaining work entirely (worse than restarting it).
+    1. the note names a *closing remainder* — «осталось (только) закрыть»
+       at a clause boundary or aimed at the card artifact — or an explicit
+       "nothing left to implement" statement;
+    2. no negation («не полностью») and no partial-credit qualifier
+       («частично», «на 70%», «кроме», «наполовину», «не начат») appears.
+
+    Deliberately narrow — it keys on the closing remainder, NOT on completion
+    phrasing and NOT on the ``ВЫПОЛНЕНО РАНЕЕ`` header that
+    :func:`agent.turn_finalizer._collect_budget_progress_note` always emits
+    (that header means "this part already landed, continue from here", so
+    matching it would collapse every real split into a single card).
+
+    The asymmetry is intentional: a false positive drops the remaining work
+    entirely (no card at all), a false negative costs one redundant split.
     """
     if not progress or not isinstance(progress, str):
         return False
     low = progress.lower()
     if any(neg in low for neg in _CLOSE_ONLY_NEGATIONS):
         return False
-    if any(marker.lower() in low for marker in _BUILTIN_CLOSE_ONLY_MARKERS):
+    if any(bad in low for bad in _CLOSE_ONLY_PARTIAL_MARKERS):
+        return False
+    if _CLOSE_ONLY_PARTIAL_PERCENT_RE.search(low):
+        return False
+    if any(phrase in low for phrase in _CLOSE_ONLY_NO_WORK_LEFT):
         return True
     return _CLOSE_REMAINDER_RE.search(low) is not None
 
