@@ -517,6 +517,27 @@ _PARTIAL_CREDIT_TAILS = [
     "Файл отчёта создан, но данные за квартал ещё не собраны.",
     "Готово: каркас, роутинг. Не готово: аутентификация, тесты.",
     "Сделал первую половину, вторая требует решения владельца.",
+    # --- reviewer r3 blocking class (a): a colon/semicolon after the closer
+    # INTRODUCES the enumeration of what remains. `:`/`;` used to be accepted as
+    # a clause end, so «раздел 3» got no card while the only child claimed
+    # «ALREADY DONE — DO NOT redo».
+    "Осталось закрыть: раздел 3.",
+    "Работа выполнена. Осталось закрыть: раздел 3, тесты.",
+    "Осталось закрыть: миграции, раздел 3 и тесты.",
+    "Осталось закрыть: 1) раздел 3; 2) тесты.",
+    "Осталось закрыть карточку и раздел 3.",
+    "Осталось закрыть тикет, но сначала надо починить сборку.",
+    "Осталось закрыть карточку — остались тесты.",
+    # --- reviewer r3 blocking class (b): «закрыть задачу <работа>» closes a WORK
+    # ITEM, not the board card. These split correctly on 15743759b0 and were
+    # REGRESSIONS on c2338e94d1.
+    "Осталось закрыть задачу миграции на прод.",
+    "Парсер готов; осталось закрыть задачу по обработке ошибок в клиенте.",
+    "Осталось закрыть задачу №5 по разделу 3.",
+    # --- remainder re-opened in a LATER clause while the closer ends one
+    "Каркас готов. Осталось закрыть.\nОсталось: раздел 3 и тесты.",
+    "Работа выполнена, осталось закрыть карточку. Но осталось: раздел 3.",
+    "Осталось: раздел 3. Осталось закрыть карточку.",
 ]
 
 _GENUINE_CLOSE_ONLY_TAILS = [
@@ -595,3 +616,31 @@ def test_close_only_needs_a_closing_remainder_not_just_a_completion_claim():
     ]:
         assert bsplit._progress_reports_completion(tail) is False, tail
         assert len(bsplit._fallback_children("t_p", "t", "b", tail)) == 2, tail
+
+
+def test_conflicting_note_resolves_to_the_safe_side():
+    """The seam embeds BOTH the post-budget summary and the transcript tail.
+
+    A worker that finished and only needs the card closed may still have a
+    transcript tail that names earlier remaining work. The combined note then
+    carries both signals; the class boundary must resolve to SPLIT (a false
+    negative costs one redundant split, a false positive drops real work).
+    """
+    note = turn_finalizer._collect_budget_progress_note(
+        messages=[
+            {"role": "user", "content": "собери отчёт"},
+            {"role": "assistant",
+             "content": "Готовы разделы 1 и 2, осталось написать разделы 3 и 4."},
+        ],
+        final_response="Работа выполнена, артефакт готов, осталось закрыть карточку.",
+        api_call_count=3,
+        max_iterations=3,
+        exit_reason="budget_exhausted",
+    )
+    assert "осталось закрыть карточку" in note
+    assert "осталось написать разделы 3 и 4" in note
+    assert bsplit._progress_reports_completion(note) is False, note
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 2
+    for child in children:
+        assert "ALREADY DONE" not in child["body"]

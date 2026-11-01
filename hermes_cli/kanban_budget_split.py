@@ -126,21 +126,46 @@ _CLOSE_ONLY_NO_WORK_LEFT = (
     "не нужно переделывать",
 )
 
-# «осталось (только|лишь)? закрыть» followed by the end of the clause, or by
-# the card artifact being closed («карточку / задачу / тикет»).
+# «осталось (только|лишь)? закрыть» ENDING its clause, optionally followed by
+# the card artifact as the LAST word of that clause.
+#
+# What counts as the end of the clause: sentence punctuation (`.!?…`), a
+# closing bracket, a quote, a line break, or end of text. `:` and `;` are
+# deliberately EXCLUDED — they introduce an enumeration of what still remains
+# («осталось закрыть: раздел 3, тесты»), which is the single most common way a
+# worker lists unfinished work. Treating them as a clause end collapsed 6 of 14
+# realistic mid-work tails in review of c2338e94d1, so the named remainder got
+# no card at all while its child body claimed «ALREADY DONE — DO NOT redo».
 #
 # Deliberately NOT accepted: closing a WORK ITEM — «осталось закрыть раздел 3»,
 # «осталось закрыть миграции», «осталось закрыть тестами функцию parse()»,
-# «осталось закрыть вопрос с лицензией». The asymmetry is intentional: a false
-# positive drops unfinished work with no card at all, while a false negative
-# only costs one redundant split. For the same reason «этот вопрос» / «вопрос о
-# закрытии» are not accepted — a question is work, not the card.
+# «осталось закрыть вопрос с лицензией», «осталось закрыть задачу миграции на
+# прод». The artifact word («карточку / тикет / задачу») only counts when
+# nothing is attached to it inside the same clause: «осталось закрыть карточку
+# и раздел 3» keeps working because the clause continues past «карточку».
+# The asymmetry is intentional: a false positive drops unfinished work with no
+# card at all, while a false negative only costs one redundant split.
 _CLOSE_REMAINDER_RE = re.compile(
     r"осталось\s+(?:только\s+|лишь\s+)?закрыть"
-    r"(?=$|[.,;:!?…)\»\"']"
-    r"|\s+(?:карточк[уа]|тикет[а]?|задач[у])\b)",
+    r"(?:\s+(?:карточк[уа]|тикет[а]?|задач[у]))?"
+    r"\s*(?:[.!?…)}\»\"']|\n|$)",
     re.IGNORECASE,
 )
+
+# A later clause that RE-OPENS the remainder («Осталось закрыть.
+# Осталось: раздел 3 и тесты», «осталось закрыть карточку. Но осталось:
+# раздел 3»), and a partial-credit remainder stated BEFORE the closer
+# («Осталось: раздел 3. Осталось закрыть карточку», «Раздел 3 не начат.
+# Осталось закрыть карточку») both mean the card is not the only thing left.
+_CLOSE_REMAINDER_REOPENS_RE = re.compile(
+    # «Осталось:» / «Осталось закрыть: раздел 3» / «Остались: тесты» — a
+    # remainder introduced by a colon within a short window after «остал(о|и)сь».
+    r"остал[оа]сь\b[^.\n]{0,40}?[:;]",
+    re.IGNORECASE,
+)
+# Work-naming verb immediately before the closer («надо дописать, осталось
+# закрыть») is not required to veto — the negations/partial markers cover the
+# explicit forms; the two patterns above cover the structural ones.
 
 # Negation and partial-credit qualifiers disqualify the note OUTRIGHT, checked
 # before any positive signal: a note that says the work is not finished must
@@ -218,10 +243,16 @@ def _progress_reports_completion(progress: str) -> bool:
     vetoes first:
 
     1. the note names a *closing remainder* — «осталось (только) закрыть»
-       at a clause boundary or aimed at the card artifact — or an explicit
-       "nothing left to implement" statement;
+       ENDING its clause (optionally «карточку/тикет/задачу» as the last word)
+       — or an explicit "nothing left to implement" statement;
     2. no negation («не полностью») and no partial-credit qualifier
        («частично», «на 70%», «кроме», «наполовину», «не начат») appears.
+
+    Structural vetoes on top of the qualifier lists, because the remainder is
+    often enumerated rather than qualified: a closer that does NOT end its
+    clause («осталось закрыть: раздел 3, тесты» — `:`/`;` introduce the list)
+    and a note that re-opens the remainder in another clause («Осталось
+    закрыть.\\nОсталось: раздел 3») are both mid-work, not close-only.
 
     Deliberately narrow — it keys on the closing remainder, NOT on completion
     phrasing and NOT on the ``ВЫПОЛНЕНО РАНЕЕ`` header that
@@ -243,6 +274,8 @@ def _progress_reports_completion(progress: str) -> bool:
         return False
     if any(phrase in low for phrase in _CLOSE_ONLY_NO_WORK_LEFT):
         return True
+    if _CLOSE_REMAINDER_REOPENS_RE.search(low):
+        return False
     return _CLOSE_REMAINDER_RE.search(low) is not None
 
 

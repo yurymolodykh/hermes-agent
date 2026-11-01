@@ -361,6 +361,37 @@ class _EverythingButTestsAgent(_BudgetAgent):
         return "Всё сделано, кроме тестов — их надо дописать и прогнать."
 
 
+class _ColonEnumerationAgent(_BudgetAgent):
+    """Reviewer r3 (a): «осталось закрыть:» introduces an ENUMERATION of work.
+
+    `:` was treated as a clause end by c2338e94d1, so this note collapsed to one
+    «[close only]» card whose body named «раздел 3» AND «ALREADY DONE» — the
+    remainder got no card at all. This is the exact reviewer reproduction.
+    """
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Осталось закрыть: раздел 3."
+
+
+class _CardArtifactPlusWorkAgent(_BudgetAgent):
+    """Reviewer r3 (a): artifact word followed by more work in the same clause."""
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Осталось закрыть карточку и раздел 3."
+
+
+class _WorkItemTaskAgent(_BudgetAgent):
+    """Reviewer r3 (b): «закрыть задачу <работа>» — a WORK ITEM, not the card.
+
+    REGRESSION on c2338e94d1 relative to 15743759b0: `задач[у]` had been added as
+    a free alternative in the card-artifact group, so closing a work task was
+    mistaken for closing the board card.
+    """
+
+    def _handle_max_iterations(self, messages, api_call_count):
+        return "Осталось закрыть задачу миграции на прод."
+
+
 class _GenuineCloseOnlyAgent(_BudgetAgent):
     def _handle_max_iterations(self, messages, api_call_count):
         return "Работа выполнена, артефакт собран, осталось закрыть карточку."
@@ -432,6 +463,10 @@ def _run_seam_and_read(kanban_home, monkeypatch, tmp_path, agent, label):
     [
         (_PartialCreditAgent, "partial-credit", 2),
         (_EverythingButTestsAgent, "everything-except-tests", 2),
+        # Reviewer r3 blocking finding, both sub-classes, end-to-end.
+        (_ColonEnumerationAgent, "colon-enumeration", 2),
+        (_CardArtifactPlusWorkAgent, "artifact-plus-work", 2),
+        (_WorkItemTaskAgent, "work-item-task", 2),
         (_GenuineCloseOnlyAgent, "genuine-close-only", 1),
     ],
 )
