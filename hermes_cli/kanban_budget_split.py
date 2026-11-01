@@ -374,14 +374,33 @@ def _worker_lines(text: str) -> str:
 
 
 def _tail_names_open_work(tail: str) -> bool:
-    """True when the text after the closer still says something is missing."""
+    """True when the text after the closer still says something is missing.
+
+    Clauses that :func:`_residual_is_completion` already recognises as full
+    completion statements are removed before the blacklist scan. That is not a
+    weakening: the blacklist keys on single words («нет», «осталось», «требует»,
+    «без»), and a genuine completion can contain those words — «замечаний нет»,
+    «129 тестов проходят, провалов нет». Without the filter every such phrase
+    vetoed a finished run and produced a redundant split. Text that is NOT a
+    recognised completion is scanned unchanged, so «…, провалов нет. Раздел 3
+    недописан.» still vetoes through the second clause.
+    """
     if not tail:
         return False
-    if _TAIL_REMAINDER_RE.search(tail):
+    kept: list[str] = []
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _residual_is_completion(stripped):
+            continue
+        kept.append(stripped)
+    if not kept:
+        return False
+    scan = "\n".join(kept)
+    if _TAIL_REMAINDER_RE.search(scan):
         return True
-    return any(
-        _TAIL_LIST_ITEM_RE.match(line.strip()) for line in tail.splitlines()
-    )
+    return any(_TAIL_LIST_ITEM_RE.match(line) for line in kept)
 
 
 # ---------------------------------------------------------------------------
@@ -426,15 +445,28 @@ _COMPLETION_CLAUSES = [
     # «артефакт собран», «отчёт готов», «тесты зелёные», «работа выполнена
     # (полностью)», «сборка проходит» — object first, participle second.
     re.compile(
+        # an optional quantifier belongs to the object: «все разделы на месте»,
+        # «оба файла готовы», «все тесты зелёные».
+        r"(?:все\s+|всё\s+|оба\s+|обе\s+)?"
         r"(?:артефакт\w*|отч[её]т\w*|отчет\w*|файл\w*|(?:[а-яё]+-)?тест\w*|код|сборк\w*"
         r"|документ\w*|скрипт\w*|модул\w*|патч\w*|данн\w*|страниц\w*"
         r"|презентац\w*|карточк\w*|задач\w*|работ\w*|раздел\w*|миграц\w*"
         r"|pytest|ruff|mypy|\d+\s+тест\w*)"
+        # an enumerated range may sit between the object and its participle
+        # («Разделы 1-4 собраны…», «Тесты 12, 13, 14 зелёные»).
+        r"(?:\s*[\d,–—-]+)*"
         r"\s+(?:(?:уже|полностью|целиком|весь|все|вс[её])\s+)*"
         r"(?:готов[аоы]?|собран[аоы]?|написан[аоы]?|проверен[аоы]?"
         r"|зел[её]н\w*|пройден\w*|прогнан\w*|сделан[аоы]?|закончен[аоы]?"
-        r"|выполнен[аоы]?|опубликован\w*|закоммичен\w*|на\s+месте|в\s+порядке)"
-        r"(?:\s+.*)?",
+        r"|выполнен[аоы]?|опубликован\w*|закоммичен\w*|на\s+месте|в\s+порядке"
+        # a conjunctive/adverbial beat may sit between the participle and the
+        # location predicate: «Все разделы написан и на месте».
+        r"|(?:написан\w*|собран\w*|сделан\w*)\s+(?:и|да|тоже)\s+на\s+месте)"
+        # what follows is the object's location/scope, not a second predication:
+        # «Отчёт готов: docs/weekly/report.v2.md», «Артефакт собран — reports/x.md».
+        # A real second predication is cut out earlier by _CLAUSE_LINK_SPLIT_RE
+        # (brackets, «но», «кроме», «а»), which is why this tail stays permissive.
+        r"(?:\s*[:—–]\s*\S.*|\s+.*)?",
         re.IGNORECASE,
     ),
     # «готово», «сделано», «готово: разделы 1-4, тесты зелёные»
@@ -455,8 +487,11 @@ _COMPLETION_CLAUSES = [
         r"|already\s+(?:done|completed|implemented|landed)(?:\s+.*)?",
         re.IGNORECASE,
     ),
-    # test counters: «129 тестов зелёные», «129 passed»
-    re.compile(r"\d+\s+(?:passed|прошл\w*|зел[её]н\w*|тест\w*\s+зел[её]н\w*)",
+    # test counters: «129 тестов зелёные», «129 passed», «129 тестов проходят,
+    # pytest 8.2» — a trailing tool/version annotation is part of the statement.
+    re.compile(r"\d+\s+(?:[а-яё]*тест\w*\s+)?"
+               r"(?:passed|pass|прошл\w*|проход\w*|зел[её]н\w*|пройден\w*|прогнан\w*)"
+               r"(?:\s*[,;—–]\s*\S.*)?",
                re.IGNORECASE),
     # «документация обновлена», «проблема устранена», «патч применён» — a noun
     # followed by a Russian SHORT passive participle is a completion statement.
@@ -474,10 +509,19 @@ _COMPLETION_CLAUSES = [
     ),
 ]
 # An explicit "nothing to redo" phrase is a completion statement even though it
-# contains «не»; checked BEFORE the blanket negation guard below.
+# contains «не»; checked BEFORE the blanket negation guard below. The same goes
+# for "no defects found" — «замечаний нет», «ошибок не обнаружено» — which is a
+# completion statement phrased as a negation of a DEFECT noun. The defect noun
+# is required, so this can never excuse «раздела 3 нет».
 _NO_REDO_CLAUSE_RE = re.compile(
     r"(?:переделывать\s+не\s+нужно|не\s+нужно\s+переделывать"
     r"|nothing\s+left\s+to\s+\w+|redoing\s+is\s+not\s+needed)",
+    re.IGNORECASE,
+)
+_NO_DEFECT_CLAUSE_RE = re.compile(
+    r"(?:замечан\w*|ошиб\w*|проблем\w*|дефект\w*|падени\w*|провал\w*|баг\w*)"
+    r"(?:\s+\S+){0,3}?\s+(?:нет|не\s+(?:обнаружен\w*|найден\w*|выявлен\w*|воспроизв\w*))"
+    r"|(?:no|zero)\s+(?:failures?|errors?|defects?|issues?)",
     re.IGNORECASE,
 )
 # Any negation anywhere in a clause means it is NOT a clean completion
@@ -486,7 +530,34 @@ _NO_REDO_CLAUSE_RE = re.compile(
 _CLAUSE_NEGATION_RE = re.compile(r"\bне\b|\bне[а-яё]|\bnot\b|\bno\b|\bwithout\b",
                                  re.IGNORECASE)
 _CLAUSE_EDGE_STRIP = " \t.,:;!?…\"'()[]{}«»-–—"
-_SENTENCE_SPLIT_RE = re.compile(r"[.!?…;\n]+")
+# A sentence ends at terminal punctuation FOLLOWED BY SPACE OR END OF TEXT. The
+# lookahead matters: worker notes are full of file paths, versions and decimals
+# («reports/full.md», «pytest 8.2, 129 passed»), and a naive split on «.» cut
+# «разделы 1-4 собраны в reports/full.md, 129 тестов проходят» into
+# «…reports/full» + «md, 129 тестов проходят», i.e. produced two fragments that
+# are no longer recognised completion clauses and forced a redundant split on a
+# genuinely finished run.
+_SENTENCE_SPLIT_RE = re.compile(r"[!?…;\n]+|\.\s+|\.$")
+# A completion pattern may END with a short tail («собраны в reports/full.md»),
+# and that tail can hide a SECOND predication: «Отчёт собран (раздел 3 пока
+# отсутствует).» matched the object+participle pattern wholesale and was granted
+# the single card although a parenthetical names open work. Rather than
+# blacklist the words inside a tail (which would re-introduce the enumeration
+# treadmill this module just escaped), the clause is cut at the STRUCTURAL
+# boundaries that introduce a second predication — brackets and adversative
+# conjunctions — and every fragment must independently be a completion
+# statement. This is a widening of the whitelist, not a list of remainder words:
+# any new phrasing still fails closed, because an unrecognised fragment forces a
+# split. «кроме»/«за исключением» split for the same structural reason (a
+# subtraction is a second predication), so «готово всё, кроме приложения Б»
+# fails closed exactly as before.
+_CLAUSE_LINK_SPLIT_RE = re.compile(
+    r"[()\[\]{}]"
+    r"|\b(?:но|однако|кроме|за\s+исключением)\b"
+    r"|\bа\b(?!\s+также)",
+    re.IGNORECASE,
+)
+_ATOM_EDGE_STRIP = " \t.,:;!?…\"'«»-–—"
 
 
 def _clause_is_completion(clause: str) -> bool:
@@ -496,9 +567,22 @@ def _clause_is_completion(clause: str) -> bool:
         return True
     if _NO_REDO_CLAUSE_RE.search(text):
         return True
+    if _NO_DEFECT_CLAUSE_RE.fullmatch(text):
+        return True
     if _CLAUSE_NEGATION_RE.search(text):
         return False
     return any(pattern.fullmatch(text) for pattern in _COMPLETION_CLAUSES)
+
+
+def _atom_is_completion(atom: str) -> bool:
+    """A single predication, after structural link-splitting and comma chaining."""
+    atom = atom.strip(_ATOM_EDGE_STRIP)
+    if not atom:
+        return True
+    if _clause_is_completion(atom):
+        return True
+    parts = [p for p in atom.split(",")]
+    return all(_clause_is_completion(p) for p in parts)
 
 
 def _residual_is_completion(residual: str) -> bool:
@@ -512,15 +596,14 @@ def _residual_is_completion(residual: str) -> bool:
         sentence = sentence.strip(_CLAUSE_EDGE_STRIP)
         if not sentence:
             continue
-        if _clause_is_completion(sentence):
-            continue
         # Commas chain completion clauses («Работа выполнена, артефакт готов»),
-        # so a sentence is acceptable when every comma-part is. A part that
-        # names open work («…, кроме раздела 3») fails here and forces a split.
-        parts = [p for p in sentence.split(",")]
-        if all(_clause_is_completion(p) for p in parts):
-            continue
-        return False
+        # and brackets / «но» / «кроме» introduce a SECOND predication that must
+        # also be a completion («Отчёт собран (раздел 3 пока отсутствует)»
+        # fails here). A part that names open work forces a split.
+        for atom in _CLAUSE_LINK_SPLIT_RE.split(sentence):
+            if _atom_is_completion(atom):
+                continue
+            return False
     return True
 
 

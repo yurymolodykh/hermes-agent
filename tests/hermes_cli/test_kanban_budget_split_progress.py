@@ -1115,3 +1115,201 @@ def test_r6_fresh_shape_through_the_real_seam_produces_children(
     for body in bodies:
         assert "ALREADY DONE" not in body
         assert "Progress note from the previous worker" in body
+
+
+# ---------------------------------------------------------------------------
+# Contract 5 — r7 (ee89417f4c): the whitelist must not punish honest completions
+# ---------------------------------------------------------------------------
+# Inverting the polarity moved the failure mode from "lost work" to "one extra
+# card". A redundant split is the accepted cost, but it is still a wrong verdict
+# and it is not free: the second child re-reads and re-verifies finished work.
+# Reviewing the switch (r7, 03-software-engineer) turned up three shapes where a
+# GENUINELY finished run was split, all of them structural defects in the
+# whitelist rather than missing vocabulary:
+#
+#   a) a file path or decimal in the completion («reports/full.md») was cut into
+#      two fragments by the sentence splitter, so neither fragment matched;
+#   b) a negation of a DEFECT noun («замечаний нет», «провалов нет») hit the
+#      blanket negation guard, and the word «нет» also tripped the blacklist
+#      veto — although it states completion, not a remainder;
+#   c) a completion with a parenthetical («Отчёт собран (раздел 3 пока
+#      отсутствует)») matched the object+participle pattern WHOLESALE, so a
+#      second predication naming open work was swallowed by the tail `.*`.
+#
+# Each fix below widens the whitelist only. None of them can grant a card to an
+# unrecognised wording: (a) and (c) split the text more finely and require EVERY
+# fragment to be a completion, (b) requires a defect noun and `fullmatch`.
+# The negative cases in each test are what pin that.
+
+_R7_FINISHED_SUMMARIES = [
+    # (a) paths / versions / counters inside the completion
+    "Разделы 1-4 собраны в reports/full.md, 129 тестов проходят.",
+    "Отчёт готов: docs/weekly/report.v2.md.",
+    "129 тестов проходят, pytest 8.2.",
+    # (b) completion phrased as the absence of defects
+    "Отчёт готов и проверен, замечаний нет.",
+    "Прогнал тесты, провалов нет.",
+    "Код собран, ошибок не обнаружено.",
+    "Все разделы на месте, no failures.",
+]
+
+# Completion wordings the whitelist deliberately does NOT recognise. These are
+# true completions, and they still split — one extra card. That is the
+# documented, accepted cost of the polarity switch (see the module docstring):
+# the alternative is a blacklist, and every blacklist round leaked named work
+# into a single «ALREADY DONE» card. They are listed here so that a future
+# reader does not "fix" the asymmetry by loosening the whitelist, and so the
+# trade stays visible in the suite instead of living only in a comment.
+_R7_UNRECOGNISED_BUT_FINISHED = [
+    "Отчёт лежит в docs/weekly/report.v2.md.",
+    "Сборка pytest 8.2 — 129 passed.",
+]
+
+_R7_STILL_OPEN = [
+    # (b) the defect-noun escape hatch must not excuse a missing ARTIFACT
+    "Раздел 3 отсутствует.",
+    "Раздел 3: замечаний нет, текста нет.",
+    # (c) second predication hidden behind a completion
+    "Отчёт собран (раздел 3 пока отсутствует).",
+    "Артефакт готов, но раздел 3 пустой.",
+    "Всё собрано, однако приложение Б не начато.",
+    "Тесты зелёные, кроме интеграционных.",
+    # (a) a path is not a licence to append open work
+    "Отчёт лежит в reports/full.md, раздел 3 недописан.",
+]
+
+
+@pytest.mark.parametrize("tail", _R7_FINISHED_SUMMARIES)
+def test_r7_honest_completion_still_resolves_to_one_card(tail):
+    """A finished run must stay ONE card even when its wording is awkward.
+
+    Both polarities of the real collector are checked, because the defects above
+    only appear once the note carries the collector's header and file inventory.
+    """
+    # A closer is mandatory by design: without one there is no "only the card is
+    # left" claim to grant, so the bare tail is expected to split.
+    assert bsplit._progress_reports_completion(f"{tail} {_R6_CLOSER}") is True, tail
+    note = _production_note(f"{tail} {_R6_CLOSER}")
+    assert bsplit._progress_reports_completion(note) is True, (tail, note)
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) == 1, f"{tail} split into {len(children)} cards"
+    assert "ALREADY DONE" in children[0]["body"]
+
+
+@pytest.mark.parametrize("tail", _R7_STILL_OPEN)
+def test_r7_second_predication_is_never_swallowed_by_a_completion(tail):
+    """The whitelist widening must not become a hole.
+
+    Every case states a completion AND open work in the same clause or the same
+    sentence. All of them must split — this is the guard that keeps (a)/(c) from
+    turning into "any clause containing a participle is done".
+    """
+    assert bsplit._progress_reports_completion(f"{tail} {_R6_CLOSER}") is False, tail
+    note = _production_note(f"{_R6_DONE} {_R6_CLOSER} {tail}")
+    assert bsplit._progress_reports_completion(note) is False, (tail, note)
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) >= 2, f"{tail} collapsed to {len(children)} card(s)"
+    for child in children:
+        assert "ALREADY DONE" not in child["body"], tail
+
+
+@pytest.mark.parametrize("tail", _R7_UNRECOGNISED_BUT_FINISHED)
+def test_r7_unrecognised_completion_splits_instead_of_losing_work(tail):
+    """The accepted cost, pinned: an unlisted completion wording gets 2 cards.
+
+    Asserting the DIRECTION matters more than asserting the exact count. If a
+    future change makes these collapse, the polarity has been quietly restored
+    to a blacklist — which is how r4/r5/r6 each lost named work.
+    """
+    note = _production_note(f"{tail} {_R6_CLOSER}")
+    assert bsplit._progress_reports_completion(note) is False, (tail, note)
+    children = bsplit._fallback_children("t_p", "report", "body", note)
+    assert len(children) >= 2, f"{tail} collapsed to {len(children)} card(s)"
+    for child in children:
+        assert "ALREADY DONE" not in child["body"], tail
+
+
+def test_r7_structural_links_break_completion_clauses():
+    """Brackets / «но» / «кроме» introduce a second predication.
+
+    Pinned on the predicate itself so a future regex rewrite cannot quietly
+    re-swallow the tail.
+    """
+    assert bsplit._residual_is_completion("Артефакт собран, тесты зелёные.") is True
+    assert bsplit._residual_is_completion(
+        "Артефакт собран (раздел 3 пока отсутствует).") is False
+    assert bsplit._residual_is_completion("Артефакт готов, но раздел 3 пустой.") is False
+    assert bsplit._residual_is_completion("Готово всё, кроме приложения Б.") is False
+    # a path must not be treated as a sentence boundary
+    assert bsplit._residual_is_completion(
+        "Разделы 1-4 собраны в reports/full.md, 129 тестов проходят.") is True
+    # …while a real sentence boundary after a numbered clause still splits
+    assert bsplit._residual_is_completion(
+        "Собрал разделы 1-2. Раздел 3 ждёт проверки.") is False
+
+
+# (tail, expect_one_card)
+_R7_SEAM_CASES = (
+    [(t, True) for t in _R7_FINISHED_SUMMARIES]
+    + [(t, False) for t in _R7_STILL_OPEN]
+    + [(t, False) for t in _R7_UNRECOGNISED_BUT_FINISHED]
+)
+
+
+@pytest.mark.parametrize("tail,expect_one", _R7_SEAM_CASES)
+def test_r7_real_seam_produces_what_the_predicate_says(
+    tail, expect_one, kanban_home, no_llm, monkeypatch
+):
+    """End-to-end: the number of cards the seam writes matches the verdict.
+
+    Six review rounds found defects where the classifier was green and the SEAM
+    still collapsed (or the reverse). This pins the seam itself.
+
+    The expectation is passed in as DATA, not recomputed from the event payload:
+    the stored ``progress_note`` is truncated to 300 characters for the event
+    record (documented behaviour, REPORT.md §4), so classifying the payload
+    would classify a cut string — a harness artefact, not the shipped decision.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(kanban_home))
+    from hermes_cli import profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _n: True)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Собрать отчёт по разделам 1-4",
+            body="acceptance: 4 sections",
+            assignee="03-software-engineer",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb._current_run_id(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    agent = _BudgetAgent(max_iterations=3)
+    summary = f"{_R6_DONE} {_R6_CLOSER} {tail}"
+    agent._handle_max_iterations = lambda messages, api_call_count: summary
+    _finalize_budget_exit(agent, [{"role": "user", "content": "собери отчёт"}])
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "budget_split"]
+        assert len(events) == 1, events
+        payload = events[0].payload or {}
+        child_ids = payload.get("child_ids") or []
+        bodies = [(kb.get_task(conn, cid).body or "") for cid in child_ids]
+
+    assert payload.get("progress_note_source") == "run_buffer", payload
+    assert payload.get("progress_note_len", 0) > 0, payload
+    if expect_one:
+        assert len(child_ids) == 1, (tail, payload)
+        assert "ALREADY DONE" in bodies[0]
+    else:
+        assert len(child_ids) >= 2, (tail, payload)
+        for body in bodies:
+            assert "ALREADY DONE" not in body
+            assert "Progress note from the previous worker" in body
