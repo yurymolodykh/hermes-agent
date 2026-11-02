@@ -1153,13 +1153,14 @@ _R7_FINISHED_SUMMARIES = [
     "Все разделы на месте, no failures.",
 ]
 
-# Completion wordings the whitelist deliberately does NOT recognise. These are
-# true completions, and they still split — one extra card. That is the
-# documented, accepted cost of the polarity switch (see the module docstring):
-# the alternative is a blacklist, and every blacklist round leaked named work
-# into a single «ALREADY DONE» card. They are listed here so that a future
-# reader does not "fix" the asymmetry by loosening the whitelist, and so the
-# trade stays visible in the suite instead of living only in a comment.
+# Completion wordings that the OLD whitelist did not recognise, and which split
+# purely because of their wording — not because they name any open work. Review
+# r7 measured this class at 77% of ordinary finished summaries (48/48 on its own
+# corpus) and 100% on the live board, so it is a defect, not an accepted cost.
+#
+# r8 replaced the whitelist with a decisive OPEN-WORK test, so these now resolve
+# to ONE card. The regression direction that still must hold is the opposite
+# one: a completion that DOES name open work has to split. See _R7_STILL_OPEN.
 _R7_UNRECOGNISED_BUT_FINISHED = [
     "Отчёт лежит в docs/weekly/report.v2.md.",
     "Сборка pytest 8.2 — 129 passed.",
@@ -1214,19 +1215,21 @@ def test_r7_second_predication_is_never_swallowed_by_a_completion(tail):
 
 
 @pytest.mark.parametrize("tail", _R7_UNRECOGNISED_BUT_FINISHED)
-def test_r7_unrecognised_completion_splits_instead_of_losing_work(tail):
-    """The accepted cost, pinned: an unlisted completion wording gets 2 cards.
+def test_r7_unrecognised_completion_resolves_to_one_card(tail):
+    """A completion whose WORDING the old whitelist missed gets ONE card.
 
-    Asserting the DIRECTION matters more than asserting the exact count. If a
-    future change makes these collapse, the polarity has been quietly restored
-    to a blacklist — which is how r4/r5/r6 each lost named work.
+    Review r7 (`b76aad825f`, changes requested) measured this class as a defect
+    rather than an accepted cost: 37/48 ordinary finished summaries split, and
+    464/464 on the live board. The wording carries no open work, so the decisive
+    open-work test must grant the single card. The guard that keeps this from
+    becoming a blacklist is `test_r7_second_predication_is_never_swallowed_by_a
+    _completion`, which pins the opposite direction on the same revision.
     """
     note = _production_note(f"{tail} {_R6_CLOSER}")
-    assert bsplit._progress_reports_completion(note) is False, (tail, note)
+    assert bsplit._progress_reports_completion(note) is True, (tail, note)
     children = bsplit._fallback_children("t_p", "report", "body", note)
-    assert len(children) >= 2, f"{tail} collapsed to {len(children)} card(s)"
-    for child in children:
-        assert "ALREADY DONE" not in child["body"], tail
+    assert len(children) == 1, f"{tail} split into {len(children)} card(s)"
+    assert "ALREADY DONE" in children[0]["body"], tail
 
 
 def test_r7_structural_links_break_completion_clauses():
@@ -1252,7 +1255,7 @@ def test_r7_structural_links_break_completion_clauses():
 _R7_SEAM_CASES = (
     [(t, True) for t in _R7_FINISHED_SUMMARIES]
     + [(t, False) for t in _R7_STILL_OPEN]
-    + [(t, False) for t in _R7_UNRECOGNISED_BUT_FINISHED]
+    + [(t, True) for t in _R7_UNRECOGNISED_BUT_FINISHED]
 )
 
 

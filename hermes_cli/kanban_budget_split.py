@@ -607,6 +607,326 @@ def _residual_is_completion(residual: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Decisive open-work test — the r8 grant layer (review r7 of b76aad825f)
+# ---------------------------------------------------------------------------
+# r7 replaced the blacklist with a completion WHITELIST, which mirrored the
+# defect instead of removing it: the single close-only card was granted only
+# when EVERY clause was a recognised completion statement, so an unrecognised
+# word-form sent finished work back for rework. Measured on the reviewer's own
+# corpora: 37/48 ordinary finished summaries, 7/8 real-seam shapes and 100%
+# (467/467) of live completed runs over-split, against 6% / 12% on the
+# pre-polarity baseline.
+#
+# The decisive test is not "is each clause a completion statement" but the
+# question the card actually asks: does anything the worker wrote NAME work that
+# is still open? Three layers:
+#
+#   L1 EXCUSE  — a clause that negates a DEFECT, reports a zero count of a bad
+#                thing, or says «переделывать не нужно» is a POSITIVE completion
+#                signal, whatever else it contains.
+#   L2 DETECT  — open work is a clause whose predicate says the work has not
+#                landed: a negated achievement verb (both word orders, incl.
+#                reflexives), a fused negation («недописан»), a future/modal
+#                plan («напишу», «надо дописать», «предстоит»), a remainder
+#                predicate («осталось», «требует», «отсутствует»), a waiting or
+#                blocked STATE («на проверке», «заблокирован»), a partiality
+#                that states PROGRESS («готовность 60%», «3 из 8»), or an
+#                emptiness predicated on the artifact («тестов нет», «пустой»).
+#   L3 GRANT   — one card iff no clause of the worker-written residual is an L2
+#                open-work clause AND the residual is not a bare enumeration.
+#
+# Two structural vetoes survive from before the polarity switch, because they
+# are about SHAPE and no wording list can express them:
+#   * a worker-written bullet/numbered line after the closer enumerates what
+#     remains (r4 review, item 2);
+#   * a residual line that is nothing but a short list of things, with no
+#     predicate anywhere («раздел 3, тесты, схема»), names work.
+#
+# A bare percentage is NOT partiality: finished runs report coverage, speedups
+# and deltas («покрытие 91%», «на 100%»). Only «готовность N%», «N% работы» and
+# «N из M» with N < M state progress.
+_DEFECT_NOUN = (
+    r"(?:замечан\w*|ошиб\w*|проблем\w*|дефект\w*|падени\w*|провал\w*|баг\w*"
+    r"|расхожден\w*|регресс\w*|warning\w*|failure\w*|error\w*|issue\w*)"
+)
+_NO_REDO_L1 = re.compile(
+    r"(?:переделывать|переделать)\s+не\s+(?:нужно|надо|требуется|придётся|придется)"
+    r"|не\s+нужно\s+переделывать"
+    r"|(?:nothing\s+left\s+to|redoing\s+is\s+not\s+needed|no\s+need\s+to\s+redo)"
+    + r"|(?:" + _DEFECT_NOUN + r")(?:\s+\S+){0,2}?\s+(?:нет|0|не\s+(?:обнаружен\w*"
+    r"|найден\w*|выявлен\w*|воспроизв\w*))"
+    + r"|\b0\s+(?:failed|failures?|errors?|warning\w*)"
+    # Zero counts of BAD things: «0 пропущено, 0 задвоено», «0 wip markers
+    # staged», «ни одного удаления», «без пустых страниц». Measured on the live
+    # board as over-splits that carried no actual open work.
+    + r"|\b0\s+(?:пропущ\w*|задво\w*|ошиб\w*|замечан\w*|wip\b|markers?\b"
+    r"|дубл\w*|удален\w*|удалён\w*|дефект\w*|провал\w*|страниц\w*)"
+    + r"|\bни\s+одного\s+(?:удален\w*|удалён\w*|провал\w*|расхожден\w*|дефект\w*)"
+    + r"|\bбез\s+пуст\w*"
+    + r"|\b(?:no|zero)\s+(?:failures?|errors?|defects?|issues?|warnings?)"
+    r"|без\s+(?:" + _DEFECT_NOUN + r"|предупрежден\w*)",
+    re.IGNORECASE,
+)
+
+_PRED_STEMS = (
+    r"напис\w*|собр\w*|сдела\w*|провер\w*|прогон\w*|прогна\w*|законч\w*|заверш\w*"
+    r"|закры\w*|почин\w*|исправ\w*|доработ\w*|додела\w*|трога\w*|трону\w*"
+    r"|каса\w*|покры\w*|покро\w*|наполн\w*|перенес\w*|перенесён\w*|обновл\w*"
+    r"|добавл\w*|реализ\w*|подключ\w*|установл\w*|настро\w*|развёрн\w*"
+    r"|разверн\w*|запуш\w*|закоммит\w*|залив\w*|залил\w*|протестир\w*"
+    r"|отревью\w*|ревью\w*|оцен\w*|запуск\w*|запуска\w*|тестир\w*"
+    r"|писа\w*|писал\w*|стро\w*|сда\w*|сдан\w*|включ\w*|выполн\w*"
+    # requirement / conformance: «лимит не соблюдён», «не подтверждена
+    # тестами», «раздел пропущен», «не начат», «не прошёл».
+    r"|нача\w*|начин\w*|пропущ\w*|опущ\w*|подтвержд\w*|соблюд\w*|влез\w*"
+    r"|соответств\w*|выдерж\w*|прош\w*|проход\w*|зачтён\w*|зачтен\w*"
+    # «не успел дописать», «проверка не проводилась», «не довёл до конца» —
+    # achievement verbs whose negation is the remainder itself, not a defect.
+    # `провод[ия]` (not `провод`) keeps the NOUN «провод» out of the predicate set.
+    r"|успе\w*|допис\w*|провод[ия]\w*|довёл\w*|довел\w*|довод\w*|дожа\w*"
+)
+_OPEN_WORK_L2 = re.compile(
+    # (1) negated achievement predicate, both word orders, incl. reflexives
+    r"\bне\s+(?:\S+\s+){0,2}?(?:" + _PRED_STEMS + r")"
+    r"|\b(?:" + _PRED_STEMS + r")\s+не\s+(?:был\w*|было|были|была|успе\w*|смог\w*)"
+    # (2) fused negation: недописан / недоделан / незакрыт / неготов
+    r"|\b(?:недопис|недодел|недосда|недосдан|незакрыт|незаверш|неготов|незаконч"
+    r"|неотревь|неоцен|непровер|ненапис|несобран|нереализов|неподключ|неисправ)\w*"
+    # (3) future / modal / plan. «следует» only before an infinitive: «чистый ДВС
+    # следует за винтом» is "follows", not "should".
+    r"|\b(?:напиш|сдела|добавл|додела|доработ|уточн|законч|заверш|исправ|перепиш"
+    r"|провер|разбер|собер|закро|почин)(?:у|ю|им|ем|ишь|ите|ет|ут|ют|ат|ят)\b"
+    r"|\bследует\s+[а-яё]+(?:ть|ться|ти)\b"
+    r"|\b(?:надо|нужно|нужна|нужен|нужны|требуется|предстоит|планир\w*|запланир\w*"
+    r"|отложен\w*|в\s+дальнейшем|позже|потом|завтра|следующ\w*|очередн\w*)\b"
+    # (4) waiting / blocked / state predicates
+    r"|\b(?:ждём|ждем|ждет|ждёт|ждут|ожида\w*|заблокирован\w*|приостановл\w*"
+    r"|в\s+очереди|в\s+процессе|в\s+работе|на\s+проверке|на\s+согласовании"
+    r"|проверяется|согласуется|дописывается|дорабатывается"
+    r"|заготовк\w*|заглушк\w*|каркас\w*|скелет\w*|набросок\w*|черновик\w*|чернов\w*)\b"
+    # (5) remainder predicates stated affirmatively
+    r"|\b(?:остал\w*|остаётся|остается|остава\w*|требу\w*|вис(?:ит|ят)"
+    r"|не\s+хватает|недостаёт|недостает|отсутству\w*)\b"
+    # (6) absence
+    r"|\bнет\b|\bотсутствует\b|\bотсутствуют\b"
+    # (7) partiality that states PROGRESS, plus absence-with-«без» of a work noun
+    r"|\bполовин\w*|\bнаполовин\w*|\bчастичн\w*|\bpartially\b|\bpartly\b"
+    r"|\bбез\s+(?:тест\w*|покрыти\w*|проверк\w*|доработк\w*|завершени\w*"
+    r"|реализаци\w*|сборк\w*|согласован\w*|ревью)"
+    r"|\bготовность\b"
+    r"|(?:на|готовность|выполнено\s+на|сделано\s+на)\s+(?:[1-9]|[1-9]\d)\s*%"
+    r"|\b(?:[1-9]|[1-9]\d)\s*%\s*(?:работ|готов)"
+    r"|\bв\s+основном\b|\bне\s+всё\b|\bне\s+все\b|\bне\s+до\s+конца\b"
+    # (7b) EXCLUSIVE connectives: a completion followed by «кроме»/«за
+    # исключением»/«однако» names what the completion does NOT cover
+    # («Тесты зелёные, кроме интеграционных»). Judged per atom, never as a
+    # blanket veto over the whole note.
+    r"|\b(?:кроме|за\s+исключением|однако)\b"
+    # (7c) SUSPENDED / PARKED state: the thing exists but is not delivered
+    # («Раздел 3 в морозилке», «Пункт 3 в подвешенном состоянии»).
+    r"|\bв\s+(?:морозилк\w*|подвешенн\w*|ожидании|очеред\w*|статусе\s+черновик\w*)"
+    # (8) emptiness predicated on the artifact
+    r"|\bпуст(?:ой|ая|ое|ые|ым|ую|ого|ых)\b|\b0\s+(?:строк|тестов|записей|пунктов)"
+    r"|\bни\s+одн\w+|\bне\s+единого"
+    # (9) bare remainder participles
+    r"|\b(?:пропущен|опущен|отложен|невыполнен)\w*\b"
+    # (10) tooling markers and transliterated remainder words
+    r"|\btodo\b|\bpending\b|\bstub\b|\bwip\b|\bfixme\b|\bremaining\b"
+    r"|\bstill\s+open\b|\bnext\s+(?:step|steps|wave|phase)\b|\bmanual[_ ]review\b"
+    r"|zaglush|\bnedodel|\bnedopis|\bnedosdan|\bnezakryt",
+    re.IGNORECASE,
+)
+
+# «3 из 8» is partial credit; «30 из 30» / «4 из 4» is complete.
+_N_OF_M_RE = re.compile(r"\b(\d+)\s+из\s+(\d+)\b")
+
+
+def _partial_n_of_m(text: str) -> bool:
+    return any(int(n) < int(m) for n, m in _N_OF_M_RE.findall(text))
+
+
+_ATOM_STRIP = " \t.,:;!?…\"'«»-–—()[]{}"
+
+# A Russian predicate: a finite verb, a short participle, or an infinitive. The
+# past tense in -л is ambiguous with nouns («раздел 3», «узел»), so it is only
+# accepted when the verb takes an object after it — a report's past-tense verb
+# is followed by what it produced, a NOUN ending in -л heads its own phrase.
+_PAST_VERB_RE = re.compile(r"\b([а-яё]{2,})(?:л|ла|ло|ли)\b", re.IGNORECASE)
+_FINITE_PRED_RE = re.compile(
+    r"\b[а-яё]+(?:ен|ён|ена|ено|ены|ан|ана|ано|аны|н|на|но|ны)\b"
+    r"|\b[а-яё]+(?:ет|ёт|ит|ут|ют|ат|ят|ешь|ишь|ем|им|ете|ите)\b"
+    r"|\b[а-яё]+(?:ть|ться|ти)\b"
+    r"|\b[а-яё]+(?:ует|уют|ится|ятся|ется|ются|ался|ился|илась|ились)\b"
+    r"|\b(?:passed|failed|done|complete|implemented|shipped|verified)\b",
+    re.IGNORECASE,
+)
+# Short predicatives that assert a finished state without a finite verb.
+_COMPLETION_ADJ_RE = re.compile(
+    r"\b(?:готов\w*|зелён\w*|зелен\w*|собран\w*|написан\w*|проверен\w*"
+    r"|выполнен\w*|закрыт\w*|завершён\w*|завершен\w*|сделан\w*|исправлен\w*"
+    r"|реализован\w*|обновлён\w*|обновлен\w*|добавлен\w*|перенесён\w*"
+    r"|перенесен\w*|установлен\w*|настроен\w*|подключён\w*|подключен\w*"
+    r"|опубликован\w*|устранён\w*|устранен\w*|создан\w*|пройден\w*"
+    r"|на\s+месте|в\s+порядке|работает|проходят|проходит|зелёные|зеленые"
+    r"|passed|done|complete\w*|completed|implemented|shipped|landed"
+    r"|finished|verified|resolved|deployed|merged|committed)\b",
+    re.IGNORECASE,
+)
+# A MEASUREMENT survives without a predicate: a number with a unit, percent,
+# currency, count or path. A bare digit next to a noun («раздел 3») is not a
+# measurement — that is an enumerated remainder.
+_MEASUREMENT_RE = re.compile(
+    r"\d+\s*(?:%|шт|с\b|мс\b|сек\b|мин\b|ч\b|час\w*|кб|мб|гб|тб|байт\w*|б\b"
+    r"|₽|\$|€|руб\w*|строк\w*|тестов\b|записей|пунктов|слайд\w*|файл\w*"
+    r"|passed|failed|из\s+\d+)"
+    r"|[A-Za-zА-Яа-я_\-]+\.(?:py|js|ts|md|json|html|zip|db|sql|yml|yaml|txt"
+    r"|log|csv|svg|pdf|sh|toml|ini|cfg|xml)\b"
+    r"|SHA-?256|HTTP\s*\d+|/",
+    re.IGNORECASE,
+)
+# Bullet markers seen in worker notes. Em/en dashes are the most common.
+_REMAINDER_LIST_RE = re.compile(r"^(?:[-*•+\u2014\u2013]|\d+[.)])\s+\S")
+_BARE_LIST_MAX_WORDS = 14
+
+
+def _has_predicate(atom: str) -> bool:
+    """True when the atom ASSERTS something, not merely names a thing."""
+    if _FINITE_PRED_RE.search(atom):
+        return True
+    for match in _PAST_VERB_RE.finditer(atom):
+        rest = atom[match.end():].strip(" \t,.;:!?…)]»\"'")
+        if not rest:
+            continue
+        if rest[0].isdigit() or rest[0] in ".!?;:,)]}":
+            continue
+        return True
+    return False
+
+
+def _iter_worker_atoms(residual: str):
+    body = _worker_lines(residual)
+    for sentence in _SENTENCE_SPLIT_RE.split(body):
+        sentence = sentence.strip(_CLAUSE_EDGE_STRIP)
+        if not sentence:
+            continue
+        for atom in _CLAUSE_LINK_SPLIT_RE.split(sentence):
+            atom = atom.strip(_ATOM_STRIP)
+            if atom:
+                yield atom
+
+
+def _is_bare_remainder_list(text: str) -> bool:
+    """True when ``text`` is a short list of things with no predicate anywhere."""
+    flat = " ".join(text.split()).strip(" \t,.;:!?…\"'«»-–—()[]{}")
+    if not flat or len(flat.split()) > _BARE_LIST_MAX_WORDS:
+        return False
+    if (_has_predicate(flat) or _COMPLETION_ADJ_RE.search(flat)
+            or _MEASUREMENT_RE.search(flat)):
+        return False
+    return True
+
+
+def _has_remainder_list(note: str) -> bool:
+    """True when the WORKER-WRITTEN body has a bullet/numbered line.
+
+    Checked on the note's own lines, never on a span-stripped residual: removing
+    the closer can leave a dangling «—» («Переделывать не нужно — артефакт
+    готов»), which is punctuation, not a bullet. A worker-written bullet after
+    the closer is the enumeration of what remains (r4 review, item 2).
+    """
+    for line in _worker_lines(note).splitlines():
+        if _REMAINDER_LIST_RE.match(line.strip()):
+            return True
+    return False
+
+
+_ABSENCE_RE = re.compile(
+    r"\b([а-яё]{3,})\s+(?:нет|отсутствует|отсутствуют|не\s+существует)\b",
+    re.IGNORECASE,
+)
+
+
+def _artifact_absence(atom: str) -> bool:
+    """True when ``atom`` says something OTHER than a defect is missing.
+
+    «замечаний нет, текста нет» — the defect is excused, but the artifact text
+    is missing, which is open work. «замечаний нет» alone is not.
+    """
+    for m in _ABSENCE_RE.finditer(atom):
+        if not re.search(_DEFECT_NOUN, m.group(1), re.IGNORECASE):
+            return True
+    return False
+
+
+def _worker_words(text: str) -> list[str]:
+    """Words that carry content (no punctuation-only tokens)."""
+    return [w for w in " ".join(text.split()).split() if any(c.isalnum() for c in w)]
+
+
+_CARD_CLOSING_ONLY = re.compile(
+    # «…, кроме закрытия самой карточки» — the exclusion IS the closer, not
+    # open work. Restricted to closing/card nouns so a real excluded artifact
+    # («кроме интеграционных тестов») still reads as a remainder.
+    r"(?:кроме|за\s+исключением|помимо)\s+(?:само[йго]\s+)?"
+    r"(?:закрыти\w*|закрыть|перевод\w*|завершени\w*)\s+"
+    r"(?:само[йго]\s+)?(?:карточк\w*|тикет\w*|задач\w*)",
+    re.IGNORECASE,
+)
+
+
+_EXCLUSIVE_APPEND_RE = re.compile(
+    r",\s*(?:кроме|за\s+исключением|однако|помимо\s+этого)\s+\S"
+    # a sentence-initial contrast word needs no comma: «… Осталось закрыть
+    # карточку. Но начала раздел 3.»
+    r"|(?:^|[.!?;\n])\s*(?:но|однако|а)\s+[а-яё]{2,}",
+    re.IGNORECASE,
+)
+
+
+def _residual_names_open_work(residual: str, strict: bool = True) -> bool:
+    """Does ``residual`` name work that is still open?
+
+    ``strict`` judges the worker's closing residual and treats a bare
+    enumeration as remainder. The transcript tail is EARLIER narration («Начал
+    работу.»), not the run's closing statement, so it may only veto on an
+    explicit open-work signal — never on a bare noun. That asymmetry is the
+    module's existing contract (see :func:`_split_note`) and it is what stops
+    «Начал.» from vetoing a finished run.
+    """
+    # A comma + exclusive connective + content appends a second predication the
+    # completion does not cover («Тесты зелёные, кроме интеграционных»). Judged
+    # on the residual because the atom splitter separates the connective from
+    # its object.
+    if _EXCLUSIVE_APPEND_RE.search(residual) and not _CARD_CLOSING_ONLY.search(residual):
+        return True
+    for atom in _iter_worker_atoms(residual):
+        if _NO_REDO_L1.search(atom) and not _artifact_absence(atom):
+            continue
+        if _partial_n_of_m(atom) or _OPEN_WORK_L2.search(atom):
+            return True
+    if strict:
+        # A predicate-less atom names a THING, not a state of work — after the
+        # closer that is a remainder («раздел 3», «тесты, схема»). Judged
+        # per-atom ONLY when the residual is short: a long technical summary is
+        # full of predicate-less fragments (headings, paths, English clauses)
+        # that name nothing outstanding, and per-atom judging on the live board
+        # dropped 467 finished runs to 13 accepted cards.
+        atoms = list(_iter_worker_atoms(residual))
+        short = sum(len(_worker_words(a)) for a in atoms) <= _BARE_LIST_MAX_WORDS
+        if short:
+            for atom in atoms:
+                if _NO_REDO_L1.search(atom):
+                    continue
+                if not (_has_predicate(atom) or _COMPLETION_ADJ_RE.search(atom)
+                        or _MEASUREMENT_RE.search(atom)):
+                    return True
+        for line in _worker_lines(residual).splitlines():
+            if _is_bare_remainder_list(line):
+                return True
+    return False
+
+
 def _find_all(haystack: str, needle: str):
     """Every start index of ``needle`` in ``haystack`` (both already lowered)."""
     start = haystack.find(needle)
@@ -672,10 +992,15 @@ def _progress_reports_completion(progress: str) -> bool:
     low = progress.lower()
     if any(neg in low for neg in _CLOSE_ONLY_NEGATIONS):
         return False
-    if any(bad in low for bad in _CLOSE_ONLY_PARTIAL_MARKERS):
-        return False
-    if _CLOSE_ONLY_PARTIAL_PERCENT_RE.search(low):
-        return False
+    # The blanket «any partial-credit word / any percentage» vetoes are gone.
+    # On the live board «покрытие 91%» and «на 100%» are measurements inside a
+    # FINISHED summary, and «закрыты, кроме закрытия самой карточки» is
+    # close-only phrasing — both were over-split 100% of the time (review r7).
+    # Partiality is now judged by PREDICATE in _OPEN_WORK_L2 («частично»,
+    # «наполовину», «готовность 60%», «3 из 8», «не начат», «в работе»), and
+    # subtraction is structural: _CLAUSE_LINK_SPLIT_RE splits on «кроме», so
+    # «готово всё, кроме приложения Б» leaves «приложения Б» as its own atom,
+    # which names work.
 
     # Every place the note states "the card is all that is left" — the closer
     # clauses and the explicit no-work-left phrases.
@@ -696,21 +1021,22 @@ def _progress_reports_completion(progress: str) -> bool:
     # wherever the remainder sits relative to the closer — forces a real split.
     # The transcript tail is scanned here as veto-only evidence: on a real seam
     # the worker's own last narration may name a remainder the post-budget
-    # summary skipped («Код готов, тесты не писал»).
-    residual = _worker_residual(low, spans)
-    if _tail_names_open_work(residual):
+    # summary skipped («Код готов, тесты не писал»). It is scanned with
+    # strict=False: earlier narration must not veto on a bare noun.
+    if _has_remainder_list(low):
         return False
-    if _tail_names_open_work(transcript_tail):
+    residual = _worker_residual(low, spans)
+    if _residual_names_open_work(residual):
+        return False
+    if _residual_names_open_work(transcript_tail, strict=False):
         return False
 
-    # (b) GRANT layer, inverted polarity: the single card is allowed only when
-    # every clause the worker actually wrote is a recognised completion
-    # statement. Unrecognised wording is treated as "probably an open remainder"
-    # and goes back to a split. A blacklist of remainder words always leaks
-    # (r6 corpus: 15/24 fresh shapes collapsed), and every leak drops named work
-    # without a card — the failure this module exists to prevent. A redundant
-    # split costs one card; a leak loses work.
-    return _residual_is_completion(residual)
+    # (b) GRANT layer: the single card is allowed when nothing the worker wrote
+    # names work that is still open. This is the DECISIVE test — it keys on
+    # open work, not on whether each clause happens to be a recognised
+    # completion wording. See _OPEN_WORK_L2 for the predicate families and the
+    # measured cost of the whitelist this replaced.
+    return True
 
 
 @dataclass
