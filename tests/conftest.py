@@ -1746,7 +1746,7 @@ def _moa_caches_isolated():
 
 
 @pytest.fixture
-def isolated_kanban_assignee_registry(monkeypatch):
+def isolated_kanban_assignee_registry(monkeypatch, tmp_path):
     """Opt-in synthetic spawn registry for hermetic Kanban unit tests.
 
     Production code keeps its filesystem-backed ``profile_exists`` preflight.
@@ -1765,6 +1765,23 @@ def isolated_kanban_assignee_registry(monkeypatch):
         return profiles.normalize_profile_name(name) in synthetic_profiles
 
     monkeypatch.setattr(profiles, "profile_exists", _synthetic_profile_exists)
+
+    # ``resolve_profile_env`` is a SECOND filesystem probe on the same registry:
+    # the assignee-aware route resolution (t_f2341b7a) swaps HERMES_HOME to the
+    # assignee profile via ``_assignee_home`` -> ``resolve_profile_env``, which
+    # raises FileNotFoundError for a synthetic profile name even though
+    # ``profile_exists`` above says it is fine. Stubbing both keeps the registry
+    # internally consistent (debugging note: the two probes drifted apart,
+    # surfacing as ``Profile 'elias' does not exist`` in spawn-arg tests).
+    _real_resolve_profile_env = profiles.resolve_profile_env
+
+    def _synthetic_resolve_profile_env(name):
+        canon = profiles.normalize_profile_name(name)
+        if canon in synthetic_profiles:
+            return str(Path(tmp_path) / "synthetic-profile-homes" / canon)
+        return _real_resolve_profile_env(name)
+
+    monkeypatch.setattr(profiles, "resolve_profile_env", _synthetic_resolve_profile_env)
 
 
 @pytest.fixture

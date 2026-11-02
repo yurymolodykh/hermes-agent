@@ -71,7 +71,9 @@ class TestGraphResolver:
             cfg = {"agent": {"reasoning_class_routing": True}}
             assert resolve_card_lane_effort(conn, "t_rev", cfg) == "max"
 
-    def test_card_with_review_child_pins_medium(self):
+    def test_container_card_pins_high(self):
+        # A card whose ONLY child is a review card is a container: it used to
+        # resolve to "medium", which the letovo backend rejects with HTTP 400.
         conn = MagicMock()
         with patch("hermes_cli.kanban_db.get_task") as _gt, patch(
             "hermes_cli.kanban_db.child_ids"
@@ -83,7 +85,23 @@ class TestGraphResolver:
             )
             _kid.side_effect = lambda c, tid: ["t_rev"] if tid == "t_writer" else []
             cfg = {"agent": {"reasoning_class_routing": True}}
-            assert resolve_card_lane_effort(conn, "t_writer", cfg) == "medium"
+            assert resolve_card_lane_effort(conn, "t_writer", cfg) == "high"
+
+    def test_author_with_work_and_review_child_pins_high(self):
+        conn = MagicMock()
+        with patch("hermes_cli.kanban_db.get_task") as _gt, patch(
+            "hermes_cli.kanban_db.child_ids"
+        ) as _kid:
+            _gt.side_effect = lambda c, tid: {
+                "t_author": _FakeTask("t_author", "03-software-engineer"),
+                "t_work": _FakeTask("t_work", "07-document-producer"),
+                "t_rev": _FakeTask("t_rev", "15-sre-qa"),
+            }[tid]
+            _kid.side_effect = lambda c, tid: (
+                ["t_work", "t_rev"] if tid == "t_author" else []
+            )
+            cfg = {"agent": {"reasoning_class_routing": True}}
+            assert resolve_card_lane_effort(conn, "t_author", cfg) == "high"
 
     def test_card_without_review_child_stays_none(self):
         conn = MagicMock()
@@ -102,7 +120,7 @@ class TestGraphResolver:
 
 
 class TestApplyLaneEffort:
-    def test_seeds_medium_on_writer_with_review_child(self):
+    def test_seeds_high_on_container_with_review_child(self):
         conn = MagicMock()
         existing = _FakeTask("t_writer", "03-software-engineer", reasoning_effort=None)
         with patch("hermes_cli.kanban_db.get_task") as _gt, patch(
@@ -119,7 +137,8 @@ class TestApplyLaneEffort:
             mock_set.return_value = True
             ok = apply_card_lane_effort(conn, "t_writer")
         assert ok is True
-        mock_set.assert_called_once_with(conn, "t_writer", "medium")
+        # Never "medium" — that value 400s the worker on the letovo backend.
+        mock_set.assert_called_once_with(conn, "t_writer", "high")
 
     def test_seeds_max_on_review_card(self):
         conn = MagicMock()

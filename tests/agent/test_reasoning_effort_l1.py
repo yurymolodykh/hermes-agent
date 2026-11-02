@@ -36,21 +36,23 @@ from agent.reasoning_effort_l1 import (
 
 class TestLetovoClamp:
     def test_domain_is_exactly_letovo_wire_set(self):
-        assert LETOVO_DOMAIN == ("none", "low", "medium", "high", "max")
-        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
+        # Live-verified 2026-10-31: none/low/high/xhigh/max are served;
+        # medium and minimal answer HTTP 400.
+        assert LETOVO_DOMAIN == ("none", "low", "high", "xhigh", "max")
+        assert LETOVO_EFFORTS == ("none", "low", "high", "xhigh", "max")
 
     def test_supported_levels_pass_through(self):
         for level in LETOVO_EFFORTS:
             assert clamp_to_letovo(level) == level
 
-    def test_medium_stays_medium(self):
-        # Experiment v4 (REPORT_v4.md) disproved W1: the wire distinguishes
-        # medium as its own step — it must NOT collapse to high.
-        assert clamp_to_letovo("medium") == "medium"
+    def test_medium_maps_to_high(self):
+        # medium is rejected by the backend, so it resolves to the nearest
+        # served level for a mid-depth ask.
+        assert clamp_to_letovo("medium") == "high"
 
-    def test_xhigh_maps_to_max(self):
-        # xhigh requests the top tier on the letovo wire (distinguishable).
-        assert clamp_to_letovo("xhigh") == "max"
+    def test_xhigh_stays_distinct(self):
+        # xhigh is served as its own level — do NOT collapse it into max.
+        assert clamp_to_letovo("xhigh") == "xhigh"
 
     def test_ultra_clamps_to_max(self):
         # Hermes-internal; letovo has no ultra tier → max.
@@ -164,15 +166,16 @@ class TestGatingOn:
         pins = reasoning_aux_pins(cfg)
         assert pins == {"web_extract": "none", "compression": "low", "indexing": "high"}
 
-    def test_aux_pin_medium_stays_medium_when_on(self):
-        # medium is a distinct wire step now — it must NOT collapse to high.
+    def test_aux_pin_medium_clamps_to_high_when_on(self):
+        # medium is rejected by the letovo backend — the pin must not reach the
+        # wire as medium.
         cfg = {
             "agent": {
                 "reasoning_class_routing": True,
                 "reasoning_aux_pins": {"indexing": "medium"},
             }
         }
-        assert reasoning_aux_pins(cfg) == {"indexing": "medium"}
+        assert reasoning_aux_pins(cfg) == {"indexing": "high"}
 
     def test_resolve_aux_effort_when_on(self):
         cfg = {
@@ -193,10 +196,11 @@ class TestGatingOn:
                 {"agent": {"reasoning_class_routing": True}},
             )
         assert ok is True
-        # medium survives to the wire (experiment v4), model untouched.
-        mock_set.assert_called_once_with(conn, "t_123", "medium")
+        # medium is not a served level — it is written to the board as high
+        # (model untouched).
+        mock_set.assert_called_once_with(conn, "t_123", "high")
 
-    def test_pin_card_effort_xhigh_clamps_to_max_when_on(self):
+    def test_pin_card_effort_xhigh_survives_when_on(self):
         conn = MagicMock()
         with patch("hermes_cli.kanban_db.set_reasoning_effort") as mock_set:
             mock_set.return_value = True
@@ -205,8 +209,8 @@ class TestGatingOn:
                 {"agent": {"reasoning_class_routing": True}},
             )
         assert ok is True
-        # xhigh requests the letovo top tier max.
-        mock_set.assert_called_once_with(conn, "t_123", "max")
+        # xhigh is served as its own level and must not be collapsed to max.
+        mock_set.assert_called_once_with(conn, "t_123", "xhigh")
 
     def test_pin_card_effort_clear_when_on(self):
         conn = MagicMock()

@@ -138,19 +138,27 @@ class TestGlm52Vocabulary:
 
 
 class TestLetovoVocabulary:
-    def test_wire_set_includes_medium_and_max(self):
-        # Experiment v4 (REPORT_v4.md) — medium is its own step on the wire.
-        assert LETOVO_EFFORTS == ("none", "low", "medium", "high", "max")
+    def test_wire_set_excludes_rejected_levels(self):
+        # Live-verified 2026-10-31: the backend serves none/low/high/xhigh/max
+        # and rejects medium AND minimal with HTTP 400 ("must be low, high,
+        # xhigh, max, or an integer within [1, 100]"). The earlier reading of
+        # experiment v4 was wrong about medium being served.
+        assert LETOVO_EFFORTS == ("none", "low", "high", "xhigh", "max")
+        assert "medium" not in LETOVO_EFFORTS
+        assert "minimal" not in LETOVO_EFFORTS
 
     def test_supported_levels_pass_through(self):
         for level in LETOVO_EFFORTS:
             assert clamp_effort(level, LETOVO_EFFORTS, LETOVO_OVERRIDES) == level
 
-    def test_medium_stays_medium(self):
-        assert clamp_effort("medium", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "medium"
+    def test_medium_maps_to_high(self):
+        # medium has no wire spelling here: it maps to the nearest served
+        # level for a mid-depth ask, high.
+        assert clamp_effort("medium", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "high"
 
-    def test_xhigh_maps_to_max(self):
-        assert clamp_effort("xhigh", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "max"
+    def test_xhigh_stays_distinct(self):
+        # xhigh is a served level — it must stay distinct from max.
+        assert clamp_effort("xhigh", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "xhigh"
 
     def test_ultra_maps_to_max(self):
         assert clamp_effort("ultra", LETOVO_EFFORTS, LETOVO_OVERRIDES) == "max"

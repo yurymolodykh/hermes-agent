@@ -370,6 +370,217 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+# ---------------------------------------------------------------------------
+# Stale quota stamp: ``last_failure_error`` must describe the CURRENT blocker,
+# not the history of the card.
+#
+# Incident (audit 2026-11-01, 40 cards idle 10-23 h, 21 294 ``respawn_guarded``
+# events with reason=blocker_auth): a run hit the quota wall (``rate_limited``
+# → quota-flavored stamp), then a LATER run ended ``api_unavailable`` (provider
+# outage) or was ``reclaimed`` (gateway restart). Both of those paths leave the
+# task in ``ready`` without counting a failure, and neither refreshed nor
+# cleared ``last_failure_error``. The cooldown branch keys off the LATEST run
+# outcome, so it stopped applying; the ``blocker_auth`` regex then matched the
+# stale quota text on every tick forever — a permanent ready-but-never-spawned
+# card with no exit (``consecutive_failures`` stays 0, so the breaker never
+# fires either).
+#
+# Required behaviour: an outcome that is not a task refusal must clear the
+# column (exactly what ``unblock_task``/``_clear_failure_counter`` already do).
+# ---------------------------------------------------------------------------
+
+
+def _provider_hit(conn, tid, n, *, host, exit_code):
+    """Claim → repoint at a dead pid → record the reap → run one
+    ``detect_crashed_workers`` pass. ``exit_code`` selects the branch under
+    test (``KANBAN_RATE_LIMIT_EXIT_CODE`` / ``KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE``).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    assert kb.claim_task(conn, tid, claimer=f"{host}:w{n}")
+    pid = 90000 + n
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    conn.commit()
+    _kb._record_worker_exit(pid, _exited_status(exit_code))
+    kb.detect_crashed_workers(conn)
+    return pid
+
+
+def test_stale_quota_stamp_cleared_by_later_api_unavailable_run(
+    kanban_home, monkeypatch,
+):
+    """rate_limited → api_unavailable must NOT leave the guard returning
+    ``blocker_auth``. Currently RED: the stamp from the quota wall survives
+    the provider-outage requeue, so the card is deferred on every tick."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_provider_route_blocker", lambda provider, model: None
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    host = _kb._claimer_id().split(":", 1)[0]
+    now = 5_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale-quota", assignee="a",
+            model_override="deepseek-v4-flash", provider_override="letovo",
+        )
+
+        # Step 1: the card hits the quota wall → requeued rate_limited, stamp set.
+        _provider_hit(
+            conn, tid, 0, host=host,
+            exit_code=_kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert "rate-limited" in (task.last_failure_error or "")
+        # Inside the cooldown the guard defers for the RIGHT reason.
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # Step 2: the next run dies of a provider outage (NOT a task refusal).
+        # Advance past the quota cooldown so branch 1 no longer applies.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        _provider_hit(
+            conn, tid, 1, host=host,
+            exit_code=_kb.KANBAN_PROVIDER_UNAVAILABLE_EXIT_CODE,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", "provider outage requeues to ready"
+        assert task.consecutive_failures == 0
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()[0]
+        assert latest == "api_unavailable"
+
+        # The stale quota stamp must be gone: nothing current says "quota".
+        assert kb.check_respawn_guard(conn, tid) is None, (
+            "a later api_unavailable run must not inherit the previous quota "
+            f"wall's stamp (got {kb.get_task(conn, tid).last_failure_error!r})"
+        )
+        # And the dispatch tick must actually spawn the card.
+        import hermes_cli.profiles as _profiles
+        monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+        monkeypatch.setattr(
+            _kb, "resolve_task_root_route",
+            lambda conn, tid, persist=False, allow_unpinned=False: (
+                (tid,), "letovo", "deepseek-v4-flash",
+            ),
+        )
+        # Assignee-aware provider pre-flight needs a real profile on disk;
+        # this test is about the respawn guard, not route resolution.
+        monkeypatch.setattr(
+            _kb, "resolve_assignee_spawn_route",
+            lambda assignee, provider, model: (provider, model, None),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, **kw: 424242, dry_run=False,
+        )
+        assert tid in [s[0] for s in res.spawned], (
+            "card with a fresh api_unavailable outcome must spawn on the next "
+            f"tick; guarded={res.respawn_guarded}"
+        )
+
+
+def test_stale_quota_stamp_cleared_by_later_reclaimed_run(
+    kanban_home, monkeypatch,
+):
+    """rate_limited → reclaimed (gateway restart) must also clear the stamp.
+    Currently RED for the same reason: the reclaim path never touches it."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_provider_route_blocker", lambda provider, model: None
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    host = _kb._claimer_id().split(":", 1)[0]
+    now = 5_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale-quota-reclaim", assignee="a",
+            model_override="deepseek-v4-flash", provider_override="letovo",
+        )
+        _provider_hit(
+            conn, tid, 0, host=host,
+            exit_code=_kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+        assert "rate-limited" in (kb.get_task(conn, tid).last_failure_error or "")
+
+        # A stale claim from a DEAD dispatcher generation reclaims the card.
+        kb.claim_task(conn, tid, claimer=f"{host}:w-reclaim")
+        conn.execute(
+            "UPDATE tasks SET gateway_generation=?, worker_pid=? WHERE id=?",
+            ("pid:1:start:0.0:boot:deadbeef", 987654, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        kb.reclaim_dead_generation_running(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+            (tid,),
+        ).fetchone()[0]
+        assert latest == "reclaimed"
+        assert task.consecutive_failures == 0
+
+        assert kb.check_respawn_guard(conn, tid) is None, (
+            "a later reclaimed run must not inherit the previous quota wall's "
+            f"stamp (got {task.last_failure_error!r})"
+        )
+
+
+def test_respawn_cooldown_still_applies_after_stamp_hygiene(
+    kanban_home, monkeypatch,
+):
+    """Guard against over-clearing: while ``rate_limited`` IS the latest
+    outcome, cooldown still defers inside the window and allows the probe
+    after it (the documented rate-limit contract must survive the reset)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_provider_route_blocker", lambda provider, model: None
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    host = _kb._claimer_id().split(":", 1)[0]
+    now = 5_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="cooldown-intact", assignee="a",
+            model_override="deepseek-v4-flash", provider_override="letovo",
+        )
+        _provider_hit(
+            conn, tid, 0, host=host,
+            exit_code=_kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+        # ensure the latest run's ended_at is the injected "now"
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE task_id=? AND ended_at IS NOT NULL",
+            (now, tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        # After the cooldown the card is allowed to probe.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 
 
 

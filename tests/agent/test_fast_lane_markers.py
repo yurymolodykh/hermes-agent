@@ -322,3 +322,44 @@ def test_strip_telegram_slow_prefix():
     assert strip_telegram_slow_prefix("обычное сообщение") == "обычное сообщение"
     assert strip_telegram_slow_prefix("") == ""
     assert strip_telegram_slow_prefix(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Writer/reader drift guard (t_aca69ccc)
+#
+# ``patch_session_fast_lane_marker`` (writer) and ``session_slow_mode``
+# (reader) MUST agree on the key and on the value round-trip: if the writer
+# ever stores what the reader cannot interpret as True, stickiness silently
+# dies and every follow-up turn drops back to the fast lane. The exhaustive
+# reader matrix lives in test_fast_lane_session_sticky.py; this is the single
+# end-to-end guard kept next to the writer's own tests.
+# ---------------------------------------------------------------------------
+
+def test_writer_and_reader_agree_on_marker_key_and_roundtrip():
+    from agent.fast_lane import session_slow_mode
+
+    con, db = _make_session_db()
+    try:
+        for decision, expected in (
+            (decide_slow_mode(text="подумай: разбери"), True),
+            (decide_slow_mode(text="сколько будет 2+2?"), False),
+        ):
+            patch_session_fast_lane_marker(db, "sess-1", decision)
+            # Same key the reader reads — no drift between write and read.
+            assert db.get_session_model_config_value("sess-1", "slow_mode") is expected
+            assert session_slow_mode(db, "sess-1") is expected
+    finally:
+        con.close()
+
+
+def test_reader_degrades_to_none_on_absent_db_session_or_key():
+    from agent.fast_lane import session_slow_mode
+
+    assert session_slow_mode(None, "sess-1") is None
+    assert session_slow_mode(object(), "sess-1") is None
+    con, db = _make_session_db()
+    try:
+        assert session_slow_mode(db, "sess-1") is None  # row without a marker
+        assert session_slow_mode(db, "") is None
+    finally:
+        con.close()
