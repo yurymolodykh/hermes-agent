@@ -131,6 +131,39 @@ _OWUI_TG_INLINE_REPORT_EXTS = frozenset({".md", ".txt", ".rst", ".log"})
 _OWUI_ARTIFACT_MAX_BYTES = 300_000
 _OWUI_ARTIFACT_MAX_CHARS = 60_000
 
+#: Report document formats eligible for the subtree deliverable fallback
+#: (t_b154af7d).  HTML is the primary mission-report format here (Up Great
+#: house style), PDF/DOCX are the usual external exports.
+_REPORT_DOC_EXTS = frozenset({
+    ".html", ".htm", ".pdf", ".docx", ".md", ".txt", ".rst",
+})
+#: At most this many subtree reports ride one terminal итог — the owner wants
+#: the final report, not an archive dump.
+_SUBTREE_REPORT_MAX_FILES = 3
+#: Below this size a "report" is a stub/placeholder, not a deliverable.
+_SUBTREE_REPORT_MIN_BYTES = 2_000
+
+#: ``.../durable/<group>/<mission>`` — the mission durable dir a controller
+#: card names as its "точка истины" (t_b154af7d fallback tier 2).
+_MISSION_DIR_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\s\"'<>|]*?[\\/]durable[\\/][^\s\"'<>|/\\]+[\\/][^\s\"'<>|/\\]+"
+)
+#: Absolute document path inside a mission note (report candidates).
+_ABS_DOC_RE = re.compile(
+    r"[A-Za-z]:[\\/][^\s\"'<>|]+?\.(?:html|htm|pdf|docx)", re.IGNORECASE
+)
+#: Document formats a mission note may name as its final report.
+_MISSION_REPORT_EXTS = frozenset({".html", ".htm", ".pdf", ".docx"})
+#: A candidate file name must carry one of these tokens — this is what keeps
+#: build scripts, datasets, opening plans and images out of the owner's chat.
+_MISSION_REPORT_STEM_TOKENS = (
+    "report", "otchet", "отчёт", "отчет", "digest", "дайджест",
+)
+#: Mission notes larger than this are logs/archives, not the plan/checkpoint.
+_MISSION_NOTE_MAX_BYTES = 2 * 1024 * 1024
+#: At most two declared reports (report + digest) ride one terminal итог.
+_MISSION_REPORT_MAX_FILES = 2
+
 
 # ---------------------------------------------------------------------------
 # Render helpers (pure, no side effects)
@@ -368,6 +401,306 @@ def owui_root_final_summary(plan: dict, msg: str,
     return _sane(full, max_chars=8000)
 
 
+def _is_final_report_name(stem: str) -> bool:
+    """True when a file stem names a MISSION-LEVEL report, not a stage note.
+
+    ``sno-economics-report-for-manager-v8`` / ``digests/day-01`` → True;
+    ``S1_REPORT`` / ``S1D_REPORT`` / ``FINAL-V8-ACCEPTANCE`` → False.  Stage
+    deliverables carry a leading stage token (``s1``, ``s2b``, ``d3``), which
+    this rejects so the owner gets the final mission report rather than the
+    per-stage paper trail.
+    """
+    s = (stem or "").lower()
+    if not s:
+        return False
+    if not any(tok in s for tok in _MISSION_REPORT_STEM_TOKENS):
+        return False
+    # Leading stage id: s1, s1d, s2-b, d1, w9a, m2 … — a per-stage artifact.
+    if re.match(r"^(?:s|d|w|m|a|b)\d+[a-z]?(?:[-_.]|$)", s):
+        return False
+    return True
+
+
+def _report_family_key(path: Path) -> str:
+    """Normalized report family key — collapses superseded versions.
+
+    ``sno-economics-report-for-manager-v7.html`` and ``...-v8.html`` are the
+    SAME deliverable at two revisions; shipping both to the owner is noise and
+    looks like two reports.  Version markers (``-v7``, ``_v8.1``, ``-r3``,
+    ``-final``, ``-draft``) are stripped so only the newest member of each
+    family survives.
+    """
+    stem = path.stem.lower()
+    stem = re.sub(
+        r"(?:[-_.]?(?:v|ver|version)\d+(?:[._]\d+)*"
+        r"|[-_.]?r\d+"
+        r"|[-_.](?:final|draft|ready|copy|new|old)\b"
+        r"|[-_.]?\d{8}(?:[-_]\d{6})?)$",
+        "",
+        stem,
+    )
+    return re.sub(r"[-_.]{2,}", "-", stem).strip("-_.")
+
+
+def _dedupe_report_families(scored: list[tuple[float, int, str]]) -> list[str]:
+    """Keep one (newest, then largest) file per report family.
+
+    ``scored`` is ``[(mtime, size, path), ...]``; the returned list preserves
+    the input order and drops every older member of an already-taken family.
+    """
+    taken: set[str] = set()
+    out: list[str] = []
+    for _mtime, _size, path in scored:
+        try:
+            key = _report_family_key(Path(path))
+        except Exception:
+            key = path
+        if key in taken:
+            logger.info(
+                "delivery engine: [final] %s superseded by a newer revision of "
+                "the same report — not delivered", path,
+            )
+            continue
+        taken.add(key)
+        out.append(path)
+    return out
+
+
+def _subtree_report_paths(conn: Any, root_id: str) -> list[str]:
+    """Report-like artifact paths produced by a root's subtree (t_b154af7d).
+
+    Mission controllers are routinely closed by an administrative archive
+    rather than ``kanban_complete(artifacts=...)``, so the root carries no
+    artifact of its own while the actual deliverable was produced by a
+    descendant card.  Without this fallback the terminal итог degenerates to
+    a bare one-liner and the owner never receives the report (the exact
+    sno-economics-r3 incident: controller t_08a192ec had 0 artifacts, the
+    report file was produced under S4/S6).
+
+    Selection rules (deliberately narrow — a wrong file in the owner's chat
+    is worse than none):
+
+    * only files whose extension is a report format (``_REPORT_DOC_EXTS``);
+    * only files that exist on disk, are absolute and readable;
+    * newest first by mtime, at most ``_SUBTREE_REPORT_MAX_FILES``;
+    * duplicate content (same name+sha256) collapses to the first hit;
+    * a candidate must be at least ``_SUBTREE_REPORT_MIN_BYTES`` (skips
+      stubs/placeholders) and at most the 25 MB attachment ceiling.
+
+    Returns ``[]`` on any failure — the caller degrades to the text итог.
+    """
+    paths: list[str] = []
+    try:
+        from hermes_cli import kanban_db as _kb
+        import json as _json
+
+        node_ids = {root_id} | set(_kb.get_descendant_ids(conn, root_id) or ())
+        if len(node_ids) < 2:
+            return []
+        placeholders = ",".join("?" * len(node_ids))
+        candidates: list[str] = []
+        rows = conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND kind='completed' "
+            "ORDER BY id DESC",
+            tuple(sorted(node_ids)),
+        ).fetchall()
+        for row in rows:
+            payload = row["payload"] if not isinstance(row, tuple) else row[1]
+            if not payload:
+                continue
+            try:
+                data = _json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                for p in data.get("artifacts") or ():
+                    if isinstance(p, str) and p.strip():
+                        candidates.append(p.strip())
+        runs = conn.execute(
+            "SELECT metadata FROM task_runs "
+            f"WHERE task_id IN ({placeholders}) AND outcome='completed' "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC",
+            tuple(sorted(node_ids)),
+        ).fetchall()
+        for row in runs:
+            meta = row["metadata"] if not isinstance(row, tuple) else row[0]
+            if not meta:
+                continue
+            try:
+                m = _json.loads(meta)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(m, dict):
+                for p in m.get("artifacts") or ():
+                    if isinstance(p, str) and p.strip():
+                        candidates.append(p.strip())
+        for tid in sorted(node_ids):
+            try:
+                for att in _kb.list_attachments(conn, tid):
+                    if att.stored_path:
+                        candidates.append(str(att.stored_path))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning(
+            "delivery engine: subtree report scan for %s failed: %s",
+            root_id, exc,
+        )
+        return []
+
+    scored: list[tuple[float, int, str]] = []
+    seen_fp: set[tuple[str, str]] = set()
+    for raw in candidates:
+        try:
+            p = Path(os.path.expanduser(raw))
+            if not p.is_absolute() or not p.is_file():
+                continue
+            if p.suffix.lower() not in _REPORT_DOC_EXTS:
+                continue
+            size = p.stat().st_size
+            if size < _SUBTREE_REPORT_MIN_BYTES or size > _OWUI_TG_ARTIFACT_MAX_BYTES:
+                continue
+            digest = hashlib.sha256()
+            with open(p, "rb") as fh:
+                while chunk := fh.read(1024 * 1024):
+                    digest.update(chunk)
+            fp = (p.name, digest.hexdigest())
+            if fp in seen_fp:
+                continue
+            seen_fp.add(fp)
+            scored.append((p.stat().st_mtime, size, str(p)))
+        except (OSError, ValueError):
+            continue
+    scored.sort(reverse=True)
+    deduped = _dedupe_report_families(scored)
+    # Prefer the FINAL report over stage/auxiliary deliverables: when the
+    # subtree yields any file whose name reads as a report/digest, ship only
+    # those and drop stage notes (``S1_REPORT.md``) and acceptance memos — the
+    # owner asked for the mission's final report, not the paper trail.  When
+    # nothing is report-named, the explicit artifacts are shipped as-is.
+    final_like = [
+        p for p in deduped
+        if _is_final_report_name(Path(p).stem.lower())
+    ]
+    chosen = final_like or deduped
+    for path in chosen[:_SUBTREE_REPORT_MAX_FILES]:
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _mission_declared_reports(conn: Any, root_id: str) -> list[str]:
+    """Final-report files EXPLICITLY declared by a mission card (t_b154af7d).
+
+    Second fallback tier, for the common case where a mission controller was
+    archived administratively: the root carries no artifacts, its subtree
+    carries none either, yet the mission's own "точка истины" documents name
+    the final report by absolute path (sno-economics-r3: NIGHT-PLAN.md /
+    checkpoint.md declare
+    ``C:/Users/hermes/vleo_economics/report/manager/sno-economics-report*.html``).
+
+    Resolution is evidence-based, never a directory guess:
+
+    1. the root card's own text (body, result, comments) must name a mission
+       durable directory (``.../durable/<group>/<mission>``);
+    2. only ``*.md`` files at the top of THAT directory are read (the mission's
+       plan/checkpoint/handoff notes);
+    3. a candidate must be an absolute path to an EXISTING document file
+       (html/htm/pdf/docx) whose stem names a report (report / отчёт / otchet /
+       digest / дайджест) — plan scripts, datasets and images never qualify;
+    4. duplicates collapse, newest first, capped at 2.
+
+    Returns ``[]`` on any failure; the caller then degrades to the text итог.
+    """
+    try:
+        import json as _json
+        from hermes_cli import kanban_db as _kb
+
+        task = _kb.get_task(conn, root_id)
+        if task is None:
+            return []
+        chunks: list[str] = [
+            str(getattr(task, "title", "") or ""),
+            str(getattr(task, "body", "") or ""),
+            str(getattr(task, "result", "") or ""),
+        ]
+        try:
+            for c in _kb.list_comments(conn, root_id)[-40:]:
+                chunks.append(str(getattr(c, "body", "") or ""))
+        except Exception:
+            pass
+        card_text = "\n".join(chunks)
+        if not card_text.strip():
+            return []
+        dirs = set()
+        for m in _MISSION_DIR_RE.finditer(card_text):
+            try:
+                cand = Path(m.group(0).replace("\\", "/").rstrip("/.,;)"))
+                if cand.is_dir():
+                    dirs.add(cand)
+            except (OSError, ValueError):
+                continue
+        if not dirs:
+            return []
+
+        declared: list[str] = []
+        for mission_dir in sorted(dirs):
+            try:
+                note_files = sorted(
+                    (p for p in mission_dir.glob("*.md") if p.is_file()),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[:8]
+            except OSError:
+                continue
+            for note in note_files:
+                try:
+                    if note.stat().st_size > _MISSION_NOTE_MAX_BYTES:
+                        continue
+                    text = note.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for raw in _ABS_DOC_RE.findall(text):
+                    norm = raw.replace("\\", "/").rstrip(".,;)]»\"'")
+                    try:
+                        p = Path(norm)
+                    except (OSError, ValueError):
+                        continue
+                    if not p.is_absolute() or not p.is_file():
+                        continue
+                    if p.suffix.lower() not in _MISSION_REPORT_EXTS:
+                        continue
+                    stem = p.stem.lower()
+                    if not any(tok in stem for tok in _MISSION_REPORT_STEM_TOKENS):
+                        continue
+                    try:
+                        size = p.stat().st_size
+                    except OSError:
+                        continue
+                    if size < _SUBTREE_REPORT_MIN_BYTES or size > _OWUI_TG_ARTIFACT_MAX_BYTES:
+                        continue
+                    if norm not in declared:
+                        declared.append(norm)
+        if not declared:
+            return []
+        scored_mission: list[tuple[float, int, str]] = []
+        for path in declared:
+            try:
+                st = Path(path).stat()
+            except OSError:
+                continue
+            scored_mission.append((st.st_mtime, st.st_size, path))
+        scored_mission.sort(reverse=True)
+        return _dedupe_report_families(scored_mission)[:_MISSION_REPORT_MAX_FILES]
+    except Exception as exc:
+        logger.warning(
+            "delivery engine: mission declared-report scan for %s failed: %s",
+            root_id, exc,
+        )
+        return []
+
+
 def owui_root_artifact_paths(plan: dict) -> list[str]:
     """Absolute readable artifact paths for the [final] branch итог (F1).
 
@@ -471,6 +804,28 @@ def owui_root_artifact_paths(plan: dict) -> list[str]:
             # task_attachments rows — durable per-task attachment blobs.
             for att in _kb.list_attachments(conn, root_id):
                 _add(att.stored_path)
+            # 4. Mission-report fallback (t_b154af7d): a mission controller is
+            #    frequently closed by an administrative archive (owner order)
+            #    WITHOUT a ``completed`` event and without attaching anything —
+            #    the real deliverable then lives only as a file on disk that a
+            #    DESCENDANT card produced (sno-economics-r3: the controller
+            #    t_08a192ec had zero artifacts while the report was produced by
+            #    S4/S6 cards under a different root).  When the root itself
+            #    yields nothing, fall back to the report-like artifacts of its
+            #    own subtree so the owner still receives the final report
+            #    instead of a bare "✅ Задача выполнена".
+            if not paths:
+                for cand in _subtree_report_paths(conn, root_id):
+                    _add(cand)
+            # 5. Mission-declared report (t_b154af7d): the mission's own
+            #    "точка истины" notes name the final report by absolute path.
+            #    This covers an administratively archived controller whose
+            #    subtree cards produced the report outside the board (the
+            #    sno-economics-r3 case).  Strictly evidence-based: only files
+            #    actually named in the mission's md notes, existing on disk.
+            if not paths:
+                for cand in _mission_declared_reports(conn, root_id):
+                    _add(cand)
         finally:
             conn.close()
     except Exception as exc:
@@ -580,6 +935,170 @@ def log_suppression(
         )
     except Exception as exc:
         logger.debug("delivery engine: suppression journal failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Report-delivery journal — the ONE place that records «отчёт отправлен»
+# ---------------------------------------------------------------------------
+
+#: Durable JSON-lines journal for the owner's Telegram report deliveries.
+#: Separate from the rotating gateway.log so the audit trail of «финальный
+#: отчёт доставлен» survives log rotation (t_e04a8f44 acceptance: «в логах
+#: видно событие отправки без ручного действия»).
+_REPORT_DELIVERY_LOG_NAME = "telegram-report-delivery.log"
+
+#: Report type buckets keyed by file extension.
+_REPORT_TYPE_BY_EXT = {
+    ".html": "html",
+    ".htm": "html",
+    ".pdf": "pdf",
+    ".md": "markdown",
+    ".txt": "text",
+    ".rst": "text",
+    ".log": "text",
+    ".csv": "data",
+    ".json": "data",
+    ".xlsx": "spreadsheet",
+    ".docx": "document",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+}
+
+
+def mask_chat_id(chat_id: Any) -> str:
+    """Mask a delivery chat id for logs (owner PII must stay out of them).
+
+    Numeric Telegram ids keep only the last 3 digits (``125805788`` →
+    ``******788``); non-numeric ids keep a short stable prefix so a log reader
+    can tell sessions apart without the full identifier.
+    """
+    raw = str(chat_id or "").strip()
+    if not raw:
+        return "?"
+    if raw.isdigit():
+        keep = raw[-3:] if len(raw) > 3 else ""
+        return ("*" * (len(raw) - len(keep))) + keep
+    head = raw.split("-")[0][:12]
+    return "{}…".format(head)
+
+
+def report_type_of(paths: Any) -> str:
+    """Return a coarse report type string for a list of artifact paths."""
+    if not paths:
+        return "none"
+    if isinstance(paths, str):
+        paths = [paths]
+    kinds: List[str] = []
+    for p in paths:
+        ext = Path(str(p)).suffix.lower()
+        kind = _REPORT_TYPE_BY_EXT.get(ext, "file")
+        if kind not in kinds:
+            kinds.append(kind)
+    return "+".join(kinds) if kinds else "none"
+
+
+def log_report_delivery(
+    *,
+    task_id: str,
+    chat_id: Any,
+    result: str,
+    platform: str = "telegram",
+    reason: str = "",
+    report_type: str = "none",
+    artifacts: Optional[list] = None,
+    artifacts_failed: Optional[list] = None,
+    text_len: int = 0,
+    trigger: str = "branch_terminal",
+    board: str = "",
+    artifacts_skipped: Optional[list] = None,
+    artifacts_discovered: Optional[list] = None,
+    extra: Optional[dict] = None,
+) -> None:
+    """Record ONE «финальный отчёт → владелец» delivery event.
+
+    Emits BOTH a single-line INFO/WARNING record on the standard logger (so
+    it shows up next to the rest of the gateway activity) and a JSON-lines
+    record in ``<hermes_home>/logs/telegram-report-delivery.log`` (durable
+    audit trail).  Fields covered — card/mission, masked chat id, report
+    type, result, artifacts, time, trigger.
+
+    Never raises: a journal write must not break the delivery path.
+    """
+    art = [str(p) for p in (artifacts or []) if p]
+    failed = [str(p) for p in (artifacts_failed or []) if p]
+    skipped = [str(p) for p in (artifacts_skipped or []) if p]
+    found = [str(p) for p in (artifacts_discovered or []) if p]
+    masked = mask_chat_id(chat_id)
+    tail = ""
+    if failed:
+        tail += " artifacts_failed=%d" % len(failed)
+    if skipped:
+        tail += " artifacts_skipped=%d" % len(skipped)
+    if found:
+        # Found-on-disk report files that never left the host (a failed text
+        # send aborts the lane before any upload) — distinct from ``artifacts``
+        # (uploaded) and from ``artifacts_failed`` (upload attempted + failed).
+        tail += " artifacts_not_uploaded=%d" % len(found)
+    if reason:
+        tail += " reason=%s" % reason
+    line = (
+        "telegram report delivery: task={task} chat={chat} report={rtype} "
+        "result={result} artifacts={n} trigger={trigger}{tail}"
+    ).format(
+        task=task_id,
+        chat=masked,
+        rtype=report_type,
+        result=result,
+        n=len(art),
+        trigger=trigger,
+        tail=tail,
+    )
+    try:
+        if result == "delivered":
+            logger.info(line)
+        else:
+            logger.warning(line)
+    except Exception:
+        pass
+    try:
+        from datetime import datetime, timezone
+
+        from hermes_constants import get_hermes_home
+
+        now = datetime.now(timezone.utc)
+        record: Dict[str, Any] = {
+            "ts": now.isoformat(timespec="seconds"),
+            "ts_epoch": round(now.timestamp(), 3),
+            "event": "report_delivery",
+            "trigger": trigger,
+            "board": board or "",
+            "task_id": task_id or "",
+            "platform": platform or "telegram",
+            "chat_id_masked": masked,
+            "report_type": report_type,
+            "result": result,
+            "reason": reason or "",
+            "text_len": int(text_len or 0),
+            "artifacts": art,
+            "artifacts_failed": failed,
+            "artifacts_skipped": skipped,
+            "artifacts_not_uploaded": found,
+            "manual": False,
+        }
+        if extra:
+            record.update(extra)
+        override = (os.environ.get("HERMES_REPORT_DELIVERY_LOG") or "").strip()
+        if override:
+            log_path = Path(override)
+        else:
+            log_path = get_hermes_home() / "logs" / _REPORT_DELIVERY_LOG_NAME
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.debug("delivery engine: report-delivery journal failed: %s", exc)
+
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1467,27 @@ class DeliveryEngine:
         text: str = ""
         tg_suppressed: bool = False
         event_id: Optional[int] = None
+        #: True when the TG lane actually accepted the message (adapter
+        #: ``SendResult.success is not False``); False when the send was
+        #: attempted and FAILED; None when no TG lane was resolved for this
+        #: subscription (OWUI-only / policy off) or no send was attempted.
+        #: Callers MUST NOT treat None as a failure — the once-only dedup
+        #: marker is marked for None (nothing to retry) but withheld for
+        #: False so the next watcher tick retries the owner's terminal итог
+        #: (t_b154af7d: a ``send_path_degraded`` send used to be dedup-marked
+        #: as if delivered and the report was lost forever).
+        tg_delivered: Optional[bool] = None
+        #: Human-readable adapter error when ``tg_delivered is False``.
+        tg_send_error: str = ""
+        #: Absolute artifact paths the TG lane actually uploaded (t_e04a8f44).
+        #: Filled from ``_deliver_kanban_artifacts`` so the caller/report journal
+        #: records what was REALLY delivered, not merely what was discovered.
+        artifacts_sent: List[str] = field(default_factory=list)
+        #: Artifact paths that were discovered but did NOT reach the chat.
+        artifacts_failed: List[str] = field(default_factory=list)
+        #: Artifact paths that were discovered but deliberately not uploaded
+        #: (missing on disk / above the size cap / unsafe path) — t_e04a8f44.
+        artifacts_skipped: List[str] = field(default_factory=list)
 
     async def handle_event(
         self,
@@ -1190,19 +1730,36 @@ class DeliveryEngine:
                 try:
                     res = await send_tg(tg_adapter, tg_lane, msg)
                     if getattr(res, "success", True) is False:
+                        _ev_err = getattr(res, "error", None) or "unknown"
                         logger.warning(
                             "delivery engine: TG lane send to telegram:%s failed: %s",
-                            tg_lane, getattr(res, "error", None) or "unknown",
+                            tg_lane, _ev_err,
                         )
+                        if et == FINAL:
+                            # t_e04a8f44: a failed terminal send is journaled
+                            # (result=failed) — the attempt and its reason stay
+                            # auditable even though the cursor rewinds.
+                            log_report_delivery(
+                                task_id=str(sub.get("task_id") or ""),
+                                chat_id=tg_lane,
+                                result="failed",
+                                reason=str(_ev_err),
+                                report_type="none",
+                                artifacts=[],
+                                text_len=len(msg or ""),
+                                trigger="terminal_event",
+                                board=board or "",
+                            )
                     else:
                         conn = _kb.connect(board=board)
                         try:
                             dedup_mark(conn, sub["task_id"], et, cause_hash)
                         finally:
                             conn.close()
+                        _ev_art_res: Optional[dict] = None
                         if et == FINAL and deliver_artifacts is not None:
                             try:
-                                await deliver_artifacts(
+                                _ev_art_res = await deliver_artifacts(
                                     adapter=tg_adapter, chat_id=tg_lane,
                                     metadata={}, event_payload=getattr(ev, "payload", None),
                                     task=task,
@@ -1212,6 +1769,28 @@ class DeliveryEngine:
                                     "delivery engine: TG lane artifacts for %s failed: %s",
                                     sub["task_id"], exc,
                                 )
+                                _ev_art_res = {"sent": [], "failed": [], "error": str(exc)}
+                        if et == FINAL:
+                            # t_e04a8f44: the per-event terminal итог is the
+                            # same «финальный отчёт владельцу» delivery as the
+                            # branch lane — journal it through the SAME helper
+                            # so the audit trail has one shape.
+                            _sent_ev = list((_ev_art_res or {}).get("sent") or [])
+                            _failed_ev = list((_ev_art_res or {}).get("failed") or [])
+                            _skipped_ev = list((_ev_art_res or {}).get("skipped") or [])
+                            log_report_delivery(
+                                task_id=str(sub.get("task_id") or ""),
+                                chat_id=tg_lane,
+                                result="delivered",
+                                reason=str((_ev_art_res or {}).get("error") or ""),
+                                report_type=report_type_of(_sent_ev),
+                                artifacts=_sent_ev,
+                                artifacts_failed=_failed_ev,
+                                artifacts_skipped=_skipped_ev,
+                                text_len=len(msg or ""),
+                                trigger="terminal_event",
+                                board=board,
+                            )
                 except Exception as exc:
                     logger.warning(
                         "delivery engine: TG lane send failed for %s to telegram:%s: %s",
@@ -1489,28 +2068,102 @@ class DeliveryEngine:
             try:
                 resx = await send_tg(tg_adapter, tg_lane, final_msg)
                 if getattr(resx, "success", True) is False:
+                    err = getattr(resx, "error", None) or "unknown"
                     logger.warning(
                         "delivery engine: branch final TG send to telegram:%s failed: %s",
-                        tg_lane, getattr(resx, "error", None) or "unknown",
+                        tg_lane, err,
                     )
+                    # t_e04a8f44: the send FAILURE is journaled as its own
+                    # report-delivery event (result=failed) so an operator sees
+                    # the attempt + reason next to the successful ones instead
+                    # of only a transient warning.
+                    log_report_delivery(
+                        task_id=root_id,
+                        chat_id=tg_lane,
+                        result="failed",
+                        reason=str(err),
+                        report_type=report_type_of(artifacts),
+                        artifacts=[],
+                        artifacts_discovered=artifacts or [],
+                        text_len=len(final_msg or ""),
+                        trigger="branch_terminal",
+                        board=board,
+                    )
+                    # t_b154af7d: report the FAILURE to the caller so the
+                    # watcher withholds the once-only dedup marker and retries
+                    # on the next tick.  Before this, a degraded send
+                    # (``send_path_degraded``) was silently marked as
+                    # delivered and the owner's итог was lost for good.
+                    res.tg_delivered = False
+                    res.tg_send_error = str(err)
+                    return res
                 else:
+                    res.tg_delivered = True
+                    _art_res: Optional[dict] = None
                     if deliver_artifacts is not None:
                         try:
-                            await deliver_artifacts(
+                            _art_res = await deliver_artifacts(
                                 adapter=tg_adapter, chat_id=tg_lane,
                                 metadata={}, event_payload={"artifacts": artifacts or []},
                                 task=None,
                             )
                         except Exception as exc:
-                            logger.debug(
-                                "delivery engine: branch final TG artifacts failed: %s",
-                                exc,
+                            # The итог text landed; a failed attachment must be
+                            # observable (a report promised as a file that never
+                            # arrives is a silent loss for the owner).
+                            logger.warning(
+                                "delivery engine: branch final TG artifacts for "
+                                "%s/%s failed: %s", root_id, tg_lane, exc,
                             )
+                            _art_res = {"sent": [], "failed": list(artifacts or []),
+                                        "error": str(exc)}
+                    # t_e04a8f44: ONE structured record per terminal delivery —
+                    # card/mission, masked chat id, report type, artifacts,
+                    # result, time.  Written only after TG accepted the text.
+                    _sent = (_art_res or {}).get("sent") if _art_res else []
+                    _failed = (_art_res or {}).get("failed") if _art_res else []
+                    _skipped = (_art_res or {}).get("skipped") if _art_res else []
+                    if _art_res is None:
+                        # No artifact lane at all: the text still carries the
+                        # итог; record it as a text-only delivery.
+                        _sent = []
+                    log_report_delivery(
+                        task_id=root_id,
+                        chat_id=tg_lane,
+                        result="delivered",
+                        reason=(str((_art_res or {}).get("error") or "")
+                                if _failed else ""),
+                        report_type=report_type_of(_sent or artifacts),
+                        artifacts=_sent or [],
+                        artifacts_failed=_failed or [],
+                        artifacts_skipped=_skipped or [],
+                        text_len=len(final_msg or ""),
+                        trigger="branch_terminal",
+                        board=board,
+                    )
+                    res.artifacts_sent = list(_sent or [])
+                    res.artifacts_failed = list(_failed or [])
+                    res.artifacts_skipped = list(_skipped or [])
             except Exception as exc:
                 logger.warning(
                     "delivery engine: branch final TG send failed for %s: %s",
                     root_id, exc,
                 )
+                log_report_delivery(
+                    task_id=root_id,
+                    chat_id=tg_lane,
+                    result="failed",
+                    reason=str(exc),
+                    report_type=report_type_of(artifacts),
+                    artifacts=[],
+                    artifacts_discovered=artifacts or [],
+                    text_len=len(final_msg or ""),
+                    trigger="branch_terminal",
+                    board=board,
+                )
+                res.tg_delivered = False
+                res.tg_send_error = str(exc)
+                return res
         if wake is not None and terminal:
             try:
                 await wake(text=final_msg)

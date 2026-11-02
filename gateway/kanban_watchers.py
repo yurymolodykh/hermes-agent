@@ -892,6 +892,12 @@ class GatewayKanbanWatchersMixin:
                                 conn,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
+                                # Terminal-card ADDRESS rows (t_099801f5) are a
+                                # subscription record, not a second channel:
+                                # the card's итог already reaches that chat via
+                                # the api_server OWUI→TG mirror. Enumerating
+                                # them here would send it twice.
+                                include_terminal_mirror=False,
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -1712,6 +1718,7 @@ class GatewayKanbanWatchersMixin:
                                 continue
                         except Exception:
                             pass
+                        _tdq_snapshot: set[str] = set()
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
@@ -1720,11 +1727,36 @@ class GatewayKanbanWatchersMixin:
                                 slug, exc,
                             )
                             continue
+                        # t_2dc720a3: cards whose terminal transition is still
+                        # awaiting delivery on this board. Read ONCE per pass so
+                        # the drain below consumes exactly what this tick saw,
+                        # and so a queued card can be logged as the reason the
+                        # scan ran early.
+                        try:
+                            _tdq_snapshot = {
+                                str(_row.get("task_id"))
+                                for _row in _kb.peek_terminal_delivery_queue(conn)
+                                if _row.get("task_id")
+                            }
+                        except Exception:
+                            _tdq_snapshot = set()
+                        if _tdq_snapshot:
+                            logger.info(
+                                "kanban branch summary: board %s has %d pending "
+                                "terminal-delivery trigger(s) — scanning now (%s)",
+                                slug, len(_tdq_snapshot),
+                                ", ".join(sorted(_tdq_snapshot))[:200],
+                            )
                         try:
                             subs = _kb.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
+                                # Terminal-card ADDRESS rows (t_099801f5) are the
+                                # card's итог ADDRESS, not a second channel — the
+                                # OWUI→TG mirror already reaches that chat. The
+                                # branch lane enumerates channels only.
+                                include_terminal_mirror=False,
                             )
                             if not subs:
                                 continue
@@ -1816,6 +1848,35 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     continue
                         finally:
+                            # t_2dc720a3: consume the terminal-delivery
+                            # triggers SNAPSHOTTED at the start of this board
+                            # pass. Every subscribed branch root was examined in
+                            # this pass, so each queued card has been
+                            # considered: its итог is planned, its marker was
+                            # refreshed, or its branch is still open. A later
+                            # close re-enqueues (the trigger is written by every
+                            # terminal transition), so clearing here cannot lose
+                            # a future report — and leaving rows behind would
+                            # make the 1-second probe spin on an open branch.
+                            if _tdq_snapshot:
+                                try:
+                                    _cleared = _kb.clear_terminal_delivery(
+                                        conn, sorted(_tdq_snapshot),
+                                    )
+                                    if _cleared:
+                                        logger.info(
+                                            "kanban branch summary: %d terminal "
+                                            "trigger(s) consumed on board %s "
+                                            "(%s)",
+                                            _cleared, slug,
+                                            ", ".join(sorted(_tdq_snapshot))[:200],
+                                        )
+                                except Exception as _tdq_exc:
+                                    logger.debug(
+                                        "kanban branch summary: terminal-trigger "
+                                        "drain failed on board %s: %s",
+                                        slug, _tdq_exc,
+                                    )
                             conn.close()
                     return plans, reactivated
 
@@ -1887,11 +1948,59 @@ class GatewayKanbanWatchersMixin:
                                 fail_counts.pop(sub_key, None)
             except Exception as exc:
                 logger.warning("kanban branch summary tick failed: %s", exc)
-            # Sleep with cancellation checks.
+            # Sleep with cancellation checks — but wake IMMEDIATELY when a
+            # terminal-delivery trigger lands in any board's queue
+            # (t_2dc720a3). The trigger is written inside the status-change
+            # transaction, so this probe is what turns "a card just went
+            # terminal" into "the итог goes out now" instead of "…within the
+            # next 45-second scan". The probe is read-only and cheap
+            # (``has_terminal_delivery_trigger`` never opens the DB writable).
             for _ in range(int(max(1, interval))):
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+                try:
+                    if await asyncio.to_thread(self._terminal_trigger_pending):
+                        break
+                except Exception:
+                    pass
+
+    def _terminal_trigger_pending(self) -> bool:
+        """True when ANY board has a queued terminal-delivery trigger.
+
+        Read-only and cheap (``has_terminal_delivery_trigger`` opens the board
+        DB ``?mode=ro`` and never runs schema init), so the branch watcher can
+        poll it every second between its normal ticks and cut the scan short the
+        moment a card goes terminal. Never raises.
+        """
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            return False
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+        seen: set[str] = set()
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            db_path = board_meta.get("db_path")
+            try:
+                key = (
+                    str(Path(db_path).expanduser().resolve())
+                    if db_path else str(_kb.kanban_db_path(slug).resolve())
+                )
+            except Exception:
+                key = f"slug:{slug}"
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if _kb.has_terminal_delivery_trigger(board=slug):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _plan_branch_summary(
         self,
@@ -2167,8 +2276,14 @@ class GatewayKanbanWatchersMixin:
                 # OWUI lane).
                 _dedup_marked = _tg_dedup_key
             if _dedup_marked is not None:
+                _mirror_res = None
+                # t_b154af7d: default is "no failure".  Initialised BEFORE the
+                # try so the ``except`` path below cannot fall through with an
+                # unbound name (NameError would abort the whole delivery loop
+                # and leave the owner without the итог).
+                _tg_failed = False
                 try:
-                    await _bs_engine.handle_branch_final(
+                    _mirror_res = await _bs_engine.handle_branch_final(
                         plan=plan, sub=sub, msg=msg, adapter=adapter,
                         sub_profile=_bs_engine_title,
                         send_tg=_bs_send_tg,
@@ -2176,21 +2291,76 @@ class GatewayKanbanWatchersMixin:
                         terminal=bool(plan.get("terminal", True)),
                         board_override=board,
                     )
-                    try:
-                        from hermes_cli import kanban_db as _kb_dd2
-                        from gateway.delivery_engine import dedup_mark as _dd_mark2
-                        _dd_conn2 = _kb_dd2.connect(board=board)
+                    # t_b154af7d: the once-only dedup marker is written ONLY
+                    # after the TG lane ACCEPTED the message.  Before this the
+                    # marker was written unconditionally, so one degraded send
+                    # (``send_path_degraded`` / flood wait / adapter hiccup)
+                    # was remembered as "already mirrored" and the owner's
+                    # terminal итог + report were lost for good — the exact
+                    # sno-economics-r3 incident (t_f4e43cb2, t_08a192ec).
+                    # ``tg_delivered is False`` ⇒ withhold the marker and let
+                    # this channel stay pending, so the next tick retries
+                    # (bounded by MAX_FAILURES in the caller).
+                    _tg_failed = (
+                        _mirror_res is not None
+                        and getattr(_mirror_res, "tg_delivered", None) is False
+                    )
+                    if _tg_failed:
+                        _err = (
+                            getattr(_mirror_res, "tg_send_error", "")
+                            or "unknown TG send failure"
+                        )
+                        self._kanban_last_branch_error = (
+                            f"TG mirror send failed: {_err}"
+                        )
+                        logger.warning(
+                            "kanban branch summary: TG mirror for %s/%s NOT "
+                            "dedup'd — send failed (%s); channel stays pending "
+                            "for retry",
+                            platform_str, root_id, _err,
+                        )
+                    else:
+                        if getattr(_mirror_res, "tg_delivered", None) is True:
+                            logger.info(
+                                "kanban branch summary: OWUI→TG mirror terminal "
+                                "итог for %s delivered to telegram:%s "
+                                "(marker %s)",
+                                root_id,
+                                _bs_engine._tg_bound_chat_for(sub, platform_str)
+                                or "?",
+                                marker_id,
+                            )
                         try:
-                            _dd_mark2(_dd_conn2, _tg_dedup_key, "branch_final", "mirror")
-                        finally:
-                            _dd_conn2.close()
-                    except Exception:
-                        pass
+                            from hermes_cli import kanban_db as _kb_dd2
+                            from gateway.delivery_engine import dedup_mark as _dd_mark2
+                            _dd_conn2 = _kb_dd2.connect(board=board)
+                            try:
+                                _dd_mark2(_dd_conn2, _tg_dedup_key, "branch_final", "mirror")
+                            finally:
+                                _dd_conn2.close()
+                        except Exception:
+                            pass
                 except Exception as _bs_engine_exc:
                     logger.warning(
                         "kanban branch summary: engine mirror for %s/%s failed: %s",
                         platform_str, root_id, _bs_engine_exc,
                     )
+                    self._kanban_last_branch_error = (
+                        f"TG mirror raised: {_bs_engine_exc}"
+                    )
+                    # t_b154af7d: an engine-level exception leaves the TG lane
+                    # in an UNKNOWN state — the send may or may not have been
+                    # accepted.  Withholding the once-only marker (and keeping
+                    # the channel pending) means at worst a duplicate итог on a
+                    # later tick; writing it would mean a permanent loss of the
+                    # owner's terminal report.  The retry is bounded by
+                    # MAX_FAILURES in the caller.
+                    _tg_failed = True
+                if _tg_failed:
+                    # Keep the OWUI channel pending as well: the owner's
+                    # terminal итог has not reached BOTH lanes yet, and the
+                    # retry budget is shared (MAX_FAILURES).
+                    return False
             else:
                 logger.info(
                     "kanban branch summary: TG mirror for %s/%s dedup'd "
@@ -2240,8 +2410,9 @@ class GatewayKanbanWatchersMixin:
             _ne_title = (sub.get("notifier_profile") or sub_profile or "")
             _ne = _NativeEngine()
             _ne._tg_adapter = adapter
+            _ne_res = None
             try:
-                await _ne.handle_branch_final(
+                _ne_res = await _ne.handle_branch_final(
                     plan=plan, sub=sub, msg=msg, adapter=adapter,
                     sub_profile=_ne_title,
                     send_tg=_native_send_tg,
@@ -2254,6 +2425,33 @@ class GatewayKanbanWatchersMixin:
                     "kanban branch summary: engine native-TG итог for %s/%s "
                     "failed: %s",
                     platform_str, root_id, _ne_exc,
+                )
+                self._kanban_last_branch_error = f"native TG итог raised: {_ne_exc}"
+                _ne_res = None
+                _ne_failed = True
+            else:
+                # t_b154af7d: a FAILED send on the native TG lane must keep
+                # the channel pending so the next tick retries, instead of
+                # acking the итог as delivered.
+                _ne_failed = getattr(_ne_res, "tg_delivered", None) is False
+                if _ne_failed:
+                    _err = (
+                        getattr(_ne_res, "tg_send_error", "")
+                        or "unknown TG send failure"
+                    )
+                    self._kanban_last_branch_error = f"native TG итог send failed: {_err}"
+                    logger.warning(
+                        "kanban branch summary: native TG итог for %s on "
+                        "telegram:%s NOT delivered (%s); channel stays pending",
+                        root_id, sub.get("chat_id"), _err,
+                    )
+            if _ne_failed:
+                return False
+            if getattr(_ne_res, "tg_delivered", None) is True:
+                logger.info(
+                    "kanban branch summary: native TG terminal итог for %s "
+                    "delivered to telegram:%s",
+                    root_id, sub.get("chat_id"),
                 )
             if plan.get("terminal", True) and (
                 sub.get("delivery_mode") in ("notify+wake", "wake")
@@ -2438,7 +2636,7 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
-    ) -> None:
+    ) -> dict:
         """Upload artifact files referenced by a completed kanban task.
 
         Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
@@ -2454,8 +2652,16 @@ class GatewayKanbanWatchersMixin:
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
         errors are logged but do not break the notifier loop.
+
+        Returns ``{"sent": [...], "failed": [...], "skipped": [...]}`` with
+        absolute paths (t_e04a8f44): the caller journals what the owner
+        ACTUALLY received instead of assuming every discovered report landed.
         """
         from pathlib import Path as _Path
+
+        sent: list[str] = []
+        failed: list[str] = []
+        skipped: list[str] = []
 
         candidates: list[str] = []
         seen_paths: set[str] = set()
@@ -2487,6 +2693,7 @@ class GatewayKanbanWatchersMixin:
                     "skipped (was silent)",
                     expanded,
                 )
+                skipped.append(expanded)
                 return
             # Size cap (F-4.3, K1 red team H-3): a >25MB artifact is rejected
             # up front with an explicit warning instead of being handed to the
@@ -2504,6 +2711,7 @@ class GatewayKanbanWatchersMixin:
                         expanded, _OWUI_TG_ARTIFACT_MAX_BYTES,
                         _OWUI_TG_ARTIFACT_MAX_BYTES // (1024 * 1024),
                     )
+                    skipped.append(expanded)
                     return
             except OSError:
                 pass
@@ -2554,12 +2762,17 @@ class GatewayKanbanWatchersMixin:
                 _add(p)
 
         if not candidates:
-            return
+            return {"sent": sent, "failed": failed, "skipped": skipped}
 
         from gateway.platforms.base import BasePlatformAdapter
+        _discovered = list(candidates)
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        for _dropped in _discovered:
+            if _dropped not in candidates:
+                # Unsafe/denied path: never delivered, must be visible.
+                skipped.append(_dropped)
         if not candidates:
-            return
+            return {"sent": sent, "failed": failed, "skipped": skipped}
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -2577,10 +2790,12 @@ class GatewayKanbanWatchersMixin:
                 await adapter.send_multiple_images(
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
+                sent.extend(image_paths)
             except Exception as exc:
                 logger.warning(
                     "kanban notifier: image batch upload failed: %s", exc,
                 )
+                failed.extend(image_paths)
 
         for path in other_paths:
             ext = _Path(path).suffix.lower()
@@ -2593,11 +2808,15 @@ class GatewayKanbanWatchersMixin:
                     await adapter.send_document(
                         chat_id=chat_id, file_path=path, metadata=metadata,
                     )
+                sent.append(path)
             except Exception as exc:
                 logger.warning(
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+                failed.append(path)
+
+        return {"sent": sent, "failed": failed, "skipped": skipped}
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
