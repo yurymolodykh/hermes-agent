@@ -5250,6 +5250,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
+                       -- model_config is MERGED at key granularity, not
+                       -- replaced: the documented contract is "fill what is
+                       -- still missing, never overwrite what an earlier writer
+                       -- set" (see the docstring). A whole-column COALESCE
+                       -- honoured that only coarsely — once ANY earlier writer
+                       -- had put a key there, a later writer's whole payload
+                       -- was discarded. That became load-bearing with
+                       -- t_b36e6939: the fast-lane marker write now creates the
+                       -- session row BEFORE the agent's own create_session, so
+                       -- a COALESCE would silently drop the agent's
+                       -- ``max_iterations`` / ``reasoning_config`` /
+                       -- ``max_tokens`` (resume reads them back off this JSON).
+                       -- json_patch(target, patch) lets ``patch`` win, so
+                       -- json_patch(excluded, sessions) keeps the EARLIER
+                       -- value on a collision and adds keys only the later
+                       -- writer carries — exactly the old semantics, extended
+                       -- from column granularity to key granularity.
+                       -- Guarded by json_type='object' on both sides because
+                       -- json_patch propagates a JSON null/base-scalar operand
+                       -- (a legacy row holding "null" would otherwise wipe the
+                       -- merged object), and the store-NULL-when-empty
+                       -- convention is preserved by comparing to '{}'.
                        model_config = CASE
                            WHEN excluded.model_config IS NOT NULL
                                 AND json_type(
@@ -5265,9 +5287,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                    sessions.model_config, '$._reset_from'
                                )
                            )
-                           ELSE COALESCE(
-                               sessions.model_config, excluded.model_config
+                           WHEN excluded.model_config IS NULL
+                           THEN sessions.model_config
+                           WHEN sessions.model_config IS NULL
+                           THEN excluded.model_config
+                           WHEN json_type(sessions.model_config) = 'object'
+                                AND json_type(excluded.model_config) = 'object'
+                           THEN COALESCE(
+                               NULLIF(
+                                   json_patch(
+                                       excluded.model_config,
+                                       sessions.model_config
+                                   ),
+                                   '{}'
+                               ),
+                               sessions.model_config
                            )
+                           ELSE sessions.model_config
                        END,
                        system_prompt_hash = COALESCE(
                            sessions.system_prompt_hash,

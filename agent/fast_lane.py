@@ -1103,12 +1103,71 @@ def session_is_fast_lane(marker: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def session_row_missing(db: Any, session_id: Optional[str]) -> Optional[bool]:
+    """Is there NO session row for ``session_id``? ``None`` = cannot tell.
+
+    Exists only so :func:`patch_session_fast_lane_marker` can decide whether the
+    ensure path is needed WITHOUT paying a write per turn. Strictly best-effort
+    like the rest of this module: no DB handle, no session id, no getter, or ANY
+    exception all degrade to ``None`` ("cannot tell" — the caller then behaves
+    exactly as before and never creates anything on a guess).
+    """
+    if not session_id or db is None:
+        return None
+    try:
+        target = _resolve_sync_db(db)
+        getter = getattr(target, "get_session", None)
+        if not callable(getter) or inspect.iscoroutinefunction(getter):
+            return None
+        row = getter(session_id)
+        if inspect.isawaitable(row):
+            close = getattr(row, "close", None)
+            if callable(close):
+                close()
+            return None
+        return not bool(row)
+    except Exception:  # §6.1 — a broken existence probe never breaks the turn
+        logger.debug(
+            "fast_lane row probe failed session=%s — treating as unknown",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _ensure_marker_row(target: Any, session_id: str, source: str) -> bool:
+    """Create the session row so a marker write can land. True when it landed.
+
+    ``SessionDB.ensure_session`` is ``INSERT OR IGNORE``-shaped and enriches on
+    conflict (``_insert_session_row``), so calling it is safe even if the row
+    appeared between the probe and this call.
+
+    ``source`` must be the REAL platform (``api_server`` / ``telegram`` / ...),
+    never ``"unknown"``: ``_insert_session_row`` COALESCEs ``source`` on
+    conflict, so a wrong placeholder would win and pin the session to a bogus
+    origin for its whole life — the same trap the reviewer-facing docstring of
+    ``_insert_session_row`` calls out ("a later bare call with source=\"unknown\"
+    can't clobber a real source" only holds in that direction).
+    """
+    ensure = getattr(target, "ensure_session", None)
+    if not callable(ensure) or inspect.iscoroutinefunction(ensure):
+        return False
+    result = ensure(session_id, source=source)
+    if inspect.isawaitable(result):
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()
+        return False
+    return True
+
+
 def patch_session_fast_lane_marker(
     db: Any,
     session_id: str,
     decision: FastLaneDecision,
     *,
     preserve_sticky: bool = False,
+    source: str = "unknown",
 ) -> None:
     """Persist the slow_mode marker onto a session row, best-effort.
 
@@ -1129,6 +1188,27 @@ def patch_session_fast_lane_marker(
     session expiry — design §D). Call sites pass True; the default stays False
     so the historical "write exactly what was decided" contract is available
     for callers that need it.
+
+    ``source`` (t_b36e6939) is the platform that owns this turn. Both call
+    sites write the marker from ``_create_agent`` / the TG lane decision, i.e.
+    BEFORE the agent creates its own session row on the first flush — so on the
+    FIRST turn of a brand-new session the write used to hit a missing row and
+    vanish silently: that turn ran slow, the next marker-less turn read
+    ``None`` and routed to ``11-fast-answers``. The writer now:
+
+    1. probes whether the row exists (one read, no write);
+    2. when it does not, creates it via ``ensure_session(source=...)`` — the
+       agent's later ``create_session`` still enriches it (the row upsert
+       merges ``model_config`` at key granularity);
+    3. writes the marker, then READS IT BACK with the same reader every call
+       site uses (:func:`session_slow_mode`) and logs a WARNING when a
+       requested latch did not land.
+
+    Any step failing degrades to the historical silent no-op — a broken marker
+    path must never break the turn (§6.1). A handle without ``ensure_session``
+    (old fakes, third-party shims) keeps the pre-fix behaviour, and the
+    readback warning stays quiet for it: "this handle cannot create rows" is
+    not evidence that the write path is broken.
     """
     if not session_id or db is None:
         return
@@ -1139,6 +1219,7 @@ def patch_session_fast_lane_marker(
             return
         if inspect.iscoroutinefunction(patch):
             return
+        can_ensure = callable(getattr(target, "ensure_session", None))
         if preserve_sticky and not decision.slow_mode:
             if session_slow_mode(target, session_id) is True:
                 # Sticky latch: keep the session slow; only refresh the
@@ -1149,6 +1230,8 @@ def patch_session_fast_lane_marker(
                     if callable(close):
                         close()
                 return
+        if can_ensure and session_row_missing(target, session_id) is True:
+            _ensure_marker_row(target, session_id, source)
         result = patch(session_id, fast_lane_marker_for_session(decision))
         if inspect.isawaitable(result):
             # Defensive: an async door slipped through the unwrap. Closing it
@@ -1156,6 +1239,21 @@ def patch_session_fast_lane_marker(
             close = getattr(result, "close", None)
             if callable(close):
                 close()
+            return
+        if not can_ensure:
+            # No row-creation primitive on this handle: the pre-fix contract
+            # ("no-op when the row is missing") applies, and a warning here
+            # would fire on every turn of every such shim.
+            return
+        landed = session_slow_mode(target, session_id)
+        if decision.slow_mode and landed is not True:
+            logger.warning(
+                "fast_lane marker write did NOT land session=%s source=%s "
+                "readback=%r — this session will NOT stay sticky",
+                session_id,
+                decision.source or "no-marker",
+                landed,
+            )
     except Exception:
         pass
 

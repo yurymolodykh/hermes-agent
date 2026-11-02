@@ -4070,6 +4070,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id,
                     _fast_decision,
                     preserve_sticky=True,
+                    source="api_server",
                 )
         except Exception:
             # Degradation: marker-parse/fast-path failure must never break

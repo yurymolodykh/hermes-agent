@@ -5878,6 +5878,12 @@ class TurnRunner:
                     ctx.session_id,
                     _fast_decision,
                     preserve_sticky=True,
+                    source=(
+                        ctx.source.platform.value
+                        if getattr(ctx, "source", None) is not None
+                        and getattr(ctx.source, "platform", None) is not None
+                        else "unknown"
+                    ),
                 )
         except Exception:
             # Degradation: marker-parse failure must never break the turn.
