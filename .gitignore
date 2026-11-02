@@ -223,3 +223,14 @@ artifacts/
 # artifacts, never working drift to commit (watchdog-excluded via
 # task-backups convention; kept local under .kanban-artifacts/)
 .kanban-artifacts/
+
+# Windows launcher wrappers produced by scripts/install.ps1 (copied out of
+# venv/Scripts into bin/ on every install). Build output of the installer,
+# never source: they went untracked and showed up as commit-drift.
+/bin/*.exe
+
+# Stray literal-%SystemDrive% tree (a tool created it without expanding the
+# variable, 2026-10-29) containing copies of Windows component caches. Not
+# repo content and not referenced by any code — kept out of drift detection
+# so the watchdog reports real work only.
+/%SystemDrive%/
