@@ -245,6 +245,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # kanban soft finish: the 80%-of-budget "complete now" directive. Only
+    # used when the transcript had no tool result to carry it (see
+    # agent/kanban_soft_finish.inject_directive); it is a runtime instruction,
+    # never user-authored context.
+    "_kanban_soft_finish_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
     # and the "issue the actual tool call now" user nudge exist only to

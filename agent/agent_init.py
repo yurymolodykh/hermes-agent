@@ -1042,6 +1042,14 @@ def init_agent(
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
 
+    # Kanban soft finish (t_ed744fd2): one-shot 80%-of-budget directive and
+    # its grace counter. Re-armed per turn by turn_context; initialised here so
+    # the conversation loop never touches an attribute it was not given.
+    agent._kanban_soft_finish_injected = False
+    agent._kanban_soft_finish_at_step = None
+    agent._kanban_soft_finish_state = None
+    agent._kanban_soft_finish_forced = False
+
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
     # (agent.run_budget_seconds) further below. None = feature fully off:

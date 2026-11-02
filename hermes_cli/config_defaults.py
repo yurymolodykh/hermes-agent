@@ -2747,6 +2747,27 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # ── Per-card worker limits applied at CREATION time (t_ed744fd2) ──
+        # Until now a card's budget depended entirely on whoever created it:
+        # only the creator's explicit ``max_runtime_seconds`` / ``max_turns``
+        # applied, so ~200 of ~300 historical cards ran with 2-8 h and
+        # hundreds of steps while the current wave got 150-200 steps and/or
+        # 3600 s. These two keys are the board's default card budget and are
+        # materialised onto the card row at creation, so the limit is a
+        # property of the card (visible in the DB, overridable per card) and
+        # never silently inherited from a profile.
+        #
+        # A big card raises them explicitly at creation
+        # (``kanban_create(max_runtime_seconds=..., max_turns=...)`` or
+        # ``hermes kanban create --max-runtime ... --max-turns ...``).
+        # ``None``/absent = keep the legacy behaviour (no cap from config).
+        "default_max_runtime_seconds": 3 * 60 * 60,
+        "default_max_turns": 300,
+        # A card that finishes AFTER this many steps past the soft-finish
+        # directive is closed done with the progress it already produced
+        # instead of being recorded as timed_out. See
+        # agent/kanban_soft_finish.py.
+        "soft_finish_grace_steps": 12,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

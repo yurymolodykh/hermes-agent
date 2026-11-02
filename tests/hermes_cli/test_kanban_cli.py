@@ -301,3 +301,38 @@ def test_kanban_cli_create_without_flag_leaves_do_not_deliver_zero(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_cli_create_without_budget_flags_gets_board_defaults(kanban_home):
+    """t_ed744fd2: `kanban create` with no budget flags gets the board default.
+
+    The limit must be a property of the CARD (DB row), not of the caller — this
+    is the CLI surface of ``kanban.default_max_runtime_seconds`` /
+    ``default_max_turns``.
+    """
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out = kc.run_slash("create 'default budget card' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.max_runtime_seconds == 3 * 60 * 60
+        assert task.max_turns == 300
+
+
+def test_cli_create_with_max_turns_flag_overrides_the_default(kanban_home):
+    """`--max-turns` is the per-card override the docs promise."""
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out = kc.run_slash(
+        "create 'big card' --assignee alice --max-runtime 8h --max-turns 600"
+    )
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.max_runtime_seconds == 8 * 60 * 60
+        assert task.max_turns == 600

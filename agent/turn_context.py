@@ -1345,6 +1345,14 @@ def build_turn_context(
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    # Kanban soft finish (t_ed744fd2): the step budget is per turn
+    # (api_call_count restarts at 0), so the one-shot directive latch and its
+    # grace counter must be re-armed per turn too. A worker that already
+    # honoured the directive in turn 1 starts turn 2 clean.
+    agent._kanban_soft_finish_injected = False
+    agent._kanban_soft_finish_at_step = None
+    agent._kanban_soft_finish_state = None
+    agent._kanban_soft_finish_forced = False
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

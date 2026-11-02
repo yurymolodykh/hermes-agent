@@ -2141,6 +2141,57 @@ def run_conversation(
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
 
+        # ── Kanban soft finish («финишируй на 80% бюджета», t_ed744fd2) ──
+        # Cards used to die at the hard wall with the deliverable already on
+        # disk: every existing stop guard is turn-end triggered, so a worker
+        # that burns its budget never reached one. This is the mid-run arm:
+        # at ~80% of the run's real budget (steps, plus wall clock when the
+        # card has max_runtime_seconds) the worker gets a one-shot directive
+        # to call kanban_complete with what it already has. Policy + fencing
+        # live in agent/kanban_soft_finish (same dispatcher-envelope /
+        # live-binding fences as the kanban stop guard, so an interactive
+        # session that inherited a stale task id is never armed).
+        if not getattr(agent, "_kanban_soft_finish_injected", False):
+            try:
+                from agent import kanban_soft_finish as _soft
+
+                if _soft.soft_finish_applies(agent, api_call_count) and not _soft._terminal_tool_called(messages):
+                    _soft.inject_directive(agent, messages, api_call_count)
+            except Exception:
+                logger.debug("kanban soft-finish check failed", exc_info=True)
+        else:
+            # Grace window: the directive went out and the worker still has
+            # not reached a terminal board tool. Close the card with what it
+            # already produced instead of letting it burn the rest of the
+            # budget into a `timed_out` that loses the work.
+            try:
+                from agent import kanban_soft_finish as _soft
+
+                if _soft.grace_expired(agent, api_call_count) and not _soft._terminal_tool_called(messages):
+                    _state = _soft.budget_state(agent, api_call_count)
+                    if _soft.force_complete(
+                        reason="soft_finish_grace_expired",
+                        messages=messages,
+                        budget=_state,
+                    ):
+                        agent._kanban_soft_finish_forced = True
+                        final_response = _soft._progress_summary(messages)
+                        _turn_exit_reason = "kanban_soft_finish_forced"
+                        if not agent.quiet_mode:
+                            agent._safe_print(
+                                f"\n✅ Soft finish: card closed with the progress "
+                                f"produced by step {api_call_count} "
+                                f"({_state['steps_used']}/{_state['steps_max'] or '∞'})"
+                            )
+                        break
+                    # Forced close refused (binding gone / board error): clear
+                    # the latch so the directive is not re-issued forever and
+                    # the normal budget path takes over.
+                    agent._kanban_soft_finish_injected = False
+                    agent._kanban_soft_finish_forced = False
+            except Exception:
+                logger.debug("kanban soft-finish grace check failed", exc_info=True)
+
         # ── Fast-budget user notice (part 3, «не молчать») ────────────
         # Immediately after the model wrap-up is latched, fire the
         # one-shot user-facing overflow notice through the dedicated

@@ -56,6 +56,9 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # kanban soft finish directive (agent/kanban_soft_finish): runtime
+    # instruction, must never survive into the resumed transcript.
+    "_kanban_soft_finish_synthetic",
 )
 
 
@@ -431,6 +434,14 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    # Kanban soft finish (t_ed744fd2): the loop already closed the card `done`
+    # with the progress the worker had (kanban_soft_finish.force_complete).
+    # Reaching the budget-exhaustion branch here would try to split/record a
+    # failure for a card that is already complete — and, worse, would describe
+    # a finished card as timed_out. Treat the exit as a normal completion.
+    soft_finish_forced = str(_turn_exit_reason) == "kanban_soft_finish_forced"
+    if soft_finish_forced:
+        budget_exhausted = False
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -529,6 +540,10 @@ def finalize_turn(
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            # A soft-finish forced close is a completed delivery even when the
+            # grace window pushed the counter to the hard cap: kanban_soft_finish
+            # already wrote `done` + the summary to the board.
+            or soft_finish_forced
         )
     )
 

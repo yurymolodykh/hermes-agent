@@ -524,6 +524,55 @@ hermes kanban create "Translate the docs site to French" \
 
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 
+### Budgets: soft finish at 80%, board defaults, reasoning depth
+
+A card's budget used to depend entirely on whoever created it: only an
+explicit `max_runtime_seconds` / `max_turns` argument applied, so the same
+board ran 2–8 h cards next to 3600 s ones and workers died at the hard wall
+with the deliverable already on disk.
+
+**Board defaults.** `kanban.default_max_runtime_seconds` (default `10800`)
+and `kanban.default_max_turns` (default `300`) are materialised onto every
+**new** card at creation, so the limit is a property of the *card* — visible
+in the DB, stable across retries, and overridable per card:
+
+```bash
+hermes kanban create "Big migration" --max-runtime-seconds 28800 --max-turns 600 --assignee 03-software-engineer
+```
+
+An explicit creator value always wins. Set a value to `0` (or negative) to
+opt one card out of the config default; delete the key entirely to fall back
+to the schema default.
+
+**Soft finish.** At ~80% of the run's real budget — `api_call_count /
+max_iterations`, plus wall clock when the card carries
+`max_runtime_seconds` — the worker receives a one-shot in-band directive to
+call `kanban_complete` with what it already has. The threshold is computed
+from that run's actual budget, never a constant; the directive is injected
+once (no per-step spam) into the newest tool result (cache-safe, same
+channel as `/steer`); firing writes an `INFO` line
+`kanban soft finish: directive injected at step N/M` to the worker log for
+audit. If the worker has not called a terminal board tool within
+`kanban.soft_finish_grace_steps` (default `12`) steps after the directive,
+the card is closed **`done`** with the progress it already produced instead
+of being recorded `timed_out`.
+
+Step budgets at or below `kanban.soft_finish_min_budget_steps` (default
+`60`) never arm the step threshold — telling a 20-step routine card to stop
+at step 16 is pure noise — so short cards behave exactly as before. Tune with
+`kanban.soft_finish` (master switch), `soft_finish_ratio` (0.8),
+`soft_finish_grace_steps` (12), `soft_finish_min_budget_steps` (60); the
+worker-side arms arrive via `HERMES_KANBAN_MAX_RUNTIME_SECONDS` /
+`HERMES_KANBAN_RUN_STARTED_AT`.
+
+**Reasoning depth is per card, and it costs steps.** Every worker gets an
+explicit `--reasoning` level (a card never inherits its assignee profile's
+`agent.reasoning_effort`). `high`/`max` buy deliberation at the price of
+turns: on routine cards (formatting, mechanical edits, single-source
+lookups) they burn budget without changing the outcome. Set the card's
+level deliberately, and reserve `high` for work that actually needs
+reasoning.
+
 :::note Goal-mode cards borrow the `/goal` engine — they don't connect to it
 `--goal` runs the continuation loop *inside that one card's worker session*. It shares the engine with the [`/goal` slash command](./goals), not the state: setting a `/goal` in a chat session never creates, claims, or moves a kanban card, and a goal-mode card's loop is invisible to any chat session's `/goal status`. If you want this conversation to keep iterating, use [`/goal`](./goals); if you want work on the board, create a card.
 :::
