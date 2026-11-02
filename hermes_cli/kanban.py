@@ -84,6 +84,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(t)
     return {
         "id": t.id,
         "title": t.title,
@@ -103,10 +104,18 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        # Budget is a property of the card (t_ed744fd2): surface it so a
+        # caller can see what the board default resolved to.
+        "max_runtime_seconds": t.max_runtime_seconds,
+        "max_turns": t.max_turns,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "root_model_override": t.root_model_override,
         "root_provider_override": t.root_provider_override,
+        # Effective per-card thinking depth + provenance (t_f2dd1fb5).
+        "reasoning_effort": t.reasoning_effort,
+        "effective_reasoning_effort": _eff_effort,
+        "reasoning_effort_source": "default" if _eff_is_default else "pin",
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -382,7 +391,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
-                               "and re-queues the task.")
+                               "and re-queues the task. Omit to use "
+                               "kanban.default_max_runtime_seconds.")
+    p_create.add_argument("--max-turns", type=int, default=None, dest="max_turns",
+                          metavar="N",
+                          help="Per-task worker iteration cap (passed to the "
+                               "worker as --max-turns). Omit to use "
+                               "kanban.default_max_turns; the soft-finish "
+                               "threshold arms at 80%% of whatever this resolves to.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -1055,6 +1071,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # --- autopin (t_d7edc3b2) ---
+    p_autopin = sub.add_parser(
+        "autopin",
+        help="Give every ACTIVE card an explicit reasoning level by the owner's rules",
+        description=(
+            "Sweep the board and write an explicit tasks.reasoning_effort onto "
+            "every ACTIVE card (triage/todo/ready/blocked/running) that does "
+            "not own one. Rules: 09/15 -> max; gated work (review child) -> "
+            "high; РГЗ mission/judgement -> max, РГЗ wave control -> high, "
+            "unknown РГЗ role -> high; mechanical routine -> low; else high. "
+            "An explicit operator pin is never overwritten, and no level "
+            "outside the letovo wire domain (none/low/high/xhigh/max) is ever "
+            "written."
+        ),
+    )
+    p_autopin.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Report what would change without writing",
+    )
+    p_autopin.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit the report as JSON",
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1159,6 +1203,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "autopin":  _cmd_autopin,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1620,6 +1665,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
+            max_turns=getattr(args, "max_turns", None),
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
@@ -1754,6 +1800,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Provenance of the card's reasoning level (t_d7edc3b2): read it while
+        # the connection is still open so ``show`` can distinguish a rule-derived
+        # level from an explicit operator pin.
+        try:
+            from agent.card_reasoning_autopin import _provenance
+
+            reasoning_origin = _provenance(conn, task.id)
+        except Exception:  # pragma: no cover - provenance is cosmetic here
+            reasoning_origin = ""
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -1810,6 +1865,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    # Thinking depth is a property of the CARD (t_f2dd1fb5): show the level the
+    # worker will actually run at, and mark WHERE it came from so an operator
+    # can tell an explicit choice from a rule-derived one (t_d7edc3b2). A NULL
+    # row is NOT "the profile decides" any more.
+    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(task)
+    if reasoning_origin == "operator":
+        _source = "operator pin"
+    elif reasoning_origin == "autopin" or _eff_is_default:
+        _source = "rule"
+    else:
+        _source = "unrecorded"
+    print(f"  reasoning: {_eff_effort} ({_source})")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -1977,6 +2044,30 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
     )
+    return 0
+
+
+def _cmd_autopin(args: argparse.Namespace) -> int:
+    """Give every ACTIVE card an explicit reasoning level (t_d7edc3b2)."""
+    from agent.card_reasoning_autopin import autopin_active_cards
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kb.connect_closing() as conn:
+        report = autopin_active_cards(conn, dry_run=dry_run)
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        return 0
+    changed = report["changed"]
+    print(
+        f"checked {report['checked']} active card(s): "
+        f"{len(changed)} {('would change' if dry_run else 'changed')}, "
+        f"{report['unchanged']} already owned a level, "
+        f"{len(report['skipped_pinned'])} operator pin(s) respected"
+    )
+    for task_id, old, new, reason in changed:
+        print(f"  {task_id}: {old or 'NULL'} -> {new}  [{reason}]")
+    for task_id, level in report["skipped_pinned"]:
+        print(f"  {task_id}: kept operator pin {level}")
     return 0
 
 

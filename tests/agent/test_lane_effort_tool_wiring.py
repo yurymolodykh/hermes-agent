@@ -4,7 +4,7 @@ Drives the REAL tool handlers (kanban_tools._handle_create / _handle_link)
 against an isolated temp kanban DB and asserts the reasoning_effort pins land
 per design/medium-review-scheme-v1.md §3:
 
-  (a) writer card that owns a review child (+09/15) -> medium
+  (a) writer card that owns a review child (+09/15) -> high (medium 400s on letovo)
   (b) review card (assignee 09) -> max
   (c) card without a review child -> NULL
   (д) uncertainty -> high
@@ -62,7 +62,7 @@ def _handle_create_routed(board_env, **kwargs):
 
 
 def test_tool_create_links_review_child_and_parent(tmp_path, monkeypatch, isolated_board):
-    """kanban_create of a review card seeds max on it + medium on its writer parent."""
+    """kanban_create of a review card seeds max on it + high on its writer parent."""
     import tools.kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
@@ -86,12 +86,17 @@ def test_tool_create_links_review_child_and_parent(tmp_path, monkeypatch, isolat
 
     # (b) review card itself pins max.
     assert tr.reasoning_effort == "max", tr.reasoning_effort
-    # (a) writer owner of the review child pins medium.
-    assert tw.reasoning_effort == "medium", tw.reasoning_effort
+    # (a) writer owner of the review child pins high — medium is rejected by the letovo wire (HTTP 400).
+    assert tw.reasoning_effort == "high", tw.reasoning_effort
 
 
-def test_tool_create_routine_card_stays_null(tmp_path, monkeypatch, isolated_board):
-    """kanban_create without a review child leaves reasoning_effort NULL."""
+def test_tool_create_routine_card_owns_a_default(tmp_path, monkeypatch, isolated_board):
+    """kanban_create without a review child still stores an explicit level.
+
+    This used to assert NULL ("the profile decides"). t_f2dd1fb5 removed that
+    inheritance: such a card now carries its own ``high`` default, marked as a
+    default rather than an operator pin.
+    """
     from hermes_cli import kanban_db as kb
 
     c = _handle_create_routed(isolated_board, _title="routine", assignee="07-document-producer")
@@ -100,13 +105,14 @@ def test_tool_create_routine_card_stays_null(tmp_path, monkeypatch, isolated_boa
     conn = kb.connect(db_path=isolated_board)
     try:
         t = kb.get_task(conn, c["task_id"])
-        assert t.reasoning_effort is None
+        assert t.reasoning_effort == "high"
+        assert t.reasoning_effort_source == "default"
     finally:
         conn.close()
 
 
-def test_tool_link_promotes_existing_writer_to_medium(tmp_path, monkeypatch, isolated_board):
-    """kanban_link of a review child under an existing writer promotes to medium."""
+def test_tool_link_promotes_existing_writer_to_high(tmp_path, monkeypatch, isolated_board):
+    """kanban_link of a review child under an existing writer promotes to high."""
     import tools.kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
@@ -125,5 +131,5 @@ def test_tool_link_promotes_existing_writer_to_medium(tmp_path, monkeypatch, iso
     finally:
         conn.close()
 
-    assert tw.reasoning_effort == "medium", tw.reasoning_effort
+    assert tw.reasoning_effort == "high", tw.reasoning_effort
     assert tr.reasoning_effort == "max", tr.reasoning_effort

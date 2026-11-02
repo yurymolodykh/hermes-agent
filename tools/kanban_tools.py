@@ -635,6 +635,7 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
+                _eff, _eff_is_default = kb.effective_card_reasoning_effort(t)
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
@@ -650,6 +651,13 @@ def _handle_show(args: dict, **kw) -> str:
                     "provider_override": t.provider_override,
                     "root_model_override": t.root_model_override,
                     "root_provider_override": t.root_provider_override,
+                    # The level the worker will actually run at, plus whether
+                    # it came from the card's own default or an explicit pin
+                    # (t_f2dd1fb5 part D: operators must SEE that there is no
+                    # inheritance — a legacy NULL row is not "profile decides").
+                    "reasoning_effort": t.reasoning_effort,
+                    "effective_reasoning_effort": _eff,
+                    "reasoning_effort_source": "default" if _eff_is_default else "pin",
                 }
 
             def _run_dict(r):

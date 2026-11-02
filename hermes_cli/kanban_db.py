@@ -151,26 +151,325 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
-def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+def normalize_reasoning_effort(
+    effort: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
     Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
     ``"none"`` (thinking disabled), case-insensitively. Empty / None means
-    "inherit the worker profile's own ``agent.reasoning_effort``" and stores
-    NULL. Anything else is rejected rather than silently dropped — a typo'd
-    level must not quietly hand the task back to the profile default.
+    "no explicit pin" and stores NULL — the spawn path then substitutes the
+    card default (:func:`default_card_reasoning_effort`), so a NULL row no
+    longer inherits the *worker profile's* ``agent.reasoning_effort``.
+
+    Anything else is rejected rather than silently dropped — a typo'd level
+    must not quietly hand the task back to the profile default.
+
+    Route-aware clamping (t_f2dd1fb5 part C): when *provider*/*base_url*
+    identifies the letovo wire — which serves ``{none, low, high, xhigh, max}``
+    and answers HTTP 400 on ``medium``/``minimal`` — a known-but-unserved
+    internal level is CLAMPED into the served domain instead of being stored
+    verbatim (``medium`` -> ``high``, ``minimal`` -> ``low``, ``ultra`` ->
+    ``max``) with a warning. Legacy pins therefore cannot brick a worker.
+    Unknown bespoke names still raise (they are typos, not levels).
     """
     from hermes_constants import VALID_REASONING_EFFORTS
 
     value = str(effort or "").strip().lower()
     if not value:
         return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
-        return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
-    raise ValueError(
-        f"reasoning_effort must be one of {allowed}, got {effort!r}"
+    if value != "none" and value not in VALID_REASONING_EFFORTS:
+        allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        raise ValueError(
+            f"reasoning_effort must be one of {allowed}, got {effort!r}"
+        )
+    clamped = clamp_card_effort_to_route(
+        value, provider=provider, model=model, base_url=base_url, task_id=task_id
     )
+    return clamped
+
+
+#: Card-owned reasoning default (t_f2dd1fb5). A card never inherits its
+#: assignee profile's ``agent.reasoning_effort`` any more: when no explicit pin
+#: exists, card creation writes — and the spawn path substitutes — this level.
+#: ``high`` is the letovo-safe middle of the served domain (the backend serves
+#: ``none/low/high/xhigh/max`` and 400s on ``medium``/``minimal``).
+DEFAULT_CARD_REASONING_EFFORT = "high"
+
+#: Independent-gate cards (assignee ``09-independent-reviewer`` /
+#: ``15-sre-qa``) pin the top served level instead of the writing default.
+REVIEW_CARD_REASONING_EFFORT = "max"
+
+#: Task ids already told (once) that their NULL pin was replaced by the card
+#: default at spawn. Bounded so a long-lived dispatcher cannot leak memory.
+_EFFORT_DEFAULT_ANNOUNCED: set[str] = set()
+_EFFORT_DEFAULT_ANNOUNCED_MAX = 4096
+
+
+def _route_is_letovo(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """True when the (provider, model, base_url) route is served by letovo.
+
+    Matches the declared wire domain by endpoint host when a base_url is
+    known (``agent.reasoning_effort.letovo_wire_domain``), and otherwise falls
+    back to the provider NAME — ``letovo`` / ``custom:letovo`` — which is how
+    the profiles declare the same endpoint without repeating the base_url.
+    """
+    try:
+        from agent.reasoning_effort import letovo_wire_domain
+
+        if letovo_wire_domain(model=model, base_url=base_url) is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive: never break card writes
+        pass
+    if (base_url or "").strip():
+        # A concrete endpoint that is not letovo's — do not guess from the name.
+        return False
+    leaf = str(provider or "").strip().lower().rsplit(":", 1)[-1]
+    return leaf == "letovo"
+
+
+def clamp_card_effort_to_route(
+    effort: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Clamp a stored effort onto the card route's served vocabulary.
+
+    Only the letovo route is closed in code today: it serves
+    ``{none, low, high, xhigh, max}`` and rejects ``medium``/``minimal`` with
+    HTTP 400. Declared overrides win (``medium`` -> ``high``, ``minimal`` ->
+    ``low``, ``ultra`` -> ``max``), so a pin written before this card existed
+    can never brick a worker. Any other route (or an unknown route) keeps the
+    requested level verbatim — the per-transport clamps still apply at the wire.
+    """
+    if effort is None:
+        return None
+    if not _route_is_letovo(provider=provider, model=model, base_url=base_url):
+        return effort
+    try:
+        from agent.reasoning_effort import LETOVO_EFFORTS, LETOVO_OVERRIDES
+
+        if effort in LETOVO_EFFORTS:
+            return effort
+        mapped = LETOVO_OVERRIDES.get(effort)
+    except Exception:  # pragma: no cover - defensive
+        return effort
+    if mapped is None:
+        return effort
+    _log.warning(
+        "reasoning_effort=%r is not served by the letovo wire; "
+        "storing %r instead%s",
+        effort,
+        mapped,
+        f" for task {task_id}" if task_id else "",
+    )
+    return mapped
+
+
+def _reviewer_assignees() -> frozenset:
+    """Profiles that own the independent review gate (09 / 15)."""
+    try:
+        from agent.reasoning_effort_l1 import REVIEWER_PROFILES
+
+        return frozenset(REVIEWER_PROFILES)
+    except Exception:  # pragma: no cover - defensive
+        return frozenset({"09-independent-reviewer", "15-sre-qa"})
+
+
+def default_card_reasoning_effort(
+    assignee: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    title: Optional[str] = None,
+    goal_mode: bool = False,
+    priority: Optional[int] = None,
+    has_reviewer_child: Optional[bool] = None,
+    child_count: int = 0,
+) -> str:
+    """The level a card owns when the operator pinned none (t_f2dd1fb5).
+
+    ``09-independent-reviewer``/``15-sre-qa`` get ``max`` (the quality gate);
+    every other card takes the OWNER'S RULE for its shape (t_d7edc3b2):
+    gated work and РГЗ wave control ``high``, РГЗ mission/judgement ``max``,
+    mechanical routine ``low``, and ``high`` for anything unclassifiable. Both
+    extremes are inside the letovo served domain, so the value is safe on this
+    host without any further clamping; the route clamp is still applied for
+    completeness (a non-letovo route keeps the level verbatim).
+
+    Callers that know the card's title / goal-mode / priority should pass them
+    so the rule can bite; a caller that passes none of them gets the plain
+    ``high``/``max`` default (identical to the pre-rule behaviour).
+    """
+    from agent.card_reasoning_autopin import resolve_card_autopin_effort
+
+    name = str(assignee or "").strip().lower()
+    if not name:
+        base = DEFAULT_CARD_REASONING_EFFORT
+    elif name in _reviewer_assignees():
+        base = REVIEW_CARD_REASONING_EFFORT
+    else:
+        base, _reason = resolve_card_autopin_effort(
+            assignee=name,
+            title=title,
+            goal_mode=goal_mode,
+            priority=priority,
+            has_reviewer_child=bool(has_reviewer_child),
+            child_count=child_count,
+        )
+    return clamp_card_effort_to_route(
+        base, provider=provider, model=model, base_url=base_url
+    ) or base
+
+
+def resolve_card_reasoning_effort(
+    assignee: Optional[str],
+    pinned: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    task_id: Optional[str] = None,
+    title: Optional[str] = None,
+    goal_mode: bool = False,
+    priority: Optional[int] = None,
+    has_reviewer_child: Optional[bool] = None,
+    child_count: int = 0,
+) -> tuple[str, bool]:
+    """Resolve the effort a card actually stores.
+
+    Returns ``(level, is_default)``. An explicit (already normalized) *pinned*
+    level wins and is only clamped to the route's served domain; otherwise the
+    card default for *assignee* is returned with ``is_default=True``. The
+    result is never empty: a card always owns its own explicit level.
+
+    The optional card-shape hints (``title``/``goal_mode``/``priority``/
+    ``has_reviewer_child``) let the OWNER'S RULE (t_d7edc3b2) pick the level
+    instead of the flat ``high`` default. Omitting them keeps the pre-rule
+    behaviour, which is what the SPAWN path wants (it must not re-derive a
+    level for a row that was already resolved at creation).
+    """
+    if pinned:
+        prov, mdl = _route_for_effort_clamp(assignee, provider, model)
+        return (
+            clamp_card_effort_to_route(
+                pinned,
+                provider=prov,
+                model=mdl,
+                base_url=base_url,
+                task_id=task_id,
+            )
+            or pinned,
+            False,
+        )
+    return (
+        default_card_reasoning_effort(
+            assignee,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            title=title,
+            goal_mode=goal_mode,
+            priority=priority,
+            has_reviewer_child=has_reviewer_child,
+            child_count=child_count,
+        ),
+        True,
+    )
+
+
+def _route_for_effort_clamp(
+    assignee: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Route used to clamp a card's effort when the card itself pins none.
+
+    A card created without ``model_override``/``provider_override`` runs on its
+    assignee profile's default route, so that route's vocabulary is the one the
+    pin has to survive. Resolving it here is what lets ``medium`` on a
+    letovo-profile card be stored as ``high`` instead of bricking the next
+    dispatch with HTTP 400.
+
+    Only consulted when the caller explicitly pinned a level but no provider —
+    the unpinned default (``high``/``max``) is letovo-safe anyway, so the usual
+    card-creation path never pays for this config read.
+
+    When even the assignee profile cannot be resolved (a deleted profile, a
+    bare unit-test home) no route is guessed: the requested level is kept
+    verbatim. That is safe rather than sloppy, because the wire emitter is the
+    final clamp (``plugins/model-providers/custom`` calls
+    ``letovo_wire_domain`` + ``clamp_effort(strict=True)`` per request since
+    t_58d592aa), so an un-clamped stored level still cannot 400 the worker.
+    """
+    if provider and model:
+        return provider, model
+    if not assignee:
+        return provider, model
+    try:
+        dp, dm = _assignee_profile_default_route(str(assignee))
+    except Exception:  # pragma: no cover - unreadable profile: no clamping
+        return provider, model
+    return provider or dp, model or dm
+
+
+def effective_card_reasoning_effort(task: "Task") -> tuple[str, bool]:
+    """``(level, is_card_default)`` for a Task row, NULL-safe.
+
+    Legacy rows may still carry NULL (the mass backfill of the ~155 active
+    cards is a separate card, t_bdcbc547): reading NULL here yields the card
+    default rather than "inherit the profile", which is what the spawn path
+    uses to ALWAYS pass ``--reasoning``.
+
+    Provenance comes from ``reasoning_effort_source`` when the row carries it,
+    so a card whose default was materialized at creation is still reported as
+    ``default`` rather than being mistaken for an operator pin that happens to
+    hold the same level. Rows that predate the column (NULL provenance) fall
+    back to the old inference: a stored level means a pin, an empty one means
+    the default was substituted.
+    """
+    stored = getattr(task, "reasoning_effort", None)
+    level, is_default = resolve_card_reasoning_effort(
+        getattr(task, "assignee", None),
+        stored,
+        provider=getattr(task, "provider_override", None),
+        model=getattr(task, "model_override", None),
+        task_id=getattr(task, "id", None),
+    )
+    source = getattr(task, "reasoning_effort_source", None)
+    if source == "pin":
+        return level, False
+    if source == "default":
+        return level, True
+    return level, is_default or not stored
+
+
+def _announce_default_effort_once(task_id: Optional[str], level: str) -> None:
+    """Log the NULL→default substitution once per card (no silent inheritance)."""
+    if not task_id or task_id in _EFFORT_DEFAULT_ANNOUNCED:
+        return
+    if len(_EFFORT_DEFAULT_ANNOUNCED) >= _EFFORT_DEFAULT_ANNOUNCED_MAX:
+        _EFFORT_DEFAULT_ANNOUNCED.clear()
+    _EFFORT_DEFAULT_ANNOUNCED.add(task_id)
+    _log.info(
+        "task %s has no explicit reasoning_effort; spawning with card default %r",
+        task_id,
+        level,
+    )
+
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1157,10 +1456,20 @@ class Task:
     root_provider_override: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
-    # off). When set, the dispatcher passes ``--reasoning <level>`` so the
-    # worker runs at that depth regardless of the profile's
-    # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
+    # off). The dispatcher ALWAYS passes ``--reasoning <level>`` — a card never
+    # inherits its assignee profile's ``agent.reasoning_effort``
+    # (t_f2dd1fb5). New rows are written non-NULL at creation (``max`` for a
+    # review-gate assignee, ``high`` otherwise); NULL survives only on legacy
+    # rows, where the spawn path substitutes the same card default and logs it
+    # once (mass backfill is t_bdcbc547).
     reasoning_effort: Optional[str] = None
+    # Provenance of ``reasoning_effort``: ``"pin"`` when an operator/explicit
+    # caller chose the stored level, ``"default"`` when the card's own default
+    # was materialized because nobody chose one, ``None`` on legacy rows that
+    # predate provenance tracking (t_f2dd1fb5). Without this column a card
+    # created with no pin would look identical to one whose operator pinned
+    # ``high``, and ``show`` would have to guess.
+    reasoning_effort_source: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1169,6 +1478,11 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # Per-task agent iteration cap (``--max-turns`` to the worker). ``None``
+    # falls through to the assignee profile's ``agent.max_turns``; a value is
+    # used only by the auto-unblock module (class B) to give ONE card a
+    # larger budget without touching any profile config.
+    max_turns: Optional[int] = None
     # When True, the dispatched worker runs in a Ralph-style goal loop
     # (the same engine behind the ``/goal`` slash command): after each
     # turn an auxiliary judge model evaluates the worker's response
@@ -1288,8 +1602,17 @@ class Task:
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
+            reasoning_effort_source=(
+                row["reasoning_effort_source"]
+                if "reasoning_effort_source" in keys
+                and row["reasoning_effort_source"]
+                else None
+            ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            max_turns=(
+                row["max_turns"] if "max_turns" in keys and row["max_turns"] else None
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
@@ -1483,10 +1806,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     root_model_override  TEXT,
     root_provider_override TEXT,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
-    -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
-    -- passes --reasoning <level> so the worker runs at that depth regardless
-    -- of the profile's agent.reasoning_effort. NULL = profile setting.
+    -- xhigh|max|ultra, or 'none' for thinking off), passed to the worker as
+    -- --reasoning <level> (t_f2dd1fb5). New rows are always non-NULL: an
+    -- operator pin clamped to the route's served vocabulary, or the card
+    -- default ('max' for a 09/15 review-gate assignee, 'high' otherwise).
+    -- NULL is legacy only: the spawn path substitutes the card default and
+    -- logs it once, so no card ever inherits the profile setting.
     reasoning_effort     TEXT,
+    -- Provenance of reasoning_effort (t_f2dd1fb5): 'pin' when an explicit
+    -- caller chose the stored level, 'default' when the card's own default
+    -- was materialized, NULL on legacy rows that predate the column. Keeps
+    -- `show` honest: an auto-default must never be reported as an operator
+    -- choice just because both happen to be 'high'.
+    reasoning_effort_source TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1503,6 +1835,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- PER-TASK agent iteration cap (t_57d0990b, auto-unblock class B).
+    -- NULL = fall through to ``agent.max_turns`` in the assignee profile's
+    -- config.yaml (the historical behaviour). A non-NULL value is passed to
+    -- the worker as ``--max-turns N``, so a single card that ran out of
+    -- budget can be given a bigger allowance WITHOUT touching any profile
+    -- config. Written only by the auto-unblock module after a budget
+    -- exhaustion, and never used to raise the platform-wide limit.
+    max_turns            INTEGER,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -1670,6 +2010,31 @@ CREATE TABLE IF NOT EXISTS delivery_dedup (
     cause_hash TEXT NOT NULL,
     created_at REAL NOT NULL,
     PRIMARY KEY (task_id, kind, cause_hash)
+);
+
+-- Terminal-delivery trigger queue (t_2dc720a3): one row per card that just
+-- transitioned into a TERMINAL state (done/archived) and is a delivery
+-- subject (has a notification subscription or children).  The row is written
+-- inside the SAME write transaction as the status change, so the trigger is
+-- durable and cannot be lost between the transition and the delivery.  The
+-- gateway branch-summary watcher drains it on a short probe so a terminal
+-- mission's final report goes out because of the TRANSITION, not because a
+-- 45-second scan happened to line up.  ``tg_chat`` records the resolved
+-- owner Telegram lane for this card at transition time (empty when the owner
+-- has no verified binding — the delivery stays fail-closed).
+CREATE TABLE IF NOT EXISTS terminal_delivery_queue (
+    task_id      TEXT PRIMARY KEY,
+    event_id     INTEGER NOT NULL DEFAULT 0,
+    from_status  TEXT,
+    to_status    TEXT NOT NULL,
+    tg_chat      TEXT,
+    created_at   INTEGER NOT NULL,
+    -- Filled once the terminal card's delivery has been handled: the resolved
+    -- owner Telegram lane, the outcome, and when. Kept (not deleted) so the
+    -- card's own TG addressing record stays auditable in the board DB.
+    delivered_at INTEGER,
+    delivered_tg TEXT,
+    outcome      TEXT
 );
 """
 
@@ -2790,6 +3155,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "max_turns" not in cols:
+        # Per-task agent iteration cap (t_57d0990b, auto-unblock class B).
+        # NULL = the worker keeps the assignee profile's ``agent.max_turns``,
+        # i.e. exactly the behaviour every pre-existing row already had.
+        _add_column_if_missing(conn, "tasks", "max_turns", "max_turns INTEGER")
+
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
@@ -2811,10 +3182,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     if "reasoning_effort" not in cols:
-        # Per-task thinking depth for the worker. NULL = the worker profile's
-        # own agent.reasoning_effort, which is what existing rows were getting.
+        # Per-task thinking depth for the worker. Legacy rows keep NULL (they
+        # predate t_f2dd1fb5); the spawn path substitutes the card default for
+        # them instead of inheriting the profile, and new rows are written
+        # non-NULL at creation.
         _add_column_if_missing(
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
+    if "reasoning_effort_source" not in cols:
+        # Provenance of the level above ('pin' | 'default'). Legacy rows stay
+        # NULL, and effective_card_reasoning_effort() derives the provenance
+        # from the level's presence for them (t_f2dd1fb5).
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort_source", "reasoning_effort_source TEXT"
         )
 
     if "goal_mode" not in cols:
@@ -3617,7 +3998,7 @@ def reclaim_dead_generation_running(conn: sqlite3.Connection) -> list[str]:
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_start = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_failure_error = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND gateway_generation IS ?",
                 (tid, row["gateway_generation"]),
@@ -3852,6 +4233,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    max_turns: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -3897,6 +4279,12 @@ def create_task(
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
 
+    A card NEVER inherits the assignee profile's ``agent.reasoning_effort``
+    (t_f2dd1fb5): when the caller passes nothing, the card's own default is
+    stored — ``max`` for a review-gate assignee (09/15), ``high`` otherwise —
+    and an explicit pin is clamped to the route's served vocabulary (letovo
+    rejects ``medium``/``minimal`` with HTTP 400).
+
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -3911,7 +4299,11 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
-    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    # Per-card reasoning effort (t_f2dd1fb5). Validate the operator's pin up
+    # front (a typo must fail fast, before any write), but resolve the FINAL
+    # stored level inside the write txn — the route (provider/model) may still
+    # be inherited from parent lineage there.
+    _pinned_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     # Global policy: every newly created unassigned task is owned by the
@@ -4102,6 +4494,20 @@ def create_task(
 
     now = int(time.time())
 
+    # Board default card budget (t_ed744fd2): materialise
+    # kanban.default_max_runtime_seconds / default_max_turns onto the row when
+    # the creator did not pass an explicit value. An explicit argument always
+    # wins, and unset config keeps the legacy "no cap" behaviour. Doing it here
+    # (not at spawn time) is deliberate: the limit becomes a property of the
+    # card — visible in the DB, overridable per card, and stable across
+    # retries/re-spawns of the same card.
+    if max_runtime_seconds is None or max_turns is None:
+        _def_runtime, _def_turns = default_card_limits()
+        if max_runtime_seconds is None:
+            max_runtime_seconds = _def_runtime
+        if max_turns is None:
+            max_turns = _def_turns
+
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
     # persistent project checkouts, so only persistent workspace kinds may
@@ -4121,6 +4527,30 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # Final per-card reasoning level (t_f2dd1fb5): the route is settled once
+    # the lineage block above has run, so the operator's pin is clamped against
+    # what this card will actually be spawned on and an absent pin becomes the
+    # card's own default. Resolved OUTSIDE the write txn because the clamp may
+    # read the assignee profile's config (HERMES_HOME swap) — never hold a
+    # board write transaction across a config read.
+    #
+    # The card default is the OWNER'S RULE (t_d7edc3b2), not a flat ``high``:
+    # the shape hints that exist at creation time (title, goal-mode, priority)
+    # are passed through, so a РГЗ mission container is born on ``max`` and
+    # mechanical routine on ``low`` instead of every non-gate card being born on
+    # ``high`` and needing a later sweep. The "gated work" shape cannot exist
+    # yet (a brand-new card has no children); it is picked up when a review
+    # child is linked, by the post-link autopin pass, and by the board sweep.
+    _stored_effort, _stored_effort_is_default = resolve_card_reasoning_effort(
+        assignee,
+        _pinned_effort,
+        provider=provider_override,
+        model=model_override,
+        title=title,
+        goal_mode=bool(goal_mode),
+        priority=priority,
+    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -4252,11 +4682,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, max_retries, max_turns, model_override, provider_override,
                         root_model_override, root_provider_override,
-                        reasoning_effort,
+                        reasoning_effort, reasoning_effort_source,
                         goal_mode, goal_max_turns, session_id, do_not_deliver
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4276,11 +4706,13 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        int(max_turns) if max_turns is not None else None,
                         model_override,
                         provider_override,
                         root_model_override,
                         root_provider_override,
-                        reasoning_effort,
+                        _stored_effort,
+                        "default" if _stored_effort_is_default else "pin",
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -4292,6 +4724,26 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                # Record WHY this card owns the level it was born with
+                # (t_d7edc3b2). The autopin sweep reads this trail to tell a
+                # RULE-owned value (re-derivable when the card's shape changes,
+                # e.g. it gains a review child) from an OPERATOR pin
+                # (``reasoning_effort_set``, never overwritten). An operator
+                # pin at creation is recorded as such, not as an autopin.
+                _append_event(
+                    conn,
+                    task_id,
+                    "reasoning_effort_autopin"
+                    if _stored_effort_is_default
+                    else "reasoning_effort_set",
+                    {
+                        "reasoning_effort": _stored_effort,
+                        "reasoning_effort_stored": _stored_effort,
+                        "reasoning_effort_default": _stored_effort_is_default
+                        or None,
+                        "by": "create_task",
+                    },
+                )
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -4315,6 +4767,10 @@ def create_task(
                         "provider_override": provider_override,
                         "root_model_override": root_model_override,
                         "root_provider_override": root_provider_override,
+                        "reasoning_effort": _stored_effort,
+                        "reasoning_effort_default": (
+                            _stored_effort_is_default or None
+                        ),
                         "do_not_deliver": bool(do_not_deliver) or None,
                     },
                 )
@@ -4578,9 +5034,18 @@ def set_reasoning_effort(
 ) -> bool:
     """Set (or clear) the per-task reasoning effort.
 
-    ``effort=None`` (or empty) clears the override — the worker falls back to
-    its profile's own ``agent.reasoning_effort``. ``"none"`` is a real value,
-    not a clear: it pins thinking OFF for this task.
+    ``effort=None`` (or empty) CLEARS the explicit pin by storing NULL, which
+    now means "not set — the card default applies"
+    (:func:`default_card_reasoning_effort`: ``max`` for a review-gate assignee
+    09/15, ``high`` otherwise). It no longer means "inherit the worker
+    profile's ``agent.reasoning_effort``" (t_f2dd1fb5): the spawn path
+    substitutes the card default for a NULL row and always passes
+    ``--reasoning``. ``"none"`` is a real value, not a clear: it pins thinking
+    OFF for this task.
+
+    A non-empty level is normalized and clamped to the card route's served
+    vocabulary, so ``medium``/``minimal`` on the letovo wire are stored as
+    ``high``/``low`` instead of bricking the next dispatch with HTTP 400.
 
     Deliberately independent of :func:`set_model_override`: a task may run the
     profile's own model at a different depth, and clearing a model override
@@ -4591,7 +5056,9 @@ def set_reasoning_effort(
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, assignee, model_override, provider_override "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -4599,15 +5066,78 @@ def set_reasoning_effort(
             raise RuntimeError(
                 f"cannot set reasoning effort on archived task {task_id}"
             )
+        keys = row.keys()
+        stored_effort, is_default = resolve_card_reasoning_effort(
+            row["assignee"] if "assignee" in keys else None,
+            effort,
+            provider=row["provider_override"]
+            if "provider_override" in keys
+            else None,
+            model=row["model_override"] if "model_override" in keys else None,
+            task_id=task_id,
+        )
+        # A cleared pin is stored as NULL so ``show`` can honestly report
+        # "high (default)" rather than claiming an operator pinned ``high``.
+        # The effective level is still never empty — the spawn path fills it.
+        # The provenance column records the SAME distinction for a card that
+        # DOES store a level: without it an auto-default and an operator pin
+        # holding the same level would be indistinguishable in ``show``.
+        column_value = None if effort is None else stored_effort
+        column_source = None if effort is None else "pin"
         conn.execute(
-            "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
-            (effort, task_id),
+            "UPDATE tasks SET reasoning_effort = ?, reasoning_effort_source = ? "
+            "WHERE id = ?",
+            (column_value, column_source, task_id),
         )
         _append_event(
-            conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
+            conn,
+            task_id,
+            "reasoning_effort_set",
+            {
+                "reasoning_effort": stored_effort,
+                "reasoning_effort_stored": column_value,
+                "reasoning_effort_requested": effort,
+                "reasoning_effort_default": is_default or None,
+            },
         )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("reasoning_effort",))
+    return True
+
+
+def set_max_turns(
+    conn: sqlite3.Connection,
+    task_id: str,
+    max_turns: Optional[int],
+) -> bool:
+    """Set (or clear) the per-task agent iteration cap.
+
+    ``max_turns=None`` (or ``<= 0``) clears the override, so the worker falls
+    back to the assignee profile's own ``agent.max_turns``. This is the ONLY
+    supported way to give a single card a bigger iteration budget: profile
+    ``config.yaml`` files are never touched by the auto-unblock layer, so one
+    oversized card can never raise the platform-wide limit.
+
+    Like :func:`set_reasoning_effort` the value takes effect on the NEXT
+    dispatch, so it is settable while the card sits in ``blocked``/``ready``.
+    Returns True on success.
+    """
+    cleared = max_turns is None or int(max_turns) <= 0
+    value = None if cleared else int(max_turns)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set max_turns on archived task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET max_turns = ? WHERE id = ?", (value, task_id)
+        )
+        _append_event(conn, task_id, "max_turns_set", {"max_turns": value})
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("max_turns",))
     return True
 
 
@@ -4649,6 +5179,18 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             {"parent": parent_id, "child": child_id},
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+    # Post-link autopin (t_d7edc3b2): linking a review-gate child turns the
+    # PARENT into "gated work", which the owner's rule places on ``high`` (and
+    # a container whose only child is the gate on ``high`` too). Run AFTER the
+    # txn commits — the pass reads the finished graph and never holds the write
+    # transaction open across a config/graph read.
+    try:
+        from agent.card_reasoning_autopin import autopin_active_cards
+
+        autopin_active_cards(conn, task_ids=[parent_id, child_id])
+    except Exception:  # pragma: no cover - seeding is best-effort
+        _log.debug("post-link autopin failed for %s->%s", parent_id, child_id,
+                   exc_info=True)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -5098,21 +5640,29 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    Returns the new event's row id so a caller can reference the exact event
+    (the terminal-delivery trigger keys its queue row on it). Callers that do
+    not need the id simply ignore the return value.
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    try:
+        return int(cur.lastrowid or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _end_run(
@@ -5958,7 +6508,8 @@ def release_stale_claims(
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_failure_error = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (retry_status, row["id"], row["claim_lock"], now),
@@ -6466,11 +7017,35 @@ def complete_task(
                         "delivery (was silent): %s",
                         task_id, len(_nons), ", ".join(_nons),
                     )
-        _append_event(
+        _completed_event_id = _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
         )
+        # t_2dc720a3: the DELIVERY TRIGGER is written in the same transaction as
+        # the status change. Before this the owner's report depended on a
+        # 45-second branch scan noticing the closed tree; if that scan had
+        # already fingerprinted the tree (or the transition landed between
+        # ticks) nothing fired at all. Enqueue is best-effort and never aborts
+        # the completion - a failure only degrades to the periodic scan.
+        try:
+            _queued = enqueue_terminal_delivery(
+                conn, task_id,
+                from_status=prior_status,
+                to_status="done",
+                event_id=_completed_event_id,
+                tg_chat=ensure_terminal_delivery_subscription(conn, task_id),
+            )
+            if _queued:
+                _log.info(
+                    "kanban: terminal-delivery trigger queued for %s (%s -> done): %s",
+                    task_id, prior_status or "?", ", ".join(_queued),
+                )
+        except Exception as _queue_exc:  # pragma: no cover - defensive
+            _log.warning(
+                "kanban: terminal-delivery trigger for %s failed (%s); "
+                "periodic branch scan still covers it", task_id, _queue_exc,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8394,8 +8969,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " reasoning_effort, reasoning_effort_source) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, 'default')",
                 (
                     new_id,
                     title,
@@ -8406,6 +8982,10 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    # A decomposed child owns its level like any other card —
+                    # it must not inherit the assignee profile's
+                    # agent.reasoning_effort (t_f2dd1fb5).
+                    default_card_reasoning_effort(assignee),
                 ),
             )
             _append_event(
@@ -8654,8 +9234,9 @@ def split_task_on_budget(
                 "(id, title, body, assignee, status, priority, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, skills, "
                 " model_override, provider_override, root_model_override, "
-                " root_provider_override, reasoning_effort, max_runtime_seconds) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " root_provider_override, reasoning_effort, "
+                " reasoning_effort_source, max_runtime_seconds) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     child["title"],
@@ -8672,7 +9253,24 @@ def split_task_on_budget(
                     row["provider_override"],
                     row["root_model_override"],
                     row["root_provider_override"],
-                    row["reasoning_effort"],
+                    # Budget-split children replace their parent, so they must
+                    # own an explicit level: mirror a parent that HAS one,
+                    # otherwise take the child's own card default instead of
+                    # copying NULL (t_f2dd1fb5).
+                    row["reasoning_effort"]
+                    or default_card_reasoning_effort(
+                        _canonical_assignee(row["assignee"])
+                    ),
+                    # Provenance travels with the level: a child mirroring a
+                    # pinned parent stays a pin; one that fell back to its own
+                    # default is marked as such, never as an operator choice.
+                    (
+                        row["reasoning_effort_source"]
+                        if row["reasoning_effort"]
+                        and "reasoning_effort_source" in row.keys()
+                        and row["reasoning_effort_source"]
+                        else ("pin" if row["reasoning_effort"] else "default")
+                    ),
                     row["max_runtime_seconds"],
                 ),
             )
@@ -8752,6 +9350,12 @@ def split_task_on_budget(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        _archive_prior = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        _archive_prior_status = (
+            str(_archive_prior["status"] or "").strip() if _archive_prior else None
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -8768,7 +9372,31 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _archived_event_id = _append_event(
+            conn, task_id, "archived", None, run_id=run_id,
+        )
+        # t_2dc720a3: an administrative archive IS a terminal close - mission
+        # controllers are routinely closed this way instead of via
+        # kanban_complete, so the delivery trigger must fire here too (the
+        # original incident: the card was archived, the report was never sent).
+        try:
+            _queued = enqueue_terminal_delivery(
+                conn, task_id,
+                from_status=_archive_prior_status,
+                to_status="archived",
+                event_id=_archived_event_id,
+                tg_chat=ensure_terminal_delivery_subscription(conn, task_id),
+            )
+            if _queued:
+                _log.info(
+                    "kanban: terminal-delivery trigger queued for %s (%s -> archived): %s",
+                    task_id, _archive_prior_status or "?", ", ".join(_queued),
+                )
+        except Exception as _queue_exc:  # pragma: no cover - defensive
+            _log.warning(
+                "kanban: terminal-delivery trigger for %s failed (%s); "
+                "periodic branch scan still covers it", task_id, _queue_exc,
+            )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -9234,6 +9862,27 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
+
+# Run outcomes that are NOT a task refusal: the provider/quota/transport was at
+# fault, or the dispatcher closed the run (restart, orphan, stale claim,
+# archive), or the work succeeded / moved on. None of them leave a blocker the
+# card must sit out, so a quota-flavored ``last_failure_error`` left by an
+# EARLIER run says nothing about the card's current state. The respawn guard
+# treats the column as CURRENT state, not history (t_f2adab08: 40 cards were
+# deferred forever by exactly such a stale stamp, because the api_unavailable /
+# reclaimed paths never refreshed it while the rate_limited path had stamped it).
+_NON_REFUSAL_RUN_OUTCOMES = frozenset({
+    "api_unavailable",   # provider outage — auto-requeued; a retry is correct
+    "reclaimed",         # gateway restart / orphan / stale claim cleanup
+    "stale",             # no-heartbeat cleanup by the dispatcher
+    "completed",         # success
+    "review_requested",  # handed off to review
+    "changes_requested", # review round-trip
+    "budget_split",      # card split into children
+    "scheduled",         # parked by the scheduler
+})
+
+
 # Cooldown after a rate-limited (quota-wall) requeue before the dispatcher
 # re-spawns the worker. Without this, a task released by the rate-limit path
 # would be re-spawned on the very next tick and immediately bounce off the
@@ -9356,6 +10005,15 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    reasoning_autopinned: list[tuple[str, Optional[str], str, str]] = field(
+        default_factory=list
+    )
+    """Active cards whose reasoning level this tick gave an explicit value by
+    the owner's rule, as ``(task_id, old_level, new_level, reason)`` triples
+    (t_d7edc3b2). A card that re-entered the active set with a NULL /
+    out-of-domain level is re-pinned BEFORE the spawn phase, so no worker can
+    ever run on an inherited profile effort. Empty in the steady state and on
+    a dry-run tick (dry-run reports without writing)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -10253,7 +10911,7 @@ def reconcile_orphaned_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_failure_error = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
                 (tid, row["claim_lock"], row["claim_expires"]),
@@ -10608,7 +11266,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     cur = conn.execute(
                         "UPDATE tasks SET status = ?, claim_lock = NULL, "
                         "claim_expires = NULL, worker_pid = NULL, "
-                        "gateway_generation = NULL "
+                        "gateway_generation = NULL, last_failure_error = NULL "
                         "WHERE id = ? AND status = 'running' "
                         "  AND worker_pid = ? AND claim_lock IS ?",
                         (retry_status, row["id"], pid, row["claim_lock"]),
@@ -10722,7 +11380,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     cur = conn.execute(
                         "UPDATE tasks SET status = ?, claim_lock = NULL, "
                         "claim_expires = NULL, worker_pid = NULL, "
-                        "api_unavailable_streak = ? "
+                        "api_unavailable_streak = ?, last_failure_error = NULL "
                         "WHERE id = ? AND status = 'running' "
                         "  AND worker_pid = ? AND claim_lock IS ?",
                         (retry_status, streak, row["id"], pid, row["claim_lock"]),
@@ -11438,10 +12096,30 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. But only
+    #    when the stamped text still describes CURRENT state: ``last_failure_error``
+    #    is a single unscoped column, so a non-refusal outcome that ran AFTER the
+    #    stamping refusal (provider outage, gateway reclaim, stale-claim cleanup,
+    #    completion) leaves a stale quota sentence behind. Honouring it forever is
+    #    the t_f2adab08 defect: 40 cards sat in ``ready`` for 10-23h emitting
+    #    ``respawn_guarded/blocker_auth`` every tick while nothing was wrong with
+    #    them. A non-refusal latest outcome therefore retires ONLY this rule —
+    #    the review-lane, ``recent_success`` and ``active_pr`` checks below still
+    #    run, so a stale stamp cannot be used to bypass any other guard.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        latest_outcome = conn.execute(
+            "SELECT outcome FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        stamp_is_history = (
+            latest_outcome is not None
+            and latest_outcome["outcome"] in _NON_REFUSAL_RUN_OUTCOMES
+        )
+        if not stamp_is_history:
+            return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
     # URL comment are the canonical *inputs* to a review handoff (worker
@@ -12984,6 +13662,23 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Reasoning autopin sweep (t_d7edc3b2): an ACTIVE card must always own an
+    # explicit level, so a card that re-entered the active set with a NULL /
+    # out-of-domain value (a legacy row, a re-created row, a hand-written
+    # insert that bypassed create_task) is re-pinned by the owner's rule before
+    # this tick spawns anything. Idempotent and cheap (one indexed SELECT plus
+    # the handful of writes only when something is actually missing); a dry-run
+    # tick reports without writing.
+    try:
+        from agent.card_reasoning_autopin import autopin_active_cards
+
+        result.reasoning_autopinned = autopin_active_cards(
+            conn, dry_run=dry_run
+        )["changed"]
+    except Exception:  # pragma: no cover - never break a dispatch tick
+        _log.warning("reasoning autopin sweep failed; cards keep their levels",
+                     exc_info=True)
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -13760,6 +14455,71 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     return parsed if parsed >= minimum else default
 
 
+def default_card_limits(kanban_cfg: Optional[dict] = None) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(max_runtime_seconds, max_turns)`` for a NEW card (t_ed744fd2).
+
+    ``kanban.default_max_runtime_seconds`` / ``kanban.default_max_turns`` are
+    the board's default card budget. Materialising them onto the card row at
+    creation makes the limit a property of the CARD (visible in the DB,
+    overridable per card) instead of an accident of which tool created it —
+    before this, only an explicit creator argument set a limit, so the same
+    board ran 2-8 h / hundreds-of-steps cards next to 3600 s / 150-step ones.
+
+    A creator's explicit value always wins. Absent/None/invalid config values
+    return ``None`` (legacy behaviour: no cap from config), so an install that
+    never sets these keys keeps its previous behaviour bit-for-bit.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
+
+    # Fall back to the schema defaults so a fresh install gets the board
+    # budget without hand-editing config.yaml; an explicit config value (or an
+    # explicit ``None`` written by an operator to opt out) always wins.
+    try:
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        _schema = DEFAULT_CONFIG.get("kanban") or {}
+    except Exception:
+        _schema = {}
+
+    def _opt_positive(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _resolve(key: str) -> Optional[int]:
+        # Three states, in order:
+        #   * key absent            -> schema default (fresh installs get the
+        #                              board budget without editing config);
+        #   * explicit positive int -> that value;
+        #   * explicit 0 / negative -> operator opt-out, no cap from config;
+        #   * unparseable junk      -> schema default (fail closed: junk must
+        #                              not silently strip a card of its budget).
+        if key not in kanban_cfg:
+            return _opt_positive(_schema.get(key))
+        raw = kanban_cfg.get(key)
+        parsed = _opt_positive(raw)
+        if parsed is not None:
+            return parsed
+        try:
+            if int(raw) <= 0:
+                return None
+        except (TypeError, ValueError):
+            pass
+        return _opt_positive(_schema.get(key))
+
+    return _resolve("default_max_runtime_seconds"), _resolve("default_max_turns")
+
+
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
     """Return ``(rotate_bytes, backup_count)`` for worker log rotation.
 
@@ -14508,6 +15268,13 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # Soft-finish budget arms (t_ed744fd2). The worker needs BOTH the card's
+    # wall-clock cap and the moment THIS attempt started to compute the 80%
+    # threshold from its real budget; without them only the step arm can fire.
+    # Absent values keep the time arm inert (no cap on the card).
+    if task.max_runtime_seconds:
+        env["HERMES_KANBAN_MAX_RUNTIME_SECONDS"] = str(int(task.max_runtime_seconds))
+        env["HERMES_KANBAN_RUN_STARTED_AT"] = str(int(time.time()))
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -14594,11 +15361,23 @@ def _default_spawn(
             # _eff_model None -> fallback to assignee default: omit both.
         else:
             cmd.extend(["-m", task.model_override])
-    # Per-task thinking depth. Independent of the model override — a task can
-    # run the profile's own model at a different depth — so this is its own
-    # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
+    # Per-task thinking depth (t_f2dd1fb5). A card NEVER inherits its
+    # assignee profile's ``agent.reasoning_effort``: the level is always
+    # resolved (a legacy NULL row gets the card default — ``max`` for a 09/15
+    # review-gate assignee, ``high`` otherwise) and always passed, so the
+    # worker's depth is a property of the CARD, not of whichever profile
+    # happens to run it. The substitution is logged once per card, so nothing
+    # falls back silently.
+    worker_reasoning, _reasoning_is_default = effective_card_reasoning_effort(task)
+    if _reasoning_is_default:
+        _announce_default_effort_once(task.id, worker_reasoning)
+    cmd.extend(["--reasoning", worker_reasoning])
+    # Per-task agent iteration cap (auto-unblock class B, t_57d0990b). The
+    # worker's own profile config still supplies the default when this is
+    # NULL; when set, the card gets exactly its own allowance and NO profile
+    # config is touched. `--max-turns` is the chat subcommand's flag, so it
+    # must come after the `chat` subcommand — it is appended below.
+    worker_max_turns = int(task.max_turns) if task.max_turns else None
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -14606,6 +15385,8 @@ def _default_spawn(
     # writes a per-run exit receipt. The regular chat path discards the result
     # and exits 0 even on a failed API call. Goal-loop workers also need -Q.
     cmd.extend(["chat", "-q", prompt, "-Q"])
+    if worker_max_turns is not None:
+        cmd.extend(["--max-turns", str(worker_max_turns)])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -15195,6 +15976,523 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Terminal-delivery trigger (t_2dc720a3)
+#
+# The owner's final report used to depend on a 45-second branch scan noticing a
+# closed tree; when it did not (or when the tree closed in a wave the scan had
+# already fingerprinted) the report simply never left. The trigger below is
+# written in the SAME transaction as the terminal status change, so the intent
+# to deliver is durable the instant the transition commits, and the gateway
+# drains it on a short probe.
+# ---------------------------------------------------------------------------
+
+#: Terminal statuses that constitute a delivery-relevant transition.
+TERMINAL_DELIVERY_STATUSES = ("done", "archived")
+
+#: Cap on rows enqueued per transition (the queue is keyed by task_id, so this
+#: only bounds how many ancestors one close can wake).
+_TERMINAL_DELIVERY_MAX_ANCESTORS = 16
+
+
+def resolve_terminal_owner_tg_chat(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Resolve the owner's Telegram lane for a card at transition time.
+
+    Reads the card's own ``api_server`` subscription (the channel it was
+    ordered from) and maps its verified owner through
+    ``delivery_policy.owui_telegram_users`` — the SAME single source of truth
+    ``gateway.delivery_engine.resolve_author_telegram`` uses, so there is no
+    second owner→TG mapping. Never raises; ``None`` means "no verified
+    binding" and the delivery stays fail-closed (OWUI-only), which is a policy
+    outcome, not an error.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT user_id, delivery_metadata FROM kanban_notify_subs "
+            "WHERE task_id = ? AND LOWER(platform) = 'api_server'",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    owners: list[str] = []
+    for row in rows:
+        owner = str(row["user_id"] or "").strip()
+        if not owner:
+            try:
+                meta = json.loads(row["delivery_metadata"] or "{}")
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict):
+                owner = str(meta.get(_OWUI_ATTR_META_KEY) or "").strip()
+        if owner:
+            owners.append(owner)
+    if not owners:
+        return None
+    try:
+        from hermes_cli.delivery_policy import owui_telegram_users
+
+        bindings = owui_telegram_users()
+    except Exception:
+        return None
+    for owner in owners:
+        chat = str((bindings or {}).get(owner) or "").strip()
+        if chat:
+            return chat
+    return None
+
+
+def ensure_terminal_delivery_subscription(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Make the terminal card addressable to the owner's Telegram, once.
+
+    Acceptance of t_2dc720a3 asks for the terminal card to carry a Telegram
+    subscription itself ("проставлять/сохранять подписку (chat_id владельца,
+    флаг notify) в том же хранилище"), created by reusing the existing
+    subscription helper — not by inventing a second store.
+
+    Rules (all idempotent, all fail-closed):
+
+    * the card already has a ``telegram`` subscription → nothing to do, the
+      native TG lane already addresses it;
+    * the card has an ``api_server`` subscription whose verified owner has a
+      server-side TG binding → a ``telegram`` row is written to the SAME store
+      (``kanban_notify_subs``) with that owner's chat as ``chat_id`` AND
+      ``user_id``, ``chat_type='dm'`` and the notify flag (``delivery_mode
+      ='notify'``). The terminal card then answers «куда идёт мой итог» by
+      itself, in the one subscription table;
+    * otherwise (no api_server binding resolvable) there is no owner chat to
+      address and nothing is fabricated.
+
+    One-итог-per-chat: the written row carries
+    ``delivery_metadata[terminal_mirror]=1``. The branch/TG lanes treat a
+    terminal-mirror row as the card's ADDRESSING record (they resolve the chat
+    from it, and the OWUI→TG mirror stands down for that chat) so the owner
+    never receives the same итог twice just because the card is now subscribed
+    on both lanes.
+
+    Runs INSIDE the caller's write transaction (``complete_task`` /
+    ``archive_task``) through :func:`_write_notify_sub_row`, so the
+    subscription and the status change commit atomically. Returns the resolved
+    owner chat id (or ``None``); never raises.
+    """
+    if not task_id:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT platform, chat_id, user_id, thread_id, chat_type, "
+            "       notifier_profile, delivery_metadata "
+            "  FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    for row in rows:
+        if str(row["platform"] or "").lower() == "telegram" and row["chat_id"]:
+            return str(row["chat_id"])
+    owner_chat = resolve_terminal_owner_tg_chat(conn, task_id)
+    if not owner_chat:
+        return None
+    profile = ""
+    for row in rows:
+        profile = str(row["notifier_profile"] or "").strip()
+        if profile:
+            break
+    try:
+        # Written through the SAME row-writer ``add_notify_sub`` uses, but
+        # directly: we are already inside the caller's write transaction
+        # (``complete_task``/``archive_task``), and ``add_notify_sub`` would
+        # open a second BEGIN IMMEDIATE. One store, one SQL implementation,
+        # atomic with the status change.
+        _write_notify_sub_row(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id=owner_chat,
+            thread_id="",
+            user_id=owner_chat,
+            chat_type="dm",
+            notifier_profile=profile or None,
+            delivery_mode="notify",
+            metadata_json=_encode_notify_delivery_metadata(
+                {_TERMINAL_MIRROR_META_KEY: 1}
+            ),
+        )
+    except sqlite3.Error as exc:
+        _log.warning(
+            "kanban: terminal TG subscription for %s failed: %s", task_id, exc,
+        )
+        return owner_chat
+    _log.info(
+        "kanban: terminal card %s subscribed to telegram:%s (owner chat stamped)",
+        task_id, owner_chat,
+    )
+    return owner_chat
+
+
+def _terminal_delivery_subject(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a card's terminal close is a delivery subject.
+
+    A terminal close matters to the owner only for a card that either carries a
+    notification subscription itself (the branch root the итог is addressed to)
+    or has descendants that do (a controller closing after its workers). A leaf
+    worker card with no subscription of its own and no children is not a
+    separate delivery subject — its result rides the branch итог, so queueing it
+    would only produce duplicate scans.
+    """
+    try:
+        has_sub = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if has_sub is not None:
+            return True
+        has_child = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return has_child is not None
+    except sqlite3.Error:
+        return False
+
+
+def enqueue_terminal_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    from_status: Optional[str],
+    to_status: str,
+    event_id: Optional[int] = None,
+    tg_chat: Optional[str] = None,
+) -> list[str]:
+    """Record the delivery trigger for a terminal transition. Returns queued ids.
+
+    Called from INSIDE the transition's write transaction (``complete_task`` /
+    ``archive_task``), so a committed status change can never exist without its
+    delivery trigger. The queue is keyed by ``task_id``: a re-close of the same
+    card overwrites the row rather than accumulating spam, and the branch
+    watcher's own ``delivery_dedup`` marker still decides whether a *message* is
+    actually sent — this queue only carries "something terminal just happened,
+    look now".
+
+    Ancestors are queued too: closing the last worker of a mission makes the
+    mission root terminal in effect, and the root is the card the owner's итог
+    is addressed to.
+
+    Best-effort by contract: a queue write must never abort a status change, so
+    every failure degrades to "the periodic scan will get it".
+    """
+    enqueued: list[str] = []
+    if str(to_status or "").strip() not in TERMINAL_DELIVERY_STATUSES:
+        return enqueued
+    try:
+        candidates: list[str] = [task_id]
+        try:
+            ancestors = sorted(get_ancestor_ids(conn, task_id))
+        except sqlite3.Error:
+            ancestors = []
+        candidates.extend(ancestors[:_TERMINAL_DELIVERY_MAX_ANCESTORS])
+        now = int(time.time())
+        for tid in dict.fromkeys(c for c in candidates if c):
+            try:
+                if not _terminal_delivery_subject(conn, tid):
+                    continue
+            except sqlite3.Error:
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO terminal_delivery_queue
+                        (task_id, event_id, from_status, to_status, tg_chat,
+                         created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        event_id     = excluded.event_id,
+                        from_status  = excluded.from_status,
+                        to_status    = excluded.to_status,
+                        tg_chat      = COALESCE(excluded.tg_chat,
+                                                terminal_delivery_queue.tg_chat),
+                        created_at   = excluded.created_at,
+                        -- A fresh terminal transition re-arms the trigger.
+                        delivered_at = NULL,
+                        delivered_tg = NULL,
+                        outcome      = NULL
+                    """,
+                    (
+                        tid,
+                        int(event_id or 0),
+                        from_status,
+                        str(to_status).strip(),
+                        tg_chat or None,
+                        now,
+                    ),
+                )
+            except sqlite3.Error as exc:
+                _log.warning(
+                    "kanban: terminal-delivery enqueue for %s failed (%s) — "
+                    "periodic branch scan still covers it", tid, exc,
+                )
+                continue
+            enqueued.append(tid)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "kanban: terminal-delivery trigger for %s skipped: %s", task_id, exc,
+        )
+    return enqueued
+
+
+def has_terminal_delivery_trigger(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Cheap read-only probe: is any terminal-delivery trigger queued?
+
+    Same contract as :func:`count_notify_subs` — never creates the DB, never
+    runs schema init, never takes a write lock, so the gateway can call it on a
+    short cadence (every few seconds) without touching the board's writer. A
+    missing DB, or a DB predating the trigger table, answers ``False``.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    try:
+        if not Path(path).exists():
+            return False
+    except OSError:
+        return False
+    try:
+        conn = sqlite3.connect(str(Path(path).resolve().as_uri()) + "?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM terminal_delivery_queue "
+            "WHERE delivered_at IS NULL LIMIT 1"
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        return False
+    except sqlite3.Error:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def peek_terminal_delivery_queue(
+    conn: sqlite3.Connection, *, limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return PENDING terminal-delivery triggers, oldest first (read-only)."""
+    try:
+        rows = conn.execute(
+            "SELECT * FROM terminal_delivery_queue "
+            "WHERE delivered_at IS NULL "
+            "ORDER BY created_at ASC, task_id ASC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(r) for r in rows]
+
+
+def note_terminal_delivery_target(
+    conn: sqlite3.Connection, task_id: str, tg_chat: Optional[str],
+) -> None:
+    """Persist the resolved owner Telegram lane for a queued trigger.
+
+    The owner→TG mapping itself stays in ONE place
+    (``gateway.delivery_engine.resolve_author_telegram``); this helper only
+    records its result next to the trigger so an operator reading the board DB
+    can see WHICH chat the terminal card was addressed to — the card's own
+    "подписка терминальной карточки на Telegram" record — without opening a
+    second ``kanban_notify_subs`` row (a second row would light up the native
+    TG lane and double-ping the owner for a branch the OWUI→TG mirror already
+    serves).
+    """
+    if not task_id:
+        return
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE terminal_delivery_queue SET tg_chat = ? WHERE task_id = ?",
+                (tg_chat or None, task_id),
+            )
+    except sqlite3.Error as exc:
+        _log.debug("kanban: terminal-delivery target note failed: %s", exc)
+
+
+def clear_terminal_delivery(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    outcome: str = "handled",
+    delivered_tg: Optional[str] = None,
+) -> int:
+    """Mark trigger rows HANDLED (delivered_at stamped), keeping the record.
+
+    Called after the branch watcher planned/claimed the итог for those roots.
+    The row is stamped rather than deleted so the terminal card keeps its
+    durable answer to «this card's report went to telegram:<chat> at <time>»,
+    which is the audit trail the acceptance asks for. Only PENDING rows are
+    touched, so re-closing the same card re-queues it cleanly (the enqueue
+    upsert resets ``delivered_at`` to NULL).
+    """
+    ids = [str(t) for t in task_ids if t]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    now = int(time.time())
+    try:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE terminal_delivery_queue "
+                "   SET delivered_at = ?, outcome = ?, "
+                "       delivered_tg = COALESCE(?, tg_chat) "
+                f" WHERE task_id IN ({placeholders}) AND delivered_at IS NULL",
+                (now, str(outcome or "handled"), delivered_tg or None, *ids),
+            )
+            return int(cur.rowcount or 0)
+    except sqlite3.Error as exc:
+        _log.warning("kanban: terminal-delivery clear failed: %s", exc)
+        return 0
+
+
+def _notify_sub_insert_mode(platform: str, delivery_mode: Optional[str]) -> str:
+    """Resolve the ``delivery_mode`` a fresh subscription row is inserted with.
+
+    ``api_server`` is stateless: the adapter has no ``send()`` — the wake
+    self-post IS the delivery on that path (see gateway/wake.py and
+    test_kanban_notifier_apiserver_wake). A plain-'notify' default would leave
+    those subscriptions with no delivery mechanism at all, regressing the
+    pre-delivery_mode behavior where a task carrying a session_id always woke.
+    Explicit modes still win.
+    """
+    if delivery_mode in _NOTIFY_DELIVERY_MODES:
+        return str(delivery_mode)
+    return "notify+wake" if platform == "api_server" else "notify"
+
+
+def _write_notify_sub_row(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    metadata_json: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> None:
+    """Insert-or-refresh ONE ``kanban_notify_subs`` row. No transaction.
+
+    This is the single row-writer used by both :func:`add_notify_sub` (which
+    wraps it in its own ``write_txn``) and by helpers that already run INSIDE
+    an open write transaction — notably
+    :func:`ensure_terminal_delivery_subscription`, called from
+    ``complete_task``/``archive_task`` while the terminal status change is
+    still uncommitted. Splitting the row-writer out is what lets the terminal
+    card's Telegram subscription be written in the SAME transaction as the
+    status change while still going through the one existing subscription
+    implementation (card t_099801f5: «переиспользовать имеющиеся функции
+    подписки», no second store, no duplicated SQL).
+
+    Callers MUST hold a write transaction: the sequence is INSERT OR IGNORE
+    followed by self-healing UPDATEs and is only atomic under one txn.
+    """
+    insert_mode = _notify_sub_insert_mode(platform, delivery_mode)
+    insert_chat_type = chat_type or "dm"
+    now = int(created_at if created_at is not None else time.time())
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+        """,
+        (
+            task_id,
+            platform,
+            chat_id,
+            thread_id or "",
+            user_id,
+            user_id_alt,
+            insert_chat_type,
+            notifier_profile,
+            insert_mode,
+            metadata_json,
+            now,
+            task_id,
+        ),
+    )
+    if chat_type:
+        # Explicit chat_type is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET chat_type = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (chat_type, task_id, platform, chat_id, thread_id or ""),
+        )
+    if user_id_alt:
+        # Self-heal legacy rows created before alternate IDs were tracked.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET user_id_alt = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (user_id_alt IS NULL OR user_id_alt = '')
+            """,
+            (user_id_alt, task_id, platform, chat_id, thread_id or ""),
+        )
+    if notifier_profile:
+        # Self-heal legacy rows that predate notifier ownership.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (notifier_profile IS NULL OR notifier_profile = '')
+            """,
+            (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        )
+    if delivery_mode in _NOTIFY_DELIVERY_MODES:
+        # Explicit delivery_mode is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_mode = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (delivery_mode, task_id, platform, chat_id, thread_id or ""),
+        )
+    if metadata_json:
+        # Refresh the routing anchor for duplicate subscriptions.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_metadata = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (metadata_json, task_id, platform, chat_id, thread_id or ""),
+        )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -15238,95 +16536,23 @@ def add_notify_sub(
     AFTER they subscribe; the gateway/tool auto-subscribe paths run at
     task creation, where the snapshot is 0 anyway.
     """
-    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
-        # api_server is stateless: the adapter has no send() — the wake
-        # self-post IS the delivery on that path (see gateway/wake.py and
-        # test_kanban_notifier_apiserver_wake). A plain-'notify' default
-        # would leave those subscriptions with no delivery mechanism at
-        # all, regressing the pre-delivery_mode behavior where a task
-        # carrying a session_id always woke. Explicit modes still win.
-        "notify+wake" if platform == "api_server" else "notify"
-    )
-    insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
-            """,
-            (
-                task_id,
-                platform,
-                chat_id,
-                thread_id or "",
-                user_id,
-                user_id_alt,
-                insert_chat_type,
-                notifier_profile,
-                insert_mode,
-                metadata_json,
-                now,
-                task_id,
-            ),
+        _write_notify_sub_row(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            metadata_json=metadata_json,
+            created_at=now,
         )
-        if chat_type:
-            # Explicit chat_type is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET chat_type = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (chat_type, task_id, platform, chat_id, thread_id or ""),
-            )
-        if user_id_alt:
-            # Self-heal legacy rows created before alternate IDs were tracked.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET user_id_alt = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (user_id_alt IS NULL OR user_id_alt = '')
-                """,
-                (user_id_alt, task_id, platform, chat_id, thread_id or ""),
-            )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
-        if delivery_mode in _NOTIFY_DELIVERY_MODES:
-            # Explicit delivery_mode is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_mode = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
-            )
-        if metadata_json:
-            # Refresh the routing anchor for duplicate subscriptions.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_metadata = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (metadata_json, task_id, platform, chat_id, thread_id or ""),
-            )
 
 
 #: Ключ в ``delivery_metadata`` подписки, по которому api_server-подписка
@@ -15339,6 +16565,72 @@ def add_notify_sub(
 #: схемы таблицы — существующие подписки (включая 234 боевые api_server-строки)
 #: остаются валидными без миграции, а новый nullable-атрибут де-факто добавлен.
 _OWUI_ATTR_META_KEY = "owui_user_id_attr"
+
+#: Ключ в ``delivery_metadata`` терминальной telegram-подписки (t_099801f5):
+#: ``{"terminal_mirror": 1}``. Ставится
+#: :func:`ensure_terminal_delivery_subscription` в момент перехода карточки в
+#: терминальное состояние. Такая строка — АДРЕС итога, а не второй канал:
+#: ветка резолвит из неё чат, а OWUI→TG зеркало для того же чата встаёт,
+#: поэтому владелец получает один итог, а не два. Отсутствие ключа = обычная
+#: подписка (native TG-канал постановки), поведение не меняется.
+_TERMINAL_MIRROR_META_KEY = "terminal_mirror"
+
+
+def is_terminal_mirror_sub(sub: Mapping[str, Any]) -> bool:
+    """True when a subscription row is a terminal card's ADDRESS record.
+
+    :func:`ensure_terminal_delivery_subscription` writes the owner's Telegram
+    chat into ``kanban_notify_subs`` at terminal transition with
+    ``delivery_metadata[terminal_mirror]=1`` (t_099801f5). The row answers «куда
+    идёт итог этой карточки» and is a real subscription row in the ONE store,
+    but it is NOT a second delivery channel: the card's итог already reaches
+    that chat through the api_server subscription's OWUI→TG mirror (the lane
+    that existed before the row). Enumerating it as a channel too would send
+    the owner the same итог twice.
+
+    Delivery paths therefore skip terminal-mirror rows when they enumerate
+    CHANNELS (branch summary, per-event notifier) while every resolver that
+    only needs the ADDRESS (``resolve_terminal_owner_tg_chat`` and friends)
+    keeps using them. A row without the marker — an ordinary native Telegram
+    subscription — is a channel exactly as before.
+    """
+    if not isinstance(sub, Mapping):
+        return False
+    meta = sub.get("delivery_metadata")
+    if not isinstance(meta, Mapping):
+        return False
+    return bool(meta.get(_TERMINAL_MIRROR_META_KEY))
+
+
+def terminal_mirror_chats(
+    conn: sqlite3.Connection, task_id: str,
+) -> set[str]:
+    """Return the owner chats recorded as terminal-mirror addresses on a card."""
+    try:
+        rows = conn.execute(
+            "SELECT platform, chat_id, delivery_metadata "
+            "  FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    chats: set[str] = set()
+    for row in rows:
+        if str(row["platform"] or "").lower() != "telegram":
+            continue
+        if is_terminal_mirror_sub(
+            {
+                "platform": row["platform"],
+                "chat_id": row["chat_id"],
+                "delivery_metadata": _decode_notify_delivery_metadata(
+                    row["delivery_metadata"]
+                ),
+            }
+        ):
+            chat = str(row["chat_id"] or "").strip()
+            if chat:
+                chats.add(chat)
+    return chats
 
 
 def set_notify_sub_owui_owner(
@@ -15427,6 +16719,7 @@ def list_notify_subs(
     *,
     notifier_profiles: Optional[Iterable[str]] = None,
     include_unowned: bool = False,
+    include_terminal_mirror: bool = True,
 ) -> list[dict]:
     """List subscriptions, optionally restricted to notifier profile owners.
 
@@ -15434,6 +16727,11 @@ def list_notify_subs(
     result. Gateway notifier processes pass the profiles whose adapters they
     own so they cannot claim another gateway's events. ``include_unowned`` is
     used by the dispatch owner for legacy rows created before profile stamping.
+
+    ``include_terminal_mirror=False`` drops the terminal-card ADDRESS rows
+    written by :func:`ensure_terminal_delivery_subscription` (t_099801f5).
+    Channel-enumeration callers pass it so one итог is not sent twice; address
+    resolvers keep the default and see every row.
     """
     owner_where, owner_params = _notify_profile_filter(
         notifier_profiles, include_unowned=include_unowned,
@@ -15457,6 +16755,8 @@ def list_notify_subs(
             item["delivery_metadata"] = _decode_notify_delivery_metadata(
                 item.get("delivery_metadata")
             )
+        if not include_terminal_mirror and is_terminal_mirror_sub(item):
+            continue
         out.append(item)
     return out
 
@@ -15855,6 +17155,36 @@ def get_ancestor_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
     return seen
 
 
+def _terminal_mirror_only_tasks(conn: sqlite3.Connection) -> set[str]:
+    """Tasks whose EVERY subscription row is a terminal-mirror ADDRESS row.
+
+    Such a card has an address for its итог but no channel of its own, so it
+    must not be treated as a subscribed branch root (t_099801f5). A card that
+    also carries a real channel row is returned unchanged by
+    :func:`subscribed_branch_roots`.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT task_id, delivery_metadata FROM kanban_notify_subs"
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    seen: dict[str, bool] = {}
+    for row in rows:
+        tid = str(row["task_id"] or "")
+        if not tid:
+            continue
+        addr_only = is_terminal_mirror_sub(
+            {
+                "delivery_metadata": _decode_notify_delivery_metadata(
+                    row["delivery_metadata"]
+                )
+            }
+        )
+        seen[tid] = seen.get(tid, True) and addr_only
+    return {tid for tid, all_addr in seen.items() if all_addr}
+
+
 def subscribed_branch_roots(conn: sqlite3.Connection) -> list[str]:
     """Return subscribed tasks that are roots of a Kanban branch.
 
@@ -15864,11 +17194,17 @@ def subscribed_branch_roots(conn: sqlite3.Connection) -> list[str]:
     up until we find the subscribed task with no subscribed parent (that task
     owns the branch итог for the whole subtree). This mirrors the orchestrator
     rule: "выбрать ту, у которой НЕТ родителя с подпиской (иначе искать выше)".
+
+    Terminal-card ADDRESS rows (``delivery_metadata[terminal_mirror]=1``,
+    t_099801f5) are not channels and do not make a card a branch root; only
+    rows that can carry a message count.
     """
     rows = conn.execute(
         "SELECT DISTINCT task_id FROM kanban_notify_subs ORDER BY task_id"
     ).fetchall()
-    subscribed = {row["task_id"] for row in rows}
+    subscribed = {
+        row["task_id"] for row in rows
+    } - _terminal_mirror_only_tasks(conn)
     if not subscribed:
         return []
     roots: list[str] = []

@@ -280,11 +280,21 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
     assert cmd[i + 1] == "high"
 
 
-def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
+def test_spawn_always_passes_a_reasoning_level(monkeypatch, tmp_path, conn):
+    """A card with no operator pin still spawns with an explicit level.
+
+    This used to assert the opposite (``--reasoning`` omitted, so the worker
+    inherited ``agent.reasoning_effort`` from its profile). t_f2dd1fb5 removed
+    that inheritance: depth is a property of the CARD, so the dispatcher passes
+    the card default whenever nobody pinned one.
+    """
     tid = kb.create_task(conn, title="t", assignee="elias")
     task = kb.get_task(conn, tid)
+    assert task.reasoning_effort == "high"
+    assert task.reasoning_effort_source == "default"
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    assert "--reasoning" not in cmd
+    i = cmd.index("--reasoning")
+    assert cmd[i + 1] == "high"
 
 
 def test_worker_cli_accepts_the_reasoning_flag():
