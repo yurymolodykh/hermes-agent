@@ -80,13 +80,26 @@ def test_resolver_reads_explicit_config_section():
 
 def test_resolver_treats_junk_as_unset():
     runtime, turns = kb.default_card_limits(
-        {"default_max_runtime_seconds": "nope", "default_max_turns": -4}
+        {"default_max_runtime_seconds": "nope", "default_max_turns": "nope"}
     )
     # Unparseable junk falls back to the schema defaults (fail closed: junk
-    # must not silently strip a card of its budget) ...
+    # must not silently strip a card of its budget).
     assert runtime == 3 * 60 * 60
-    # ... while an explicit non-positive value is an operator opt-out.
-    assert turns is None
+    assert turns == 300
+
+
+def test_resolver_treats_negative_as_junk():
+    """A negative number is a typo, not an opt-out (F2, t_4a7fae37).
+
+    The docstring's "operator opt-out" reading applied to negatives too, so a
+    slipped minus sign silently stripped a card of its budget — fail OPEN,
+    while the acceptance text demands fail CLOSED for junk. Only an explicit
+    ``0`` opts out now.
+    """
+    runtime, turns = kb.default_card_limits(
+        {"default_max_runtime_seconds": -5, "default_max_turns": -5}
+    )
+    assert (runtime, turns) == (3 * 60 * 60, 300)
 
 
 def test_resolver_zero_is_an_explicit_opt_out():
@@ -181,10 +194,30 @@ def test_spawn_env_exports_the_time_budget_arms(board, monkeypatch):
 
 
 def test_spawn_env_omits_time_arms_without_a_cap(board, monkeypatch):
+    """An uncapped card must not inherit a foreign budget clock (F1).
+
+    ``env = dict(os.environ)`` copies the dispatcher's environment, and a
+    dispatcher spawned *inside* a worker carries that worker's
+    ``HERMES_KANBAN_MAX_RUNTIME_SECONDS`` / ``HERMES_KANBAN_RUN_STARTED_AT``.
+    The spawner purges only ``gateway.session_context._VAR_MAP`` keys, so
+    without an explicit pop these arms survive into a card that has NO cap of
+    its own — and the child is armed at step 1 by its PARENT's clock
+    (``time_fraction≈0.95`` → "Stop all work now" → forced close with nothing
+    done).
+
+    The leak is seeded here rather than relied on from the ambient
+    environment, so the test guards the POP itself and stays green whichever
+    way the suite is launched (inside a kanban worker or bare).
+    """
     tid = kb.create_task(board, title="uncapped", assignee="01-orchestrator")
     board.execute("UPDATE tasks SET max_runtime_seconds = NULL WHERE id = ?", (tid,))
     task = kb.claim_task(board, tid)
     assert task is not None
+    assert task.max_runtime_seconds is None
+
+    # A parent worker's budget, 94 % elapsed — exactly what leaks or does not.
+    monkeypatch.setenv("HERMES_KANBAN_MAX_RUNTIME_SECONDS", "10800")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_STARTED_AT", "1000")
 
     captured = {}
 
@@ -204,3 +237,39 @@ def test_spawn_env_omits_time_arms_without_a_cap(board, monkeypatch):
     env = captured["env"]
     assert "HERMES_KANBAN_MAX_RUNTIME_SECONDS" not in env
     assert "HERMES_KANBAN_RUN_STARTED_AT" not in env
+
+
+def test_spawn_env_never_leaks_a_stale_clock_into_a_capped_card(board, monkeypatch):
+    """A capped card gets ITS budget, not the parent's (F1, companion).
+
+    The values are rewritten when a cap exists, so this half was already
+    safe — pinned here so a future "pop after the if" refactor cannot make the
+    parent's start time win over this attempt's.
+    """
+    tid = kb.create_task(
+        board, title="capped", assignee="01-orchestrator", max_runtime_seconds=3600,
+    )
+    task = kb.claim_task(board, tid)
+    assert task is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_MAX_RUNTIME_SECONDS", "10800")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_STARTED_AT", "1000")
+
+    captured = {}
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        raise FileNotFoundError("stop here")
+
+    monkeypatch.setattr(kb.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda *_: None)
+    import tempfile
+
+    ws = tempfile.mkdtemp()
+    with pytest.raises(RuntimeError):
+        kb._default_spawn(task, ws)
+
+    env = captured["env"]
+    assert env["HERMES_KANBAN_MAX_RUNTIME_SECONDS"] == "3600"
+    assert int(env["HERMES_KANBAN_RUN_STARTED_AT"]) > 1000

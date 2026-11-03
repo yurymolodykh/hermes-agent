@@ -14465,9 +14465,12 @@ def default_card_limits(kanban_cfg: Optional[dict] = None) -> tuple[Optional[int
     before this, only an explicit creator argument set a limit, so the same
     board ran 2-8 h / hundreds-of-steps cards next to 3600 s / 150-step ones.
 
-    A creator's explicit value always wins. Absent/None/invalid config values
-    return ``None`` (legacy behaviour: no cap from config), so an install that
-    never sets these keys keeps its previous behaviour bit-for-bit.
+    A creator's explicit value always wins. An absent key takes the schema
+    default, an explicit ``0`` opts the board out of the cap, and anything
+    unparseable — including a negative number, which is a typo rather than an
+    opt-out — falls back to the schema default (fail closed: bad config must
+    never silently strip a card of its budget). An install that sets neither
+    key therefore keeps the historical uncapped behaviour.
     """
     if kanban_cfg is None:
         try:
@@ -14501,9 +14504,13 @@ def default_card_limits(kanban_cfg: Optional[dict] = None) -> tuple[Optional[int
         #   * key absent            -> schema default (fresh installs get the
         #                              board budget without editing config);
         #   * explicit positive int -> that value;
-        #   * explicit 0 / negative -> operator opt-out, no cap from config;
+        #   * explicit 0            -> operator opt-out, no cap from config;
         #   * unparseable junk      -> schema default (fail closed: junk must
         #                              not silently strip a card of its budget).
+        #   * negative int          -> junk, same fail-closed default. A
+        #                              slipped minus sign is a typo, and
+        #                              reading it as an opt-out left the card
+        #                              with no guard at all (t_4a7fae37, F2).
         if key not in kanban_cfg:
             return _opt_positive(_schema.get(key))
         raw = kanban_cfg.get(key)
@@ -14511,7 +14518,7 @@ def default_card_limits(kanban_cfg: Optional[dict] = None) -> tuple[Optional[int
         if parsed is not None:
             return parsed
         try:
-            if int(raw) <= 0:
+            if int(raw) == 0:
                 return None
         except (TypeError, ValueError):
             pass
@@ -15272,6 +15279,18 @@ def _default_spawn(
     # wall-clock cap and the moment THIS attempt started to compute the 80%
     # threshold from its real budget; without them only the step arm can fire.
     # Absent values keep the time arm inert (no cap on the card).
+    # PURGE BEFORE SETTING (t_4a7fae37, F1 of the t_47aedaa9 review). ``env``
+    # is ``dict(os.environ)``, and the purge above only removes
+    # ``gateway.session_context._VAR_MAP`` keys — the two budget arms are not
+    # in that map. A dispatcher that itself runs inside a worker therefore
+    # inherits that worker's cap and start time, and the ``if`` below only
+    # OVERWRITES them when the child card has a cap of its own: a card with
+    # ``max_runtime_seconds = NULL`` kept the parent's clock and was armed at
+    # step 1 (``time_fraction≈0.95`` → "Stop all work now" → forced close with
+    # no work done). Purging first makes the arms strictly card-scoped, the
+    # same invariant the card identity already has.
+    env.pop("HERMES_KANBAN_MAX_RUNTIME_SECONDS", None)
+    env.pop("HERMES_KANBAN_RUN_STARTED_AT", None)
     if task.max_runtime_seconds:
         env["HERMES_KANBAN_MAX_RUNTIME_SECONDS"] = str(int(task.max_runtime_seconds))
         env["HERMES_KANBAN_RUN_STARTED_AT"] = str(int(time.time()))
