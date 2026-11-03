@@ -917,6 +917,28 @@ def _spawn_detached(script_path: Path | None = None) -> int:
 
     # Inherit PATH etc. from the current env, overlay our required vars.
     env = {**os.environ, **env_overlay}
+    # PURGE INHERITED KANBAN SESSION BUDGET (t_ff216dbf). A gateway process is
+    # frequently started from an agent shell that is itself a kanban worker
+    # (`hermes gateway restart`). `env_overlay` pins identity/home but carries
+    # neither soft-finish budget arm, so `{**os.environ}` would hand the fresh
+    # gateway the WORKER's cap and start time as its own environment. The
+    # dispatcher then builds each child env from `dict(os.environ)`, so a card
+    # with `max_runtime_seconds = NULL` would be spawned already past the 80%
+    # threshold, get "Stop all work now" at step 1 and be force-closed without
+    # doing any work — the F1 defect (t_4a7fae37) re-created one layer above
+    # the code fix. The gateway is never a worker: drop the whole session
+    # envelope, keeping only the board/home pin that dispatch legitimately
+    # inherits.
+    for _stale_key in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_MAX_RUNTIME_SECONDS",
+        "HERMES_KANBAN_RUN_STARTED_AT",
+    ):
+        env.pop(_stale_key, None)
+
     primary_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}
 
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't

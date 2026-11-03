@@ -353,6 +353,55 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Inherited kanban budget arms must not reach a freshly spawned gateway.
+#
+# t_ff216dbf. ``_spawn_detached`` builds the child env as
+# ``{**os.environ, **env_overlay}`` and ``env_overlay`` carries neither
+# ``HERMES_KANBAN_MAX_RUNTIME_SECONDS`` nor ``HERMES_KANBAN_RUN_STARTED_AT``.
+# So when an agent starts a new gateway process from inside a kanban worker,
+# the fresh gateway adopts that worker's cap and start time as its OWN
+# os.environ. The dispatcher then builds every child env from
+# ``dict(os.environ)``, so a card with ``max_runtime_seconds = NULL`` would be
+# spawned with a foreign clock, armed at step 1 and force-closed with no work
+# done — the F1 defect (t_4a7fae37) re-created one layer above the code fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.windows_only
+def test_spawn_detached_purges_inherited_kanban_budget_arms(monkeypatch, tmp_path):
+    """A gateway process spawned from a kanban worker must not inherit its budget."""
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    captured = {}
+
+    def fake_popen(call_argv, **kwargs):
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (argv, str(tmp_path), {"HERMES_GATEWAY_DETACHED": "1"}),
+    )
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", fake_popen)
+    # The worker session this launch happens inside of.
+    monkeypatch.setenv("HERMES_KANBAN_MAX_RUNTIME_SECONDS", "10800")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_STARTED_AT", "1793681473")
+
+    gateway_windows._spawn_detached()
+
+    env = captured["env"]
+    assert "HERMES_KANBAN_MAX_RUNTIME_SECONDS" not in env, (
+        "inherited runtime cap leaked into the new gateway env"
+    )
+    assert "HERMES_KANBAN_RUN_STARTED_AT" not in env, (
+        "inherited run start-time leaked into the new gateway env"
+    )
+    # The launcher's own pin must survive the purge.
+    assert env["HERMES_GATEWAY_DETACHED"] == "1"
+
+
+# ---------------------------------------------------------------------------
 # stop() drain semantics — issue #33778
 #
 # Background: on Windows, asyncio.add_signal_handler raises NotImplementedError,
