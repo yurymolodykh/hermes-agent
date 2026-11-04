@@ -790,6 +790,96 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
 
 
+# ---------------------------------------------------------------------------
+# Completion-prose artifact discovery (t_24120021)
+# ---------------------------------------------------------------------------
+
+
+def _scratch_task_with_files(conn, tmp_path, names):
+    t = kb.create_task(conn, title="review")
+    task = kb.get_task(conn, t)
+    ws = kb.resolve_workspace(task)
+    kb.set_workspace_path(conn, t, ws)
+    files = []
+    for name in names:
+        p = ws / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("output", encoding="utf-8")
+        files.append(p)
+    return t, ws, files
+
+
+def test_prose_artifact_discovery_accepts_forward_slashes(kanban_home):
+    """A Windows worker that names its scratch files with ``/`` keeps them.
+
+    t_24120021: the soft-finish close of t_f1581cbb listed six files in the
+    summary using the documented forward-slash notation; the literal
+    workspace-prefix match found none, ``artifacts`` stayed empty, and
+    ``_cleanup_workspace`` deleted ``VERDICT_t_f1581cbb.md`` with the rest.
+    """
+    with kb.connect() as conn:
+        t, ws, files = _scratch_task_with_files(conn, None, ["VERDICT_x.md"])
+        prose = "Файлы, созданные в этом прогоне:\n- " + str(files[0]).replace("\\", "/")
+
+        assert kb.complete_task(conn, t, summary=prose)
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        payload = completed.payload.get("artifacts") or []
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert len(payload) == 1
+    preserved = Path(payload[0])
+    assert preserved.read_text(encoding="utf-8") == "output"
+    assert preserved.parent == kb.task_attachments_dir(t)
+
+
+def test_prose_artifact_discovery_dedupes_two_spellings(kanban_home):
+    """``C:/a/b`` and ``C:\\a\\b`` in one summary are one artifact, not two."""
+    with kb.connect() as conn:
+        t, _ws, files = _scratch_task_with_files(conn, None, ["report.md"])
+        prose = (
+            f"Отчёт: {files[0]}\n"
+            f"Копия того же пути: {str(files[0]).replace(chr(92), '/')}\n"
+        )
+
+        assert kb.complete_task(conn, t, summary=prose)
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        payload = completed.payload.get("artifacts") or []
+        attachments = kb.list_attachments(conn, t)
+
+    assert len(payload) == 1, payload
+    assert [a.filename for a in attachments] == ["report.md"]
+
+
+def test_prose_artifact_discovery_handles_spaces_in_filenames(kanban_home):
+    """A bullet line is read whole, so ``rv defects.py`` is not truncated."""
+    with kb.connect() as conn:
+        t, _ws, files = _scratch_task_with_files(conn, None, ["rv defects.py"])
+        prose = "Файлы:\n- " + str(files[0])
+
+        assert kb.complete_task(conn, t, summary=prose)
+
+        attachments = kb.list_attachments(conn, t)
+
+    assert [a.filename for a in attachments] == ["rv defects.py"]
+
+
+def test_prose_artifact_discovery_ignores_paths_outside_workspace(kanban_home, tmp_path):
+    """Only files inside the managed scratch workspace are promoted."""
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("not a deliverable", encoding="utf-8")
+    with kb.connect() as conn:
+        t, _ws, files = _scratch_task_with_files(conn, None, ["inside.md"])
+        prose = f"- {files[0]}\n- {outside}\n"
+
+        assert kb.complete_task(conn, t, summary=prose)
+
+        attachments = kb.list_attachments(conn, t)
+
+    assert [a.filename for a in attachments] == ["inside.md"]
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
@@ -1314,6 +1404,190 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Migrator totality on boards that predate task_runs / task_events (t_5c74d00b)
+#
+# `connect()` runs SCHEMA_SQL before the additive pass, so the tables always
+# exist there and the missing-table hole was invisible. The pass is also called
+# directly (`init_db` re-migration, repair tooling, tests) on hand-built legacy
+# files, and there `PRAGMA table_info` on an absent table returns zero rows
+# instead of raising — so every column read as missing and the following
+# `ALTER TABLE ... ADD COLUMN` died with `no such table: task_runs`, taking the
+# whole migration (and `connect()`) down with it.
+# ---------------------------------------------------------------------------
+
+
+def _build_pre_run_model_board(conn, *, with_claim_columns: bool) -> None:
+    """Create a legacy kanban schema that has no ``task_runs`` table.
+
+    ``with_claim_columns`` selects the realistic pre-run-model shape (v1 task
+    table carrying the claim/worker columns the in-flight backfill imports)
+    versus the pared-down shape the older migration tests use.
+    """
+    claim_columns = (
+        " assignee TEXT, started_at INTEGER, claim_lock TEXT,"
+        " claim_expires INTEGER, worker_pid INTEGER,"
+        " max_runtime_seconds INTEGER, last_heartbeat_at INTEGER,"
+    )
+    if not with_claim_columns:
+        claim_columns = ""
+    conn.execute(
+        "CREATE TABLE tasks ("
+        " id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT,"
+        f"{claim_columns}"
+        " status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,"
+        " created_by TEXT, created_at INTEGER NOT NULL, completed_at INTEGER,"
+        " workspace_kind TEXT NOT NULL DEFAULT 'scratch', workspace_path TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,"
+        " kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'pre-run-model card', 'ready', 1)"
+    )
+    conn.commit()
+
+
+def test_migrator_creates_task_runs_when_board_predates_it():
+    """`no such table: task_runs` must be impossible (t_5c74d00b).
+
+    Pins the exact crash from the card: the pass is handed a board with only
+    ``tasks`` + ``task_events`` and must create ``task_runs`` (with
+    ``worker_session_id``) instead of raising, and must do it idempotently.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _build_pre_run_model_board(conn, with_claim_columns=False)
+
+    before = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone()
+    assert before is None, "fixture must not contain task_runs"
+
+    kb._migrate_add_optional_columns(conn)  # was: OperationalError
+
+    tables = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "task_runs" in tables, "migration must materialize task_runs"
+    run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert "worker_session_id" in run_cols
+    ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
+    assert "run_id" in ev_cols
+
+    indexes = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    for expected in ("idx_runs_task", "idx_runs_status", "idx_events_run"):
+        assert expected in indexes, f"bootstrap must create {expected}"
+
+    # Second pass is a no-op, not a duplicate CREATE / duplicate column crash.
+    kb._migrate_add_optional_columns(conn)
+    conn.close()
+
+
+def test_migrator_survives_board_without_task_events_either():
+    """A board missing BOTH additive-target tables must still migrate."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks ("
+        " id TEXT PRIMARY KEY, title TEXT NOT NULL,"
+        " status TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1','ancient','ready',1)"
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+
+    tables = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"task_runs", "task_events"} <= tables
+    conn.close()
+
+
+def test_migrator_backfill_still_imports_claim_state_when_columns_exist():
+    """Skipping the backfill must be conditioned on missing columns ONLY.
+
+    The guard added for t_5c74d00b must not quietly disable the real
+    pre-run-model backfill: a board that does carry the v1 claim columns still
+    gets exactly one synthesized run, adopted as ``current_run_id``, and a
+    second migration must not duplicate it.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _build_pre_run_model_board(conn, with_claim_columns=True)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, started_at,"
+        " assignee, claim_lock) VALUES ('running-card','was running','running',"
+        " 1, 1, 'worker', 'lock-legacy')"
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+
+    runs = conn.execute(
+        "SELECT id, profile, status FROM task_runs WHERE task_id = 'running-card'"
+    ).fetchall()
+    assert len(runs) == 1, f"expected exactly 1 backfilled run, got {len(runs)}"
+    assert runs[0]["status"] == "running"
+    assert runs[0]["profile"] == "worker"
+    pointer = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = 'running-card'"
+    ).fetchone()["current_run_id"]
+    assert pointer == runs[0]["id"]
+
+    kb._migrate_add_optional_columns(conn)
+    again = conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = 'running-card'"
+    ).fetchone()[0]
+    assert again == 1, f"re-migration duplicated the backfilled run ({again})"
+    conn.close()
+
+
+def test_init_db_upgrades_on_disk_board_without_task_runs(tmp_path):
+    """End-to-end AC3: a real legacy file opens through the public API.
+
+    Builds the pre-run-model board on disk, drives ``init_db`` (the path that
+    re-runs the additive pass WITHOUT SCHEMA_SQL going first), and reads the
+    cards back through ``get_task``/``list_runs``.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy_kanban.db"
+    raw = sqlite3.connect(str(db_path))
+    _build_pre_run_model_board(raw, with_claim_columns=True)
+    raw.execute(
+        "INSERT INTO tasks (id, title, status, created_at, started_at,"
+        " assignee, claim_lock) VALUES ('running-card','was running','running',"
+        " 1, 1, 'worker', 'lock-legacy')"
+    )
+    raw.commit()
+    raw.close()
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, "legacy").status == "ready"
+        running = kb.get_task(conn, "running-card")
+        assert running.status == "running"
+        runs = kb.list_runs(conn, "running-card")
+        assert len(runs) == 1
+        assert running.current_run_id == runs[0].id
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1514,6 +1514,9 @@ class Task:
     # delivery subject for terminal/branch-summary routing. Default False
     # for ordinary user-created cards. See the column comment in SCHEMA_SQL.
     do_not_deliver: bool = False
+    # How the close was EARNED (t_84101fb7). NULL on legacy rows and on any
+    # close that did not run a worker (direct CLI / ready / blocked / review).
+    close_verdict: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1635,6 +1638,11 @@ class Task:
                 bool(row["do_not_deliver"])
                 if "do_not_deliver" in keys and row["do_not_deliver"] is not None
                 else False
+            ),
+            close_verdict=(
+                row["close_verdict"]
+                if "close_verdict" in keys and row["close_verdict"]
+                else None
             ),
         )
 
@@ -1876,7 +1884,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- summary delivery (Telegram mirrors, notifier wakes) must skip it, and
     -- it never inherits a subscription's routing. 0 (the default) = normal
     -- card, delivery as usual. Do NOT set on ordinary user-created cards.
-    do_not_deliver       INTEGER NOT NULL DEFAULT 0
+    do_not_deliver       INTEGER NOT NULL DEFAULT 0,
+    -- How the close was EARNED (t_84101fb7). A forced budget close and a
+    -- worker-reported completion are both ``done`` — which meant the board
+    -- could not tell «the run was cut short» from «the task was verified
+    -- done», and 8 of 139 done cards (5.8 %) were forced closes hiding in
+    -- the same bucket. Values:
+    --   'verified'   — a worker closed the card through kanban_complete;
+    --   'partial'    — forced close, but the run committed verdict items to
+    --                  the board before the budget ran out;
+    --   'unverified' — forced close with narration only: no verdict at all.
+    -- NULL = legacy row, or a close that never ran a worker (direct CLI /
+    -- ready / blocked / review approval). Written ONLY by complete_task.
+    close_verdict        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3048,6 +3068,70 @@ def init_db(
     return path
 
 
+def _schema_statements_for(table: str) -> list[str]:
+    """Canonical ``CREATE TABLE``/``CREATE INDEX`` texts for *table* in SCHEMA_SQL.
+
+    The additive migration pass below needs to materialize tables that a
+    sufficiently old board may not have yet. Hard-coding a second copy of the
+    DDL invites exactly the drift ``_rebuild_drifted_tables`` guards against,
+    so the statements are lifted verbatim out of :data:`SCHEMA_SQL` instead.
+    Both object kinds are idempotent (``IF NOT EXISTS``), which is what makes
+    the extraction safe to execute on a board that already has the table.
+    """
+    table_ref = re.escape(table)
+    statements: list[str] = []
+    create_table = re.compile(
+        r"CREATE TABLE IF NOT EXISTS\s+" + table_ref + r"\s*\(.*?\);",
+        re.DOTALL,
+    )
+    match = create_table.search(SCHEMA_SQL)
+    if match is None:
+        raise KeyError(f"SCHEMA_SQL has no CREATE TABLE for {table!r}")
+    statements.append(match.group(0))
+    index_pattern = re.compile(
+        r"CREATE INDEX IF NOT EXISTS\s+\w+\s+ON\s+" + table_ref + r"\s*\([^;]*\);"
+    )
+    statements.extend(m.group(0) for m in index_pattern.finditer(SCHEMA_SQL))
+    return statements
+
+
+def _ensure_additive_target_tables(conn: sqlite3.Connection) -> None:
+    """Create tables the additive pass ALTERs when the board predates them.
+
+    ``PRAGMA table_info`` on a missing table returns zero rows instead of
+    raising, so every "is the column there?" check below reads as "no" and the
+    following ``ALTER TABLE ... ADD COLUMN`` dies with ``no such table:
+    task_runs`` — killing the whole migration pass and, with it, ``connect()``
+    on any board old enough to predate the run model (t_5c74d00b).
+
+    ``connect()`` hides this today because it runs :data:`SCHEMA_SQL` before
+    the pass, so the tables always exist there. The migrator is also called
+    directly (``init_db`` re-migration, tests, repair tooling on a hand-built
+    legacy file), and it must be total on its own: either the column is there
+    or it is added. Creating the two tables up front makes the rest of the
+    pass unconditional, which is why the tables are named here rather than
+    guarded at each of the seven call sites that would otherwise need it.
+
+    ``tasks`` is deliberately NOT created: it is the board's sentinel table
+    (:func:`_schema_is_present`), and inventing one would silently hand back
+    an empty board instead of failing loudly.
+    """
+    for table in ("task_events", "task_runs"):
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone() is not None
+        if exists:
+            continue
+        _log.warning(
+            "kanban migration: board has no %s table (pre-run-model schema); "
+            "creating it before the additive column pass",
+            table,
+        )
+        for statement in _schema_statements_for(table):
+            conn.execute(statement)
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -3275,6 +3359,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # ``task_runs.worker_session_id`` is written only by the dispatcher-owned
     # worker bootstrap. Legacy runs stay NULL and therefore cannot authorize
     # a worker mutation through the public tool surface.
+    #
+    # Both tables below are ALTERed (and indexed) rather than only read, so a
+    # board that predates them must have them materialized first — otherwise
+    # the pass dies with ``no such table: task_runs`` (t_5c74d00b).
+    _ensure_additive_target_tables(conn)
     run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
     if "worker_session_id" not in run_cols:
         _add_column_if_missing(
@@ -3358,10 +3447,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
+    #
+    # The SELECT below reads claim state off ``tasks``. A board ancient enough
+    # to predate the run model normally has those columns (they are v1), but a
+    # pared-down/partially-built legacy file need not — and then there is no
+    # claim state to synthesize, only a ``no such column: assignee`` crash to
+    # swallow the whole migration with (t_5c74d00b). Skip with a log instead of
+    # inventing columns this pass does not own.
+    _backfill_source_cols = (
+        "assignee", "claim_lock", "claim_expires", "worker_pid",
+        "max_runtime_seconds", "last_heartbeat_at", "started_at",
+        "current_run_id",
+    )
+    task_cols_now = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    missing_backfill_cols = [
+        name for name in _backfill_source_cols if name not in task_cols_now
+    ]
     runs_exist = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
-    if runs_exist:
+    if runs_exist and missing_backfill_cols:
+        _log.warning(
+            "kanban migration: skipping in-flight run backfill — tasks lacks "
+            "%s, so no pre-run-model claim state can exist to import",
+            ", ".join(missing_backfill_cols),
+        )
+    if runs_exist and not missing_backfill_cols:
+        # The additive pass above issues DML (the legacy counter copies, the
+        # notify delivery_mode backfill). pysqlite's legacy isolation mode
+        # leaves that in an implicit transaction, and ``write_txn`` refuses to
+        # nest by design. Commit the already-applied idempotent statements so
+        # the backfill starts from a real transaction boundary instead of
+        # dying with ``RuntimeError: write_txn: already inside a transaction``
+        # (surfaced as the second half of t_5c74d00b once the missing-table
+        # crash stopped masking it).
+        if conn.in_transaction:
+            conn.commit()
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -7094,6 +7215,55 @@ def complete_task(
 # ---------------------------------------------------------------------------
 
 
+def _workspace_prefix_pattern(workspace: str) -> str:
+    """Regex for a workspace prefix that tolerates either path separator.
+
+    ``re.escape(str(workspace))`` used to be compared literally, which meant a
+    Windows worker that wrote the (documented, POSIX-looking) forward-slash
+    form of its own scratch path was never matched: the completion prose
+    discovered nothing, ``artifacts`` stayed empty, and the subsequent
+    ``_cleanup_workspace`` rmtree'd the run's output (t_24120021 —
+    ``VERDICT_t_f1581cbb.md`` died exactly this way after a soft-finish close).
+    Path separators are interchangeable on Windows, so the pattern has to be
+    too.
+    """
+    parts = [re.escape(part) for part in re.split(r"[\\/]+", str(workspace)) if part]
+    return r"[/\\]+".join(parts)
+
+
+# Windows paths are case-insensitive; a worker that echoes ``c:/users/...``
+# must still match the stored ``C:\Users\...`` workspace path.
+_CASE_INSENSITIVE_PATHS = os.name == "nt"
+
+
+def _iter_prose_path_candidates(text: str, workspace: Path) -> Iterator[str]:
+    """Yield every absolute path under *workspace* named in *text*.
+
+    Two passes, because prose produced by workers has two shapes:
+
+    * the token scan catches a path embedded in a sentence (no spaces);
+    * the line scan catches the bullet list both producers emit
+      (``- C:/.../VERDICT_x.md``) and — unlike the token scan — tolerates
+      spaces in file names.
+
+    Callers validate each candidate with ``is_file()``, so an over-eager
+    match costs nothing.
+    """
+    pattern = _workspace_prefix_pattern(str(workspace))
+    flags = re.IGNORECASE if _CASE_INSENSITIVE_PATHS else 0
+    trailing = ".,;:!?)]}`\"'…"
+
+    for match in re.finditer(pattern + r"(?:[/\\][^\s`\"'<>]+)", text, flags):
+        yield match.group(0).rstrip(trailing)
+
+    bullet_prefix = re.compile(pattern + r"[/\\]", flags)
+    for line in text.splitlines():
+        stripped = re.sub(r"^[-*•]\s*", "", line.strip()).strip("`").strip()
+        if not stripped or not bullet_prefix.match(stripped):
+            continue
+        yield stripped.rstrip(trailing)
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7120,13 +7290,23 @@ def _merge_completion_prose_artifacts(
     text = "\n".join(part for part in (summary, result) if part)
     if not text:
         return metadata
-    prefix = re.escape(str(workspace))
     discovered: list[str] = []
-    for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
-        raw = match.group(0).rstrip(".,;:!?)]}")
+    seen_keys: set[str] = set()
+    for raw in _iter_prose_path_candidates(text, workspace):
         candidate = Path(raw)
-        if candidate.is_file():
-            discovered.append(str(candidate))
+        try:
+            if not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        # Two spellings of the same file (``C:/a/b`` vs ``C:\a\b``) must not
+        # become two artifact entries — the copy step would duplicate the file
+        # and the delivery layer would upload it twice.
+        key = os.path.normcase(os.path.abspath(str(candidate)))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        discovered.append(os.path.normpath(str(candidate)))
     if not discovered:
         return metadata
     updated = dict(metadata) if isinstance(metadata, dict) else {}
@@ -15279,6 +15459,7 @@ def _default_spawn(
     # wall-clock cap and the moment THIS attempt started to compute the 80%
     # threshold from its real budget; without them only the step arm can fire.
     # Absent values keep the time arm inert (no cap on the card).
+    #
     # PURGE BEFORE SETTING (t_4a7fae37, F1 of the t_47aedaa9 review). ``env``
     # is ``dict(os.environ)``, and the purge above only removes
     # ``gateway.session_context._VAR_MAP`` keys — the two budget arms are not
@@ -17385,17 +17566,201 @@ def clear_branch_summary(conn: sqlite3.Connection, root_id: str) -> int:
     return int(cur.rowcount or 0)
 
 
+def has_reviewer_descendant(
+    conn: sqlite3.Connection, root_id: str,
+) -> bool:
+    """True when the branch of ``root_id`` carries an independent-review card.
+
+    A REVIEW card is any descendant whose ``assignee`` is one of the profiles
+    that own the independent review gate (``REVIEWER_PROFILES``: 09 / 15 —
+    the same list that pins review effort, ``_reviewer_assignees``).  Used by
+    the delivery gate to tell «миссия закрыта ПОСЛЕ ревью» from «миссия
+    закрыта без ревью» (the owner rule of 03.11.2026: the итог reaches the
+    chat only after an independent review closed successfully).  A branch
+    with no reviewer descendant is a legitimate review-less итог and must
+    never be silenced by that rule.
+    """
+    reviewers = _reviewer_assignees()
+    if not reviewers:
+        return False
+    ids = get_descendant_ids(conn, root_id)
+    if not ids:
+        return False
+    ordered = sorted(ids)
+    placeholders = ", ".join("?" * len(ordered))
+    rows = conn.execute(
+        "SELECT assignee FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ordered,
+    ).fetchall()
+    for row in rows:
+        if str(row["assignee"] or "").strip() in reviewers:
+            return True
+    return False
+
+
+def summary_has_passed_review(
+    conn: sqlite3.Connection, root_id: str, outcome: str,
+) -> bool:
+    """SINGLE source of truth: may this branch итог reach the channel?
+
+    Rule (owner decision, 03.11.2026, mission «могилы» / «СНО»): an итоговый
+    отчёт is delivered ONLY when the приёмка/ревью of the mission finished
+    POSITIVELY.  Formally, for a branch that is already terminal
+    (``branch_state(root) is not None``):
+
+      * ``outcome != "success"`` → True — a failure/refusal verdict is itself
+        the вердикт and MUST be visible.  It is delivered, but as
+        «❌ Задача не выполнена / доработка отклонена» (``branch_summary_message``
+        failure branch), never as «✅ Задача выполнена».
+      * ``outcome == "success"`` and the branch has NO reviewer descendant
+        (``has_reviewer_descendant`` is False) → True — a mission that was never
+        put through independent review (incl. a childless isolated root) is a
+        legitimate итог; silencing it would leave the owner without any report.
+      * ``outcome == "success"`` and the branch HAS a reviewer descendant →
+        True only when every reviewer card of the branch is closed with a
+        terminal-success status (``BRANCH_TERMINAL_SUCCESS``).  A reviewer card
+        parked in ``blocked``/``gave_up`` already makes the branch outcome
+        ``failure`` (see ``branch_state``), so a ``success`` branch with an
+        unfinished reviewer can only mean corrupted state — fail closed.
+
+    Review configuration coverage (both shapes of review in this board):
+
+      (а) review as a STATUS of the card itself (``request_review`` → status
+          ``review``): covered one level up — such a card is
+          ``SA_BRANCH_NODE_OPEN``, so ``branch_state`` returns None and
+          ``_plan_branch_summary`` never plans an итог;
+      (б) review as a SEPARATE reviewer CHILD card: covered here — the child is
+          in ``get_descendant_ids`` and is matched by ``assignee``;
+      (в) no review at all: passes (не глушим законный итог).
+
+    Deliberately derived from statuses, not from a machine-readable verdict
+    field: the schema has no ``review_verdict`` column and the reviewer's
+    ``completed`` rows carry no ``conclusion`` (all NULL); the verdict lives as
+    free text in ``task_comments``.  See design/REVIEW-DELIVERY-RULE.md (the
+    canonisation card t_ff1867f5) for the decided schema if one is ever added
+    (a ``review_verdict`` event kind emitted by ``request_changes`` /
+    ``kanban_complete``), and why statuses suffice today.
+    """
+    if str(outcome or "").strip() != "success":
+        # A failure verdict is the вердикт — always visible.
+        return True
+    reviewers = _reviewer_assignees()
+    if not reviewers:
+        return True
+    ids = get_descendant_ids(conn, root_id)
+    if not ids:
+        return True
+    ordered = sorted(ids)
+    placeholders = ", ".join("?" * len(ordered))
+    rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ordered,
+    ).fetchall()
+    for row in rows:
+        if str(row["assignee"] or "").strip() not in reviewers:
+            continue
+        if str(row["status"] or "").strip() not in BRANCH_TERMINAL_SUCCESS:
+            # Reviewer card not closed positively → no итог yet (fail closed).
+            return False
+    # No reviewer descendant: a review-less mission is a legitimate итог.
+    return True
+
+
+def acceptance_refusal_ids(
+    conn: sqlite3.Connection, root_id: str, failed: Iterable[tuple[str, str]],
+) -> list[str]:
+    """Failed nodes of a branch that are an ACCEPTANCE (review) refusal.
+
+    ``branch_state`` classifies a node as failed from its STATUS only; it cannot
+    tell «этап упал» from «приёмка не приняла работу».  The owner-rule of
+    03.11.2026 requires that second case to reach the chat as a VERDICT
+    («доработка отклонена»), not as the generic «задача не выполнена» failure
+    summary — but it must never be silenced (the refusal IS the terminal итог).
+
+    A failed node is a refusal when its ``assignee`` is one of the independent
+    review profiles (``REVIEWER_PROFILES``: 09 / 15) — the same list
+    ``has_reviewer_descendant`` / ``summary_has_passed_review`` use, so no
+    second status vocabulary appears here either.  Order follows ``failed`` so
+    the compiled message stays deterministic.
+    """
+    reviewers = _reviewer_assignees()
+    if not reviewers:
+        return []
+    # Only nodes that really belong to THIS branch may turn the wording into an
+    # acceptance verdict: a failure reported for a foreign card (shared
+    # descendant of another root) must not relabel this mission's summary.
+    # The branch is root-or-self PLUS its transitive descendants; the root
+    # itself is included so a root-level refusal still counts.  ``root_id`` is
+    # required for the scoping to be provable — with no root_id there is no
+    # branch to check against, so the wording stays generic (empty list).
+    if not root_id:
+        return []
+    in_branch = {root_id} | get_descendant_ids(conn, root_id)
+    ordered: list[str] = []
+    for item in failed or ():
+        tid = str(item[0] if isinstance(item, (list, tuple)) else item)
+        if not tid or tid in ordered:
+            continue
+        if tid not in in_branch:
+            continue
+        ordered.append(tid)
+    if not ordered:
+        return []
+    placeholders = ", ".join("?" * len(ordered))
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        ordered,
+    ).fetchall()
+    refused = {
+        str(row["id"])
+        for row in rows
+        if str(row["assignee"] or "").strip() in reviewers
+    }
+    return [tid for tid in ordered if tid in refused]
+
+
 def branch_summary_message(
     outcome: str, failed: Iterable[tuple[str, str]],
+    *, refused_ids: Optional[Iterable[str]] = None,
 ) -> str:
     """Compile the SHORT channel message for a terminal branch.
 
-    Success: ``✅ Задача выполнена``. Failure: ``❌ Задача не выполнена
-    (нужен фикс): <id:title>[, <id2:title2>…]`` — capped at 3 failing nodes
-    with an ``(+N ещё)`` tail so the message stays one line.
+    Success: ``✅ Задача выполнена``.
+
+    Failure splits by CAUSE (owner-rule 03.11.2026, card t_f6790ef5) — both
+    forms are delivered, neither is silenced, only the wording differs:
+
+    * ``refused_ids`` non-empty (an acceptance/review card rejected the work):
+      ``❌ Доработка отклонена — приёмка не приняла результат: <id:title>[, …]``
+      — the verdict of a finished review, not «the mission crashed».
+    * otherwise: ``❌ Задача не выполнена (нужен фикс): <id:title>[, …]``.
+
+    Both lists are capped at 3 nodes with an ``(+N ещё)`` tail so the message
+    stays one line.  ``refused_ids`` comes from :func:`acceptance_refusal_ids`
+    (a pure status read); when it is omitted the generic wording is kept, so
+    every pre-existing caller behaves exactly as before.
     """
     if outcome != "failure":
         return "✅ Задача выполнена"
+    refused = {str(x) for x in (refused_ids or ())}
+    if refused:
+        rejected = [(tid, title) for tid, title in failed if str(tid) in refused]
+        others = [(tid, title) for tid, title in failed if str(tid) not in refused]
+        if rejected:
+            refs = [f"{task_id}:{title[:80]}" for task_id, title in rejected]
+            shown = refs[:3]
+            # Tail counts EVERY failing node that is not shown — the refused
+            # ones beyond the cap AND the non-refusal failures, so «(+N ещё)»
+            # never under-reports what still needs a fix.
+            extra = (len(rejected) + len(others)) - len(shown)
+            tail = f" (+{extra} ещё)" if extra > 0 else ""
+            return (
+                "❌ Доработка отклонена — приёмка не приняла результат: "
+                + ", ".join(shown) + tail
+            )
     parts = [f"{task_id}:{title[:80]}" for task_id, title in failed]
     shown = parts[:3]
     tail = f" (+{len(parts) - 3} ещё)" if len(parts) > 3 else ""

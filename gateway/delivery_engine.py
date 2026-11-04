@@ -1504,6 +1504,7 @@ class DeliveryEngine:
         mission_live: bool = False,
         has_open_descendants: bool = False,
         has_subscribed_descendant: bool = False,
+        review_passed: bool = True,
         replace_summary: bool = False,
         task_tg_owner: str = "",
         do_not_deliver: bool = False,
@@ -1561,6 +1562,30 @@ class DeliveryEngine:
         # (root_closing RF2) without re-opening the per-child mirror spam the
         # P2 rule was added to close: per-child still stays silent because a
         # subscribing child is by definition a subscribed descendant.
+        #
+        # FIX (t_b7b4995c, native-TG root wake): the previous expression
+        # short-circuited to True for EVERY non-api_server platform, so a
+        # root's own ``completed`` was classified [final] on the notifier lane
+        # even when the branch carried other subscribed channels.  For the
+        # primary mission shape that is premature: ``complete_task`` gates a
+        # child behind its parents, so a root with children ALWAYS closes FIRST
+        # and its children close afterwards; its per-event close is by
+        # construction an INTERMEDIATE step of a branch that is still open.
+        # On 45dbaf3e3a this spent a creator wake per mission that the real
+        # branch итог then repeated — the owner contract is ONE wake per branch
+        # итог (t_8788288c / t_0a121f42 «wake только на терминальные итоги
+        # ветки»), stated by the replaced pre-R1 predicate as «the SAME routine
+        # kinds even for ROOT tasks — under replace mode the root's own
+        # completion ping is not the итог: the branch_summary stage owns the
+        # single channel message and its wake».
+        #
+        # The TEXT ping keeps the original classification on purpose: replace
+        # mode silences DESCENDANT pings, never the subscribed ROOT's own ping
+        # (tests/gateway/test_kanban_branch_summary_watcher.py
+        # ::test_replace_mode_suppresses_descendant_notifier_pings pins that the
+        # root close reaches its channel).  The wake is gated separately below
+        # via ``branch_summary_owns_wake``, which is the actual subject of this
+        # card.
         branch_terminal = (
             bool(task_is_root)
             and not bool(mission_live)
@@ -1579,6 +1604,42 @@ class DeliveryEngine:
                 platform_str != "api_server"
                 or not bool(has_subscribed_descendant)
             )
+            # F10 (chamber-graves-ex / sno-economics, 03.11): «завершено» корня,
+            # у которого ещё открыты собственные дети, — закрытие ЭТАПА, а не
+            # итог миссии.  Правило выше освобождает native-TG от проверки
+            # открытых детей, и это верно: у нативной TG-подписки один канал и
+            # нет отдельной ветки-итога, поэтому закрытие корня обязано быть
+            # видно (иначе владелец не узнает о факте закрытия вообще).
+            # Для OWUI (api_server) так нельзя: приёмка/ревью — дочерние
+            # карточки той же миссии, и владелец получал «Итоговый отчёт»
+            # до её прохождения (ровно инцидент 03.11: S4 «отчёт собран» ушёл
+            # в чат, пока S5-приёмка была running).  Итог отдаётся только
+            # после закрытия всей ветки — это делает ветка-итог.
+            and (
+                platform_str != "api_server"
+                or not bool(has_open_descendants)
+            )
+            # ОВНЕР-ПРАВИЛО (03.11.2026): итог «выполнено» проходит только
+            # если ревью ветки завершилось ПОЛОЖИТЕЛЬНО. Единственная точка
+            # правды — kb.summary_has_passed_review: watcher считает её в
+            # _collect и передаёт сюда как ``review_passed`` (t_f6790ef5; до
+            # этой карточки параметр не передавался никем и гейт был мёртвым).
+            # Приёмка отказом даёт branch_state(outcome="failure") →
+            # доставляется как вердикт «❌ Доработка отклонена», а не как итог;
+            # здесь глушится только «успех без положительного ревью».
+            and bool(review_passed)
+        )
+        #: The single creator WAKE of a branch belongs to the branch-summary
+        #: итог whenever the branch's root did not close last or the branch has
+        #: another subscribed channel.  A per-event [final] there is either
+        #: premature (branch still open → the итог has not happened yet) or a
+        #: duplicate of the итог wake that lands on the next branch tick; both
+        #: must stay silent, which is exactly the «no wake on intermediate /
+        #: one wake per итог» contract of t_8788288c / t_0a121f42.
+        #: A standalone root (sole subscription, no descendants) is NOT covered
+        #: — it has no итог to wait for, so its own close keeps its wake.
+        branch_summary_owns_wake = bool(task_is_root) and (
+            bool(has_open_descendants) or bool(has_subscribed_descendant)
         )
         tree_ctx = {
             "card_status": getattr(task, "status", None) if task else None,
@@ -1801,6 +1862,17 @@ class DeliveryEngine:
         # ---- wake (rule 1: [final] terminal + rule 4: [needs-decision]) ----
         if wake is not None:
             want_wake = et in (FINAL, NEEDS_DECISION)
+            # FIX (t_b7b4995c): a root's per-event [final] must not spend a
+            # SECOND creator turn when the branch-summary итог owns the single
+            # wake for that tree.  ``branch_summary_owns_wake`` is True when the
+            # branch still had open descendants at this event (the close was
+            # premature — the итог has not happened yet) or when another card of
+            # the branch is subscribed too (the итог lands on the next branch
+            # tick and wakes for the whole tree).  The TEXT ping is unaffected:
+            # it keeps its separately accepted contract above.  [needs-decision]
+            # is never gated — a human-action event is its own wake cause.
+            if et == FINAL and branch_summary_owns_wake:
+                want_wake = False
             if want_wake and not do_not_deliver:
                 # ``delivery_mode='wake'`` on a push adapter: the wake IS the
                 # sole delivery (the text ping was skipped), so a failed wake

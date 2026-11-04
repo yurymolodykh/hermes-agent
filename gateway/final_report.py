@@ -163,7 +163,16 @@ def _compose(conn: Any, root_id: str, board: Optional[str]) -> tuple[str, List[s
     try:
         st = kb.branch_state(conn, root_id)
         if st:
-            msg = kb.branch_summary_message(st["outcome"], st["failed"])
+            # Same verdict wording as the branch-summary watcher: an acceptance
+            # refusal reaches the owner as «доработка отклонена», not as the
+            # generic failure line (owner-rule 03.11.2026, t_f6790ef5).
+            refused_ids = (
+                kb.acceptance_refusal_ids(conn, root_id, st["failed"])
+                if st["outcome"] == "failure" else []
+            )
+            msg = kb.branch_summary_message(
+                st["outcome"], st["failed"], refused_ids=refused_ids,
+            )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("final report: branch state for %s failed: %s", root_id, exc)
 

@@ -112,6 +112,17 @@ def build_gateway_parser(
         action="store_true",
         help="Kill ALL stale gateway processes across all profiles before starting",
     )
+    gateway_start.add_argument(
+        "--install-service",
+        dest="install_service",
+        action="store_true",
+        help=(
+            "If no gateway service is registered, install one (Windows login "
+            "auto-start) and then start it. Without this flag `gateway start` "
+            "never installs persistence; on Windows an unattended start with no "
+            "service registered fails instead of silently creating a login item."
+        ),
+    )
     _add_compat_platform_flag(gateway_start)
 
     # gateway stop

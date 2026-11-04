@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.prompt_builder import KANBAN_GUIDANCE
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -462,6 +463,34 @@ def _build(builder, **overrides):
         patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
     ):
         return builder(agent)
+
+
+class TestKanbanWorkerGuidanceBlock:
+    """The kanban lifecycle block is rendered verbatim for a worker session.
+
+    t_417a182e: run 6008 of t_f1581cbb spent 156/180 steps re-verifying and
+    never issued a verdict. The durable remedy is a rule the worker actually
+    reads, so the block must reach the prompt — a constant nobody renders
+    would change nothing. The block is session-static (agent_init resolves it
+    once from ``kanban_show`` presence) and must stay out of a plain chat
+    session.
+    """
+
+    def test_worker_block_reaches_the_prompt(self):
+        parts = _prompt_parts(_make_agent(_kanban_worker_guidance=KANBAN_GUIDANCE))
+        prompt = "\n".join(parts.values())
+        assert "Deliver the verdict item by item, not at the end." in prompt
+        assert "what was NOT checked" in prompt
+
+    def test_chat_session_sees_no_kanban_block(self):
+        prompt = "\n".join(_prompt_parts(_make_agent(_kanban_worker_guidance="")).values())
+        assert "Deliver the verdict item by item" not in prompt
+
+    def test_block_is_stable_band(self):
+        # Session-static text belongs to the cached prefix; putting it in the
+        # volatile band would break the prompt-cache gain it was hoisted for.
+        parts = _prompt_parts(_make_agent(_kanban_worker_guidance=KANBAN_GUIDANCE))
+        assert "Deliver the verdict item by item" in parts["stable"]
 
 
 class TestSkillsInVolatileBand:

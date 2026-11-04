@@ -340,6 +340,72 @@ async def test_triage_routed_card_wakes(board_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_root_completed_with_open_child_does_not_wake(board_env, monkeypatch):
+    """A ROOT's own ``completed`` is intermediate while its child is still open.
+
+    Native-Telegram counterpart of the api_server P2 rule (t_ecab4990): the
+    branch is NOT closed, so the root's per-event close is not the итог and
+    must not spend a creator wake.  The owner contract is explicit —
+    «wake только на терминальные итоги ветки» (t_8788288c / t_0a121f42): under
+    replace mode the branch_summary stage owns the single wake.
+
+    Before the fix the ``branch_terminal`` gate in
+    ``delivery_engine.handle_event`` short-circuited to True for every
+    non-api_server platform, so this premature close woke the creator while
+    the mission was still running — the same defect class as the
+    R4/sno-economics incident (t_85a095e0), on the notifier lane.
+
+    NOTE on scope: the card's subject is the WAKE.  The root's own TEXT ping
+    is a separate, separately accepted contract (replace mode silences
+    DESCENDANT pings, not the subscribed root's — pinned by
+    test_kanban_branch_summary_watcher
+    ::test_replace_mode_suppresses_descendant_notifier_pings), so it is not
+    asserted here.
+    """
+    root = _mk(board_env, "root")
+    child = _mk(board_env, "child")
+    kb.link_tasks(board_env, root, child)
+    _tg_sub(board_env, root, "chat-root")
+    _tg_sub(board_env, child, "chat-child")
+
+    # Root closes FIRST; the child is still running -> branch NOT terminal.
+    _complete(board_env, root, summary="root done")
+
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    assert adapter.handled == [], (
+        "root completed with an OPEN child must not wake; "
+        f"got {len(adapter.handled)} wakes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_root_completion_still_wakes(board_env, monkeypatch):
+    """Control: a root that is the SOLE subscription still wakes.
+
+    A standalone root has no branch-summary итог to wait for — the watcher
+    finds no second channel to collapse — so its own close remains the
+    channel's terminal notification and must still wake the creator exactly
+    once.  This pins the boundary of the fix: only a root that IS part of a
+    multi-card branch delegates its wake to the итог.
+    """
+    root = _mk(board_env, "solo")
+    _tg_sub(board_env, root, "chat-solo")
+    _complete(board_env, root, summary="solo done")
+
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+    await _run_one_notifier_tick(monkeypatch, runner)
+
+    assert len(adapter.handled) == 1, (
+        "standalone root close must still wake the creator once; "
+        f"got {len(adapter.handled)}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_terminal_branch_summary_wakes(board_env, monkeypatch):
     root = _mk(board_env, "root")
     child = _mk(board_env, "child")

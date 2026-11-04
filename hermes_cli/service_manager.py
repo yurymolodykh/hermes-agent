@@ -282,7 +282,8 @@ class WindowsServiceManager(_RegistrationUnsupportedMixin):
 
     def start(self, name: str) -> None:
         from hermes_cli import gateway_windows
-        gateway_windows.start()
+        # Protocol lifecycle verb: never a hidden install/auto-start.
+        gateway_windows.start(allow_uninstalled=True)
 
     def stop(self, name: str) -> None:
         from hermes_cli import gateway_windows

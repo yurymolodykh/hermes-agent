@@ -56,8 +56,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 from agent import kanban_stop as _ks
 
@@ -81,6 +82,16 @@ SOFT_FINISH_DIRECTIVE = (
     "[SYSTEM DIRECTIVE — kanban budget {pct}% used ({used}/{budget}{time_part})] "
     "Stop all new work now. Do NOT start new checks, do NOT re-read sources, "
     "do NOT rewrite text that is already written.\n"
+    "If the deliverable is NOT on disk yet (a verdict, report, or review you "
+    "have not written down), the deliverable IS what you produce next: write "
+    "it now, item by item, from the evidence you have already collected. Name "
+    "every item you could not check in an explicit 'НЕ ПРОВЕРЕНО' / 'NOT "
+    "CHECKED' list at the end. An honest partial verdict with an explicit "
+    "unchecked list is accepted; silence after a full budget is not.\n"
+    "Record each item the moment you decide it — `kanban_comment(body=\"verdict: "
+    "<item> — <result>\")`, or a comment that opens as «Вердикт …» / «VERDICT …», "
+    "one comment per decided item — so an aborted run still leaves every "
+    "decision on the board.\n"
     "Your very next action must be `kanban_complete(summary=..., "
     "artifacts=[...])` using the result you already have — even if the "
     "remaining polish is unfinished. A card that finishes with an honest "
@@ -89,6 +100,164 @@ SOFT_FINISH_DIRECTIVE = (
     "If the work genuinely cannot be completed, call `kanban_block(reason=...)` "
     "instead — but do not spend another step exploring."
 )
+
+# Durable partial-verdict channel. A review worker that burns its budget while
+# re-verifying leaves nothing behind unless each decided item was written down
+# as it was decided: the transcript dies with the run and the scratch workspace
+# is rmtree'd after the close (t_24120021). Board comments ARE durable, so a
+# one-line comment per decided item is the cheapest record that survives.
+VERDICT_NOTE_PREFIX = "verdict:"
+# The prefix is a convention, not a contract: a worker that writes a real
+# partial verdict in its own words must still be harvested. The actual reviewer
+# of t_39fcfc77 committed «**Промежуточный вердикт … часть 1/3**» and
+# «ВЕРДИКТ НЕЗАВИСИМОЙ ПРИЁМКИ … часть 2/2» — neither starts with the literal
+# prefix, so a prefix-only harvester returned 0 items for precisely the run this
+# channel exists to protect.
+#
+# Matching is HEAD-ANCHORED on purpose. A substring search over the whole body
+# would classify «обычный комментарий, не вердикт» as a verdict note (caught by
+# tests/agent/test_kanban_soft_finish.py); the marker has to open the comment,
+# after stripping markdown decoration.
+VERDICT_NOTE_MARKERS = (
+    "verdict",
+    "вердикт",
+    "промежуточный вердикт",
+    "частичный вердикт",
+    "предварительный вердикт",
+)
+_VERDICT_DECORATION = "*#►•-–— \t«\"'`(>_"
+# How far into the comment the opening marker may sit. Keeps a long preamble
+# from qualifying while still allowing a short breadcrumb before the heading.
+_VERDICT_MARKER_WINDOW = 200
+# A comment that OPENS as «Вердикт не вынесен» is the exact inverse of a
+# recorded verdict: the worker reports that there is NO verdict and the close
+# would then report that there is one (t_6c41691e D1, run 6008's incident
+# shape). Negation is therefore rejected after the decoration is stripped.
+#
+# The hard part is that the negated forms come in two different SHAPES, and a
+# single "does the window contain a negator" test gets one of them wrong:
+#
+#   A. the marker's own clause carries it — «Вердикт не вынесен»,
+#      «Вердикта нет.», «Вердикт по существу не вынесен»;
+#   B. the marker is followed by a colon and the CONTENT itself is the
+#      negation — «Вердикт: не вынесен», «Вердикт: пока нет».
+#
+# Shape B is what a naive clause-scoped test misses (the clause ends at the
+# colon, so «вердикт» alone looks positive). But a colon alone cannot decide
+# it either: a genuine verdict legitimately writes «Вердикт: пункт 3 — не готов
+# к выпуску» and «Вердикт: пока нет данных по пункту 4, остальное принято».
+# The rule that separates them: after a colon the negation must BE the whole
+# first content segment. «не вынесен» alone → no verdict; «не вынесен» followed
+# by an object/continuation → a decided item that happens to be negative.
+_NEGATION_VERB = (
+    r"(?:"
+    r"не\s+(?:вынесен\w*|выношу|выносится|выносились|готов\w*|сформирован\w*"
+    r"|будет|состоится|состоялся|берусь|представляется)"
+    r"|пока\s+нет"
+    r"|not\s+(?:yet\s+)?(?:issued|ready)|no\s+verdict|pending"
+    r")"
+)
+# Shape A, at the marker itself: «вердикта нет», «вердикт не будет».
+_VERDICT_NEGATION_MARKER_CLAUSE = re.compile(
+    r"(?:^|\s)(?:" + _NEGATION_VERB + r"|нет)\b", re.IGNORECASE
+)
+# Shape B: the entire first content segment after the colon is the negation.
+_VERDICT_NEGATION_CONTENT_SEGMENT = re.compile(
+    r"^" + _NEGATION_VERB + r"$", re.IGNORECASE
+)
+# Unambiguous phrasings that do not depend on where the marker sits.
+_VERDICT_NEGATION_EXPLICIT = re.compile(
+    r"(вердикт\w*\s+нет\b"
+    r"|вердиктовать\s+не"
+    r"|не\s+берусь"
+    r"|no\s+verdict"
+    r"|verdict\s+(?:not\s+(?:yet\s+)?issued|was\s+not\s+issued))",
+    re.IGNORECASE,
+)
+# Where the marker's own clause ends. A colon starts the verdict's CONTENT
+# («Вердикт: …»), so everything after it is result text, not a qualification
+# of whether the verdict exists.
+_VERDICT_CLAUSE_BREAKS = (":", "\n", "\r", ".", "—", "–", ";")
+# Where the first CONTENT segment ends, used by the shape-B test.
+_VERDICT_CONTENT_BREAKS = (",", "\n", "\r", ".", ";", "—", "–", ")", "(")
+# How much of a harvested note the forced-close summary shows per item. The
+# full text stays in the board comment; the summary only has to make the close
+# self-explanatory to a human reading the card.
+_VERDICT_SUMMARY_NOTE_MAX_CHARS = 600
+_VERDICT_NOTE_HEADER = (
+    "Вердикт, зафиксированный по частям в комментариях доски "
+    "(переживает уборку рабочего каталога):"
+)
+
+
+def _verdict_marker_at(head: str) -> Optional[tuple[int, str]]:
+    """``(index, marker)`` of the opening verdict marker in ``head``, or None.
+
+    Decorations are stripped from the front only, so the marker must be the
+    first word of the comment (after ``**``, ``#``, ``«`` …).
+    """
+    for marker in VERDICT_NOTE_MARKERS:
+        if head.startswith(marker):
+            return 0, marker
+    return None
+
+
+def _first_segment(text: str, breaks: tuple[str, ...]) -> str:
+    """Text up to the earliest occurrence of any separator in ``breaks``."""
+    cut = len(text)
+    for sep in breaks:
+        at = text.find(sep)
+        if at != -1:
+            cut = min(cut, at)
+    return text[:cut]
+
+
+def _verdict_is_negated(text: str) -> bool:
+    """True when the comment's HEAD says there is no verdict.
+
+    Only the opening window is inspected: a real verdict may discuss a missing
+    verdict deep in the body («пункт 4: вердикт не вынесен, нужны данные»)
+    without becoming a non-verdict.
+
+    Inside that window both negated shapes are rejected (see the block comment
+    above on ``_NEGATION_VERB``), while a verdict whose CONTENT is a negative
+    finding («Вердикт: пункт 3 — не готов к выпуску») is still harvested.
+    """
+    head = text[:_VERDICT_MARKER_WINDOW].lstrip(_VERDICT_DECORATION).lower()
+    if _VERDICT_NEGATION_EXPLICIT.search(head):
+        return True
+    hit = _verdict_marker_at(head)
+    if hit is None:
+        return False
+    marker_region = head[hit[0]:]
+    # Consume the marker word itself, including its inflected tail
+    # («вердикт» → «вердикта» / «вердиктов» / «вердикты» / «verdicts»).
+    tail = marker_region[len(hit[1]):]
+    tail = tail.lstrip("abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+    tail = tail.lstrip()
+    if tail.startswith(":"):
+        segment = _first_segment(tail[1:].strip(), _VERDICT_CONTENT_BREAKS).strip()
+        return bool(_VERDICT_NEGATION_CONTENT_SEGMENT.match(segment))
+    clause = _first_segment(tail, _VERDICT_CLAUSE_BREAKS).strip()
+    return bool(_VERDICT_NEGATION_MARKER_CLAUSE.search(clause))
+
+
+def _is_verdict_note(body: str) -> bool:
+    """True when a comment OPENS as a (partial) verdict, not merely mentions it.
+
+    Negated openings («Вердикт не вынесен», «Вердиктов пока нет», «no verdict»)
+    are the inverse of a recorded verdict and must not be harvested: the forced
+    close would otherwise report an item-level result for a run whose own last
+    word was that it issued none (t_6c41691e D1).
+    """
+    text = body.strip()
+    if not text:
+        return False
+    head = text[:_VERDICT_MARKER_WINDOW].lstrip(_VERDICT_DECORATION).lower()
+    if not any(head.startswith(marker) for marker in VERDICT_NOTE_MARKERS):
+        return False
+    return not _verdict_is_negated(text)
+
 
 _FORCED_SUMMARY_HEADER = (
     "Принудительное закрытие по мягкому порогу бюджета (soft finish): воркер "
@@ -366,27 +535,243 @@ def grace_expired(agent: Any, api_call_count: int) -> bool:
 # ── forced close ─────────────────────────────────────────────────────────────
 
 
-def _progress_summary(messages: Iterable[dict] | None) -> str:
-    """Best available description of what the worker already produced.
+def _run_output_paths(messages: Iterable[dict] | None) -> list[str]:
+    """Absolute paths of files this run wrote, de-duplicated, paths normalised.
 
-    Reuses ``turn_finalizer``'s deterministic collector (no LLM, no network):
-    the last visible narration plus the files the run actually touched. When
-    the run left no trace the honest answer is the header alone — an empty
-    summary would hide the forced close from the board.
+    Shared by the summary text and the ``artifacts`` handoff so the two can
+    never disagree about what the run produced.
     """
-    tail = ""
     paths: list[str] = []
     try:
-        from agent.turn_finalizer import _git_status_paths, _last_assistant_text, _run_file_mutation_paths
+        from agent.turn_finalizer import _git_status_paths, _run_file_mutation_paths
 
-        tail = _last_assistant_text(messages) or ""
         paths = list(_run_file_mutation_paths(messages) or [])
         if not paths:
             paths = _git_status_paths(os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip())
     except Exception:
         logger.debug("kanban soft finish: progress collection failed", exc_info=True)
 
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        # ``_git_status_paths`` yields ``XY path`` lines, not bare paths.
+        if not os.path.isabs(text):
+            text = text[2:].strip() if len(text) > 3 and text[2] == " " else text
+            workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+            if workspace and text:
+                text = os.path.join(workspace, text)
+        if not text or not os.path.isabs(text):
+            continue
+        key = os.path.normcase(os.path.abspath(text))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(os.path.normpath(text))
+    return out
+
+
+class VerdictHarvest(NamedTuple):
+    """What the harvester found, split by attempt boundary.
+
+    ``current`` — items this RUN recorded (``created_at >= run start``);
+    ``inherited`` — items a PREVIOUS attempt of the same profile recorded on
+    the same card. They are still this card's accumulated partial verdict, so
+    dropping them would hide real work, but they must never be counted as
+    "how far THIS run got" (t_6c41691e D2).
+    """
+
+    current: list
+    inherited: list
+    run_started_at: Optional[int]
+    boundary_known: bool
+
+
+def _current_run_started_at(task_id: Optional[str] = None) -> tuple[Optional[int], bool]:
+    """``(started_at, known)`` for the run this process is executing.
+
+    Source of truth is the board row for ``HERMES_KANBAN_RUN_ID`` — not the
+    ``HERMES_KANBAN_RUN_STARTED_AT`` env var, which the dispatcher only exports
+    when the card carries ``max_runtime_seconds`` (so a step-capped card would
+    silently lose its boundary). The env value is the fallback when the run row
+    cannot be read; when neither is available the boundary is UNKNOWN and the
+    caller must not claim the items belong to this run.
+    """
+    raw_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if raw_run:
+        try:
+            run_id = int(raw_run)
+        except ValueError:
+            run_id = 0
+        if run_id:
+            try:
+                from hermes_cli import kanban_db as kb
+
+                conn = kb.connect()
+                try:
+                    run = kb.get_run(conn, run_id)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if run is not None:
+                    started = int(getattr(run, "started_at", 0) or 0)
+                    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                    if started > 0 and (not tid or getattr(run, "task_id", tid) == tid):
+                        return started, True
+            except Exception:
+                logger.debug(
+                    "kanban soft finish: run start lookup failed", exc_info=True
+                )
+    raw_start = (os.environ.get("HERMES_KANBAN_RUN_STARTED_AT") or "").strip()
+    if raw_start:
+        try:
+            started = int(float(raw_start))
+        except (TypeError, ValueError):
+            started = 0
+        if started > 0:
+            return started, True
+    return None, False
+
+
+def _run_verdict_notes(task_id: Optional[str] = None) -> list[str]:
+    """``verdict:`` comments THIS RUN committed to the card, oldest first.
+
+    Kept as a list for backwards compatibility with callers that only need the
+    current attempt's items; :func:`_harvest_verdict_notes` is the full view
+    (current + inherited, with the boundary state).
+    """
+    return list(_harvest_verdict_notes(task_id).current)
+
+
+def _harvest_verdict_notes(task_id: Optional[str] = None) -> VerdictHarvest:
+    """Split this profile's verdict comments by the current run's start.
+
+    Read-only and fail-soft: a board that cannot be opened yields an empty
+    harvest and the forced close behaves exactly as before. Only comments
+    authored by this worker's own profile are harvested — a ``verdict:`` note
+    written by another profile (a different reviewer, the orchestrator) is that
+    profile's result and must not be re-attributed to this worker's handoff.
+
+    ``task_comments`` carries no run id, so the attempt boundary is
+    ``created_at >= started_at`` of THIS run. A re-dispatched card therefore
+    does not inherit an earlier attempt's items into ``verdict_items_recorded``;
+    those are reported separately as ``verdict_items_inherited`` and labelled
+    «из прошлой попытки» in the close summary.
+    """
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not tid:
+        return VerdictHarvest([], [], None, False)
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    started, boundary_known = _current_run_started_at(tid)
+    current: list[str] = []
+    inherited: list[str] = []
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+    except Exception:
+        logger.debug("kanban soft finish: verdict notes — board connection failed", exc_info=True)
+        return VerdictHarvest([], [], started, boundary_known)
+    try:
+        for comment in kb.list_comments(conn, tid):
+            body = str(getattr(comment, "body", "") or "").strip()
+            author = str(getattr(comment, "author", "") or "").strip()
+            if profile and author and author != profile:
+                continue
+            if not _is_verdict_note(body):
+                continue
+            if body.lower().startswith(VERDICT_NOTE_PREFIX):
+                note = body[len(VERDICT_NOTE_PREFIX):].strip() or body
+            else:
+                note = body
+            # Without a known boundary, a comment cannot be attributed to this
+            # run — it goes to ``inherited`` so the counter stays honest.
+            if boundary_known and int(getattr(comment, "created_at", 0) or 0) >= started:
+                current.append(note)
+            else:
+                inherited.append(note)
+    except Exception:
+        logger.debug("kanban soft finish: verdict notes read failed", exc_info=True)
+        return VerdictHarvest([], [], started, boundary_known)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return VerdictHarvest(current, inherited, started, boundary_known)
+
+
+_VERDICT_NOTE_INHERITED_HEADER = (
+    "Пункты вердикта из ПРОШЛОЙ попытки этой же карточки "
+    "(не результат текущего прогона):"
+)
+
+
+def _progress_summary(
+    messages: Iterable[dict] | None,
+    paths: Optional[list[str]] = None,
+    verdict_notes: Optional[list[str]] = None,
+    inherited_notes: Optional[list[str]] = None,
+) -> str:
+    """Best available description of what the worker already produced.
+
+    Reuses ``turn_finalizer``'s deterministic collector (no LLM, no network):
+    the last visible narration plus the files the run actually touched. When
+    the run left no trace the honest answer is the header alone — an empty
+    summary would hide the forced close from the board.
+
+    ``verdict_notes`` are the ``verdict:`` comments THIS run committed to the
+    board as it decided each item. They lead the summary because they are the
+    only part of the result that survived the run: the review's item-level
+    findings are exactly what a reviewer card exists to deliver, and they are
+    absent from the narration tail whenever the worker was still mid-check
+    (t_417a182e — 156/180 steps spent re-verifying, no verdict issued).
+
+    ``inherited_notes`` belong to an EARLIER attempt of the same card. They are
+    shown, because dropping a previous attempt's decided items would lose real
+    work, but under their own header and never as «how far this run got»
+    (t_6c41691e D2).
+    """
+    tail = ""
+    try:
+        from agent.turn_finalizer import _last_assistant_text
+
+        tail = _last_assistant_text(messages) or ""
+    except Exception:
+        logger.debug("kanban soft finish: progress collection failed", exc_info=True)
+
+    if paths is None:
+        paths = _run_output_paths(messages)
+    if verdict_notes is None and inherited_notes is None:
+        harvest = _harvest_verdict_notes()
+        verdict_notes = harvest.current
+        inherited_notes = harvest.inherited
+    verdict_notes = verdict_notes or []
+    inherited_notes = inherited_notes or []
+
     parts = [_FORCED_SUMMARY_HEADER]
+
+    def _render(notes: list[str]) -> str:
+        # A harvested note may be a whole verdict body (an in-the-worker's-words
+        # partial verdict is accepted, not only the one-line `verdict:` form).
+        # Keep each one readable in the close: first line(s) up to a fixed cap,
+        # because the full text already lives in the board comment it came from.
+        shown = []
+        for note in notes[:40]:
+            text = note.strip()
+            if len(text) > _VERDICT_SUMMARY_NOTE_MAX_CHARS:
+                text = text[:_VERDICT_SUMMARY_NOTE_MAX_CHARS].rstrip() + " …"
+            shown.append(text)
+        return "\n".join(f"- {n}" for n in shown)
+
+    if verdict_notes:
+        parts.append(_VERDICT_NOTE_HEADER + "\n" + _render(verdict_notes))
+    if inherited_notes:
+        parts.append(_VERDICT_NOTE_INHERITED_HEADER + "\n" + _render(inherited_notes))
     if tail:
         parts.append("Последнее, что воркер сообщил:\n" + tail)
     if paths:
@@ -419,14 +804,62 @@ def force_complete(
     except ValueError:
         return False
 
-    summary = _progress_summary(messages)
+    # The summary records EVERY path the run touched (honest audit trail,
+    # including files that have since vanished); ``artifacts`` declares only
+    # what can actually be preserved — a declared-but-absent path raises
+    # ArtifactPreservationError in ``complete_task`` and would abort the whole
+    # forced close, losing the handoff.
+    touched = _run_output_paths(messages)
+    artifacts = [p for p in touched if os.path.isfile(p)]
+    harvest = _harvest_verdict_notes()
+    verdict_notes = list(harvest.current)
+    inherited_notes = list(harvest.inherited)
+
+    summary = _progress_summary(
+        messages,
+        paths=touched,
+        verdict_notes=verdict_notes,
+        inherited_notes=inherited_notes,
+    )
     if summary_extra:
         summary = summary + "\n\n" + summary_extra.strip()
 
     metadata = {
         "soft_finish_forced": True,
         "forced_close_reason": reason,
+        # Distinguish «the run was cut short» from «the task is verified done»
+        # (t_417a182e). The directive now asks a review worker to commit each
+        # decided item to the board as it decides it, so this counter is the
+        # durable measure of how far it actually got: 0 means the close carries
+        # narration only and the card's real deliverable (an item-level
+        # verdict) was never issued.
+        #
+        # Only THIS run's items are counted (t_6c41691e D2): ``task_comments``
+        # carries no run id, so a re-dispatched card's earlier attempt would
+        # otherwise inflate the count and close a run that decided nothing with
+        # a non-zero score. Those are reported separately below so the earlier
+        # work is preserved without being mis-attributed.
+        "verdict_items_recorded": len(verdict_notes),
+        "verdict_items_inherited": len(inherited_notes),
+        "verdict_partial": True,
     }
+    # Surface the boundary state in the handoff: with an unknown run start the
+    # items cannot be attributed to this attempt at all, and a downstream reader
+    # must not read ``verdict_items_recorded: 0`` as «the run decided nothing».
+    metadata["verdict_boundary_known"] = bool(harvest.boundary_known)
+    if harvest.run_started_at is not None:
+        metadata["verdict_run_started_at"] = int(harvest.run_started_at)
+    # Declare the run's own output as artifacts explicitly (t_24120021).
+    # Previously the forced close carried the file list as PROSE only, so
+    # saving the work depended on the completion-prose scanner re-parsing it.
+    # That made the last line of defence a string-format detail: a worker whose
+    # paths were written with forward slashes lost every file to
+    # ``_cleanup_workspace``.  Passing ``artifacts`` here drives the documented
+    # path (``_persist_scratch_completion_artifacts`` copies each file into the
+    # task attachment store before the scratch dir is removed).
+    if artifacts:
+        metadata["artifacts"] = artifacts
+
     if isinstance(budget, dict):
         metadata.update(
             {
@@ -484,6 +917,8 @@ __all__ = [
     "DEFAULT_SOFT_FINISH_MIN_BUDGET_STEPS",
     "DEFAULT_SOFT_FINISH_RATIO",
     "SOFT_FINISH_DIRECTIVE",
+    "VERDICT_NOTE_PREFIX",
+    "VERDICT_NOTE_MARKERS",
     "budget_state",
     "force_complete",
     "grace_expired",

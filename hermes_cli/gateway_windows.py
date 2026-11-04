@@ -1018,11 +1018,45 @@ def _install_choice_from_env(name: str) -> bool | None:
     return None
 
 
+def _env_flag(name: str) -> bool:
+    """True when ``name`` is set to a truthy value (unset/blank/garbage: False)."""
+    return _install_choice_from_env(name) is True
+
+
+class NonInteractiveInstallError(RuntimeError):
+    """An unattended caller must state its autostart intent explicitly.
+
+    Installing a Windows login auto-start changes host behaviour at every
+    future logon. ``prompt_yes_no`` falls back to its ``default`` when there
+    is nobody to answer (non-interactive child, closed stdin), and the
+    historical defaults were all ``True`` — so an agent or a dashboard
+    "start gateway" action silently created a Startup-folder login item.
+    A decision like that may only come from a human or from an explicit
+    flag/env value, never from a default.
+    """
+
+
+# Outcomes of install(). Callers must distinguish "persistence installed" from
+# "started only" and "an elevated child owns the rest": re-probing the
+# filesystem made `--no-start-on-login` print a false "did not complete".
+_INSTALL_SCHEDULED_TASK = "scheduled-task"
+_INSTALL_STARTUP_FALLBACK = "startup-fallback"
+_INSTALL_SKIPPED_NO_LOGIN = "skipped-no-login"
+_INSTALL_ELEVATION_PENDING = "elevation-pending"
+_INSTALL_FAILED = "failed"
+
+
 def _prompt_install_choices(
     start_now: bool | None = None,
     start_on_login: bool | None = None,
 ) -> tuple[bool, bool]:
-    """Return (start_now, start_on_login), asking before any UAC escalation."""
+    """Return (start_now, start_on_login), asking before any UAC escalation.
+
+    Non-interactive callers (``HERMES_NONINTERACTIVE=1`` / no readable stdin)
+    must pass both choices — via flags or the ``HERMES_GATEWAY_INSTALL_START_*``
+    env vars — otherwise :class:`NonInteractiveInstallError` is raised instead
+    of accepting a ``True`` default.
+    """
     env_start_now = _install_choice_from_env("HERMES_GATEWAY_INSTALL_START_NOW")
     env_start_on_login = _install_choice_from_env("HERMES_GATEWAY_INSTALL_START_ON_LOGIN")
     if start_now is None:
@@ -1032,7 +1066,23 @@ def _prompt_install_choices(
     if start_now is not None and start_on_login is not None:
         return start_now, start_on_login
 
-    from hermes_cli.setup import prompt_yes_no
+    from hermes_cli.setup import is_noninteractive, prompt_yes_no
+
+    if is_noninteractive():
+        missing = [
+            label
+            for label, value in (
+                ("--start-now/--no-start-now", start_now),
+                ("--start-on-login/--no-start-on-login", start_on_login),
+            )
+            if value is None
+        ]
+        raise NonInteractiveInstallError(
+            "no terminal to ask, and no answer given for "
+            + ", ".join(missing)
+            + ". Refusing to guess: an unanswered autostart question must not "
+            "default to 'yes'."
+        )
 
     if start_now is None:
         start_now = prompt_yes_no("Start the gateway now after install?", True)
@@ -1044,8 +1094,12 @@ def _prompt_install_choices(
     return start_now, start_on_login
 
 
-def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -> None:
-    """Install the Startup-folder fallback and optionally start once."""
+def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -> str:
+    """Install the Startup-folder fallback and optionally start once.
+
+    Returns ``_INSTALL_STARTUP_FALLBACK`` so callers can report success
+    without re-probing the filesystem.
+    """
     print(f"↻ Scheduled Task install blocked ({detail.splitlines()[0]}) — using Startup folder fallback")
     entry = _install_startup_entry(script_path)
     print(f"✓ Installed Windows login item: {entry}")
@@ -1069,6 +1123,7 @@ def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -
         print("ℹ Startup fallback installed; gateway not started now.")
         print(f"  Start manually with: {start_cmd}")
     _print_next_steps()
+    return _INSTALL_STARTUP_FALLBACK
 
 
 def install(
@@ -1077,12 +1132,16 @@ def install(
     start_now: bool | None = None,
     start_on_login: bool | None = None,
     elevated_handoff: bool = False,
-) -> None:
+) -> str:
     """Install the gateway as a Windows Scheduled Task (with Startup fallback).
 
     Idempotent: re-running updates the task to point at the current python/
     project paths. ``force`` is accepted for API parity with ``launchd_install``
     / ``systemd_install`` but isn't needed — we always reconcile.
+
+    Returns an ``_INSTALL_*`` outcome. Callers must use it instead of probing
+    the filesystem afterwards: an explicit ``--no-start-on-login`` run installs
+    nothing by design and is not a failure.
     """
     _assert_windows()
     start_now, start_on_login = _prompt_install_choices(start_now, start_on_login)
@@ -1099,7 +1158,7 @@ def install(
         else:
             print("ℹ Gateway not started and no auto-start service installed.")
             print("  Run later with: hermes gateway start")
-        return
+        return _INSTALL_SKIPPED_NO_LOGIN
 
     task_name = get_task_name()
     script_path = _write_task_script()
@@ -1120,12 +1179,11 @@ def install(
                     print("  Approve the Windows UAC prompt; the elevated install will start the gateway afterwards.")
                 else:
                     print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                return
+                return _INSTALL_ELEVATION_PENDING
             print("⚠ Falling back to Startup folder because elevation was unavailable or cancelled.")
         else:
             print("  Skipped elevation. Falling back to Startup folder.")
-        _install_startup_fallback(script_path, start_now, "administrator approval was not used")
-        return
+        return _install_startup_fallback(script_path, start_now, "administrator approval was not used")
 
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
@@ -1143,7 +1201,7 @@ def install(
             print("ℹ Gateway not started now.")
             print("  Start manually with: hermes gateway start")
         _print_next_steps()
-        return
+        return _INSTALL_SCHEDULED_TASK
 
     # schtasks create didn't work. Prefer a real Scheduled Task over the
     # Startup-folder fallback when the only blocker is elevation. This gives
@@ -1161,37 +1219,16 @@ def install(
                     print("  Approve the Windows UAC prompt; the elevated install will start the gateway afterwards.")
                 else:
                     print("  Approve the Windows UAC prompt, then run: hermes gateway status")
-                return
+                return _INSTALL_ELEVATION_PENDING
             print("⚠ Falling back to Startup folder because elevation was unavailable or cancelled.")
         else:
             print("  Skipped elevation. Falling back to Startup folder.")
 
     # schtasks create didn't work. See if it's a "fall back to startup" case.
     if _should_fall_back(1, detail):
-        print(f"↻ Scheduled Task install blocked ({detail.splitlines()[0]}) — using Startup folder fallback")
-        entry = _install_startup_entry(script_path)
-        print(f"✓ Installed Windows login item: {entry}")
-        print(f"  Task script: {script_path}")
-
-        # Re-running `hermes -p <profile> gateway install` must be safe.
-        # Startup-folder fallback only installs login persistence. Starting is
-        # controlled by the pre-UAC start_now answer so all user decisions happen
-        # before any elevation prompt.
-        from hermes_cli.gateway import find_gateway_pids, _profile_arg
-
-        running_pids = list(find_gateway_pids())
-        if running_pids:
-            print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
-        elif start_now:
-            pid = _spawn_detached()
-            _report_gateway_start(f"direct spawn (PID {pid})")
-        else:
-            profile_arg = _profile_arg()
-            start_cmd = f"hermes {profile_arg} gateway start" if profile_arg else "hermes gateway start"
-            print("ℹ Startup fallback installed; gateway not started now.")
-            print(f"  Start manually with: {start_cmd}")
-        _print_next_steps()
-        return
+        # Single implementation of the Startup-folder path (see
+        # _install_startup_fallback): duplicated bodies here drifted apart.
+        return _install_startup_fallback(script_path, start_now, detail)
 
     # Unknown schtasks error — surface it and bail.
     raise RuntimeError(f"Windows gateway install failed: {detail}")
@@ -1507,9 +1544,36 @@ def status(deep: bool = False) -> None:
         print("  hermes gateway install")
 
 
-def start() -> None:
-    """Start the gateway using the canonical detached Windows launch path."""
+class GatewayServiceNotInstalledError(RuntimeError):
+    """``gateway start`` was asked to start a service that does not exist.
+
+    Historically ``start`` degraded into an interactive *install* when no
+    Scheduled Task / Startup entry was registered. In an unattended context
+    that turned a read-mostly "start it" into a permanent login auto-start
+    plus a UAC/Startup-fallback decision the caller never asked for. Starting
+    and installing are now separate verbs: ``start`` refuses, and the caller
+    either runs ``hermes gateway install`` or passes ``--install-service``.
+    """
+
+
+def start(*, install_service: bool = False, allow_uninstalled: bool = False) -> None:
+    """Start the gateway using the canonical detached Windows launch path.
+
+    Never installs persistence on its own. ``install_service`` (the CLI's
+    ``--install-service``) or an explicit interactive "yes" lets a *start*
+    verb install a login auto-start; without either the command refuses with
+    :class:`GatewayServiceNotInstalledError`.
+
+    ``allow_uninstalled`` is for internal respawn paths (``restart``) and for
+    operator launchers that own the lifecycle themselves (a service
+    supervisor): the caller restarts a process it does not want to turn into
+    a login item, so a missing service registration is not an error. Those
+    launchers set ``HERMES_GATEWAY_ALLOW_UNINSTALLED_START=1`` instead of
+    passing the kwarg, because the flag has to survive the CLI boundary.
+    """
     _assert_windows()
+    if not allow_uninstalled:
+        allow_uninstalled = _env_flag("HERMES_GATEWAY_ALLOW_UNINSTALLED_START")
     running_pids = _gateway_pids()
     if running_pids:
         print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
@@ -1518,19 +1582,50 @@ def start() -> None:
     task_installed = is_task_registered()
     startup_installed = is_startup_entry_installed()
 
-    if not task_installed and not startup_installed:
-        from hermes_cli.setup import prompt_yes_no
+    if not task_installed and not startup_installed and not allow_uninstalled:
+        from hermes_cli.setup import is_noninteractive, prompt_yes_no
 
         print("✗ Gateway service is not installed")
-        if not prompt_yes_no("  Install it now so the gateway starts on login?", True):
+        if not install_service:
+            if is_noninteractive():
+                raise GatewayServiceNotInstalledError(
+                    "no gateway service is installed and there is no terminal to "
+                    "ask about installing one. `gateway start` does not create "
+                    "login auto-start on its own — run `hermes gateway install "
+                    "--start-now --start-on-login` (or --no-start-on-login) "
+                    "explicitly, then `hermes gateway start`."
+                )
+            # Interactive human: they must say yes out loud. The default is
+            # "no" so that a stray Enter cannot install a login item.
+            if not prompt_yes_no(
+                "  Install it now so the gateway starts on login (creates a login auto-start)?",
+                False,
+            ):
+                print("  Run: hermes gateway install")
+                return
+        try:
+            # start_now=True is implied by the verb ("start"); the login
+            # auto-start answer is NOT implied — install() requires it from a
+            # flag/env/interactive answer and fails closed otherwise.
+            outcome = install(force=False, start_now=True)
+        except NonInteractiveInstallError as exc:
+            raise GatewayServiceNotInstalledError(
+                f"{exc} Run `hermes gateway install` with an explicit "
+                "--start-on-login/--no-start-on-login choice first."
+            ) from exc
+        if outcome == _INSTALL_ELEVATION_PENDING:
+            print("  If a UAC prompt opened, approve it, then run: hermes gateway start")
+            return
+        if outcome == _INSTALL_FAILED:
+            print("⚠ Gateway install did not complete in this process.")
             print("  Run: hermes gateway install")
             return
-        install(force=False)
-        task_installed = is_task_registered()
-        startup_installed = is_startup_entry_installed()
-        if not task_installed and not startup_installed:
-            print("⚠ Gateway install did not complete in this process.")
-            print("  If a UAC prompt opened, approve it, then run: hermes gateway start")
+        # install() may already have spawned the gateway (start_now=True).
+        # Re-check before spawning again: two spawns from one command race
+        # each other, and the loser exits on the double-run guard.
+        running_pids = _gateway_pids()
+        if running_pids:
+            print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
             return
 
     # Manual starts use the same console-less direct spawn path as restart()
@@ -1723,7 +1818,9 @@ def restart() -> None:
 
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
-    start()
+    # A restart respawns an already-decided process; it must never turn into
+    # an install/auto-start decision (that is `gateway install`'s job).
+    start(allow_uninstalled=True)
 
     if not _wait_for_gateway_ready(timeout_s=15.0):
         raise RuntimeError(

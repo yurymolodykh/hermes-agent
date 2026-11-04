@@ -402,6 +402,220 @@ def test_spawn_detached_purges_inherited_kanban_budget_arms(monkeypatch, tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# `gateway start` must never install a login auto-start behind the caller's
+# back (t_db577abc).
+#
+# Observed 2026-11-03: an agent session ran `... gateway start` with no TTY.
+# gateway_windows.start() fell through to install(), install() asked three
+# yes/no questions, prompt_yes_no() returned its `True` default for each
+# because there was nobody to answer, and a Startup-folder login item appeared
+# on the host. install(start_now=True) then spawned a gateway, and start()
+# spawned a second one on top of it.
+#
+# Contract now: start() refuses in an unattended context, never installs
+# persistence without --install-service, and never double-spawns.
+# ---------------------------------------------------------------------------
+
+
+def _arrange_no_service(monkeypatch):
+    """No service registered, no gateway running, nothing spawned."""
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+
+
+def test_prompt_install_choices_fails_closed_when_unattended(monkeypatch):
+    """No TTY + no explicit answer must raise, not accept the True default."""
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.delenv("HERMES_GATEWAY_INSTALL_START_NOW", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_INSTALL_START_ON_LOGIN", raising=False)
+
+    with pytest.raises(gateway_windows.NonInteractiveInstallError) as exc:
+        gateway_windows._prompt_install_choices()
+    assert "--start-on-login" in str(exc.value)
+
+    # An explicit answer is accepted without a terminal.
+    assert gateway_windows._prompt_install_choices(True, False) == (True, False)
+
+
+def test_prompt_install_choices_honours_env_answers(monkeypatch):
+    """Unattended callers can answer via env; both keys are then complete."""
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.setenv("HERMES_GATEWAY_INSTALL_START_NOW", "1")
+    monkeypatch.setenv("HERMES_GATEWAY_INSTALL_START_ON_LOGIN", "0")
+
+    assert gateway_windows._prompt_install_choices() == (True, False)
+
+
+def test_start_refuses_unattended_without_service(monkeypatch, capsys):
+    """The reported incident: unattended `start` must not install anything."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    installs = []
+    monkeypatch.setattr(
+        gateway_windows, "install", lambda **kw: installs.append(kw)
+    )
+
+    with pytest.raises(gateway_windows.GatewayServiceNotInstalledError) as exc:
+        gateway_windows.start()
+
+    assert "gateway install" in str(exc.value)
+    assert installs == [], "start() installed a service without being asked"
+    assert "Gateway service is not installed" in capsys.readouterr().out
+
+
+def test_start_install_service_still_fails_closed_without_login_choice(monkeypatch):
+    """--install-service implies start-now, not an unanswered auto-start."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.delenv("HERMES_GATEWAY_INSTALL_START_ON_LOGIN", raising=False)
+    created = []
+    monkeypatch.setattr(
+        gateway_windows, "install", lambda **kw: (_ for _ in ()).throw(
+            gateway_windows.NonInteractiveInstallError("no answer for --start-on-login")
+        )
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_install_startup_entry", lambda p: created.append(p)
+    )
+
+    with pytest.raises(gateway_windows.GatewayServiceNotInstalledError):
+        gateway_windows.start(install_service=True)
+
+    assert created == [], "a Startup login item was created without an explicit answer"
+
+
+def test_start_interactive_prompt_defaults_to_no(monkeypatch):
+    """A human pressing Enter must not install a login item either."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: False)
+    asked = {}
+
+    def fake_prompt(question, default=True):
+        asked["default"] = default
+        return default
+
+    monkeypatch.setattr(setup, "prompt_yes_no", fake_prompt)
+    installs = []
+    monkeypatch.setattr(gateway_windows, "install", lambda **kw: installs.append(kw))
+
+    gateway_windows.start()
+
+    assert asked["default"] is False, "Enter must not mean 'install an auto-start'"
+    assert installs == []
+
+
+def test_start_does_not_double_spawn_after_install(monkeypatch):
+    """install(start_now=True) captures the only spawn; start() must see it."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.setenv("HERMES_GATEWAY_INSTALL_START_ON_LOGIN", "1")
+
+    state = {"installed": False}
+    pids = []
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: list(pids))
+    monkeypatch.setattr(
+        gateway_windows, "is_startup_entry_installed", lambda: state["installed"]
+    )
+    spawned = []
+
+    def fake_install(**kwargs):
+        # install(start_now=True) registers the login item AND launches the
+        # gateway itself.
+        spawned.append("install")
+        state["installed"] = True
+        pids.append(4242)
+
+    monkeypatch.setattr(gateway_windows, "install", fake_install)
+    monkeypatch.setattr(
+        gateway_windows, "_spawn_detached", lambda *a, **kw: spawned.append("start") or 111
+    )
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+
+    gateway_windows.start(install_service=True)
+
+    assert spawned == ["install"], f"expected a single spawn, got {spawned}"
+
+
+@pytest.mark.windows_only
+def test_restart_respawn_never_installs_persistence(monkeypatch):
+    """restart() respawns a process; it must not evaluate install questions."""
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **kw: True)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **kw: [999])
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+    installs = []
+    monkeypatch.setattr(gateway_windows, "install", lambda **kw: installs.append(kw))
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda *a, **kw: 999)
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+
+    gateway_windows.restart()
+
+    assert installs == []
+
+
+# ---------------------------------------------------------------------------
+# An operator launcher that owns the lifecycle (service_supervisor) must still
+# be able to start a gateway with no login item registered.
+#
+# fast_answers_gateway_start.cmd / safe_gateway_start.cmd call `gateway start`
+# from a supervisor tick. Those launchers are the persistence mechanism, so the
+# absence of a Startup entry is expected — refusing there would turn a healthy
+# recovery path into a permanent DOWN. They opt out with an env flag because
+# the decision has to cross the CLI boundary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.windows_only
+def test_start_honours_supervisor_allow_uninstalled_env(monkeypatch):
+    """HERMES_GATEWAY_ALLOW_UNINSTALLED_START=1 keeps supervised starts working."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.setenv("HERMES_GATEWAY_ALLOW_UNINSTALLED_START", "1")
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    installs: list = []
+    monkeypatch.setattr(
+        gateway_windows, "install", lambda **kw: installs.append(kw) or "startup-fallback"
+    )
+    spawned: list = []
+    monkeypatch.setattr(
+        gateway_windows, "_spawn_detached", lambda *a, **kw: spawned.append(1) or 777
+    )
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+
+    gateway_windows.start()
+
+    assert spawned == [1], "supervised start must launch exactly one gateway"
+    assert installs == [], "a supervised start must not install a login item"
+
+
+@pytest.mark.windows_only
+def test_start_flag_is_off_by_default(monkeypatch):
+    """No env flag, no kwarg -> unattended start still refuses (fail closed)."""
+    _arrange_no_service(monkeypatch)
+    monkeypatch.setattr(setup, "is_noninteractive", lambda: True)
+    monkeypatch.delenv("HERMES_GATEWAY_ALLOW_UNINSTALLED_START", raising=False)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    installs: list = []
+    monkeypatch.setattr(gateway_windows, "install", lambda **kw: installs.append(kw))
+    spawned: list = []
+    monkeypatch.setattr(
+        gateway_windows, "_spawn_detached", lambda *a, **kw: spawned.append(1) or 777
+    )
+
+    with pytest.raises(gateway_windows.GatewayServiceNotInstalledError):
+        gateway_windows.start()
+
+    assert spawned == []
+    assert installs == []
+
+
+# ---------------------------------------------------------------------------
 # stop() drain semantics — issue #33778
 #
 # Background: on Windows, asyncio.add_signal_handler raises NotImplementedError,

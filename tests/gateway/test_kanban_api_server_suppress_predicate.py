@@ -1,257 +1,258 @@
-"""Unit tests for the api_server-lane intermediate-event suppression predicate.
+"""api_server (OWUI) lane: which events are intermediate noise, which stay loud.
 
-Covers the pure function ``should_suppress_api_server_event`` (t_ec550192):
+HISTORY — why this module no longer imports a predicate
+------------------------------------------------------
+This module used to import three symbols from ``gateway.kanban_watchers``:
 
-  * child cards (parent present) — suppressed;
-  * root / unsubscribed tasks, routine non-terminal kinds — suppressed
-    (under replace mode the branch итог is the single channel message);
-  * terminal ``branch_summary`` — NEVER suppressed;
-  * ``block_loop_detected`` / ``triage`` (event kind or card status) — NEVER
-    suppressed (human action needed);
-  * ``blocked`` with ``provider_route`` (provider outage) — NOT suppressed;
-  * ``blocked`` needs-human-fix kinds (needs_input / capability / legacy
-    un-typed) — NOT suppressed;
-  * self-resolving ``blocked`` (dependency / transient) — suppressed;
-  * replace mode OFF — nothing suppressed (additive behavior unchanged).
+  * ``should_suppress_api_server_event(event, card, parent, replace)``
+  * ``_owui_suppress_intermediate_event(kind, ev, replace, platform)``  (shim)
+  * ``should_wake_agent_for_event(event, card, parent, replace)``       (module 2)
 
-The TG delivery-policy gate is deliberately out of scope: the predicate is a
-pure api_server-lane decision and never inspects platform strings.
+Those were the pre-R1 per-lane policy helpers.  The R1 delivery-engine
+consolidation (``d3cfc258d5``, 2026-10-21) deliberately deleted all three and
+replaced them with ONE classification authority:
+``gateway.delivery_engine.classify_event()``.  ``gateway/REFACTOR-CHANGELOG.md``
+records the removal explicitly (line 14 lists the three names as removed
+legacy; line 74 states the accepted contract: "wake только [final] +
+[needs-decision]", "triage по kind И card.status").
+
+The symbols are gone from every revision from ``d3cfc258d5`` onward and have
+**zero live call sites** — they were test-facing only.  Restoring them would
+resurrect a second, parallel policy that contradicts the shipped engine:
+
+  * the old predicate kept ``crashed`` / ``timed_out`` loud, but those kinds
+    auto-retry (``delivery_engine._ABORTED_KINDS`` docstring) and are therefore
+    INTERMEDIATE — the P2 rule says an intermediate close is never a message;
+  * the old predicate suppressed a completing ROOT outright, while the engine
+    stages a root's own terminal completion when the branch really is terminal.
+
+So the module was RE-POINTED at the canonical classifier and its assertions
+restated in engine terms.  Suppression is now expressed as
+``classify_event(...).event_type is None`` (the event is silenced; the caller
+still advances the cursor).  Everything the old tests actually cared about —
+routine intermediate traffic stays quiet, machine-actionable and human-action
+traffic stays loud, malformed input never silently drops a real event — is
+preserved, now asserted against the single source of truth.
+
+ONE ASSERTION WAS DROPPED, NOT SILENTLY RELAXED — the retired predicate
+-----------------------------------------------------------------------
+The old module asserted that ``gave_up`` / ``crashed`` / ``timed_out`` stay
+loud on the api_server lane.  The engine still delivers them, but as
+``[aborted]`` rather than as a needs-decision ping; the assertions here now
+encode that.  ``gave_up`` (the breaker-tripped terminal failure,
+``BRANCH_TERMINAL_FAILURE_KIND`` in ``hermes_cli/kanban_db``) additionally
+still reaches the user through the branch итог, so nothing is lost — only the
+per-event loudness became the aborted-delivery contract.  ``crashed`` /
+``timed_out`` auto-retry, so treating them as intermediate is the correct
+reading of the P2 rule, not a regression.
 """
+
+from types import SimpleNamespace
 
 import pytest
 
-from gateway.kanban_watchers import (
-    _owui_suppress_intermediate_event,
-    should_suppress_api_server_event,
+from gateway.delivery_engine import (
+    ABORTED,
+    FINAL,
+    LIVE_STATUS,
+    NEEDS_DECISION,
+    classify_event,
 )
 
 
-class _Ev:
-    """Minimal event stand-in matching hermes_cli.kanban_db.Event fields."""
-
-    def __init__(self, kind, payload=None):
-        self.kind = kind
-        self.payload = payload or {}
+def _ev(kind, payload=None):
+    return SimpleNamespace(kind=kind, payload=payload or {}, id=11)
 
 
-class _Card:
-    """Minimal card stand-in exposing the fields the predicate reads."""
-
-    def __init__(self, status="running"):
-        self.status = status
-        self.id = "t_card"
-        self.title = "card"
-
-
-def _supp(kind, *, payload=None, card=None, parent=None, replace=True):
-    ev = _Ev(kind, payload)
-    return should_suppress_api_server_event(
-        ev, card=card, parent=parent, branch_summary_replace=replace,
+def _task(status="running", block_kind=None):
+    return SimpleNamespace(
+        status=status, title="card", result="", block_kind=block_kind,
     )
 
 
-# ---------------------------------------------------------------------------
-# Replace-mode OFF: additive behavior — nothing suppressed.
-# ---------------------------------------------------------------------------
+def _ctx(*, branch_terminal=False, card_status="running",
+         block_kind=None, is_root=False):
+    return {
+        "branch_terminal": branch_terminal,
+        "is_root": is_root,
+        "card_status": card_status,
+        "block_kind": block_kind,
+    }
 
 
-def test_replace_off_never_suppresses():
-    for kind in ("completed", "status", "blocked", "archived", "unblocked",
-                 "branch_summary", "block_loop_detected"):
-        assert _supp(kind, replace=False) is False
-        assert _supp(kind, card=_Card(), parent=_Card(), replace=False) is False
+#: A descendant card of a mission tree — the "intermediate" case.
+CHILD = _ctx()
+#: The branch root whose OWN close really is the terminal итог.
+ROOT_TERMINAL = _ctx(branch_terminal=True, is_root=True, card_status="done")
 
 
-# ---------------------------------------------------------------------------
-# Terminal branch итог: NEVER suppressed.
-# ---------------------------------------------------------------------------
-
-
-def test_terminal_branch_summary_never_suppressed():
-    assert _supp("branch_summary") is False
-    assert _supp("branch_summary", card=_Card(), parent=_Card()) is False
-
-
-# ---------------------------------------------------------------------------
-# Human-attention kinds: NEVER suppressed.
-# ---------------------------------------------------------------------------
-
-
-def test_block_loop_detected_never_suppressed():
-    assert _supp("block_loop_detected") is False
-    # Even for a routed-to-triage card / any card.
-    assert _supp("block_loop_detected", card=_Card("running"),
-                 parent=_Card("running")) is False
-
-
-def test_triage_event_kind_never_suppressed():
-    assert _supp("triage") is False
-    assert _supp("triage", card=_Card("triage")) is False
-
-
-def test_triage_card_status_never_suppressed():
-    # Routine completed on a card whose status is triage — still loud.
-    assert _supp("completed", card=_Card("triage")) is False
-    assert _supp("status", card=_Card("triage")) is False
-
-
-def test_terminal_failure_kinds_never_suppressed():
-    for kind in ("gave_up", "crashed", "timed_out", "review_requested"):
-        assert _supp(kind) is False
-        assert _supp(kind, card=_Card(), parent=_Card()) is False
+def _silenced(kind, *, payload=None, ctx=None, task=None, **kwargs):
+    """True when the engine silences this event (nothing is delivered)."""
+    dec = classify_event(
+        task or _task(), _ev(kind, payload), dict(ctx if ctx is not None else CHILD),
+        **kwargs,
+    )
+    return dec.event_type is None
 
 
 # ---------------------------------------------------------------------------
-# blocked + provider_route (provider outage): NOT suppressed.
+# Terminal branch итог: the single channel message — never silenced.
 # ---------------------------------------------------------------------------
 
 
-def test_blocked_provider_route_not_suppressed():
-    ev = _Ev("blocked", {"reason": "API down",
-                          "kind": "needs_input", "provider_route": "x/y"})
-    assert should_suppress_api_server_event(
-        ev, card=_Card("blocked"), parent=None, branch_summary_replace=True,
-    ) is False
-    # Even on a child card (parent present) a provider outage stays loud.
-    assert _supp("blocked", payload={"provider_route": "x/y"},
-                 card=_Card("blocked"), parent=_Card()) is False
+def test_terminal_root_completion_is_final():
+    dec = classify_event(_task("done"), _ev("completed"), dict(ROOT_TERMINAL))
+    assert dec.event_type == FINAL
+
+
+def test_root_completion_with_open_subscribed_descendant_is_intermediate():
+    # P2 (t_ecab4990): an api_server root that still owns subscribed children
+    # is NOT the branch итог — the branch-summary watcher owns that message.
+    ctx = _ctx(branch_terminal=False, is_root=True, card_status="done")
+    assert classify_event(_task("done"), _ev("completed"), dict(ctx)).event_type is None
 
 
 # ---------------------------------------------------------------------------
-# blocked needs-human-fix kinds: NOT suppressed.
+# Routine intermediate traffic: silenced (the branch итог carries it).
 # ---------------------------------------------------------------------------
 
 
-def test_blocked_needs_input_not_suppressed():
-    assert _supp("blocked", payload={"kind": "needs_input"}) is False
-    assert _supp("blocked", payload={"kind": "capability"}) is False
-    # Legacy un-typed block → treated as a human blocker.
-    assert _supp("blocked", payload={}) is False
-    assert _supp("blocked", payload=None) is False
-
-
-def test_blocked_self_resolving_suppressed():
-    assert _supp("blocked", payload={"kind": "dependency"}) is True
-    assert _supp("blocked", payload={"kind": "transient"}) is True
-
-
-# ---------------------------------------------------------------------------
-# Child cards (parent present): suppressed.
-# ---------------------------------------------------------------------------
-
-
-def test_child_completed_suppressed():
-    assert _supp("completed", card=_Card(), parent=_Card()) is True
-    assert _supp("status", card=_Card(), parent=_Card()) is True
-    assert _supp("archived", card=_Card(), parent=_Card()) is True
-    assert _supp("unblocked", card=_Card(), parent=_Card()) is True
-
-
-def test_child_split_close_suppressed():
-    # [split N/M] one-off child close while the ancestor mission is still
-    # running — suppressed on the api_server lane.
-    assert _supp("completed", card=_Card(), parent=_Card()) is True
-
-
-# ---------------------------------------------------------------------------
-# Root / unsubscribed tasks: routine non-terminal kinds suppressed, too.
-# ---------------------------------------------------------------------------
-
-
-def test_root_routine_kinds_suppressed():
-    # Under replace mode the root's own completion ping is not the итог — the
-    # branch_summary stage owns that single channel message.
-    assert _supp("completed", card=_Card(), parent=None) is True
-    assert _supp("status", card=_Card(), parent=None) is True
-    assert _supp("archived", card=_Card(), parent=None) is True
-    assert _supp("unblocked", card=_Card(), parent=None) is True
-
-
-def test_p2_parent_with_children_completed_suppressed():
-    # P2 (t_ecab4990): a completing ROOT/PARENT card that still has children
-    # is NOT the branch итог under replace mode — its completed is suppressed
-    # on the api_server lane regardless of whether it has a signed parent
-    # (the whole-mission итог is the branch_summary watcher's single message).
-    childed = _Card()
-    childed.children = ["t_child_1", "t_child_2"]  # has_children marker
+def test_child_routine_kinds_silenced():
     for kind in ("completed", "status", "archived", "unblocked"):
-        assert _supp(kind, card=childed, parent=None) is True
-    # Even the parent card's own self-resolving blocked stays routine.
-    assert _supp("blocked", payload={"kind": "dependency"},
-                 card=childed, parent=None) is True
-    # A parent with children may also be a mid-tree node (has a parent too).
-    assert _supp("completed", card=childed, parent=_Card()) is True
+        assert _silenced(kind) is True
 
 
-def test_root_blocked_self_resolving_suppressed():
-    assert _supp("blocked", payload={"kind": "dependency"},
-                 card=_Card(), parent=None) is True
+def test_child_split_close_silenced():
+    # [split N/M] one-off child close while the ancestor mission is running.
+    assert _silenced("completed") is True
 
 
-# ---------------------------------------------------------------------------
-# Defensive: None / malformed inputs.
-# ---------------------------------------------------------------------------
+def test_self_resolving_block_silenced():
+    # dependency / transient resolve on their own — never a message.
+    assert _silenced("blocked", payload={"kind": "dependency"}) is True
+    assert _silenced("blocked", payload={"kind": "transient"}) is True
 
 
-def test_none_event_not_suppressed():
-    assert should_suppress_api_server_event(
-        None, card=_Card(), parent=None, branch_summary_replace=True,
-    ) is False
+def test_root_self_resolving_block_silenced():
+    ctx = _ctx(is_root=True)
+    assert _silenced("blocked", payload={"kind": "dependency"}, ctx=ctx) is True
 
 
-def test_event_without_kind_not_suppressed():
-    class _Bare:
-        pass
-    assert should_suppress_api_server_event(
-        _Bare(), card=_Card(), parent=None, branch_summary_replace=True,
-    ) is False
-
-
-def test_non_dict_payload_handled():
-    class _Weird:
-        kind = "blocked"
-
-        @property
-        def payload(self):
-            raise TypeError("boom")
-    ev = _Weird()
-    assert should_suppress_api_server_event(
-        ev, card=_Card("blocked"), parent=None, branch_summary_replace=True,
-    ) is False
+def test_unclassified_kind_silenced():
+    assert _silenced("weird_kind") is True
 
 
 # ---------------------------------------------------------------------------
-# Legacy shim still routes through the canonical predicate.
+# Human-action events: never silenced.
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_shim_forwards_behavior():
-    # api_server lane + replace mode → routine kinds suppressed.
-    assert _owui_suppress_intermediate_event("completed", _Ev("completed"),
-                                             True, "api_server") is True
-    assert _owui_suppress_intermediate_event("status", _Ev("status"),
-                                             True, "api_server") is True
-    # blocked needs-human-fix → loud.
-    assert _owui_suppress_intermediate_event(
-        "blocked", _Ev("blocked", {"kind": "needs_input"}), True,
-        "api_server") is False
-    # blocked provider_route → loud.
-    assert _owui_suppress_intermediate_event(
-        "blocked", _Ev("blocked", {"provider_route": "a/b"}), True,
-        "api_server") is False
-    # block_loop_detected → loud.
-    assert _owui_suppress_intermediate_event(
-        "block_loop_detected", _Ev("block_loop_detected"), True,
-        "api_server") is False
-    # branch_summary → loud.
-    assert _owui_suppress_intermediate_event(
-        "branch_summary", _Ev("branch_summary"), True, "api_server") is False
-    # Non-api_server lane → never silenced by this gate.
-    assert _owui_suppress_intermediate_event("completed", _Ev("completed"),
-                                             True, "telegram") is False
-    # Replace mode off → never silenced.
-    assert _owui_suppress_intermediate_event("completed", _Ev("completed"),
-                                             False, "api_server") is False
+def test_human_attention_kinds_loud():
+    for kind in ("block_loop_detected", "review_requested", "triage"):
+        dec = classify_event(_task(), _ev(kind), dict(CHILD))
+        assert dec.event_type == NEEDS_DECISION
+
+
+def test_blocked_needs_human_fix_loud():
+    for block_kind in ("needs_input", "capability"):
+        dec = classify_event(_task(), _ev("blocked", {"kind": block_kind}), dict(CHILD))
+        assert dec.event_type == NEEDS_DECISION
+    # Legacy un-typed block == human decision (branch_state semantics).
+    for payload in ({}, None):
+        dec = classify_event(_task(), _ev("blocked", payload), dict(CHILD))
+        assert dec.event_type == NEEDS_DECISION
+
+
+def test_blocked_provider_route_loud():
+    dec = classify_event(
+        _task(), _ev("blocked", {"reason": "API down", "provider_route": "x/y"}),
+        dict(CHILD),
+    )
+    assert dec.event_type == NEEDS_DECISION
+
+
+def test_card_status_triage_beats_routine_kind():
+    # A card routed to triage needs a human decision no matter which event
+    # carries the notification.
+    for kind in ("completed", "status", "archived"):
+        ctx = _ctx(card_status="triage")
+        assert classify_event(_task(), _ev(kind), dict(ctx)).event_type == NEEDS_DECISION
+
+
+def test_card_status_triage_beats_self_resolving_block():
+    ctx = _ctx(card_status="triage")
+    dec = classify_event(_task(), _ev("blocked", {"kind": "dependency"}), dict(ctx))
+    assert dec.event_type == NEEDS_DECISION
+
+
+# ---------------------------------------------------------------------------
+# Aborted: terminal failure / interruption is a delivery, not a silence.
+# ---------------------------------------------------------------------------
+
+
+def test_aborted_kinds_delivered():
+    for kind in ("gave_up", "crashed", "timed_out"):
+        dec = classify_event(_task(), _ev(kind), dict(CHILD))
+        assert dec.event_type == ABORTED
+
+
+# ---------------------------------------------------------------------------
+# Live status: an in-flight card edits its message, never a fresh ping.
+# ---------------------------------------------------------------------------
+
+
+def test_live_status_kinds():
+    for kind in ("spawned", "claimed"):
+        assert classify_event(_task(), _ev(kind), dict(CHILD)).event_type == LIVE_STATUS
+    for payload in ({"status": "running"}, {"to": "running"}):
+        assert classify_event(
+            _task(), _ev("status", payload), dict(CHILD),
+        ).event_type == LIVE_STATUS
+
+
+def test_non_running_status_is_silenced():
+    assert _silenced("status", payload={"status": "ready"}) is True
+
+
+# ---------------------------------------------------------------------------
+# Synthetic readback cards are never a delivery subject.
+# ---------------------------------------------------------------------------
+
+
+def test_do_not_deliver_silences_everything():
+    dec = classify_event(
+        _task("done"), _ev("completed"), dict(ROOT_TERMINAL), do_not_deliver=True,
+    )
+    assert dec.event_type is None
+    dec = classify_event(
+        _task(), _ev("block_loop_detected"), dict(CHILD), do_not_deliver=True,
+    )
+    assert dec.event_type is None
+
+
+# ---------------------------------------------------------------------------
+# Defensive: malformed input is silenced, never crashes the notifier.
+# ---------------------------------------------------------------------------
+
+
+def test_none_event_silenced():
+    assert classify_event(_task(), None, dict(CHILD)).event_type is None
+
+
+def test_event_without_kind_silenced():
+    assert classify_event(_task(), object(), dict(CHILD)).event_type is None
+
+
+def test_non_dict_payload_tolerated():
+    # A non-dict payload must not crash classification.
+    for payload in (None, "not-a-dict", 42):
+        dec = classify_event(_task(), _ev("blocked", payload), dict(CHILD))
+        assert dec.event_type == NEEDS_DECISION
+
+
+def test_missing_tree_ctx_tolerated():
+    dec = classify_event(_task(), _ev("block_loop_detected"), None)
+    assert dec.event_type == NEEDS_DECISION
 
 
 if __name__ == "__main__":

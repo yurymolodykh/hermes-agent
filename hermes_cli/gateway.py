@@ -3014,8 +3014,13 @@ def ensure_gateway_service(context: str = "setup") -> bool:
             else:
                 from hermes_cli import gateway_windows
 
-                # Registers the Scheduled Task AND starts it.
-                gateway_windows.install(force=False)
+                # Registers the Scheduled Task AND starts it. This path is
+                # documented as never-prompting, so it states its intent
+                # explicitly instead of letting install() ask (or fail closed
+                # on) the login auto-start question.
+                gateway_windows.install(
+                    force=False, start_now=True, start_on_login=True
+                )
                 print_success("  Gateway service installed and started.")
                 return True
 
@@ -7462,7 +7467,14 @@ def gateway_setup():
                         else:
                             from hermes_cli import gateway_windows
 
-                            gateway_windows.install(force=False)
+                            # Pass the wizard's own answers through: install()
+                            # must not re-ask (double prompt) and must not fall
+                            # back to a default in an unattended run.
+                            gateway_windows.install(
+                                force=False,
+                                start_now=start_now,
+                                start_on_login=start_on_login,
+                            )
                             did_install = True
                         print()
                         if did_install and start_now:
@@ -7472,8 +7484,11 @@ def gateway_setup():
                                 elif is_macos():
                                     launchd_start()
                                 elif is_windows():
+                                    # Idempotent: start() returns early when a
+                                    # gateway is already running, so this does
+                                    # not double-spawn after install()'s launch.
                                     from hermes_cli import gateway_windows
-                                    gateway_windows.start()
+                                    gateway_windows.start(allow_uninstalled=True)
                             except UserSystemdUnavailableError as e:
                                 print_error(
                                     "  Start failed — user systemd not reachable:"
@@ -7967,7 +7982,13 @@ def _gateway_command_inner(args):
         elif is_windows():
             from hermes_cli import gateway_windows
 
-            gateway_windows.start()
+            try:
+                gateway_windows.start(
+                    install_service=getattr(args, "install_service", False)
+                )
+            except gateway_windows.GatewayServiceNotInstalledError as exc:
+                print_error(f"  {exc}")
+                sys.exit(1)
         elif is_wsl():
             print("WSL detected but systemd is not available.")
             print("Run the gateway in foreground mode instead:")
@@ -8184,7 +8205,8 @@ def _gateway_command_inner(args):
                 # when invoked from a gateway-hosted agent/tool call, foreground
                 # run_gateway() is tied to the very gateway process we just
                 # stopped and can die before the replacement is stable.
-                gateway_windows.start()
+                # allow_uninstalled: a restart must never install persistence.
+                gateway_windows.start(allow_uninstalled=True)
             else:
                 run_gateway(verbose=0)
             return

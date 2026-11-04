@@ -339,6 +339,43 @@ def _branch_summary_terminal(conn, kb, root_id: str) -> bool:
             if kb.branch_state(conn, aid) is None:
                 # An ancestor mission tree is still open/running → intermediate.
                 return False
+    try:
+        stage_children = kb.get_descendant_ids(conn, root_id)
+    except Exception:
+        stage_children = set()
+    if stage_children:
+        # F10 (chamber-graves-ex / sno-economics): a branch root that closes
+        # while its OWN descendants are still open/running is NOT the mission
+        # итог — an acceptance (приёмка) card, a rework card or any still
+        # attached step is downstream work of the same mission.  The pre-F10
+        # gate looked ONLY upward (ancestors), so the «готов» итог of an
+        # upstream stage (report assembly) fired the moment that stage closed,
+        # while the independent review card was already spawned and running —
+        # the owner received the итог of a mission whose приёмка had not
+        # finished.  branch_state(root) being terminal therefore means "this
+        # subtree closed", not "the mission closed": a close is terminal only
+        # when nothing below it is still in flight either.  Status
+        # classification reuses ``classify_branch_node_status`` so this gate
+        # cannot drift from ``branch_state``'s own notion of "open".
+        ordered_children = sorted(stage_children)
+        placeholders = ", ".join("?" * len(ordered_children))
+        rows = conn.execute(
+            "SELECT id, status, block_kind FROM tasks "
+            f"WHERE id IN ({placeholders})",
+            ordered_children,
+        ).fetchall()
+        for row in rows:
+            raw_status = str(row["status"] or "").strip()
+            block_kind = str(row["block_kind"] or "").strip() or None
+            cls = kb.classify_branch_node_status(raw_status, block_kind)
+            if cls == kb.SA_BRANCH_NODE_OPEN:
+                return False
+            if cls == kb.SA_BRANCH_NODE_FAIL:
+                # Отказ ветки — законный терминальный итог: владелец должен
+                # узнать, что приёмка упёрлась в неисправимое.  Глушить его
+                # нельзя даже ради «отчёт только по завершении»: отказ и есть
+                # завершение, а молчание здесь оставило бы миссию без вердикта.
+                continue
     if _has_live_mission_controller(conn, kb, root_id):
         # A live goal_mode controller owns the same OWUI session → intermediate.
         return False
@@ -1056,6 +1093,48 @@ class GatewayKanbanWatchersMixin:
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
                                         " (silent: descendant replace-mode)" if silent else "",
                                     )
+                                    # ОВНЕР-ПРАВИЛО (03.11.2026, t_f6790ef5):
+                                    # «завершено» корня проходит как итог только
+                                    # если ревью ветки закрылось ПОЛОЖИТЕЛЬНО.
+                                    # Единственная точка правды —
+                                    # ``_kb.summary_has_passed_review``;
+                                    # значение пробрасывается в движок как
+                                    # ``review_passed``. До этой карточки гейт в
+                                    # движке был мёртвым: параметр объявлен, но
+                                    # никто его не передавал (всегда True).
+                                    #
+                                    # ``branch_state(root)`` уже посчитан
+                                    # ключевым гейтом ниже? Нет.
+                                    # Значение нужно только для api_server-итога
+                                    # (движок применяет флаг лишь там), поэтому
+                                    # для остальных платформ остаётся True —
+                                    # их поведение не меняется, лишних чтений БД
+                                    # нет.
+                                    review_passed = True
+                                    if platform == "api_server":
+                                        try:
+                                            _rst = _kb.branch_state(
+                                                conn, sub["task_id"],
+                                            )
+                                            if _rst is not None:
+                                                review_passed = bool(
+                                                    _kb.summary_has_passed_review(
+                                                        conn, sub["task_id"],
+                                                        _rst["outcome"],
+                                                    )
+                                                )
+                                        except Exception as _rp_exc:
+                                            # Fail closed: не отдаём «выполнено»,
+                                            # если проверку ревью доказать
+                                            # нельзя. Итог по-прежнему доставит
+                                            # ветка-итог, когда ревью закроется.
+                                            review_passed = False
+                                            logger.warning(
+                                                "kanban notifier: review gate for %s "
+                                                "failed (%s); suppressing the "
+                                                "per-event OWUI final",
+                                                sub["task_id"], _rp_exc,
+                                            )
                                     deliveries.append({
                                         "sub": sub,
                                         "old_cursor": old_cursor,
@@ -1069,6 +1148,7 @@ class GatewayKanbanWatchersMixin:
                                         "mission_live": mission_live,
                                         "has_open_descendants": has_open_desc,
                                         "has_subscribed_descendant": has_subscribed_desc,
+                                        "review_passed": review_passed,
                                         "task_tg_owner": task_tg_owner,
                                     })
                                 except Exception as sub_exc:
@@ -1432,6 +1512,10 @@ class GatewayKanbanWatchersMixin:
                             mission_live=bool(d.get("mission_live")),
                             has_open_descendants=bool(d.get("has_open_descendants")),
                             has_subscribed_descendant=bool(d.get("has_subscribed_descendant")),
+                            # t_f6790ef5: гейт положительного ревью больше не
+                            # мёртвый — _collect считает его канонической
+                            # ``kb.summary_has_passed_review``.
+                            review_passed=bool(d.get("review_passed", True)),
                             do_not_deliver=bool(d.get("do_not_deliver")),
                             silent=bool(d.get("silent")),
                             platform_str=platform_str,
@@ -2028,7 +2112,24 @@ class GatewayKanbanWatchersMixin:
                 return {"reactivated": True, "cleared": cleared, "root_id": root_id}
             return None
         outcome = st["outcome"]
-        msg = _kb.branch_summary_message(outcome, st["failed"])
+        if not _kb.summary_has_passed_review(conn, root_id, outcome):
+            # ОВНЕР-ПРАВИЛО (03.11.2026, миссии «могилы»/«СНО»): итоговый отчёт
+            # доставляется только после ПОЛОЖИТЕЛЬНОГО ревью. Единственная
+            # точка правды — ``kb.summary_has_passed_review``. Ветка закрыта,
+            # но в ней есть карточка-ревьюер (09/15), которая закрылась НЕ
+            # положительно → итога нет. Ответ владельцу здесь именно про
+            # успех, поэтому тихий пропуск, а не вердикт отказа.
+            return None
+        # Вердикт отказа приёмки (owner-rule 03.11.2026, t_f6790ef5): провал
+        # обязан быть виден, но как «доработка отклонена», а не как «задача не
+        # выполнена». Отказ НЕ глушится — меняется только формулировка.
+        refused_ids = (
+            _kb.acceptance_refusal_ids(conn, root_id, st["failed"])
+            if outcome == "failure" else []
+        )
+        msg = _kb.branch_summary_message(
+            outcome, st["failed"], refused_ids=refused_ids,
+        )
         # F6-style terminal gate for the TG mirror of the branch итог: the
         # итог is TERMINAL only when the whole mission/root tree above the
         # branch root is closed too (no open/running ancestor remains).  A
