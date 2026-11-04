@@ -288,6 +288,27 @@ def _reviewer_assignees() -> frozenset:
         return frozenset({"09-independent-reviewer", "15-sre-qa"})
 
 
+def _reviewer_assignees_lower() -> frozenset:
+    """``_reviewer_assignees()`` normalized for ``assignee`` column matching."""
+    return frozenset(str(r).strip().lower() for r in _reviewer_assignees())
+
+
+def _is_reviewer_assignee(assignee: Optional[str]) -> bool:
+    """True when ``assignee`` is one of the independent review profiles.
+
+    ONE membership test for every reader of ``REVIEWER_PROFILES``
+    (``has_reviewer_descendant``, ``acceptance_refusal_ids``,
+    ``summary_has_passed_review`` / ``branch_review_gate``), so the call sites
+    can never drift into two different notions of "reviewer card" — the same
+    reason ``_reviewer_assignees`` is shared with the review-effort pin
+    (t_5f76c8d0).
+    """
+    reviewers = _reviewer_assignees_lower()
+    if not reviewers:
+        return False
+    return str(assignee or "").strip().lower() in reviewers
+
+
 def default_card_reasoning_effort(
     assignee: Optional[str],
     *,
@@ -17566,6 +17587,438 @@ def clear_branch_summary(conn: sqlite3.Connection, root_id: str) -> int:
     return int(cur.rowcount or 0)
 
 
+#: Reviewer verdict vocabulary (t_5f76c8d0) — the ONE place the classes live.
+#:
+#: A reviewer card (``REVIEWER_PROFILES``) closes with ``kanban_complete`` for
+#: BOTH outcomes: a positive approval and a rejection both leave the card
+#: ``done``; the verdict itself rides ``task_runs.metadata`` (free-form JSON).
+#: ``request_changes`` is the other path — it reopens the card to ``ready``.
+#: Therefore ``done`` alone proves nothing, and the delivery gate must read the
+#: verdict instead of the status.
+#:
+#: The live board writes a verdict in 12+ spellings of the same class
+#: (``approved`` / ``APPROVED`` / ``PASS`` / ``ok`` / ``approve`` /
+#: ``approved_with_limitations`` / ``PASS (approved_with_limitations)`` /
+#: ``revision_required`` / ``CHANGES`` / ``REWORK`` / ``REQUEST_CHANGES`` /
+#: ``ДОРАБОТАТЬ``), so equality against one constant cannot work. It also stores
+#: long NARRATIVE in the same keys (``"fails before task-1 ✓ (RED at HEAD …);
+#: passes after ✓ …"``, ``"PASS 7/7 (0 FAIL, 0 UNCERTAIN)"``), which is why a
+#: substring scan is wrong: it reads the word ``FAIL`` inside
+#: ``"0 FAIL"``/``"FAILOVER"`` as a rejection and would silence a legitimate
+#: итог (owner rule №4 forbids that).
+#:
+#: Classification is therefore LABEL-shaped, and asymmetric on purpose:
+#:
+#:   1. An explicit ``вердикт:`` / ``verdict:`` marker wins wherever it sits.
+#:   2. Otherwise only the LEAD of the value is read (first :data:`_VERDICT_LEAD_TOKENS`
+#:      tokens, skipping fillers), matching canonical class TOKENS — not
+#:      substrings: ``changes`` matches ``changes``/``changes_requested`` but not
+#:      ``exchange``; ``pass`` matches ``pass``/``passed`` but not ``compass``.
+#:   3. A value longer than :data:`_VERDICT_LABEL_MAX_CHARS` without a marker is
+#:      PROSE, not a label → ``unknown`` (never negative). Under-reporting a
+#:      rejection degrades to today's behaviour; inventing one silences the
+#:      owner's report, which the owner rule forbids.
+#:   4. A negation immediately before the class token flips the class
+#:      (``"not approved"`` → negative, ``"no critical FAIL"`` → positive).
+#:
+#: Negative wins over positive only when both are present in the lead
+#: (``"CHANGES (содержание PASS…)"`` is still a changes request).
+REVIEW_VERDICT_NEGATIVE_TOKENS: frozenset[str] = frozenset({
+    "revision", "revisions", "changes", "change", "changed", "rework",
+    "reworked", "rejected", "reject", "rejection", "failed", "fail", "fails",
+    "blocked", "incomplete",
+    # NOTE: the NOUNS ``defect``/``defects``/``blocker`` are deliberately NOT
+    # class tokens — the live board carries ``defect_closed_verified`` (a
+    # defect that WAS closed and verified) and treating the noun as a verdict
+    # would read an approval as a rejection and silence the итог.
+    "доработать", "доработка", "доработ", "переделать", "переделка",
+    "неверен", "неверный", "отклонено", "отклонён", "отклонен", "отклон",
+    "провал", "провалено", "непригоден", "нерабочий",
+})
+REVIEW_VERDICT_POSITIVE_TOKENS: frozenset[str] = frozenset({
+    "approved", "approve", "approves", "approval", "approved_with_limitations",
+    "pass", "passes", "passed", "ok", "okay", "accepted", "accept",
+    "acception", "verified", "verified_live", "ready", "complete",
+    "completed", "met", "clean", "go", "да", "принято", "приемлемо",
+    "соответствует", "выполнено", "готово", "годен",
+})
+#: Tokens allowed to precede a class token without ending the lead scan
+#: (articles, fillers, list numbering such as ``"(a)"``).
+_VERDICT_FILLER_TOKENS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "be", "was", "all", "and", "or", "of",
+    "to", "for", "with", "by", "on", "in", "at", "as", "it", "s",
+    "request", "requested", "requesting",
+    "вердикт", "итог", "результат", "приемка", "приёмка", "ревью", "статус",
+})
+#: How many leading tokens the class scan may inspect.
+_VERDICT_LEAD_TOKENS = 4
+#: A verdict LABEL is short; longer values in a verdict key are narrative.
+_VERDICT_LABEL_MAX_CHARS = 110
+
+#: Machine-readable metadata keys that carry a review verdict. Exact names plus
+#: a prefix rule (``verdict_*`` / ``review_*`` / ``acceptance_*``) — the live
+#: board stores it as ``verdict`` most of the time, but ``review_verdict``,
+#: ``review_outcome``, ``canonical_status``, ``verdict_delivery_1``,
+#: ``verdict_p5`` … all appear. Keys that point AT evidence rather than state
+#: the verdict (``verdict_file``, ``verdict_artifact``, ``acceptance_md``,
+#: ``verdict_sha256`` …) are excluded by suffix.
+REVIEW_VERDICT_METADATA_KEYS: frozenset[str] = frozenset({
+    "verdict",
+    "review_verdict",
+    "review_outcome",
+    "review_status",
+    "canonical_status",
+    "verdict_label",
+    "verdict_label_ru",
+    "verdict_detail",
+    "acceptance",
+    "accepted",
+    "acceptance_status",
+})
+REVIEW_VERDICT_KEY_PREFIXES: tuple[str, ...] = ("verdict_", "review_", "acceptance_")
+REVIEW_VERDICT_KEY_EXCLUDED_SUFFIXES: tuple[str, ...] = (
+    "_file",
+    "_doc",
+    "_artifact",
+    "_md",
+    "_path",
+    "_sha256",
+    "_bytes",
+    "_lines",
+    "_prefix",
+)
+
+REVIEW_VERDICT_POSITIVE = "positive"
+REVIEW_VERDICT_NEGATIVE = "negative"
+REVIEW_VERDICT_UNKNOWN = "unknown"
+REVIEW_VERDICT_MISSING = "missing"
+
+#: Negation words that flip the class of the token that follows them.
+_VERDICT_NEGATIONS: frozenset[str] = frozenset({
+    "not", "no", "without", "never", "cannot", "can", "не", "нет", "без", "никак",
+})
+_VERDICT_MARKER_RE = re.compile(r"(?i)(?:вердикт|verdict)\s*[:\-—]\s*([^\n;]{0,110})")
+
+
+def normalize_review_verdict_text(raw: Any) -> str:
+    """Normalize a raw verdict string for class matching (see the vocabulary).
+
+    ``"PASS (approved_with_limitations)"`` →
+    ``"pass approved with limitations"``; ``"REWORK (п.3 PASS, п.4 PASS)"`` →
+    ``"rework п 3 pass п 4 pass"``.  Bracketed tails are NOT dropped (a verdict
+    often keeps its meaning there), they are flattened into the token stream.
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    for ch in "_-–—/\\|:;,.!?\"'`()[]{}<>*#":
+        text = text.replace(ch, " ")
+    text = re.sub(r"[^0-9a-zа-яё ]+", " ", text)
+    return " ".join(text.split())
+
+
+def _verdict_lead_tokens(text: str) -> list[str]:
+    """Leading tokens of a normalized verdict, fillers skipped, capped.
+
+    Stops at the first token that is neither a class token nor a filler: a
+    label puts its class FIRST (``changes_requested (K4 …)``, ``PASS (… )``),
+    so anything after narrative prose must not be read as the verdict.
+    """
+    lead: list[str] = []
+    for idx, token in enumerate(text.split()):
+        if token in REVIEW_VERDICT_NEGATIVE_TOKENS:
+            lead.append((idx, token))
+        elif token in REVIEW_VERDICT_POSITIVE_TOKENS:
+            lead.append((idx, token))
+        elif token in _VERDICT_FILLER_TOKENS or token in _VERDICT_NEGATIONS:
+            continue
+        elif token.isdigit():
+            continue
+        else:
+            break
+        if len(lead) >= _VERDICT_LEAD_TOKENS:
+            break
+    return lead
+
+
+def _classify_lead(lead: list[tuple[int, str]], text: str) -> str:
+    """Class of the FIRST class token in the lead, honouring an adjacent negation.
+
+    FIRST token wins on purpose. Every live label leads with its own class and
+    only narrates afterwards (``CHANGES (содержание PASS …)``,
+    ``PASS 7/7 (0 FAIL …)``, ``REWORK (п.3 PASS …)``) — so reading further
+    tokens would let the narrative override the label, which is exactly the
+    substring bug this replaces.
+    """
+    if not lead:
+        return REVIEW_VERDICT_UNKNOWN
+    words = text.split()
+    for idx, token in lead:
+        prev = words[idx - 1] if idx > 0 else ""
+        negated = prev in _VERDICT_NEGATIONS
+        is_negative = token in REVIEW_VERDICT_NEGATIVE_TOKENS
+        # A negated positive is a rejection («not approved»); a negated negative
+        # is an approval («no critical FAIL»).
+        if negated:
+            return REVIEW_VERDICT_POSITIVE if is_negative else REVIEW_VERDICT_NEGATIVE
+        return REVIEW_VERDICT_NEGATIVE if is_negative else REVIEW_VERDICT_POSITIVE
+    return REVIEW_VERDICT_UNKNOWN
+
+
+def classify_review_verdict(raw: Any) -> str:
+    """Classify ONE raw verdict string: positive / negative / unknown / missing.
+
+    Label-shaped, asymmetric by design (see the vocabulary block):
+
+      * an explicit ``вердикт:`` / ``verdict:`` marker is authoritative wherever
+        it sits in the value;
+      * otherwise a value longer than :data:`_VERDICT_LABEL_MAX_CHARS` is
+        NARRATIVE, not a label → ``unknown`` (never ``negative``): reporting a
+        rejection that was not written would silence a legitimate итог;
+      * otherwise the LEAD tokens are matched against the canonical class
+        tokens, with an adjacent negation flipping the class.
+
+    An unrecognized present verdict is ``unknown`` (NOT positive), so the caller
+    records what it decided instead of folding it into «done значит принято».
+    """
+    text = normalize_review_verdict_text(raw)
+    if not text:
+        return REVIEW_VERDICT_MISSING
+    raw_str = str(raw or "")
+    marker = _VERDICT_MARKER_RE.search(raw_str)
+    if marker:
+        marked = normalize_review_verdict_text(marker.group(1))
+        cls = _classify_lead(_verdict_lead_tokens(marked), marked)
+        if cls != REVIEW_VERDICT_UNKNOWN:
+            return cls
+    if len(raw_str.strip()) > _VERDICT_LABEL_MAX_CHARS:
+        return REVIEW_VERDICT_UNKNOWN
+    return _classify_lead(_verdict_lead_tokens(text), text)
+
+
+def _review_verdict_metadata_values(metadata: Any) -> list[tuple[str, str]]:
+    """Extract ``(key, raw_value)`` verdict candidates from run metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    for key, value in metadata.items():
+        if not isinstance(value, str):
+            continue
+        name = str(key).strip().lower()
+        if not name or name.endswith(REVIEW_VERDICT_KEY_EXCLUDED_SUFFIXES):
+            continue
+        if name in REVIEW_VERDICT_METADATA_KEYS or name.startswith(
+            REVIEW_VERDICT_KEY_PREFIXES
+        ):
+            if value.strip():
+                out.append((name, value.strip()))
+    # ``verdict`` first so it leads the reported evidence.
+    out.sort(key=lambda kv: (kv[0] != "verdict", kv[0]))
+    return out
+
+
+def _classify_review_run(metadata: Any, summary: Any) -> tuple[str, str]:
+    """Classify one reviewer run's verdict: ``(class, raw_evidence)``.
+
+    Machine-readable metadata wins; the handoff summary is only a fallback for
+    legacy cards that opened ``done`` with prose (``"Вердикт: revision_required"``).
+    Within one run a negative candidate dominates (a run that rejected one
+    delivery and accepted another is not an approval).
+    """
+    classes: list[tuple[str, str]] = []
+    for key, value in _review_verdict_metadata_values(metadata):
+        classes.append((classify_review_verdict(value), f"{key}={value[:120]}"))
+    if REVIEW_VERDICT_NEGATIVE in {cls for cls, _ in classes}:
+        return REVIEW_VERDICT_NEGATIVE, next(
+            raw for cls, raw in classes if cls == REVIEW_VERDICT_NEGATIVE
+        )
+    if REVIEW_VERDICT_POSITIVE in {cls for cls, _ in classes}:
+        return REVIEW_VERDICT_POSITIVE, next(
+            raw for cls, raw in classes if cls == REVIEW_VERDICT_POSITIVE
+        )
+    if classes:
+        return REVIEW_VERDICT_UNKNOWN, classes[0][1]
+    # No machine-readable verdict: read the handoff prose, lead-token style.
+    lead = str(summary or "").strip()
+    if lead:
+        head = lead[:400]
+        m = re.search(
+            r"(?i)(?:вердикт|verdict)\s*[:\-—]\s*([^\n.;]{0,80})", head,
+        )
+        candidate = m.group(1) if m else head.splitlines()[0][:120]
+        cls = classify_review_verdict(candidate)
+        if cls != REVIEW_VERDICT_UNKNOWN:
+            return cls, f"summary={candidate.strip()[:120]}"
+    return REVIEW_VERDICT_MISSING, ""
+
+
+def _branch_review_rows(conn: sqlite3.Connection, ordered: list[str]) -> list[sqlite3.Row]:
+    """Reviewer cards of a branch with their LAST run — one query, no N+1."""
+    placeholders = ", ".join("?" * len(ordered))
+    return conn.execute(
+        "SELECT t.id AS id, t.title AS title, t.assignee AS assignee,"
+        "       t.status AS status, t.completed_at AS completed_at,"
+        "       r.id AS run_id, r.outcome AS run_outcome,"
+        "       r.metadata AS run_metadata, r.summary AS run_summary,"
+        "       r.ended_at AS run_ended_at"
+        "  FROM tasks t"
+        "  LEFT JOIN task_runs r ON r.id = ("
+        "        SELECT id FROM task_runs WHERE task_id = t.id"
+        "        ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1)"
+        f" WHERE t.id IN ({placeholders})",
+        ordered,
+    ).fetchall()
+
+
+def branch_review_gate(
+    conn: sqlite3.Connection, root_id: str, outcome: str,
+) -> dict:
+    """SINGLE source of truth for «можно ли отдать итог ветки» + WHY.
+
+    Returns a decision dict (always, never raises on data shape)::
+
+        {"passed": bool,
+         "reason": "not_success" | "no_review" | "reviewer_open"
+                   | "negative_verdict" | "verdict_unknown" | "positive_verdict",
+         "verdict_class": "positive"|"negative"|"unknown"|"missing"|None,
+         "decided_by": {task_id,title,assignee,run_id,verdict_class,
+                        evidence,ended_at} | None,
+         "reviewers": [ {...one entry per reviewer card...} ],
+         "refusal_ids": [reviewer ids whose verdict is negative],
+         "refusal_titles": [(id, title), ...]}
+
+    Rule (owner decision 03.11.2026, hardened by t_5f76c8d0):
+
+      * ``outcome != "success"`` → passed. A failure/refusal verdict IS the
+        вердикт and must stay visible (delivered by ``branch_summary_message``
+        in its failure form).
+      * ``outcome == "success"`` and no reviewer descendant → passed
+        (``no_review``): a mission that never went through independent review,
+        including a childless isolated root, is a legitimate итог.
+      * ``outcome == "success"`` and a reviewer card is NOT terminal-success →
+        ``reviewer_open``, not passed. (``branch_state`` would normally return
+        ``None`` here; this only fires on corrupted state — fail closed.)
+      * ``outcome == "success"``, every reviewer terminal, and the branch's
+        REVIEW VERDICT is negative → ``negative_verdict``, not passed. The
+        caller must deliver this as the refusal verdict («❌ Доработка
+        отклонена»), NOT silence it: the reviewer did reject the result.
+      * verdict ``positive`` → passed.
+      * verdict ``unknown``/``missing`` → passed, explicitly and auditable:
+        ``decided_by.verdict_class`` carries the class and callers log it.
+
+    Why unknown/missing passes instead of failing closed (explicit decision,
+    not the old silent «done значит принято»): on the live board 62 of the last
+    131 closed reviewer cards carry no machine-readable verdict at all
+    (``task_runs.metadata`` has no verdict key; the handoff summary is prose
+    such as «Независимая приёмка … 4/4 критерия VERIFIED»). Failing closed there
+    would silence the legitimate итог of ~47% of accepted missions, which the
+    owner rule №4 forbids («молчание недопустимо»). The defect being fixed is
+    the OPPOSITE case — evidence of a rejection being ignored — so a KNOWN
+    negative is required to withhold the success итог. The class is recorded in
+    the gate payload (and logged by the watcher) so the unknown tail stays
+    measurable rather than invisible.
+
+    Multiple reviewer cards (68 branches on the live board): the branch's review
+    is decided by its MOST RECENT verdict (last-run ``ended_at``). That is the
+    re-review semantics — a negative verdict superseded by a later positive one
+    (rework → re-review) unlocks the итог, and a later negative relocks it. All
+    cards are listed in ``reviewers`` with their timestamps, so the decision is
+    auditable end to end.
+    """
+    result: dict = {
+        "passed": True,
+        "reason": "not_success",
+        "verdict_class": None,
+        "decided_by": None,
+        "reviewers": [],
+        "refusal_ids": [],
+        "refusal_titles": [],
+    }
+    if str(outcome or "").strip() != "success":
+        return result
+    if not _reviewer_assignees():
+        result["reason"] = "no_review"
+        return result
+    ids = get_descendant_ids(conn, root_id)
+    if not ids:
+        result["reason"] = "no_review"
+        return result
+    ordered = sorted(ids)
+    rows = _branch_review_rows(conn, ordered)
+    reviewer_rows = [r for r in rows if _is_reviewer_assignee(r["assignee"])]
+    if not reviewer_rows:
+        result["reason"] = "no_review"
+        return result
+
+    entries: list[dict] = []
+    for row in reviewer_rows:
+        status = str(row["status"] or "").strip()
+        metadata: Any = {}
+        try:
+            metadata = json.loads(row["run_metadata"]) if row["run_metadata"] else {}
+        except (TypeError, ValueError):
+            metadata = {}
+        cls, evidence = _classify_review_run(metadata, row["run_summary"])
+        entries.append({
+            "task_id": str(row["id"]),
+            "title": str(row["title"] or ""),
+            "assignee": str(row["assignee"] or ""),
+            "status": status,
+            "run_id": int(row["run_id"]) if row["run_id"] else None,
+            "run_outcome": str(row["run_outcome"] or ""),
+            "verdict_class": cls,
+            "evidence": evidence,
+            "ended_at": int(row["run_ended_at"] or row["completed_at"] or 0),
+        })
+    entries.sort(key=lambda e: (e["ended_at"], e["task_id"]))
+    result["reviewers"] = entries
+
+    for entry in entries:
+        if entry["status"] not in BRANCH_TERMINAL_SUCCESS:
+            result["passed"] = False
+            result["reason"] = "reviewer_open"
+            result["verdict_class"] = entry["verdict_class"]
+            result["decided_by"] = entry
+            return result
+
+    # Most recent verdict decides (re-review semantics); ties → negative wins.
+    last = entries[-1]
+    negatives = [e for e in entries if e["verdict_class"] == REVIEW_VERDICT_NEGATIVE]
+    result["refusal_ids"] = [e["task_id"] for e in negatives]
+    result["refusal_titles"] = [(e["task_id"], e["title"]) for e in negatives]
+    if negatives:
+        decided = max(
+            negatives,
+            key=lambda e: (e["ended_at"], e["task_id"]),
+        )
+        if decided["ended_at"] >= last["ended_at"]:
+            result["passed"] = False
+            result["reason"] = "negative_verdict"
+            result["verdict_class"] = REVIEW_VERDICT_NEGATIVE
+            result["decided_by"] = decided
+            return result
+        # A later verdict superseded this rejection. The LABEL follows the
+        # deciding verdict, not the mere existence of an earlier negative
+        # (t_5f76c8d0: reporting «positive_verdict» while the deciding class is
+        # ``unknown``/``missing`` would misdescribe the audit trail).
+        result["verdict_class"] = last["verdict_class"]
+        result["decided_by"] = last
+        result["reason"] = (
+            "positive_verdict"
+            if last["verdict_class"] == REVIEW_VERDICT_POSITIVE
+            else "verdict_unknown"
+        )
+        return result
+    result["verdict_class"] = last["verdict_class"]
+    result["decided_by"] = last
+    result["reason"] = (
+        "positive_verdict"
+        if last["verdict_class"] == REVIEW_VERDICT_POSITIVE
+        else "verdict_unknown"
+    )
+    return result
+
+
 def has_reviewer_descendant(
     conn: sqlite3.Connection, root_id: str,
 ) -> bool:
@@ -17580,8 +18033,7 @@ def has_reviewer_descendant(
     with no reviewer descendant is a legitimate review-less итог and must
     never be silenced by that rule.
     """
-    reviewers = _reviewer_assignees()
-    if not reviewers:
+    if not _reviewer_assignees():
         return False
     ids = get_descendant_ids(conn, root_id)
     if not ids:
@@ -17594,7 +18046,7 @@ def has_reviewer_descendant(
         ordered,
     ).fetchall()
     for row in rows:
-        if str(row["assignee"] or "").strip() in reviewers:
+        if _is_reviewer_assignee(row["assignee"]):
             return True
     return False
 
@@ -17604,68 +18056,122 @@ def summary_has_passed_review(
 ) -> bool:
     """SINGLE source of truth: may this branch итог reach the channel?
 
-    Rule (owner decision, 03.11.2026, mission «могилы» / «СНО»): an итоговый
-    отчёт is delivered ONLY when the приёмка/ревью of the mission finished
-    POSITIVELY.  Formally, for a branch that is already terminal
-    (``branch_state(root) is not None``):
+    Thin predicate over :func:`branch_review_gate` (which owns the rule, the
+    verdict vocabulary and the audit payload).  Kept as the public name the
+    delivery lanes already call (``_plan_branch_summary``,
+    ``_collect``→``handle_event(review_passed=…)``), so no caller changes
+    behaviour by switching to the richer function.
 
-      * ``outcome != "success"`` → True — a failure/refusal verdict is itself
-        the вердикт and MUST be visible.  It is delivered, but as
-        «❌ Задача не выполнена / доработка отклонена» (``branch_summary_message``
-        failure branch), never as «✅ Задача выполнена».
-      * ``outcome == "success"`` and the branch has NO reviewer descendant
-        (``has_reviewer_descendant`` is False) → True — a mission that was never
-        put through independent review (incl. a childless isolated root) is a
-        legitimate итог; silencing it would leave the owner without any report.
-      * ``outcome == "success"`` and the branch HAS a reviewer descendant →
-        True only when every reviewer card of the branch is closed with a
-        terminal-success status (``BRANCH_TERMINAL_SUCCESS``).  A reviewer card
-        parked in ``blocked``/``gave_up`` already makes the branch outcome
-        ``failure`` (see ``branch_state``), so a ``success`` branch with an
-        unfinished reviewer can only mean corrupted state — fail closed.
+    Rule (owner decision 03.11.2026, corrected by t_5f76c8d0):
 
-    Review configuration coverage (both shapes of review in this board):
+      * ``outcome != "success"`` → True. A failure/refusal verdict IS the
+        вердикт and must stay visible («❌ Доработка отклонена» /
+        «❌ Задача не выполнена»), never «✅ Задача выполнена».
+      * ``outcome == "success"``, no reviewer descendant → True (a review-less
+        mission, incl. a childless isolated root, is a legitimate итог).
+      * ``outcome == "success"``, reviewer descendant present → True only when
+        the branch's REVIEW VERDICT is not negative: reviewer card terminal
+        AND its last run's ``metadata.verdict`` is not a rejection.
 
-      (а) review as a STATUS of the card itself (``request_review`` → status
-          ``review``): covered one level up — such a card is
-          ``SA_BRANCH_NODE_OPEN``, so ``branch_state`` returns None and
-          ``_plan_branch_summary`` never plans an итог;
-      (б) review as a SEPARATE reviewer CHILD card: covered here — the child is
-          in ``get_descendant_ids`` and is matched by ``assignee``;
-      (в) no review at all: passes (не глушим законный итог).
+    What changed and why (t_5f76c8d0 / review t_298a2513): the previous body
+    answered «is the reviewer card closed?» (``status ∈ BRANCH_TERMINAL_SUCCESS``).
+    A reviewer of profile 09/15 closes BOTH a positive and a negative verdict
+    through ``kanban_complete`` — the card is ``done`` either way and the
+    verdict lives in ``task_runs.metadata``. ``done`` therefore proves nothing,
+    and 32 live (root, reviewer) pairs had «✅ Задача выполнена» delivered after
+    a ``revision_required``/``CHANGES`` verdict. The verdict is read now.
 
-    Deliberately derived from statuses, not from a machine-readable verdict
-    field: the schema has no ``review_verdict`` column and the reviewer's
-    ``completed`` rows carry no ``conclusion`` (all NULL); the verdict lives as
-    free text in ``task_comments``.  See design/REVIEW-DELIVERY-RULE.md (the
-    canonisation card t_ff1867f5) for the decided schema if one is ever added
-    (a ``review_verdict`` event kind emitted by ``request_changes`` /
-    ``kanban_complete``), and why statuses suffice today.
+    The earlier justification in this docstring — «машиночитаемого вердикта нет,
+    он живёт текстом в task_comments» — was factually wrong: ``task_runs.conclusion``
+    does not exist as a column, but ``task_runs.metadata.verdict`` does, and 208
+    closed reviewer cards carried it. No schema migration was needed.
+
+    An absent or unrecognized verdict passes, with the class recorded in the
+    gate payload (``verdict_unknown`` / ``missing``) — an explicit decision, not
+    the old silent «done значит принято»: see :func:`branch_review_gate` for the
+    measured justification (62/131 recent closed reviewer cards carry none, and
+    the owner rule forbids silencing those итоги).
     """
-    if str(outcome or "").strip() != "success":
-        # A failure verdict is the вердикт — always visible.
-        return True
-    reviewers = _reviewer_assignees()
-    if not reviewers:
-        return True
-    ids = get_descendant_ids(conn, root_id)
-    if not ids:
-        return True
-    ordered = sorted(ids)
-    placeholders = ", ".join("?" * len(ordered))
-    rows = conn.execute(
-        "SELECT id, status, assignee FROM tasks "
-        f"WHERE id IN ({placeholders})",
-        ordered,
-    ).fetchall()
-    for row in rows:
-        if str(row["assignee"] or "").strip() not in reviewers:
-            continue
-        if str(row["status"] or "").strip() not in BRANCH_TERMINAL_SUCCESS:
-            # Reviewer card not closed positively → no итог yet (fail closed).
-            return False
-    # No reviewer descendant: a review-less mission is a legitimate итог.
-    return True
+    return branch_review_gate(conn, root_id, outcome)["passed"]
+
+
+def branch_summary_decision(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    st: Optional[dict] = None,
+) -> Optional[dict]:
+    """ONE decision for «что и в каком тексте отдать владельцу» for a branch.
+
+    Compiles the review gate (:func:`branch_review_gate`) and the verdict
+    wording (:func:`branch_summary_message`, :func:`acceptance_refusal_ids`)
+    into a single payload both delivery lanes consume — the branch-summary
+    watcher (``_plan_branch_summary``) and the manual final-report entry point
+    (``gateway/final_report._compose``) — so they can never disagree.
+
+    Returns ``None`` for an open branch (``branch_state`` is ``None``), else::
+
+        {"deliver": bool,          # may a message go to the channel at all?
+         "kind": "success"|"refusal"|"failure"|"blocked",
+         "outcome": str,           # branch_state outcome (audit)
+         "review_passed": bool,    # gate verdict
+         "review_reason": str,     # gate reason (auditable)
+         "verdict_class": str|None,
+         "msg": str|None,          # exact channel text when deliver is True
+         "refused_ids": [str],     # nodes whose refusal the wording names
+         "st": dict,               # branch_state (failed/fingerprint)
+         "gate": dict}             # full gate payload
+
+    ``deliver`` is False ONLY for a branch that closed ``success`` while its
+    own review did not pass (``reviewer_open`` / corrupted state). A NEGATIVE
+    verdict is never silenced: it is delivered as the refusal verdict
+    (``kind="refusal"``, «❌ Доработка отклонена…»), which is exactly owner rule
+    №4 — the refusal must be visible, only the wording differs from «выполнено».
+    """
+    state = st if st is not None else branch_state(conn, root_id)
+    if state is None:
+        return None
+    outcome = str(state["outcome"])
+    gate = branch_review_gate(conn, root_id, outcome)
+    decision: dict = {
+        "deliver": True,
+        "kind": "success",
+        "outcome": outcome,
+        "review_passed": bool(gate["passed"]),
+        "review_reason": str(gate["reason"]),
+        "verdict_class": gate["verdict_class"],
+        "msg": None,
+        "refused_ids": [],
+        "st": state,
+        "gate": gate,
+    }
+    if outcome == "failure":
+        refused = acceptance_refusal_ids(conn, root_id, state["failed"])
+        decision["refused_ids"] = refused
+        decision["kind"] = "refusal" if refused else "failure"
+        decision["msg"] = branch_summary_message(
+            outcome, state["failed"], refused_ids=refused,
+        )
+        return decision
+    if gate["passed"]:
+        decision["msg"] = branch_summary_message(outcome, state["failed"])
+        return decision
+    if gate["reason"] == "negative_verdict":
+        # The reviewer REJECTED the result and closed the card `done`. The
+        # branch is formally a success (every node terminal-success), so there
+        # is no `failed` node to name — the refusal is named by the reviewer
+        # card itself and its recorded verdict.
+        refused = list(gate["refusal_ids"])
+        decision["refused_ids"] = refused
+        decision["kind"] = "refusal"
+        decision["msg"] = branch_summary_message(
+            "failure", gate["refusal_titles"], refused_ids=refused,
+        )
+        return decision
+    # reviewer_open / corrupted state: no итог may be planned (fail closed).
+    decision["deliver"] = False
+    decision["kind"] = "blocked"
+    return decision
 
 
 def acceptance_refusal_ids(
@@ -17685,8 +18191,7 @@ def acceptance_refusal_ids(
     second status vocabulary appears here either.  Order follows ``failed`` so
     the compiled message stays deterministic.
     """
-    reviewers = _reviewer_assignees()
-    if not reviewers:
+    if not _reviewer_assignees():
         return []
     # Only nodes that really belong to THIS branch may turn the wording into an
     # acceptance verdict: a failure reported for a foreign card (shared
@@ -17717,7 +18222,7 @@ def acceptance_refusal_ids(
     refused = {
         str(row["id"])
         for row in rows
-        if str(row["assignee"] or "").strip() in reviewers
+        if _is_reviewer_assignee(row["assignee"])
     }
     return [tid for tid in ordered if tid in refused]
 

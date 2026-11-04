@@ -1093,18 +1093,21 @@ class GatewayKanbanWatchersMixin:
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
                                         " (silent: descendant replace-mode)" if silent else "",
                                     )
-                                    # ОВНЕР-ПРАВИЛО (03.11.2026, t_f6790ef5):
-                                    # «завершено» корня проходит как итог только
-                                    # если ревью ветки закрылось ПОЛОЖИТЕЛЬНО.
+                                    # ОВНЕР-ПРАВИЛО (03.11.2026, t_f6790ef5;
+                                    # t_5f76c8d0): «завершено» корня проходит как
+                                    # итог только если ревью ветки закрылось
+                                    # ПОЛОЖИТЕЛЬНО — причём «положительно» теперь
+                                    # означает МАШИНОЧИТАЕМЫЙ вердикт ревьюера,
+                                    # а не факт `done` его карточки.
                                     # Единственная точка правды —
-                                    # ``_kb.summary_has_passed_review``;
-                                    # значение пробрасывается в движок как
-                                    # ``review_passed``. До этой карточки гейт в
-                                    # движке был мёртвым: параметр объявлен, но
-                                    # никто его не передавал (всегда True).
+                                    # ``_kb.branch_summary_decision`` (обёртка
+                                    # над ``branch_review_gate``); значение
+                                    # пробрасывается в движок как
+                                    # ``review_passed`` и глушит только успешный
+                                    # итог. Вердикт ОТКАЗА не глушится: он
+                                    # доставляется отдельным событием карточки
+                                    # ревьюера (см. путь «отказ приёмки» ниже).
                                     #
-                                    # ``branch_state(root)`` уже посчитан
-                                    # ключевым гейтом ниже? Нет.
                                     # Значение нужно только для api_server-итога
                                     # (движок применяет флаг лишь там), поэтому
                                     # для остальных платформ остаётся True —
@@ -1117,11 +1120,24 @@ class GatewayKanbanWatchersMixin:
                                                 conn, sub["task_id"],
                                             )
                                             if _rst is not None:
-                                                review_passed = bool(
-                                                    _kb.summary_has_passed_review(
+                                                _dec = (
+                                                    _kb.branch_summary_decision(
                                                         conn, sub["task_id"],
-                                                        _rst["outcome"],
+                                                        st=_rst,
                                                     )
+                                                )
+                                                # ``review_passed`` here guards
+                                                # ONLY the success [final], so it
+                                                # must be the GATE, not
+                                                # ``deliver``: a negative verdict
+                                                # is deliverable (deliver=True)
+                                                # but must never produce a
+                                                # «✅ выполнено» on this lane.
+                                                # The refusal wording travels the
+                                                # branch-summary lane instead.
+                                                review_passed = bool(
+                                                    _dec is not None
+                                                    and _dec["review_passed"]
                                                 )
                                         except Exception as _rp_exc:
                                             # Fail closed: не отдаём «выполнено»,
@@ -2112,24 +2128,35 @@ class GatewayKanbanWatchersMixin:
                 return {"reactivated": True, "cleared": cleared, "root_id": root_id}
             return None
         outcome = st["outcome"]
-        if not _kb.summary_has_passed_review(conn, root_id, outcome):
-            # ОВНЕР-ПРАВИЛО (03.11.2026, миссии «могилы»/«СНО»): итоговый отчёт
-            # доставляется только после ПОЛОЖИТЕЛЬНОГО ревью. Единственная
-            # точка правды — ``kb.summary_has_passed_review``. Ветка закрыта,
-            # но в ней есть карточка-ревьюер (09/15), которая закрылась НЕ
-            # положительно → итога нет. Ответ владельцу здесь именно про
-            # успех, поэтому тихий пропуск, а не вердикт отказа.
+        # SINGLE decision surface (t_5f76c8d0): the review gate reads the
+        # reviewer's MACHINE-READABLE verdict, not just its card status, and the
+        # same payload compiles the channel text. ``review_passed`` alone would
+        # answer only «можно ли отдать ✅»; a reviewer that closed `done` with
+        # ``revision_required`` must still reach the owner as a VERDICT (owner
+        # rule №4: молчание недопустимо), so the decision also says WHICH text.
+        decision = _kb.branch_summary_decision(conn, root_id, st=st)
+        if decision is None:
             return None
-        # Вердикт отказа приёмки (owner-rule 03.11.2026, t_f6790ef5): провал
-        # обязан быть виден, но как «доработка отклонена», а не как «задача не
-        # выполнена». Отказ НЕ глушится — меняется только формулировка.
-        refused_ids = (
-            _kb.acceptance_refusal_ids(conn, root_id, st["failed"])
-            if outcome == "failure" else []
-        )
-        msg = _kb.branch_summary_message(
-            outcome, st["failed"], refused_ids=refused_ids,
-        )
+        if not decision["deliver"]:
+            # Branch closed `success` but its own review did not pass
+            # (reviewer deliberately withheld). Nothing may be planned for the
+            # success lane; the verdict (if any) comes from the reviewer card.
+            logger.info(
+                "kanban branch summary: root %s on board %s has no passed "
+                "review (%s, verdict=%s); success итог withheld",
+                root_id, board_slug, decision["review_reason"],
+                decision["verdict_class"],
+            )
+            return None
+        msg = decision["msg"] or _kb.branch_summary_message(outcome, st["failed"])
+        if decision["kind"] != "success":
+            logger.info(
+                "kanban branch summary: root %s on board %s delivers a %s "
+                "verdict (review_reason=%s, verdict=%s, refused=%s)",
+                root_id, board_slug, decision["kind"],
+                decision["review_reason"], decision["verdict_class"],
+                ",".join(decision["refused_ids"]) or "-",
+            )
         # F6-style terminal gate for the TG mirror of the branch итог: the
         # итог is TERMINAL only when the whole mission/root tree above the
         # branch root is closed too (no open/running ancestor remains).  A
@@ -2182,6 +2209,7 @@ class GatewayKanbanWatchersMixin:
                 "subs": root_subs,
                 "pending": pending,
                 "outcome": outcome,
+                "kind": decision["kind"],
                 "msg": msg,
                 "marker_id": marker.get("_event_id"),
                 "fingerprint": st["fingerprint"],
@@ -2190,6 +2218,16 @@ class GatewayKanbanWatchersMixin:
         payload = {
             "fingerprint": st["fingerprint"],
             "outcome": outcome,
+            # The wording kind is delivered in the marker: ``success`` /
+            # ``refusal`` / ``failure``. A `success` branch whose review was
+            # rejected is recorded as `refusal` while `outcome` keeps the
+            # auditable branch_state value (t_5f76c8d0).
+            "kind": decision["kind"],
+            "review": {
+                "passed": decision["review_passed"],
+                "reason": decision["review_reason"],
+                "verdict_class": decision["verdict_class"],
+            },
             "failed": [{"id": tid, "title": title} for tid, title in st["failed"]],
             "message": msg,
             "delivered": [],
@@ -2203,6 +2241,7 @@ class GatewayKanbanWatchersMixin:
             "subs": root_subs,
             "pending": list(root_subs),
             "outcome": outcome,
+            "kind": decision["kind"],
             "msg": msg,
             "marker_id": marker_id,
             "fingerprint": st["fingerprint"],
