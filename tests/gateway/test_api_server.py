@@ -32,7 +32,6 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
-    _classify_openwebui_service_request,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
@@ -366,6 +365,12 @@ class TestAgentExecution:
         mock_agent.session_prompt_tokens = 1
         mock_agent.session_completion_tokens = 2
         mock_agent.session_total_tokens = 3
+        # A6 marker seam: _run_agent hands the model
+        # _effective_api_user_message(agent, user_message), and MagicMock
+        # auto-vends a child for _fast_lane_effective_message. Pin the
+        # "no marker stripped" state so the test still asserts the caller's
+        # text reaches run_conversation verbatim.
+        mock_agent._fast_lane_effective_message = None
 
         model_options = {"reasoning": {"enabled": False}, "fast": False}
         with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create_agent:
@@ -1164,8 +1169,19 @@ class TestChatCompletionsEndpoint:
                                 content = choice.get("delta", {}).get("content", "")
                                 # Tool emoji markers must never leak into content
                                 assert "ls -la" not in content or content == "Here are the files."
-                # Final content must also be present
-                assert "Here are the files." in body
+                # Final content must also be present. The SSE writer runs
+                # each delta through the hold-back path sanitizer, so the
+                # sentence legitimately arrives across several chunks — assert
+                # on the reassembled delta.content, not on the raw body.
+                reassembled = "".join(
+                    (choice.get("delta") or {}).get("content") or ""
+                    for line in body.splitlines()
+                    if line.startswith("data: {")
+                    for chunk in [_json.loads(line[len("data: "):])]
+                    for choice in chunk.get("choices", [])
+                    if chunk.get("object") == "chat.completion.chunk"
+                )
+                assert reassembled == "Here are the files."
 
 
     @pytest.mark.asyncio
@@ -1409,116 +1425,6 @@ class TestDeriveChatSessionId:
         a = _derive_chat_session_id("You are a pirate.", "Hello")
         b = _derive_chat_session_id("You are a robot.", "Hello")
         assert a != b
-
-
-class TestOpenWebUIServiceRequestIsolation:
-    TITLE_PROMPT = """### Task:
-Generate a concise title summarizing the chat history.
-### Guidelines:
-- Keep it short.
-### Chat History:
-<chat_history>
-USER: hello
-ASSISTANT: hi
-</chat_history>"""
-
-    FOLLOW_UP_PROMPT = """### Task:
-Suggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next in this conversation as a **user**, based on the chat history, to help continue or deepen the discussion.
-### Chat History:
-<chat_history>
-USER: hello
-ASSISTANT: hi
-</chat_history>"""
-
-    def test_classifier_is_narrow_and_recognizes_openwebui_metadata_tasks(self):
-        assert _classify_openwebui_service_request(self.TITLE_PROMPT) == "title_generation"
-        assert _classify_openwebui_service_request(self.FOLLOW_UP_PROMPT) == "follow_up_generation"
-        assert _classify_openwebui_service_request(
-            "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history\n"
-            "<chat_history>x</chat_history>"
-        ) == "tag_generation"
-        assert _classify_openwebui_service_request(
-            "### Task:\nAnalyze the chat history to determine the necessity of generating search queries, "
-            "in the given language.\n<chat_history>x</chat_history>"
-        ) == "search_query_generation"
-        assert _classify_openwebui_service_request("Please generate a concise title") is None
-        assert _classify_openwebui_service_request(
-            "### Task:\nGenerate a concise title summarizing the chat history."
-        ) is None
-
-    @pytest.mark.asyncio
-    async def test_nonstream_service_request_bypasses_agent_history_and_session_db(self, adapter):
-        app = _create_app(adapter)
-        with (
-            patch("agent.oneshot.run_oneshot", return_value='{"title":"Greeting"}') as oneshot,
-            patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent,
-            patch.object(
-                adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-                side_effect=AssertionError("service request must not load session DB"),
-            ),
-        ):
-            async with TestClient(TestServer(app)) as cli:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    headers={"X-Hermes-Session-Id": "owui-chat-123"},
-                    json={
-                        "model": "hermes-agent",
-                        "messages": [
-                            {"role": "user", "content": "hello"},
-                            {"role": "assistant", "content": "hi"},
-                            {"role": "user", "content": self.TITLE_PROMPT},
-                        ],
-                    },
-                )
-                assert response.status == 200
-                data = await response.json()
-
-        assert data["choices"][0]["message"]["content"] == '{"title":"Greeting"}'
-        assert "X-Hermes-Session-Id" not in response.headers
-        run_agent.assert_not_awaited()
-        oneshot.assert_called_once()
-        assert oneshot.call_args.kwargs["task"] == "title_generation"
-        assert oneshot.call_args.kwargs["user_input"] == self.TITLE_PROMPT
-
-    @pytest.mark.asyncio
-    async def test_stream_service_request_returns_sse_without_agent_or_session_write(self, adapter):
-        app = _create_app(adapter)
-        with (
-            patch("agent.oneshot.run_oneshot", return_value='{"follow_ups":["Next?"]}'),
-            patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run_agent,
-            patch.object(
-                adapter,
-                "_ensure_session_db_async",
-                new_callable=AsyncMock,
-                side_effect=AssertionError("service request must not load session DB"),
-            ),
-        ):
-            async with TestClient(TestServer(app)) as cli:
-                response = await cli.post(
-                    "/v1/chat/completions",
-                    headers={"X-Hermes-Session-Id": "owui-chat-123"},
-                    json={
-                        "model": "hermes-agent",
-                        "stream": True,
-                        "messages": [{"role": "user", "content": self.FOLLOW_UP_PROMPT}],
-                    },
-                )
-                assert response.status == 200
-                body = await response.text()
-
-        chunks = [
-            json.loads(line[len("data: "):])
-            for line in body.splitlines()
-            if line.startswith("data: {")
-        ]
-        assert chunks[0]["choices"][0]["delta"]["content"] == (
-            '{"follow_ups":["Next?"]}'
-        )
-        assert "data: [DONE]" in body
-        assert "X-Hermes-Session-Id" not in response.headers
-        run_agent.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

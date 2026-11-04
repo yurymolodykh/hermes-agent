@@ -20,8 +20,9 @@ status-pill channel.
 
 Module is deliberately self-contained (mirrors
 ``tests/gateway/test_api_server_cut_path.py``) because the parent
-``tests/gateway/test_api_server.py`` is blocked at collection by the
-pre-existing missing ``_classify_openwebui_service_request`` symbol.
+``tests/gateway/test_api_server.py`` used to be blocked at collection by a
+missing ``_classify_openwebui_service_request`` symbol; card t_635176e3
+removed those tests, so the blocker is gone.
 
 Coverage here:
   * the NON-streaming /v1/chat/completions handler reaches ``_run_agent``

@@ -1,10 +1,10 @@
 """Focused unit tests for ``_strip_existing_local_paths`` in api_server.py.
 
 This module is deliberately self-contained (imports only the helper from
-``gateway.platforms.api_server``) so it stays collectible even while
-``tests/gateway/test_api_server.py`` is blocked at collection by the
-pre-existing missing ``_classify_openwebui_service_request`` symbol (a
-separate OWUI-origin-binding feature, documented as an external blocker).
+``gateway.platforms.api_server``).  It was written while
+``tests/gateway/test_api_server.py`` could not be collected because of a
+missing ``_classify_openwebui_service_request`` symbol (a separate
+OWUI-origin-binding feature); card t_635176e3 removed those tests.
 
 Contract under test (task t_3e687b88):
   * only absolute local filesystem paths that EXIST on this machine are

@@ -12,10 +12,11 @@ Matching the "existing local path" contract of task t_bc0ed52d:
   * a path inside a backtick code example stays visible (code samples are
     never mutilated).
 
-Module is deliberately self-contained so it stays collectible while
-``tests/gateway/test_api_server.py`` is blocked at collection by the
-pre-existing missing ``_classify_openwebui_service_request`` symbol (a
-separate OWUI feature, documented as an external blocker on the parent card).
+Module is deliberately self-contained.  It was written while
+``tests/gateway/test_api_server.py`` could not even be collected because of a
+missing ``_classify_openwebui_service_request`` symbol (a separate OWUI
+feature); card t_635176e3 removed those tests, so the blocker is gone and the
+self-containment is now just a fast, focused regression slice.
 
 When run against the pre-task-1 source (HEAD of
 ``release/t_b0291572-owui-origin-binding``), the content assertions FAIL

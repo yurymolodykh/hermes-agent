@@ -11,9 +11,10 @@ whole path and the path leaks into user-visible content.
 last whitespace/newline, reassembles each candidate path across tokens, and only
 emits bytes once a boundary proves the path complete (running the same
 whole-text strip on the released prefix).  This module is deliberately
-self-contained (imports only the helper) so it stays collectible while
-``tests/gateway/test_api_server.py`` is blocked at collection by the
-pre-existing missing ``_classify_openwebui_service_request`` symbol.
+self-contained (imports only the helper).  It was written while
+``tests/gateway/test_api_server.py`` could not be collected because of a
+missing ``_classify_openwebui_service_request`` symbol; card t_635176e3
+removed those tests, so the blocker is gone.
 
 Contract under test:
   * an EXISTING absolute local path, streamed in fragmented tokens, never
