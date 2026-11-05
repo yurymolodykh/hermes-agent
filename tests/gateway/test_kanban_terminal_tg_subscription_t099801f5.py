@@ -294,12 +294,16 @@ async def test_terminal_card_receives_exactly_one_message_per_chat(
     runner = _make_runner(adapter)
     await _run_one_branch_tick(monkeypatch, runner)
 
-    assert len(adapter.sent) == 1, (
-        "ровно одно сообщение в чат владельца, не два: "
+    # Контракт владельца 2026-11-04 («в TG только по делу»): это api_server-
+    # подписка OWUI-владельца, итог успешный и БЕЗ файла-артефакта.  Такой
+    # итог — служебное сообщение, он не дублируется в TG-зеркало; вердикт
+    # остаётся в OWUI-канале.  Проверяемое свойство исходного теста —
+    # «ровно одно сообщение на чат, не два» — сохраняется на каждом лейне:
+    # OWUI получает итог один раз, TG не получает вовсе.
+    assert adapter.sent == [], (
+        "текстовый успешный итог не дублируется в TG: "
         f"{adapter.sent}"
     )
-    assert adapter.sent[0]["chat_id"] == OWNER_TG
-    assert "контроллер миссии закрыт" in adapter.sent[0]["text"]
     assert len(staged) == 1, "OWUI-лейн получил итог ровно один раз"
 
     # Повторный тик — ни новой отправки, ни нового стейджа.

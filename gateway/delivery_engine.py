@@ -1991,6 +1991,7 @@ class DeliveryEngine:
         send_tg: Any = None,
         terminal: bool = False,
         board_override: Optional[str] = None,
+        owui_healthy: Optional[bool] = None,
     ) -> "DeliveryEngine.HandleResult":
         """[final] for a closed branch (branch-summary watcher path).
 
@@ -1999,6 +2000,12 @@ class DeliveryEngine:
         the root's summary + artifacts (F1 content contract) and dispatched
         via the same dual-lane table as every other [final].  Returns the
         handle result so the branch watcher can ack the channel or rewind.
+
+        ``owui_healthy`` — состояние OWUI-канала для api_server-подписки
+        (``True`` доставлено/подтверждено, ``False`` канал мёртв: ``unbound``
+        /``failed``, ``None`` неизвестно).  Управляет только правом гасить
+        текстовый успешный итог: если OWUI-канала фактически нет, TG-зеркало
+        остаётся единственным путём до владельца и гасить его нельзя.
         """
         board = board_override or plan.get("board") or "default"
         root_id = plan.get("root_id") or sub.get("task_id") or ""
@@ -2136,6 +2143,67 @@ class DeliveryEngine:
                 )
                 # Channel is acked regardless — nothing to deliver now nor on
                 # a later tick (the bare итог cannot become content later).
+                return res
+            # ОВНЕР-КОНТРАКТ Telegram (2026-11-04, state.db msg 973591):
+            # «в телеграм приходило только по делу — вопросы по миссиям,
+            # итоговые артефакты, алерты по невыполнению задач. а служебные и
+            # технические сообщения можно гасить».
+            #
+            # Отсюда ТРИ разрешённых класса и один запрещённый:
+            #   1) вопросы по миссиям -> [needs-decision] lane (не здесь);
+            #   2) итог с файлом-артефактом -> проходит ниже;
+            #   3) алерт по невыполнению -> kind=refusal|failure, проходит
+            #      ниже (гейт их НЕ трогает: «❌ Доработка отклонена» — это
+            #      именно алерт, а не служебное сообщение);
+            #   X) успешный текстовый итог без файла -> служебное сообщение,
+            #      гасится: канал молча акается, вердикт остаётся в OWUI.
+            #
+            # Два ограничения, без которых гейт вредит:
+            #  * ``kind == "success"`` — слепое «только с артефактом» убило бы
+            #    вердикты ревью, а они почти всегда текстовые: владелец перестал
+            #    бы видеть отказы приёмки (это класс 3, а не служебное);
+            #  * ``platform_str == "api_server"`` — гасим только ДУБЛЬ в TG-
+            #    зеркале OWUI-лейна, у которого есть полноценный OWUI-канал.
+            #    Нативная TG-подписка (platform=telegram) — единственный канал
+            #    владельца по этой карточке; её молчание не «убирает дубль», а
+            #    теряет сигнал целиком (см. F10 выше: закрытие корня обязано
+            #    быть видно, иначе владелец не узнает о факте закрытия).
+            if (
+                not artifacts
+                and platform_str == "api_server"
+                and str(plan.get("kind") or "success") == "success"
+                and owui_healthy is not False
+            ):
+                from hermes_cli.delivery_policy import PolicyDecision
+                log_suppression(
+                    app="kanban",
+                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+                    target=f"telegram:{tg_lane}",
+                    decision=PolicyDecision(
+                        action="suppress",
+                        reason="success итог without artifact (owner contract 2026-11-04)",
+                        detail=(
+                            "успешный terminal-итог без файла-артефакта — "
+                            "служебное сообщение, в Telegram не дублируется "
+                            "(вердикт остаётся в OWUI). Отказы приёмки и "
+                            "падения (refusal/failure) этому гейту не подлежат"
+                        ),
+                    ),
+                    snippet=(final_msg or "")[:200],
+                    extra={
+                        "task_id": root_id,
+                        "event_kind": "branch_summary",
+                        "event_id": plan.get("marker_id") or 0,
+                        "owui_to_tg": True,
+                        "branch_kind": str(plan.get("kind") or "success"),
+                    },
+                )
+                logger.info(
+                    "delivery engine: terminal успешный итог %s without "
+                    "artifact — OWUI only (no TG mirror, owner contract "
+                    "2026-11-04)", root_id,
+                )
+                res.tg_suppressed = True
                 return res
             try:
                 resx = await send_tg(tg_adapter, tg_lane, final_msg)

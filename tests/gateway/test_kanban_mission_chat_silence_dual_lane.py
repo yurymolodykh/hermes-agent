@@ -358,8 +358,11 @@ async def test_parent_with_open_children_completed_control_tg(mission_env, monke
     await _run_one_branch_tick(monkeypatch, runner)
 
     tg_texts = adapter_sent_texts(tg)
-    assert tg_texts, f"P2 control: terminal итог must reach TG: {tg_texts}"
-    assert branch_staged, f"P2 control: OWUI итог must be staged: {branch_staged}"
+    # Контракт владельца 2026-11-04: итог без файла-артефакта в Telegram не
+    # дублируется. Контроль P2 здесь проверяет, что маршрут итога сработал
+    # (OWUI-канал получил вердикт), а TG молчит по новому правилу.
+    assert branch_staged, f"P2 control: итог должен уйти в OWUI: {branch_staged}"
+    assert tg_texts == [], f"P2 control: text-only итог не идёт в TG: {tg_texts}"
 
 
 @pytest.mark.asyncio
@@ -655,14 +658,13 @@ async def test_p4_foreign_owner_with_binding_delivers_to_own_lanes(mission_env, 
     # TG mirror: delivered to Maria's OWN bound chat, never home.  F1
     # (tg-delivery-contract): the итог to TG carries the handoff summary below
     # the closed-branch header — no more contentless "✅" alone.
+    # TG mirror: текстовый итог БЕЗ артефакта в Telegram не идёт (контракт
+    # владельца 2026-11-04: «в TG только по делу» — вопросы миссий, файлы,
+    # алерты).  Отклик постановщику доставляется OWUI-каналом выше.
     tg_chats = [s["chat_id"] for s in tg.sent]
-    assert tg_chats == [FOREIGN_TG], (
-        f"П.4: foreign owner итог must reach her OWN TG chat, not home/Yuri: "
-        f"{tg.sent}"
+    assert tg_chats == [], (
+        f"П.4: text-only итог не должен дублироваться в TG: {tg.sent}"
     )
-    assert len(tg.sent) == 1
-    assert "Задача выполнена" in tg.sent[0]["text"]
-    assert "mission maria done" in tg.sent[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -971,9 +973,11 @@ async def test_mirror_plan_rider_bare_itog_still_suppressed(mission_env, monkeyp
         deliver_artifacts=_deliver_artifacts, send_tg=_send_tg,
     )
     assert res.action == "advance", f"terminal итог должен доставляться: {res}"
-    # The composed итог reaches the owner's bound TG chat.
-    assert sent, f"terminal итог must be delivered to the bound TG chat: {sent}"
-    assert all(chat_id == OWNER_TG for chat_id, _ in sent)
+    # Контракт владельца 2026-11-04: terminal итог БЕЗ файла-артефакта в
+    # Telegram не идёт — канал молча акается (res.tg_suppressed), вердикт и
+    # так лежит в OWUI.
+    assert sent == [], f"text-only итог не должен идти в TG: {sent}"
+    assert res.tg_suppressed is True
     # No artifacts on the plan → nothing to upload; empty list rides harmless.
     assert docs == []
 

@@ -2442,6 +2442,14 @@ class GatewayKanbanWatchersMixin:
                         deliver_artifacts=self._deliver_kanban_artifacts,
                         terminal=bool(plan.get("terminal", True)),
                         board_override=board,
+                        # Контракт владельца 2026-11-04 («в TG только по делу»)
+                        # гасит текстовый успешный итог ТОЛЬКО когда вердикт уже
+                        # лёг в живой OWUI-канал.  Здесь OWUI-стадия этого тика
+                        # известна: unbound/failed — канал мёртв навсегда (сессия
+                        # удалена, привязки нет), pending — жив, но не подтверждён.
+                        # При мёртвом OWUI молчание TG означало бы потерю итога на
+                        # ОБОИХ лейнах сразу — ровно инцидент t_f4e43cb2/t_08a192ec.
+                        owui_healthy=(_owui_state not in ("unbound", "failed", "")),
                     )
                     # t_b154af7d: the once-only dedup marker is written ONLY
                     # after the TG lane ACCEPTED the message.  Before this the

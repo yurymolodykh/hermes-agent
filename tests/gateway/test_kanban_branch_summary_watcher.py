@@ -1140,9 +1140,15 @@ def _make_bs_runner(adapter, *, tg_adapter=None, profile="01-orchestrator"):
 async def test_pending_owui_still_mirrors_tg_once_and_keeps_channel(
     board_env, monkeypatch,
 ):
-    """t_5d99e48d: OWUI pending (slow drain) → the OWUI→TG mirror fires on
-    the FIRST tick (not after the drain ACK), exactly once, and the channel
-    stays pending so a later tick can ack it once the OWUI row persists."""
+    """t_5d99e48d + контракт владельца 2026-11-04: OWUI pending (slow drain).
+
+    Исходное свойство (t_5d99e48d) — «pending не должен голодить TG-зеркало,
+    потому что итог обязан дойти до владельца» — сохранено, но его носитель
+    сменился контрактом владельца.  Живой, хотя и не подтверждённый OWUI-канал
+    САМ доставит итог (после ACK); поэтому текстовый успешный итог в TG не
+    дублируется, канал остаётся pending до ACK, а дедуп-маркер TG НЕ пишется —
+    если OWUI умрёт, следующий тик доставит через TG (owui_healthy=False).
+    """
     import json as _json
     from gateway import kanban_origin_delivery as _kod
 
@@ -1183,11 +1189,10 @@ async def test_pending_owui_still_mirrors_tg_once_and_keeps_channel(
     for _ in range(3):
         await _run_one_branch_tick(monkeypatch, runner)
 
-    # TG mirror fired exactly once across the 3 pending ticks.
-    assert len(tg.sent) == 1, (
-        f"slow-drain OWUI must mirror to TG exactly once, got {tg.sent}"
+    # TG mirror молчит: живой OWUI-канал сам отдаст итог после ACK.
+    assert tg.sent == [], (
+        f"pending OWUI — текстовый успешный итог не дублируется в TG: {tg.sent}"
     )
-    assert tg.sent[0]["chat_id"], f"TG mirror must target a chat: {tg.sent}"
     # Channel stays pending (not acked, not dropped) while OWUI is pending.
     marker = kb.has_branch_summary(kb.connect(board="default"), root)
     assert marker is not None
@@ -1197,11 +1202,11 @@ async def test_pending_owui_still_mirrors_tg_once_and_keeps_channel(
     )
     assert pending, "channel must stay pending while OWUI not yet acked"
 
-    # OWUI recovers on a later tick -> channel acked, still no second TG ping.
+    # OWUI recovers on a later tick -> channel acked, still no TG punctuation.
     mode["state"] = "acknowledged"
     await _run_one_branch_tick(monkeypatch, runner)
-    assert len(tg.sent) == 1, (
-        f"no second TG ping after OWUI ack; got {tg.sent}"
+    assert tg.sent == [], (
+        f"no TG ping after OWUI ack; got {tg.sent}"
     )
     conn = kb.connect(board="default")
     try:

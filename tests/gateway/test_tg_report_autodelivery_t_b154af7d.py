@@ -303,9 +303,15 @@ async def test_mission_without_report_still_delivers_text(
     _staged_sink(monkeypatch, staged)
     adapter = FlakyAdapter()
     await _run_one_branch_tick(monkeypatch, _make_runner(adapter))
-    assert adapter.sent, "текст итога обязан дойти даже без отчёта"
-    assert "миссия завершена без отчётного файла" in adapter.sent[0]["text"]
+    # Контракт владельца 2026-11-04: в Telegram только итоги с файлом-
+    # артефактом, вопросы миссий и алерты. Текстовый итог без отчёта
+    # остаётся в OWUI-канале и в TG не дублируется.
+    assert adapter.sent == [], (
+        f"text-only итог не должен идти в TG: {adapter.sent}"
+    )
+    assert staged, "OWUI-канал обязан получить итог"
     assert adapter.docs == []
+
 
 
 # ---------------------------------------------------------------------------
@@ -559,10 +565,12 @@ async def test_text_only_close_is_journaled_without_artifacts(
     await _run_one_branch_tick(monkeypatch, _make_runner(FlakyAdapter()))
 
     events = _journal_events(journal)
-    assert len(events) == 1, events
-    assert events[0]["result"] == "delivered"
-    assert events[0]["artifacts"] == []
-    assert events[0]["report_type"] == "none"
+    # Контракт владельца 2026-11-04: текстовый итог без файла в Telegram не
+    # доставляется → журнала доставки нет (канал молча акается).
+    assert events == [], (
+        f"text-only итог не должен доставляться в TG, журнал: {events}"
+    )
+
 
 
 @pytest.mark.asyncio

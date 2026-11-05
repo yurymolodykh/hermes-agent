@@ -351,15 +351,19 @@ async def test_branch_summary_full_mission_tg_delivered_with_owui_binding(
     runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
     await _run_one_branch_tick(monkeypatch, runner)
 
-    # F7 (t_ebc0a351): терминальный итог миссии доставляется в BOTH native
-    # telegram-подписку И в OWUI→TG зеркало (чат привязки владельца) —
-    # обе ленты получают «✅ Задача выполнена» (F1: с summary корня).
-    assert [s["text"] for s in adapter.sent] == [
-        "✅ Задача выполнена\n\ndone", "✅ Задача выполнена\n\ndone",
-    ]
-    assert {s["chat_id"] for s in adapter.sent} == {"tg-chat-bind", OWNER_TG}
+    # Контракт владельца 2026-11-04 («в TG только по делу»): из двух лент
+    # остаётся ОДНА — нативная telegram-подписка (её сообщение и есть итог,
+    # ждать его больше неоткуда).  OWUI→TG зеркало текстового успешного итога
+    # без файла-артефакта погашено: вердикт уже лежит в OWUI, дубль в TG —
+    # служебное сообщение.  Проверяемое свойство F7 сохранено: нативная
+    # telegram-лента не потеряна, OWUI-лента стаджена ровно один раз.
+    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
+    assert {s["chat_id"] for s in adapter.sent} == {"tg-chat-bind"}
     assert len(staged) == 1  # OWUI-лента сохранена
-    assert _read_suppression_journal() == []
+    journal = _read_suppression_journal()
+    assert [r["reason"] for r in journal] == [
+        "success итог without artifact (owner contract 2026-11-04)"
+    ], f"зеркало погашено по контракту владельца, не по другому поводу: {journal}"
 
 
 # ---------------------------------------------------------------------------
@@ -702,11 +706,18 @@ async def test_branch_summary_owui_only_root_terminal_mirrors_to_tg(
     runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
     await _run_one_branch_tick(monkeypatch, runner)
 
-    assert [s["chat_id"] for s in adapter.sent] == [OWNER_TG]
-    assert [s["text"] for s in adapter.sent] == ["✅ Задача выполнена\n\ndone"]
+    # Контракт владельца 2026-11-04: у этой OWUI-миссии ТОЛЬКО api_server-
+    # подписка, и итог успешный без файла-артефакта.  Такой дубль в TG —
+    # служебное сообщение, он погашен; OWUI primary lane не теряется.
+    assert adapter.sent == [], (
+        f"текстовый успешный итог не дублируется в TG: {adapter.sent}"
+    )
     assert len(staged) == 1, "OWUI primary lane не теряется"
     assert staged[0][0] == "owui-owner"
-    assert _read_suppression_journal() == []
+    journal = _read_suppression_journal()
+    assert [r["reason"] for r in journal] == [
+        "success итог without artifact (owner contract 2026-11-04)"
+    ], f"зеркало погашено по контракту владельца: {journal}"
 
 
 @pytest.mark.asyncio
@@ -1012,16 +1023,19 @@ async def test_branch_summary_leaf_without_controller_tg_delivered(
     runner.adapters = {Platform.TELEGRAM: adapter, Platform.API_SERVER: adapter}
     await _run_one_branch_tick(monkeypatch, runner)
 
-    # OWUI primary lane delivered (staged), AND the terminal итог is also
-    # mirrored to the owner's bound Telegram chat (adapter.sent non-empty).
+    # OWUI primary lane delivered (staged).  Проверяемое свойство F9-negative —
+    # «F9-подавление не срабатывает всухую для обычных (не-миссионных)
+    # закрытий» — сохранено: причина подавления НЕ `routine status close`,
+    # а контракт владельца 2026-11-04 (текстовый успешный итог без файла).
     assert len(staged) == 1, f"OWUI-лента не должна теряться: staged={staged}"
     assert staged[0][0] == "owui-solo"
-    assert adapter.sent != [], (
-        f"терминальный итог без контроллера должен доставляться в TG: "
-        f"sent={adapter.sent}"
+    journal = _read_suppression_journal()
+    assert [r["reason"] for r in journal] == [
+        "success итог without artifact (owner contract 2026-11-04)"
+    ], f"F9 не должен срабатывать всухую; подавление — по контракту: {journal}"
+    assert adapter.sent == [], (
+        f"текстовый успешный итог не дублируется в TG: {adapter.sent}"
     )
-    assert {s["chat_id"] for s in adapter.sent} == {OWNER_TG}
-    assert _read_suppression_journal() == []
 
 
 # ---------------------------------------------------------------------------
