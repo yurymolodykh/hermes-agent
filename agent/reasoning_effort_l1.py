@@ -235,6 +235,13 @@ def pin_card_effort(
         return False
     from hermes_cli import kanban_db
 
+    if str(effort or "").strip().lower() == kanban_db.AUTO_EFFORT_PIN:
+        # ``auto`` is a rule, not a depth: pass it through verbatim.
+        # ``clamp_to_letovo`` would drop it to None (an unknown bespoke value),
+        # which would silently CLEAR the pin instead of keeping the rule.
+        return kanban_db.set_reasoning_effort(
+            conn, task_id, kanban_db.AUTO_EFFORT_PIN
+        )
     clamped = None if effort in (None, "", "unset") else clamp_to_letovo(effort)
     return kanban_db.set_reasoning_effort(conn, task_id, clamped)
 

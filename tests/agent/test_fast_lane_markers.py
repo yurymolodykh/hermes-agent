@@ -308,7 +308,7 @@ def test_fast_lane_marker_for_session_shape():
     assert mf["fast_lane"] is True
     assert mf["review_exempt"] is True
     assert mf["slow_mode"] is False
-    assert mf["reasoning_effort"] == "medium"
+    assert mf["reasoning_effort"] == "low"
 
 
 # ---------------------------------------------------------------------------

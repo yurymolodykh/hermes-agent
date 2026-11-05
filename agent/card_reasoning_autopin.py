@@ -48,7 +48,9 @@ _log = logging.getLogger(__name__)
 
 __all__ = [
     "ACTIVE_AUTOPIN_STATUSES",
+    "AUTO_EFFORT_PIN",
     "LETOVO_WIRE_DOMAIN",
+    "resolve_auto_effort",
     "resolve_card_autopin_effort",
     "autopin_active_cards",
 ]
@@ -66,6 +68,18 @@ ACTIVE_AUTOPIN_STATUSES: tuple[str, ...] = (
 #: for its own validation (kept in sync by
 #: ``tests/agent/test_card_reasoning_autopin.py``).
 LETOVO_WIRE_DOMAIN: tuple[str, ...] = ("none", "low", "high", "xhigh", "max")
+
+#: The ``auto`` sentinel a card may be PINNED to (t_f89294b8). ``auto`` is not
+#: a wire level: it names a RULE, not a depth. The dispatcher resolves it at
+#: SPAWN time from the card's own shape, so the worker always receives a
+#: concrete ``--reasoning <level>`` and the pin survives shape changes (a card
+#: that gains children flips to the authoring level on its next spawn).
+AUTO_EFFORT_PIN = "auto"
+
+#: Profiles that author work and own the board's decomposition/steering lane.
+#: A card assigned to one of them is an authoring/container card by definition
+#: — the owner's «постановка карточек» shape.
+_AUTHORING_ASSIGNEES = frozenset({"01-orchestrator"})
 
 #: Fallback when ``agent.reasoning_effort_l1`` cannot be imported (a stripped
 #: install): the same two profiles that own the independent review gate.
@@ -180,6 +194,100 @@ def _has_any(hay: str, markers: Iterable[str]) -> bool:
     return any(m in hay for m in markers)
 
 
+def resolve_auto_effort(
+    *,
+    assignee: Optional[str],
+    title: Optional[str] = None,
+    goal_mode: bool = False,
+    child_count: int = 0,
+    planning_node: bool = False,
+) -> tuple[str, str]:
+    """Resolve the ``auto`` pin into a concrete level for one card (t_f89294b8).
+
+    Pure: no DB, no config, no I/O. The caller supplies the card's DIRECT
+    child count (``task_links.parent_id = id``) because that is the only
+    shape signal the DB owns.
+
+    Strict order (first match wins — the card body's list):
+
+    1. ``09-independent-reviewer`` / ``15-sre-qa`` → ``max``. Independent
+       acceptance is the quality gate; it is the most expensive error.
+    2. A container / authoring card — ANY of:
+       * ``assignee == 01-orchestrator`` (the posting/decomposition lane),
+       * **``planning_node`` is on** (t_cabee680) — the author DECLARED this
+         card a planning node, so it is one even before it posts a single
+         child,
+       * it owns at least one child (``child_count >= 1``),
+       * ``goal_mode`` is on (a goal-loop worker re-plans its own turns),
+       * the РГЗ trigger fired (the SAME phrase list as the fast lane —
+         ``agent.rgz_reasoning.rgz_trigger_detected``, no second list)
+       → ``max``.
+    3. Everything else → ``low``.
+
+    ``max`` and ``low`` both live inside the letovo wire domain, so a level
+    produced here can never 400 on the current endpoint. ``medium`` /
+    ``minimal`` / ``ultra`` are NEVER produced.
+
+    Degenerate input never raises: an empty/unknown assignee, a NULL title or
+    a negative child count simply falls through to ``low``.
+
+    ORDERING (t_cabee680): the ``child_count`` signal alone is read at SPAWN
+    time, so a card that posts its children only later would look like a leaf
+    on its first spawn. ``planning_node`` exists precisely to remove that
+    dependence: it is written when the card is CREATED (or latched the first
+    time the card is observed with children), so the node property no longer
+    decays with the order in which the chain happens to be executed — and it
+    survives the children's completion, which ``child_count`` does not.
+    ``child_count`` stays as an inference for cards nobody declared.
+    """
+    name = str(assignee or "").strip().lower()
+    text = str(title or "").strip()
+
+    # 1. Independent review gate.
+    if name and name in _reviewer_profiles():
+        return "max", "auto:review-gate-assignee"
+
+    # 2. Container / authoring card. ``planning_node`` comes FIRST among the
+    # shape signals: it is the only one that is true before the children exist
+    # and stays true after they close (t_cabee680).
+    if name and name in _AUTHORING_ASSIGNEES:
+        return "max", "auto:authoring-assignee"
+    if planning_node:
+        return "max", "auto:planning-node"
+    if int(child_count or 0) > 0:
+        return "max", "auto:container-with-children"
+    if goal_mode:
+        return "max", "auto:goal-mode"
+    if _rgz_trigger(text):
+        return "max", "auto:rgz-trigger"
+
+    # 3. Everything else — the mechanical/execution lane.
+    return "low", "auto:execution"
+
+
+def _rgz_trigger(text: Optional[str]) -> bool:
+    """True when *text* fires the single shared РГЗ phrase contract.
+
+    Reuses ``agent.rgz_reasoning.rgz_trigger_detected`` (which in turn reuses
+    the fast-lane «always-slow» list) so there is exactly ONE phrase list in
+    the codebase. Falls back to the same regex-level check when that module
+    cannot be imported (stripped install), still without a second list.
+    """
+    if not text:
+        return False
+    try:
+        from agent.rgz_reasoning import rgz_trigger_detected
+
+        return bool(rgz_trigger_detected(text))
+    except Exception:  # pragma: no cover - defensive (stripped install)
+        try:
+            from agent.fast_lane import contains_always_slow_phrase
+
+            return bool(contains_always_slow_phrase(text))
+        except Exception:
+            return False
+
+
 def resolve_card_autopin_effort(
     *,
     assignee: Optional[str],
@@ -188,13 +296,17 @@ def resolve_card_autopin_effort(
     priority: Optional[int] = None,
     has_reviewer_child: bool = False,
     child_count: int = 0,
+    planning_node: bool = False,
 ) -> tuple[str, str]:
     """Resolve ``(level, reason)`` for one card by the owner's rules.
 
     Pure: no DB, no config, no I/O. ``has_reviewer_child`` / ``child_count``
     describe the card's DIRECT children (``child_count`` is only used to tell
     the "container" shape from the "author with a review child" shape for the
-    audit reason — both resolve to ``high``).
+    audit reason — both resolve to ``high``). ``planning_node`` is the
+    author-declared (or latched) "this card posts children" flag of
+    t_cabee680; a declared node is a POSITION on ``max`` regardless of how many
+    children exist right now.
 
     The returned level is always inside :data:`LETOVO_WIRE_DOMAIN`.
     """
@@ -206,7 +318,13 @@ def resolve_card_autopin_effort(
     if name and name in _reviewer_profiles():
         return "max", "review-gate-assignee"
 
-    # 2. Gated work: the card owns a review-gate child.
+    # 2. Declared/latched planning node (t_cabee680). Sweep-side counterpart of
+    # ``auto:planning-node``: a card that posts other cards is a mission
+    # container shape, so it sits on max before (and after) its children exist.
+    if planning_node:
+        return "max", "planning-node"
+
+    # 3. Gated work: the card owns a review-gate child.
     if has_reviewer_child:
         reason = (
             "review-child-container" if int(child_count or 0) <= 1
@@ -370,16 +488,16 @@ def autopin_active_cards(
     if wanted is not None:
         placeholders = ",".join("?" for _ in wanted)
         query = (
-            "SELECT id, title, assignee, status, goal_mode, priority, "
-            "reasoning_effort FROM tasks "
+            "SELECT id, title, assignee, status, goal_mode, "
+            "planning_node, priority, reasoning_effort FROM tasks "
             f"WHERE id IN ({placeholders})"
         )
         args: tuple = tuple(wanted)
     else:
         placeholders = ",".join("?" for _ in ACTIVE_AUTOPIN_STATUSES)
         query = (
-            "SELECT id, title, assignee, status, goal_mode, priority, "
-            "reasoning_effort FROM tasks "
+            "SELECT id, title, assignee, status, goal_mode, "
+            "planning_node, priority, reasoning_effort FROM tasks "
             f"WHERE status IN ({placeholders}) "
             "ORDER BY priority DESC, created_at ASC"
         )
@@ -402,8 +520,9 @@ def autopin_active_cards(
         assignee = get("assignee") if get else row[2]
         status = get("status") if get else row[3]
         goal_mode = get("goal_mode") if get else row[4]
-        priority = get("priority") if get else row[5]
-        stored = get("reasoning_effort") if get else row[6]
+        planning_node = get("planning_node") if get else row[5]
+        priority = get("priority") if get else row[6]
+        stored = get("reasoning_effort") if get else row[7]
 
         if wanted is not None and status not in ACTIVE_AUTOPIN_STATUSES:
             continue
@@ -417,10 +536,21 @@ def autopin_active_cards(
             priority=priority,
             has_reviewer_child=has_reviewer_child,
             child_count=child_count,
+            planning_node=bool(planning_node),
         )
 
         stored_level = str(stored).strip().lower() if stored else None
         origin = _provenance(conn, str(task_id))
+
+        if stored_level == AUTO_EFFORT_PIN:
+            # ``auto`` is a deliberate RULE choice, not a missing level
+            # (t_f89294b8): the dispatcher resolves it per spawn, so the sweep
+            # must never replace the sentinel with a frozen level — doing so
+            # would silently turn a self-updating pin into a one-shot decision
+            # and break the "container that gains children flips to max" case.
+            skipped_pinned.append((str(task_id), AUTO_EFFORT_PIN))
+            unchanged += 1
+            continue
 
         if stored_level is None:
             # No level at all: the rule decides (the legacy-row case).

@@ -84,7 +84,11 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(t)
+    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(
+        t, child_count=getattr(t, "child_count", None)
+    )
+    _stored = str(t.reasoning_effort or "").strip().lower()
+    _is_auto = _stored == kb.AUTO_EFFORT_PIN
     return {
         "id": t.id,
         "title": t.title,
@@ -113,9 +117,21 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "root_model_override": t.root_model_override,
         "root_provider_override": t.root_provider_override,
         # Effective per-card thinking depth + provenance (t_f2dd1fb5).
+        # ``reasoning_effort`` is the STORED value (``auto`` stays ``auto``);
+        # ``effective_reasoning_effort`` is what the worker would run at right
+        # now, with ``auto`` already resolved from the card's shape
+        # (t_f89294b8). ``reasoning_effort_pin`` names the rule when the card
+        # is auto-pinned, so a caller can tell a rule from a frozen level.
         "reasoning_effort": t.reasoning_effort,
         "effective_reasoning_effort": _eff_effort,
-        "reasoning_effort_source": "default" if _eff_is_default else "pin",
+        "reasoning_effort_source": (
+            "auto" if _is_auto else ("default" if _eff_is_default else "pin")
+        ),
+        # Planning-node shape signal (t_cabee680): True when the card is
+        # declared OR latched as a node, i.e. when its 'auto' level is decided
+        # by "I post children" rather than by the current live child count.
+        "planning_node": bool(getattr(t, "planning_node", False)),
+        "goal_mode": bool(getattr(t, "goal_mode", False)),
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -425,6 +441,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument(
+        "--reasoning", default=None, dest="reasoning_effort",
+        metavar="LEVEL",
+        help="Pin the card's thinking depth: one of auto, none, low, high, "
+             "xhigh, max (medium/minimal/ultra are clamped onto the wire "
+             "domain). 'auto' stores the RULE and resolves it at each spawn: "
+             "09/15 review gate -> max; 01-orchestrator / a card with "
+             "children / goal_mode / a РГЗ phrase -> max; otherwise low. "
+             "An explicit level always wins over auto. Omit to use the card "
+             "default (high, or max for a review-gate assignee).")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -438,6 +464,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--planning-node", action="store_true", default=False,
+                          dest="planning_node",
+                          help="Declare this card a PLANNING NODE: it "
+                               "decomposes work and will post children. The "
+                               "'auto' effort pin then resolves it to max "
+                               "IMMEDIATELY, regardless of whether its "
+                               "children already exist — this is what makes "
+                               "a mid-chain node's level independent of the "
+                               "order in which the chain is executed. A card "
+                               "observed with children is latched as a node "
+                               "automatically, so the flag is only needed for "
+                               "a node whose children are still to come.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1670,8 +1708,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            planning_node=bool(getattr(args, "planning_node", False)),
             initial_status=getattr(args, "initial_status", "running"),
             do_not_deliver=bool(getattr(args, "do_not_deliver", False)),
         )
@@ -1809,6 +1849,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
             reasoning_origin = _provenance(conn, task.id)
         except Exception:  # pragma: no cover - provenance is cosmetic here
             reasoning_origin = ""
+        # ``auto`` resolves from the card's shape (t_f89294b8), and the only
+        # shape signal that lives in the board is the direct child count —
+        # read it here, on the open connection, instead of making the printer
+        # open its own.
+        try:
+            _kids_row = conn.execute(
+                "SELECT count(*) AS n FROM task_links WHERE parent_id = ?",
+                (task.id,),
+            ).fetchone()
+            child_count_for_effort = int(_kids_row["n"] if _kids_row is not None else 0) or 0
+        except Exception:  # pragma: no cover - cosmetic
+            child_count_for_effort = None
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -1869,14 +1921,39 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # worker will actually run at, and mark WHERE it came from so an operator
     # can tell an explicit choice from a rule-derived one (t_d7edc3b2). A NULL
     # row is NOT "the profile decides" any more.
-    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(task)
-    if reasoning_origin == "operator":
+    _eff_effort, _eff_is_default = kb.effective_card_reasoning_effort(
+        task, child_count=child_count_for_effort
+    )
+    _stored_level = str(task.reasoning_effort or "").strip().lower()
+    if _stored_level == kb.AUTO_EFFORT_PIN:
+        # An auto-pinned card names the RULE and the level it currently
+        # resolves to (t_f89294b8): "auto -> low" is the whole point — the
+        # operator must not read the stored sentinel as an unknown level.
+        print(f"  reasoning: {_eff_effort} (auto; stored pin: {kb.AUTO_EFFORT_PIN})")
+    elif reasoning_origin == "operator":
         _source = "operator pin"
     elif reasoning_origin == "autopin" or _eff_is_default:
         _source = "rule"
     else:
         _source = "unrecorded"
-    print(f"  reasoning: {_eff_effort} ({_source})")
+    if _stored_level != kb.AUTO_EFFORT_PIN:
+        print(f"  reasoning: {_eff_effort} ({_source})")
+    # Whether this card is a planning node (t_cabee680). This is the
+    # ORDER-STABLE half of the resolution: a node resolves max from the flag,
+    # not from the children that happen to exist right now, so the operator
+    # can see WHY a childless card is already on max. Printed for EVERY card,
+    # not just auto-pinned ones — a hand-pinned node still needs to advertise
+    # the shape (and a hand-pinned leaf silently holding the flag is exactly
+    # the drift an operator must be able to spot here).
+    if getattr(task, "planning_node", False):
+        _node_note = (
+            "planning node -> auto resolves max"
+            if _stored_level == kb.AUTO_EFFORT_PIN
+            else "planning node (flag set; explicit pin governs the level)"
+        )
+        print(f"  node:      yes ({_node_note})")
+    elif _stored_level == kb.AUTO_EFFORT_PIN:
+        print("  node:      no (execution card -> auto resolves low)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

@@ -5667,6 +5667,24 @@ class TurnRunner:
                 reasoning_config = {"enabled": True, "effort": "max"}
         except Exception:  # pragma: no cover — guarantee must never break a turn
             logger.debug("rgz_reasoning: trigger check skipped", exc_info=True)
+        # An explicit session-level override (/reasoning --session, or the RGZ
+        # pin applied above) is the OPERATOR'S decision for this conversation
+        # and outranks the fast-lane heuristic (t_0563b054): a per-request lane
+        # decision must never rewrite a pinned `max` back down to a fast level.
+        # Read once here; the fast-path block below consults it.
+        _session_reasoning_pinned = False
+        try:
+            _r_state = (
+                self._runner._peek_session_state(ctx.session_key)
+                if ctx.session_key
+                else None
+            )
+            _session_reasoning_pinned = (
+                _r_state is not None
+                and _r_state.conversation.reasoning_override is not None
+            )
+        except Exception:  # peek is advisory — never break the turn
+            _session_reasoning_pinned = False
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -5795,6 +5813,7 @@ class TurnRunner:
                 strip_telegram_slow_prefix as _fast_lane_strip,
                 patch_session_fast_lane_marker as _patch_fast_lane_marker,
                 resolve_fast_reasoning_pin as _fast_lane_resolve_pin,
+                DEFAULT_FAST_REASONING,
             )
             _fast_lane_config = (ctx.user_config or {}).get("fast_lane") or {}
             _fast_lane_active = _fast_lane_enabled(ctx.user_config or {})
@@ -5834,6 +5853,8 @@ class TurnRunner:
                 _fast_decision = _fast_lane_resolve(
                     _fast_decision, ctx.message or "",
                     reasoning_pin=_fast_reasoning_pin,
+                    wire_base_url=runtime_kwargs.get("base_url"),
+                    wire_model=model,
                 )
             _fast_stripped_message = _fast_lane_strip(ctx.message or "")
             if _fast_decision.slow_mode:
@@ -5853,7 +5874,7 @@ class TurnRunner:
                     ctx.session_key or "",
                     _fast_decision.source or "-",
                     _fast_decision.complexity or "-",
-                    _fast_decision.reasoning_effort or "medium",
+                    _fast_decision.reasoning_effort or DEFAULT_FAST_REASONING,
                     _fast_decision.max_iterations,
                     _fast_decision.run_budget_seconds,
                     _fast_decision.review_exempt,
@@ -6152,15 +6173,23 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent. Fast-path
-            # overrides (t_ae312f32): reasoning medium/high, max_iterations
-            # cap ≤16, run_budget_seconds=300 are injected here when the
-            # decision is fast AND the fast-lane flag is ON (inert by default;
-            # §6.2).
+            # overrides (t_ae312f32): reasoning low/high, max_iterations
+            # cap, run_budget_seconds=300 are injected here when the decision is
+            # fast AND the fast-lane flag is ON (inert by default; §6.2).
+            # An explicit session reasoning override (RGZ trigger / /reasoning
+            # --session) is the operator's decision and is never rewritten by
+            # the lane heuristic (t_0563b054).
             _fast_agent_kwargs: dict = {}
-            if _fast_lane_active and _fast_decision is not None and not _fast_decision.slow_mode:
+            if (
+                _fast_lane_active
+                and _fast_decision is not None
+                and not _fast_decision.slow_mode
+                and not _session_reasoning_pinned
+            ):
                 reasoning_config = {
                     "enabled": True,
-                    "effort": _fast_decision.reasoning_effort or "medium",
+                    "effort": _fast_decision.reasoning_effort
+                    or DEFAULT_FAST_REASONING,
                 }
                 if _fast_decision.max_iterations is not None:
                     max_iterations = _fast_decision.max_iterations
@@ -6307,21 +6336,28 @@ class TurnRunner:
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Fast-path per-turn overrides on a REUSED (cached) agent
-        # (t_ae312f32). reasoning_config is already set per-message above;
-        # the iteration cap and wall-clock budget must also be pushed onto
-        # the reused object (turn_context.prepare_turn resets the
-        # IterationBudget from agent.max_iterations and stamps the run
-        # budget each turn). Slow requests restore the normal (unlimited)
-        # path so a fast request in an otherwise-unbounded session cannot
-        # accidentally inherit a previous fast cap. All of this is inert
-        # unless the fast-lane flag is ON (§6.2) — with the flag unset the
-        # agent is left exactly as before.
+        # (t_ae312f32). On a fresh agent the whole config is baked in above;
+        # a cached object keeps whatever it was built with, so every fast-path
+        # field must be pushed onto it explicitly. reasoning_config is set
+        # unconditionally two lines up, but the LEVEL it carries must come from
+        # the fast decision when this turn is fast — and must NOT when the
+        # operator pinned a session level (RGZ max, /reasoning --session), see
+        # `_session_reasoning_pinned` (t_0563b054). Slow requests restore the
+        # normal (unlimited) path so a fast request in an otherwise-unbounded
+        # session cannot accidentally inherit a previous fast cap. All of this
+        # is inert unless the fast-lane flag is ON (§6.2).
         if _fast_lane_active and _fast_decision is not None:
             if _fast_decision.slow_mode:
                 agent.max_iterations = _current_max_iterations()
                 agent.run_budget_seconds = None
                 agent.review_exempt = False
             else:
+                if not _session_reasoning_pinned:
+                    agent.reasoning_config = {
+                        "enabled": True,
+                        "effort": _fast_decision.reasoning_effort
+                        or DEFAULT_FAST_REASONING,
+                    }
                 if _fast_decision.max_iterations is not None:
                     agent.max_iterations = _fast_decision.max_iterations
                 agent.run_budget_seconds = (

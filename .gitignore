@@ -234,3 +234,37 @@ artifacts/
 # repo content and not referenced by any code — kept out of drift detection
 # so the watchdog reports real work only.
 /%SystemDrive%/
+
+# --- Working-tree noise of THIS checkout (t_e6c9c62d) -----------------------
+# The detector (scripts/uncommitted_drift_detector.py) excludes these paths
+# already, but git status did not, so they kept reappearing as "untracked
+# significant files" in commit-drift alerts (26 reported files, of which 9
+# were pure tooling noise). Ignoring them here makes the repo's own answer
+# equal to the detector's answer.
+#
+# Local SQLite boards/temp DBs written into the checkout by tooling. The root
+# `kanban.db` was a 0-byte leftover; the live board lives in
+# %LOCALAPPDATA%/hermes/kanban.db, never here.
+/kanban.db
+/kanban/
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Rollback snapshots taken by task workers before an edit (backups/<slot>/<file>).
+# Historical rollback points, same rationale as *.bak-* above.
+/backups/
+
+# Pristine clone used by a task to isolate HEAD from a dirty working tree
+# (t391-wt-pristine, 171 MB of a second copy of the tree). Never repo content.
+/-wt-pristine/
+/t391-wt-pristine/
+
+# Ad-hoc debug logs written to the repo root while chasing a live bug
+# (after_fastlane.log, live_now.log, mutant_now.log, …). *.log is already in
+# the detector's ignore list; anchor it here too so git status agrees.
+/*.log
+
+# Per-card handoff/scratch directory created by task workers in the checkout.
+# Same convention the detector excludes (see task-backups above).
+/task-backups/

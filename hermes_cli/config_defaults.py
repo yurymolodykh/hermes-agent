@@ -2659,6 +2659,12 @@ DEFAULT_CONFIG = {
         # with ``kanban list --status done`` or ``--historical``. Set 0 to hide
         # every timestamped completed task from the default view.
         "list_done_retention_hours": 12.0,
+        # Срок годности итога (t_fc08695e). Итог, чья ветка закрылась раньше
+        # этого окна, не отправляется владельцу: сообщение «по старой
+        # карточке» — не результат миссии. 0 или меньше выключает гейт (итоги
+        # уходят независимо от возраста, как было до 04.11.2026).
+        # Отказ приёмки (refusal) гейт не глушит — он доходит всегда.
+        "summary_max_age_hours": 6.0,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
@@ -3768,12 +3774,23 @@ DEFAULT_CONFIG = {
     # fast-lane machinery (reasoning split, iteration/budget caps,
     # review-exemption markers in agent/fast_lane.py) is compiled in but INERT,
     # and every request runs on the existing full lane unchanged. When enabled,
-    # marker-less requests take the fast path (reasoning medium/high — never
-    # low — max 8 iterations, 300s budget) with review-exemption; any fast-path
-    # error degrades silently to the full lane (fast_lane_degraded=true) and is
-    # never surfaced as a request error. Roll out wave-style; roll back with a
-    # single config edit + gateway restart. Read per-request by the gateway
-    # call sites (gateway/run.py, gateway/platforms/api_server.py).
+    # marker-less requests take the fast path (reasoning low for routine class
+    # A, high for complex work — see ``reasoning_effort`` below, 300s budget)
+    # with review-exemption; any fast-path error degrades silently to the full
+    # lane (fast_lane_degraded=true) and is never surfaced as a request error.
+    # Roll out wave-style; roll back with a single config edit + gateway
+    # restart. Read per-request by the gateway call sites (gateway/run.py,
+    # gateway/platforms/api_server.py).
+    #
+    # ``reasoning_effort`` (default "low", t_0563b054): the level a routine
+    # fast request thinks at. It is the ONLY per-profile pin for the fast lane
+    # and it does not touch ``agent.reasoning_effort`` (which governs the full
+    # lane). Values outside none|minimal|low|medium|high|xhigh|max|ultra are
+    # ignored with a warning, and the resolved level is clamped to the served
+    # endpoint's domain (letovo: none/low/high/xhigh/max) before it can reach
+    # the wire. An explicit operator pin — ``/reasoning --session``, a
+    # per-request reasoning parameter, or the RGZ max guarantee — always wins
+    # over this value; the fast lane never demotes it.
     #
     # ``route_to_profile`` (default False, §4.2 Track M): when enabled, fast
     # (markerless) requests EXECUTE under the 11-fast-answers profile (its own
@@ -3790,6 +3807,7 @@ DEFAULT_CONFIG = {
     # run.py/run_agent seam (design parity with api_server).
     "fast_lane": {
         "enabled": False,
+        "reasoning_effort": "low",
         "route_to_profile": False,
         "route_platforms": None,
     },

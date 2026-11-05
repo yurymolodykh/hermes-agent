@@ -159,13 +159,20 @@ def normalize_reasoning_effort(
     base_url: Optional[str] = None,
     task_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Normalize a per-task reasoning effort into a storable level.
+    """Normalize a per-task reasoning effort into a storable value.
 
     Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
     ``"none"`` (thinking disabled), case-insensitively. Empty / None means
     "no explicit pin" and stores NULL — the spawn path then substitutes the
     card default (:func:`default_card_reasoning_effort`), so a NULL row no
     longer inherits the *worker profile's* ``agent.reasoning_effort``.
+
+    ``"auto"`` (t_f89294b8) is accepted as the RULE sentinel: it stores the
+    literal ``auto`` (never clamped, it is not a wire level) and the spawn path
+    resolves it into a concrete level from the card's own shape
+    (:func:`resolve_card_auto_effort`). Storing the sentinel — rather than a
+    frozen level — is what makes the pin follow a card that later gains
+    children.
 
     Anything else is rejected rather than silently dropped — a typo'd level
     must not quietly hand the task back to the profile default.
@@ -183,8 +190,11 @@ def normalize_reasoning_effort(
     value = str(effort or "").strip().lower()
     if not value:
         return None
+    if value == AUTO_EFFORT_PIN:
+        # A rule, not a depth: keep the sentinel verbatim, never clamp it.
+        return AUTO_EFFORT_PIN
     if value != "none" and value not in VALID_REASONING_EFFORTS:
-        allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        allowed = ", ".join(("none", AUTO_EFFORT_PIN, *VALID_REASONING_EFFORTS))
         raise ValueError(
             f"reasoning_effort must be one of {allowed}, got {effort!r}"
         )
@@ -200,6 +210,13 @@ def normalize_reasoning_effort(
 #: ``high`` is the letovo-safe middle of the served domain (the backend serves
 #: ``none/low/high/xhigh/max`` and 400s on ``medium``/``minimal``).
 DEFAULT_CARD_REASONING_EFFORT = "high"
+
+#: The ``auto`` RULE sentinel (t_f89294b8). Not a wire level — a card pinned to
+#: ``auto`` stores this literal, and the spawn path resolves it into a concrete
+#: level from the card's own shape (:func:`resolve_card_auto_effort`), so the
+#: worker always receives ``--reasoning <level>`` and the pin tracks a card
+#: that gains children between spawns.
+AUTO_EFFORT_PIN = "auto"
 
 #: Independent-gate cards (assignee ``09-independent-reviewer`` /
 #: ``15-sre-qa``) pin the top served level instead of the writing default.
@@ -256,6 +273,10 @@ def clamp_card_effort_to_route(
     """
     if effort is None:
         return None
+    if str(effort).strip().lower() == AUTO_EFFORT_PIN:
+        # ``auto`` is a rule, not a wire level: it is never clamped, it is
+        # resolved into a level at spawn time (t_f89294b8).
+        return AUTO_EFFORT_PIN
     if not _route_is_letovo(provider=provider, model=model, base_url=base_url):
         return effort
     try:
@@ -320,6 +341,7 @@ def default_card_reasoning_effort(
     priority: Optional[int] = None,
     has_reviewer_child: Optional[bool] = None,
     child_count: int = 0,
+    planning_node: bool = False,
 ) -> str:
     """The level a card owns when the operator pinned none (t_f2dd1fb5).
 
@@ -350,10 +372,197 @@ def default_card_reasoning_effort(
             priority=priority,
             has_reviewer_child=bool(has_reviewer_child),
             child_count=child_count,
+            planning_node=planning_node,
         )
     return clamp_card_effort_to_route(
         base, provider=provider, model=model, base_url=base_url
     ) or base
+
+
+def resolve_card_auto_effort(
+    conn: Optional[sqlite3.Connection],
+    task: Optional["Task"],
+    *,
+    child_count: Optional[int] = None,
+) -> tuple[str, str]:
+    """Resolve an ``auto``-pinned card into ``(level, reason)`` (t_f89294b8).
+
+    The DB-aware wrapper around
+    :func:`agent.card_reasoning_autopin.resolve_auto_effort`: it supplies the
+    one shape signal that lives in the board — the card's DIRECT child count
+    (``task_links.parent_id = id``) — and nothing else. ``child_count`` may be
+    passed by a caller that already has the graph in hand (the dispatch loop
+    does, for the container/skip decisions), which keeps this off the hot path
+    when it matters.
+
+    Never raises and never returns an empty level: a missing conn/task, a DB
+    failure or a malformed title degrade to the execution lane (``low``), which
+    is inside the letovo wire domain. ``medium``/``minimal``/``ultra`` are never
+    produced.
+
+    See :func:`resolve_auto_effort` for the rule order and for the documented
+    ordering limit (a card that posts children only AFTER its first spawn runs
+    ``low`` on that first spawn; ``t_cabee680`` owns closing that gap).
+    """
+    from agent.card_reasoning_autopin import resolve_auto_effort
+
+    if task is None:
+        return "low", "auto:no-card"
+    assignee = getattr(task, "assignee", None)
+    title = getattr(task, "title", None)
+    goal_mode = bool(getattr(task, "goal_mode", False))
+    planning_node = bool(getattr(task, "planning_node", False))
+    if child_count is None:
+        child_count = 0
+        task_id = getattr(task, "id", None)
+        if conn is not None and task_id:
+            try:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM task_links WHERE parent_id = ?",
+                    (str(task_id),),
+                ).fetchone()
+                child_count = int(row["n"] if hasattr(row, "keys") else row[0]) or 0
+            except Exception:  # pragma: no cover - defensive: never break a spawn
+                _log.warning(
+                    "card %s: child count unreadable; auto resolves as a leaf",
+                    task_id,
+                )
+                child_count = 0
+    try:
+        return resolve_auto_effort(
+            assignee=assignee,
+            title=title,
+            goal_mode=goal_mode,
+            child_count=child_count,
+            planning_node=planning_node,
+        )
+    except Exception:  # pragma: no cover - defensive: never break a spawn
+        _log.warning("auto effort resolution failed; using low", exc_info=True)
+        return "low", "auto:resolve-error"
+
+
+def latch_planning_node(
+    conn: Optional[sqlite3.Connection], task_ids: Iterable[str]
+) -> list[str]:
+    """Mark *task_ids* as planning nodes if they are not declared ones yet.
+
+    t_cabee680. ``planning_node`` is the shape signal that does not decay with
+    execution order, but it needs to be TRUE for cards nobody declared. This is
+    the latch: as soon as a card is observed owning at least one direct child,
+    it IS a node, so the fact is written once and stays written even after the
+    children close and ``child_count`` drops back to zero.
+
+    Deliberately narrow:
+
+    * only cards whose stored level is the ``auto`` sentinel are touched — they
+      are the only consumers of the flag, so an explicitly pinned card is never
+      mutated (an explicit pin outranks ``auto`` anyway);
+    * only cards that do not already carry the flag are written, so the call is
+      idempotent and costs one UPDATE per newly-observed node;
+    * an audit event ``planning_node_latched`` records WHY the flag appeared,
+      so the board shows inference and declaration as different things.
+
+    Fail-soft: any DB error is logged and yields ``[]`` — a spawn must never be
+    blocked by an observability latch.
+    """
+    ids = [str(t) for t in task_ids if t]
+    if conn is None or not ids:
+        return []
+    latched: list[str] = []
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+            "AND planning_node = 0 "
+            "AND lower(coalesce(reasoning_effort, '')) = ?",
+            (*ids, AUTO_EFFORT_PIN),
+        ).fetchall()
+        latched = [str(r["id"] if hasattr(r, "keys") else r[0]) for r in rows]
+        if not latched:
+            return []
+        with write_txn(conn):
+            for tid in latched:
+                conn.execute(
+                    "UPDATE tasks SET planning_node = 1 WHERE id = ?", (tid,)
+                )
+                _append_event(
+                    conn,
+                    tid,
+                    "planning_node_latched",
+                    {
+                        "planning_node": 1,
+                        "reason": "observed-with-children",
+                        "by": "dispatcher",
+                    },
+                )
+        _log.info(
+            "card(s) %s latched as planning nodes (auto pin resolved max from now on)",
+            ", ".join(latched),
+        )
+    except Exception:  # pragma: no cover - never break a spawn over a latch
+        _log.warning("planning_node latch failed for %s", ids, exc_info=True)
+        return []
+    return latched
+
+
+def _apply_card_shape(conn: sqlite3.Connection, task: Task) -> None:
+    """Stamp the ``auto`` resolver's shape fields onto a just-claimed *task*.
+
+    t_f89294b8 / t_cabee680. Both dispatch lanes must see the SAME shape, so
+    the read lives here instead of being copy-pasted per lane:
+
+    ``child_count`` — direct children, read ONCE on the connection that already
+    holds the claim, so ``_default_spawn`` never opens its own connection just
+    to answer "is this a container".
+
+    ``planning_node`` — ORDER-stable node signal: a card observed WITH children
+    is a planning node for good, not only until its children close. The latch
+    is persisted so the fact survives their completion, and applied in memory
+    so THIS spawn already resolves from it. A non-``auto`` card needs no latch
+    (its explicit pin governs) but still reports the true shape.
+    """
+    try:
+        kids = conn.execute(
+            "SELECT count(*) AS n FROM task_links WHERE parent_id = ?",
+            (task.id,),
+        ).fetchone()
+        task.child_count = int(kids["n"] if kids is not None else 0) or 0
+    except Exception:  # pragma: no cover - defensive: never break a spawn
+        task.child_count = None
+    if task.child_count and not task.planning_node:
+        if latch_planning_node(conn, [task.id]):
+            task.planning_node = True
+        elif str(task.reasoning_effort or "").strip().lower() != AUTO_EFFORT_PIN:
+            task.planning_node = True
+
+
+def _direct_child_count(task_id: Optional[str]) -> int:
+    """Direct child count for *task_id* over its OWN short-lived connection.
+
+    Only used when a caller has no board connection in hand (a direct
+    ``_default_spawn`` from a script or a test). The dispatch loop passes the
+    count on the Task instead, so the hot path never opens a connection here.
+
+    Fail-soft: any error (no DB yet, unreadable file, missing table) yields
+    ``0`` — the caller treats the card as a leaf rather than crashing a spawn.
+    """
+    if not task_id:
+        return 0
+    try:
+        with connect_closing() as conn:
+            row = conn.execute(
+                "SELECT count(*) AS n FROM task_links WHERE parent_id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if row is None:
+                return 0
+            return int(row["n"] if hasattr(row, "keys") else row[0]) or 0
+    except Exception:  # pragma: no cover - defensive: never break a spawn
+        _log.warning(
+            "card %s: direct child count unreadable; treating as a leaf",
+            task_id,
+        )
+        return 0
 
 
 def resolve_card_reasoning_effort(
@@ -369,6 +578,7 @@ def resolve_card_reasoning_effort(
     priority: Optional[int] = None,
     has_reviewer_child: Optional[bool] = None,
     child_count: int = 0,
+    planning_node: bool = False,
 ) -> tuple[str, bool]:
     """Resolve the effort a card actually stores.
 
@@ -407,6 +617,7 @@ def resolve_card_reasoning_effort(
             priority=priority,
             has_reviewer_child=has_reviewer_child,
             child_count=child_count,
+            planning_node=planning_node,
         ),
         True,
     )
@@ -447,7 +658,12 @@ def _route_for_effort_clamp(
     return provider or dp, model or dm
 
 
-def effective_card_reasoning_effort(task: "Task") -> tuple[str, bool]:
+def effective_card_reasoning_effort(
+    task: "Task",
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    child_count: Optional[int] = None,
+) -> tuple[str, bool]:
     """``(level, is_card_default)`` for a Task row, NULL-safe.
 
     Legacy rows may still carry NULL (the mass backfill of the ~155 active
@@ -461,8 +677,21 @@ def effective_card_reasoning_effort(task: "Task") -> tuple[str, bool]:
     hold the same level. Rows that predate the column (NULL provenance) fall
     back to the old inference: a stored level means a pin, an empty one means
     the default was substituted.
+
+    ``auto`` (t_f89294b8) is resolved HERE into the concrete level the worker
+    will run at, from the card's own shape. The stored column keeps the
+    sentinel (the pin follows the card); this function is the single read-side
+    place that turns it into a depth, so ``show``/JSON/spawn all agree. Pass
+    *conn* (or a precomputed *child_count*) so the child-count lookup does not
+    have to open a connection of its own; without either, an ``auto`` card is
+    resolved with what the row itself knows (assignee/title/goal_mode).
     """
     stored = getattr(task, "reasoning_effort", None)
+    if str(stored or "").strip().lower() == AUTO_EFFORT_PIN:
+        level, _reason = resolve_card_auto_effort(
+            conn, task, child_count=child_count
+        )
+        return level, False
     level, is_default = resolve_card_reasoning_effort(
         getattr(task, "assignee", None),
         stored,
@@ -1491,6 +1720,21 @@ class Task:
     # created with no pin would look identical to one whose operator pinned
     # ``high``, and ``show`` would have to guess.
     reasoning_effort_source: Optional[str] = None
+    # TRANSIENT (never persisted, never read from a row): the concrete level an
+    # ``auto``-pinned card resolved to at THIS spawn, plus the rule that fired
+    # (t_f89294b8). ``_default_spawn`` fills them from the card's shape so the
+    # spawn event can record ``auto -> <level>`` for observability, and the
+    # dispatch loop hands the pair to ``_set_worker_pid``. Both stay ``None``
+    # for every non-``auto`` card.
+    spawn_reasoning_effort: Optional[str] = None
+    spawn_reasoning_reason: Optional[str] = None
+    # TRANSIENT: direct child count handed to the ``auto`` resolver so the
+    # spawn path never has to guess the card's shape. The dispatch loop fills
+    # it from the board (``task_links.parent_id``) right after claiming; a
+    # caller that already holds the graph may set it directly. ``None`` means
+    # "unknown" — the resolver then uses the read connection, and only when
+    # neither is available does it treat the card as a leaf.
+    child_count: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1517,6 +1761,15 @@ class Task:
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # PLANNING-NODE flag (t_cabee680). True = the author declared this card to
+    # be a planning/container node: it decomposes work and posts children, so
+    # its thinking depth must not depend on whether those children happen to
+    # exist at the moment of a spawn. The ``auto`` resolver reads it FIRST,
+    # which is what closes the ordering hole of ``auto:container-with-children``
+    # (a mid-chain node whose children are created after its first spawn used
+    # to resolve ``low``). False (default) = ordinary execution card; the
+    # resolver then falls back to the live child graph.
+    planning_node: bool = False
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -1640,6 +1893,11 @@ class Task:
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+            ),
+            planning_node=(
+                bool(row["planning_node"])
+                if "planning_node" in keys and row["planning_node"]
+                else False
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
@@ -1864,6 +2122,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- PLANNING-NODE flag (t_cabee680). 1 = the card is a планирующий узел:
+    -- it decomposes work and posts children, whether or not those children
+    -- exist yet. This is the shape signal that does NOT decay with the
+    -- execution order — the ``auto`` effort resolver reads it FIRST, so a
+    -- node card whose children are created only AFTER its first spawn still
+    -- resolves to ``max`` instead of looking like a leaf.
+    -- 0 (the default) = ordinary execution card. Set explicitly by the card
+    -- author (``--planning-node`` / ``planning_node=1``); a card that gains
+    -- children is also inferred as a node at spawn time (see
+    -- ``resolve_card_auto_effort``), so the flag is a hint, not a
+    -- precondition.
+    planning_node        INTEGER NOT NULL DEFAULT 0,
     -- PER-TASK agent iteration cap (t_57d0990b, auto-unblock class B).
     -- NULL = fall through to ``agent.max_turns`` in the assignee profile's
     -- config.yaml (the historical behaviour). A non-NULL value is passed to
@@ -3317,6 +3587,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
         )
 
+    if "planning_node" not in cols:
+        # Explicit "this card is a planning node" flag (t_cabee680). 0 for
+        # every existing row: an old card was never declared a node, and the
+        # ``auto`` resolver still infers the shape from the live child graph,
+        # so no backfill can silently change an existing resolution.
+        _add_column_if_missing(
+            conn, "tasks", "planning_node", "planning_node INTEGER NOT NULL DEFAULT 0"
+        )
+
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
         # created from within an agent loop that propagated
@@ -4381,6 +4660,7 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    planning_node: bool = False,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -4692,6 +4972,7 @@ def create_task(
         title=title,
         goal_mode=bool(goal_mode),
         priority=priority,
+        planning_node=bool(planning_node),
     )
 
     # Retry once on the extremely unlikely id collision.
@@ -4827,8 +5108,8 @@ def create_task(
                         skills, max_retries, max_turns, model_override, provider_override,
                         root_model_override, root_provider_override,
                         reasoning_effort, reasoning_effort_source,
-                        goal_mode, goal_max_turns, session_id, do_not_deliver
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, planning_node, session_id, do_not_deliver
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4857,6 +5138,7 @@ def create_task(
                         "default" if _stored_effort_is_default else "pin",
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
+                        1 if planning_node else 0,
                         session_id,
                         1 if do_not_deliver else 0,
                     ),
@@ -9552,10 +9834,13 @@ def split_task_on_budget(
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         _archive_prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         _archive_prior_status = (
             str(_archive_prior["status"] or "").strip() if _archive_prior else None
+        )
+        _archive_prior_completed_at = (
+            _archive_prior["completed_at"] if _archive_prior else None
         )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -9580,23 +9865,45 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # controllers are routinely closed this way instead of via
         # kanban_complete, so the delivery trigger must fire here too (the
         # original incident: the card was archived, the report was never sent).
+        #
+        # t_fc08695e (owner, 04.11.2026): но обратное неверно — уборка доски
+        # не является завершением миссии. Пакетная архивация (91 карточка за
+        # 7 секунд в ночь на 04.11) ставила триггер на КАЖДУЮ карточку, и
+        # владелец получал пачку «итогов» по вчерашним делам. Поэтому триггер
+        # ставится только когда карточка пришла в архив ИЗ закрытого
+        # состояния (``done``): тогда архивация лишь прячет уже отданный
+        # результат. Архивация «висяка» (blocked/ready/running/failed) —
+        # уборка, и сообщения не порождает.
         try:
-            _queued = enqueue_terminal_delivery(
-                conn, task_id,
-                from_status=_archive_prior_status,
-                to_status="archived",
-                event_id=_archived_event_id,
-                tg_chat=ensure_terminal_delivery_subscription(conn, task_id),
+            _queue_archive = _terminal_archive_is_result(
+                _archive_prior_status, _archive_prior_completed_at,
             )
-            if _queued:
-                _log.info(
-                    "kanban: terminal-delivery trigger queued for %s (%s -> archived): %s",
-                    task_id, _archive_prior_status or "?", ", ".join(_queued),
+        except Exception:  # pragma: no cover - defensive
+            _queue_archive = True
+        if _queue_archive:
+            try:
+                _queued = enqueue_terminal_delivery(
+                    conn, task_id,
+                    from_status=_archive_prior_status,
+                    to_status="archived",
+                    event_id=_archived_event_id,
+                    tg_chat=ensure_terminal_delivery_subscription(conn, task_id),
                 )
-        except Exception as _queue_exc:  # pragma: no cover - defensive
-            _log.warning(
-                "kanban: terminal-delivery trigger for %s failed (%s); "
-                "periodic branch scan still covers it", task_id, _queue_exc,
+                if _queued:
+                    _log.info(
+                        "kanban: terminal-delivery trigger queued for %s (%s -> archived): %s",
+                        task_id, _archive_prior_status or "?", ", ".join(_queued),
+                    )
+            except Exception as _queue_exc:  # pragma: no cover - defensive
+                _log.warning(
+                    "kanban: terminal-delivery trigger for %s failed (%s); "
+                    "periodic branch scan still covers it", task_id, _queue_exc,
+                )
+        else:
+            _log.info(
+                "kanban: administrative archive of %s (prior status %s, no "
+                "completed result) — no delivery trigger",
+                task_id, _archive_prior_status or "?",
             )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
@@ -12136,12 +12443,27 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    auto_effort: Optional[str] = None,
+    auto_reason: Optional[str] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    For an ``auto``-pinned card (t_f89294b8) the payload also records the
+    resolution itself: ``reasoning_effort_pin="auto"``,
+    ``reasoning_effort_resolved=<level>`` and
+    ``reasoning_effort_resolution=<rule that fired>``. That is what makes
+    ``auto -> low`` / ``auto -> max`` READABLE on the board without a debugger —
+    the stored column deliberately keeps the sentinel, so without this payload
+    the resolution would only exist in the worker log.
 
     Also refreshes the gateway-generation marker ("at every tick spawn")
     and back-stamps the generation onto the task (defensive: the claim-time
@@ -12169,7 +12491,13 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {"pid": int(pid)}
+        if auto_effort:
+            payload["reasoning_effort_pin"] = AUTO_EFFORT_PIN
+            payload["reasoning_effort_resolved"] = str(auto_effort)
+            if auto_reason:
+                payload["reasoning_effort_resolution"] = str(auto_reason)
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -14334,6 +14662,10 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Card shape for the ``auto`` reasoning resolver (t_f89294b8) plus the
+        # order-stable node latch (t_cabee680). Shared with the review lane so
+        # the resolver cannot see two different shapes for one card.
+        _apply_card_shape(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -14389,7 +14721,11 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    auto_effort=claimed.spawn_reasoning_effort,
+                    auto_reason=claimed.spawn_reasoning_reason,
+                )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -14551,6 +14887,11 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Same shape read as the ready lane (t_f89294b8/t_cabee680): a review
+        # card is normally a leaf, but read it rather than assume it — the
+        # resolver must see the SAME graph on both lanes, and this is one
+        # shared helper precisely so the two cannot drift.
+        _apply_card_shape(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -14609,7 +14950,11 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    auto_effort=claimed.spawn_reasoning_effort,
+                    auto_reason=claimed.spawn_reasoning_reason,
+                )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -15589,9 +15934,40 @@ def _default_spawn(
     # worker's depth is a property of the CARD, not of whichever profile
     # happens to run it. The substitution is logged once per card, so nothing
     # falls back silently.
-    worker_reasoning, _reasoning_is_default = effective_card_reasoning_effort(task)
-    if _reasoning_is_default:
-        _announce_default_effort_once(task.id, worker_reasoning)
+    #
+    # ``auto`` cards (t_f89294b8) resolve HERE, at spawn, from the card's own
+    # shape (assignee / children / goal_mode / РГЗ phrase). The stored sentinel
+    # is deliberately NOT overwritten: it keeps describing the RULE, so a card
+    # that gains children between spawns follows them to ``max`` on its next
+    # run. The resolved pair is stashed on the Task and written into the
+    # ``spawned`` event so the resolution is observable from the board.
+    task.spawn_reasoning_effort = None
+    task.spawn_reasoning_reason = None
+    _is_auto_pin = str(task.reasoning_effort or "").strip().lower() == AUTO_EFFORT_PIN
+    if _is_auto_pin:
+        _auto_children = task.child_count
+        if _auto_children is None:
+            # A direct caller (test, script) did not hand us the graph. Read it
+            # once, read-only — the spawn path never holds a write txn here, so
+            # this cannot deadlock the board.
+            _auto_children = _direct_child_count(task.id)
+        worker_reasoning, _auto_reason = resolve_card_auto_effort(
+            None, task, child_count=_auto_children
+        )
+        task.spawn_reasoning_effort = worker_reasoning
+        task.spawn_reasoning_reason = _auto_reason
+        _log.info(
+            "task %s pinned auto; spawning with resolved reasoning %r (%s)",
+            task.id,
+            worker_reasoning,
+            _auto_reason,
+        )
+    else:
+        worker_reasoning, _reasoning_is_default = effective_card_reasoning_effort(
+            task, child_count=task.child_count
+        )
+        if _reasoning_is_default:
+            _announce_default_effort_once(task.id, worker_reasoning)
     cmd.extend(["--reasoning", worker_reasoning])
     # Per-task agent iteration cap (auto-unblock class B, t_57d0990b). The
     # worker's own profile config still supplies the default when this is
@@ -16211,6 +16587,12 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
 #: Terminal statuses that constitute a delivery-relevant transition.
 TERMINAL_DELIVERY_STATUSES = ("done", "archived")
 
+#: Срок годности итога в часах по умолчанию (t_fc08695e). Итог, чья ветка
+#: закрылась раньше этого окна, владельцу не отправляется: это сообщение по
+#: старой карточке, а не результат миссии. Переопределяется
+#: ``kanban.summary_max_age_hours``; ``<= 0`` выключает гейт.
+DEFAULT_SUMMARY_MAX_AGE_HOURS = 6.0
+
 #: Cap on rows enqueued per transition (the queue is keyed by task_id, so this
 #: only bounds how many ancestors one close can wake).
 _TERMINAL_DELIVERY_MAX_ANCESTORS = 16
@@ -16355,6 +16737,33 @@ def ensure_terminal_delivery_subscription(
         task_id, owner_chat,
     )
     return owner_chat
+
+
+def _terminal_archive_is_result(
+    prior_status: Optional[str], prior_completed_at: Any,
+) -> bool:
+    """Является ли архивация уборкой или закрытием результата (t_fc08695e).
+
+    Возвращает True, когда карточка пришла в архив ИЗ закрытого состояния:
+    ``prior_status == "done"`` или у неё уже был заполнен ``completed_at``.
+    Только тогда архивация «прячет» уже существующий результат и её итог
+    владельцу нужен.
+
+    Возвращает False для административной уборки — архивации карточки,
+    которая никогда не закрывалась как результат (blocked/ready/running/
+    triage/failed). Именно этот случай давал владельцу ночные пачки
+    «итогов» по вчерашним делам (91 карточка за 7 секунд, 04.11).
+
+    Неизвестный prior_status (None — строка исчезла между чтениями) трактуется
+    как «результат»: fail-open, чтобы не потерять законный итог контроллера,
+    закрытого архивацией (исходный инцидент t_2dc720a3).
+    """
+    if prior_status is None:
+        return True
+    status = str(prior_status).strip().lower()
+    if status == "done" or status in BRANCH_TERMINAL_SUCCESS:
+        return True
+    return _epoch_of(prior_completed_at) is not None
 
 
 def _terminal_delivery_subject(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -17452,6 +17861,78 @@ def _task_ids_with_gave_up_event(
     return {row["task_id"] for row in rows}
 
 
+def branch_close_epoch(conn: sqlite3.Connection, root_id: str) -> Optional[float]:
+    """Момент последнего закрытия в ветке ``root_id`` (unix seconds), либо None.
+
+    Ветка = корень + транзитивные потомки. Возраст итога считается по
+    ПОСЛЕДНЕМУ закрытию, а не по закрытию корня: миссия, чей корень закрыли
+    утром, а приёмку вечером, имеет свежий итог вечером — и наоборот, итог,
+    который «дозрел» только к ночному сканированию, старый.
+
+    Источник — максимум из ``tasks.completed_at`` и времени терминального
+    события (``completed`` / ``archived`` / ``gave_up`` / ``crashed`` /
+    ``timed_out``). Два источника нужны потому, что административная
+    архивация пишет событие, но НЕ пишет ``completed_at``.
+
+    Возвращает None когда в ветке нет ни одного отметчика времени — вызывающий
+    тогда считает итог свежим (fail-open: не глушить законный итог из-за
+    отсутствия метаданных).
+    """
+    try:
+        node_ids = {root_id} | get_descendant_ids(conn, root_id)
+    except sqlite3.Error:
+        return None
+    if not node_ids:
+        return None
+    ordered = sorted(node_ids)
+    placeholders = ",".join("?" * len(ordered))
+    best: Optional[float] = None
+    try:
+        row = conn.execute(
+            "SELECT MAX(completed_at) FROM tasks "
+            f"WHERE id IN ({placeholders})",
+            ordered,
+        ).fetchone()
+        best = _epoch_of(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+    except sqlite3.Error:
+        best = None
+    try:
+        row = conn.execute(
+            "SELECT MAX(created_at) FROM task_events "
+            f"WHERE task_id IN ({placeholders}) "
+            "  AND kind IN ('completed', 'archived', 'gave_up', "
+            "               'crashed', 'timed_out')",
+            ordered,
+        ).fetchone()
+        ev = _epoch_of(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+        if ev is not None and (best is None or ev > best):
+            best = ev
+    except sqlite3.Error:
+        pass
+    return best
+
+
+def _epoch_of(value: Any) -> Optional[float]:
+    """Привести значение времени из БД к unix-секундам (int/float/ISO-строка)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def branch_state(
     conn: sqlite3.Connection, root_id: str,
 ) -> Optional[dict]:
@@ -18095,6 +18576,83 @@ def summary_has_passed_review(
     return branch_review_gate(conn, root_id, outcome)["passed"]
 
 
+def branch_summary_freshness(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    max_age_hours: Optional[float] = None,
+) -> dict:
+    """Свежий ли итог ветки — единственный предикат «не по старой карточке».
+
+    Владелец (04.11.2026): «отчёт не должен приходить раньше времени — ни по
+    старым карточкам». Замер на живой доске: из 343 доставленных итогов 168
+    ушли позже 6 часов после закрытия ветки (медиана 5,3 ч, максимум 15 суток),
+    а 7 итогов за сутки ушли пачкой в 00:02 спустя 14–23 ч — их «дозрело»
+    ночное сканирование, а не миссия.
+
+    Контракт возврата::
+
+        {"deliver": bool,       # можно ли отдавать итог владельцу
+         "reason": "fresh"|"stale"|"disabled"|"unknown",
+         "age_hours": float|None,
+         "max_age_hours": float|None}
+
+    Семантика:
+    * ``disabled`` — лимит выключен (``<= 0``): поведение до этой правки;
+    * ``stale``    — ветка закрылась раньше, чем ``max_age_hours`` назад;
+    * ``fresh``    — закрылась в пределах окна;
+    * ``unknown``  — в ветке нет ни одного отметчика времени (fail-open: не
+      глушить законный итог из-за отсутствия метаданных).
+
+    ``max_age_hours`` по умолчанию берётся из ``kanban.summary_max_age_hours``
+    (конфиг, дефолт 6); явный аргумент переопределяет его (тесты, ручной путь).
+    """
+    if max_age_hours is None:
+        max_age_hours = _summary_max_age_hours_config()
+    try:
+        limit = float(max_age_hours)
+    except (TypeError, ValueError):
+        limit = DEFAULT_SUMMARY_MAX_AGE_HOURS
+    if limit <= 0:
+        return {
+            "deliver": True, "reason": "disabled",
+            "age_hours": None, "max_age_hours": limit,
+        }
+    epoch = branch_close_epoch(conn, root_id)
+    if epoch is None:
+        return {
+            "deliver": True, "reason": "unknown",
+            "age_hours": None, "max_age_hours": limit,
+        }
+    age_hours = max(0.0, (time.time() - epoch) / 3600.0)
+    return {
+        "deliver": age_hours <= limit,
+        "reason": "fresh" if age_hours <= limit else "stale",
+        "age_hours": age_hours,
+        "max_age_hours": limit,
+    }
+
+
+def _summary_max_age_hours_config() -> float:
+    """Прочитать ``kanban.summary_max_age_hours`` (дефолт 6 ч), не падая.
+
+    Конфиг читается лениво и защищённо: kanban_db используется и вне шлюза
+    (CLI, тесты, дашборд), где полный конфиг может отсутствовать. Любая
+    ошибка → дефолт, чтобы предикат не стал новой точкой отказа.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        if not isinstance(kanban_cfg, dict):
+            return DEFAULT_SUMMARY_MAX_AGE_HOURS
+        raw = kanban_cfg.get("summary_max_age_hours", DEFAULT_SUMMARY_MAX_AGE_HOURS)
+        return float(raw)
+    except Exception:
+        return DEFAULT_SUMMARY_MAX_AGE_HOURS
+
+
 def branch_summary_decision(
     conn: sqlite3.Connection,
     root_id: str,
@@ -18112,7 +18670,7 @@ def branch_summary_decision(
     Returns ``None`` for an open branch (``branch_state`` is ``None``), else::
 
         {"deliver": bool,          # may a message go to the channel at all?
-         "kind": "success"|"refusal"|"failure"|"blocked",
+         "kind": "success"|"refusal"|"failure"|"blocked"|"stale",
          "outcome": str,           # branch_state outcome (audit)
          "review_passed": bool,    # gate verdict
          "review_reason": str,     # gate reason (auditable)
@@ -18120,11 +18678,14 @@ def branch_summary_decision(
          "msg": str|None,          # exact channel text when deliver is True
          "refused_ids": [str],     # nodes whose refusal the wording names
          "st": dict,               # branch_state (failed/fingerprint)
-         "gate": dict}             # full gate payload
+         "gate": dict,             # full gate payload
+         "freshness": dict}        # срок годности (branch_summary_freshness)
 
-    ``deliver`` is False ONLY for a branch that closed ``success`` while its
-    own review did not pass (``reviewer_open`` / corrupted state). A NEGATIVE
-    verdict is never silenced: it is delivered as the refusal verdict
+    ``deliver`` is False for (a) a branch that closed ``success`` while its own
+    review did not pass (``reviewer_open`` / corrupted state) and (b) a
+    ``success`` итог whose branch closed longer ago than the freshness window
+    (``kind="stale"``, t_fc08695e — «не присылать отчёт по старым карточкам»).
+    A NEGATIVE verdict is never silenced: it is delivered as the refusal verdict
     (``kind="refusal"``, «❌ Доработка отклонена…»), which is exactly owner rule
     №4 — the refusal must be visible, only the wording differs from «выполнено».
     """
@@ -18133,6 +18694,17 @@ def branch_summary_decision(
         return None
     outcome = str(state["outcome"])
     gate = branch_review_gate(conn, root_id, outcome)
+    # Свежесть (t_fc08695e, владелец 04.11.2026): итог, «дозревший» только к
+    # очередному сканированию спустя сутки, — это сообщение по старой карточке.
+    # Решение принимается ЗДЕСЬ, чтобы оба пути (watcher и ручной
+    # final_report) не могли разойтись. Отказ (refusal) гейт свежести не
+    # глушит: владелец правило №4 формулировал про «✅ выполнено», а невердикт
+    # приёмки обязан дойти.
+    try:
+        freshness = branch_summary_freshness(conn, root_id)
+    except Exception:  # pragma: no cover - defensive
+        freshness = {"deliver": True, "reason": "unknown", "age_hours": None,
+                     "max_age_hours": None}
     decision: dict = {
         "deliver": True,
         "kind": "success",
@@ -18144,6 +18716,7 @@ def branch_summary_decision(
         "refused_ids": [],
         "st": state,
         "gate": gate,
+        "freshness": freshness,
     }
     if outcome == "failure":
         refused = acceptance_refusal_ids(conn, root_id, state["failed"])
@@ -18155,6 +18728,13 @@ def branch_summary_decision(
         return decision
     if gate["passed"]:
         decision["msg"] = branch_summary_message(outcome, state["failed"])
+        # Срок годности применяется ТОЛЬКО к «✅ выполнено»: это и есть
+        # сообщение «по старой карточке», на которое жаловался владелец.
+        # Отказ и падение (ниже) гейт свежести не глушит — молчание о
+        # непринятой работе было бы хуже позднего сообщения.
+        if not freshness.get("deliver", True):
+            decision["deliver"] = False
+            decision["kind"] = "stale"
         return decision
     if gate["reason"] == "negative_verdict":
         # The reviewer REJECTED the result and closed the card `done`. The

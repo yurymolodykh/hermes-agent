@@ -1,15 +1,18 @@
 """Fast-path + reasoning-split tests for agent/fast_lane.py (t_ae312f32).
 
-Covers design §4.2 Track S, §5 (D3 reasoning split — no "low") and §7 (D5
-review-exempt marker) for fast requests (slow_mode=False).
+Covers design §4.2 Track S, the reasoning split (t_0563b054: routine -> ``low``,
+complex -> ``high``) and §7 (D5 review-exempt marker) for fast requests
+(slow_mode=False).
 
 Acceptance matrix exercised here:
-  * fast request  -> reasoning medium (routine) / high (complex), never low;
-  * budget capped at 16 max_iterations + run_budget 300s;
+  * fast request  -> reasoning low (routine) / high (complex);
+  * a profile pin (``fast_lane.reasoning_effort``) beats the class default;
+  * the resolved level is clamped onto the letovo wire domain, so ``medium``
+    can never reach a letovo turn;
   * fast request -> review_exempt=True (no review card);
   * slow request  -> untouched (budget unlimited, effort as configured,
     review_exempt=False);
-  * classify_complexity never returns "low".
+  * classify_complexity returns only the labels "routine"/"high".
 """
 from __future__ import annotations
 
@@ -82,14 +85,14 @@ def test_classify_never_returns_low():
 # ---------------------------------------------------------------------------
 
 
-def test_fast_request_routine_medium_budget_review_exempt():
+def test_fast_request_routine_low_budget_review_exempt():
     d = resolve_fast_path(
         decide_slow_mode(text="сколько будет 2+2?"), "сколько будет 2+2?"
     )
     assert d.slow_mode is False
     assert d.mode == "fast"
     assert d.complexity == "routine"
-    assert d.reasoning_effort == FAST_REASONING_ROUTINE == "medium"
+    assert d.reasoning_effort == FAST_REASONING_ROUTINE == "low"
     # Variant 2 (owner decision): fast lane bounds by TIME, not call count. Even
     # routine fast requests are never hard-cut by max_iterations; they keep only
     # the soft 5-minute run_budget (300s).
@@ -147,17 +150,24 @@ def test_deep_think_routes_slow_and_untouched():
     assert d.review_exempt is False
 
 
-def test_no_low_ever_on_fast_path():
+def test_no_medium_or_minimal_ever_on_letovo_fast_path():
+    # t_0563b054: the fast lane must never put a letovo-unservable level on the
+    # wire. `medium` is accepted by the backend today (measured 2026-11-05) but
+    # is NOT in the declared domain, so the engine must map it away itself.
     for text in [
         "сколько будет 2+2?",
         "привет",
         "сравни два файла",
         "x" * 400,
     ]:
-        d = resolve_fast_path(decide_slow_mode(text=text), text)
-        if not d.slow_mode:
-            assert d.reasoning_effort in ("medium", "high")
-            assert d.reasoning_effort != "low"
+        d = resolve_fast_path(
+            decide_slow_mode(text=text),
+            text,
+            wire_base_url="https://llm.letovo.site/openai",
+            wire_model="deepseek-v4-flash",
+        )
+        assert d.reasoning_effort not in ("medium", "minimal")
+        assert d.reasoning_effort in ("none", "low", "high", "xhigh", "max")
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +184,7 @@ def test_fast_request_marker_is_review_exempt():
     assert m["fast_lane"] is True
     assert m["review_exempt"] is True
     assert m["slow_mode"] is False
-    assert m["reasoning_effort"] == "medium"
+    assert m["reasoning_effort"] == "low"
     assert session_is_fast_lane(m) is True
 
 

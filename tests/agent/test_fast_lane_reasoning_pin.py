@@ -3,18 +3,18 @@
 The defect: the D3 fast-path floor (medium routine / high complex) rewrote the
 executing profile's own reasoning level, so profile ``11-fast-answers`` — pinned
 by the owner at ``low`` via ``fast_lane.reasoning_effort`` — had every
-api_server turn escalated to medium/high, which the letovo wire answered with
-HTTP 400 before the clamp existed.
+api_server turn escalated to medium/high, a level the declared letovo domain
+does not serve.
 
 Contract under test:
   * ``resolve_fast_reasoning_pin`` reads ``fast_lane.reasoning_effort`` of the
     config it is handed (the EXECUTING profile's config), ignores unknown
     values and YAML booleans;
-  * ``resolve_fast_path(..., reasoning_pin=...)`` lets that pin beat the D3
-    class default on the FAST lane only — a slow request keeps full-lane
-    semantics (effort high, review NOT exempt) regardless of the pin;
-  * with no pin every historical behaviour is byte-identical (medium routine,
-    high complex).
+  * ``resolve_fast_path(..., reasoning_pin=...)`` lets that pin beat the class
+    default on the FAST lane only — a slow request keeps full-lane semantics
+    (effort high, review NOT exempt) regardless of the pin;
+  * with no pin the code default applies (low routine, high complex), and the
+    level is clamped onto the letovo wire domain.
 """
 
 from agent.fast_lane import (
@@ -68,11 +68,54 @@ def test_pin_does_not_read_agent_section():
 # resolve_fast_path — pin beats the D3 default on the fast lane
 # ---------------------------------------------------------------------------
 
-def test_no_pin_keeps_historical_defaults():
+def test_no_pin_keeps_code_defaults():
     d = resolve_fast_path(decide_slow_mode(text=ROUTINE_TEXT), ROUTINE_TEXT)
-    assert d.reasoning_effort == FAST_REASONING_ROUTINE == "medium"
+    assert d.reasoning_effort == FAST_REASONING_ROUTINE == "low"
     d = resolve_fast_path(decide_slow_mode(text=COMPLEX_TEXT), COMPLEX_TEXT)
     assert d.reasoning_effort == FAST_REASONING_COMPLEX == "high"
+
+
+def test_no_pin_clamps_to_letovo_wire_domain():
+    """Without a pin the resolved level is still wire-safe on letovo."""
+    d = resolve_fast_path(
+        decide_slow_mode(text=ROUTINE_TEXT),
+        ROUTINE_TEXT,
+        wire_base_url="https://llm.letovo.site/openai",
+        wire_model="deepseek-v4-flash",
+    )
+    assert d.reasoning_effort == "low"
+    d = resolve_fast_path(
+        decide_slow_mode(text=COMPLEX_TEXT),
+        COMPLEX_TEXT,
+        wire_base_url="https://llm.letovo.site/openai",
+        wire_model="deepseek-v4-flash",
+    )
+    assert d.reasoning_effort == "high"
+
+
+def test_medium_pin_is_clamped_away_on_letovo():
+    """A pin of `medium` is not served by letovo — it must not reach the wire."""
+    d = resolve_fast_path(
+        decide_slow_mode(text=ROUTINE_TEXT),
+        ROUTINE_TEXT,
+        reasoning_pin="medium",
+        wire_base_url="https://llm.letovo.site/openai",
+        wire_model="deepseek-v4-flash",
+    )
+    assert d.reasoning_effort == "high"  # declared mapping medium -> high
+    assert d.reasoning_effort not in ("medium", "minimal")
+
+
+def test_minimal_pin_is_clamped_away_on_letovo():
+    d = resolve_fast_path(
+        decide_slow_mode(text=ROUTINE_TEXT),
+        ROUTINE_TEXT,
+        reasoning_pin="minimal",
+        wire_base_url="https://llm.letovo.site/openai",
+        wire_model="deepseek-v4-flash",
+    )
+    assert d.reasoning_effort == "low"  # declared mapping minimal -> low
+    assert d.reasoning_effort not in ("medium", "minimal")
 
 
 def test_low_pin_survives_routine_fast_request():

@@ -73,10 +73,18 @@ _SLOW_REASONING_EFFORTS = frozenset({"high", "xhigh", "max", "ultra"})
 # Fast-path defaults (design §2.4/§2.5, §4.2 Track S, §5).
 FAST_MAX_ITERATIONS = 16       # ≤16 LLM calls per fast request (§2.4)
 FAST_RUN_BUDGET_SECONDS = 300  # wall-clock budget for fast requests (§2.4)
-FAST_REASONING_ROUTINE = "medium"  # routine class A -> medium (§5)
-FAST_REASONING_COMPLEX = "high"    # complex/critical/giant -> high (§5)
-# "low" is NEVER used on the fast path (D3) — medium is the floor.
-_REASONING_FLOOR = "medium"
+FAST_REASONING_ROUTINE = "low"    # routine class A -> low (owner policy 2026-11-04)
+FAST_REASONING_COMPLEX = "high"   # complex/critical/giant -> high (§5)
+# Configurable fast-lane level (``fast_lane.reasoning_effort``). Until
+# t_0563b054 the design froze the routine class on ``medium`` — a level the
+# letovo wire rejects outright (HTTP 400), so every markerless chat turn was
+# one backend check away from failing. The level is now DECLARED in config with
+# ``low`` as the code default: routine fast turns think at ``low``, and a
+# profile pin (``fast_lane.reasoning_effort``) may move it anywhere on the
+# ladder. ``_REASONING_FLOOR`` is the level the policy will not go below on its
+# own — it no longer RAISES an explicitly pinned ``low`` back up (that was D3).
+DEFAULT_FAST_REASONING = FAST_REASONING_ROUTINE
+_REASONING_FLOOR = "low"
 # Internal ladder accepted by a profile-owned fast-lane reasoning pin. A pin
 # outside this set is ignored (with a warning) so a typo can never put an
 # arbitrary string on the wire.
@@ -91,12 +99,12 @@ def resolve_fast_reasoning_pin(
     """Return the profile-owned fast-lane reasoning pin, or ``None``.
 
     ``fast_lane.reasoning_effort`` is the ONLY place a profile can pin what a
-    fast request thinks at. Without it the fast path applies the design §5
-    defaults (medium routine / high complex), which silently overrode a
-    profile whose own ``agent.reasoning_effort`` was lower — profile
-    11-fast-answers is pinned at ``low`` by the owner, yet every api_server
-    turn came out ``medium``/``high`` because D3's floor replaced the profile
-    config wholesale (t_71dd1bfc).
+    fast request thinks at. Without it the fast path applies the design default
+    (``low`` routine / ``high`` complex), which used to override a profile
+    whose own ``agent.reasoning_effort`` was lower — profile 11-fast-answers is
+    pinned at ``low`` by the owner, yet every api_server turn came out
+    ``medium``/``high`` because D3's floor replaced the profile config wholesale
+    (t_71dd1bfc).
 
     Precedence contract: an explicit pin in THIS profile's config wins over
     the D3 defaults, and never inherits another profile's value — the caller
@@ -124,6 +132,66 @@ def resolve_fast_reasoning_pin(
         )
         return None
     return effort
+
+
+def clamp_fast_effort_to_wire(
+    effort: Optional[str],
+    *,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Optional[str]:
+    """Clamp a fast-lane level onto the endpoint's served effort domain.
+
+    The fast lane resolves its level BEFORE it knows which wire will carry the
+    turn (config pin / class default), and some wires declare a CLOSED
+    vocabulary. The letovo backend advertises
+    ``{none, low, high, xhigh, max}``: it answers ``medium``/``minimal`` with a
+    validation error, so a level resolved here and forwarded verbatim becomes a
+    failed turn rather than a slower one.
+
+    This helper is the single fast-lane chokepoint for that: it looks the domain
+    up by ENDPOINT (``letovo_wire_domain``, host-based — the model name alone is
+    served by unrelated backends too) and clamps with the shared
+    ``clamp_effort(strict=True)`` policy, so the mapping table lives in
+    ``agent.reasoning_effort`` and is never duplicated here.
+
+    Returns the level unchanged when the endpoint declares no domain (custom
+    providers keep their own vocabulary) or when no base_url is known; returns
+    ``None`` only when a closed domain refuses the value outright (the caller
+    then keeps its own default rather than putting an unusable string on the
+    wire).
+    """
+    if not effort:
+        return effort
+    if not base_url:
+        # No endpoint information: nothing to clamp against. Guessing a domain
+        # would silently rewrite levels for harmless custom providers.
+        return effort
+    try:
+        from agent.reasoning_effort import clamp_effort, letovo_wire_domain
+
+        domain = letovo_wire_domain(model=model, base_url=base_url)
+        if domain is None:
+            return effort
+        supported, overrides = domain
+        clamped = clamp_effort(effort, supported, overrides, strict=True)
+        if clamped is None:
+            logger.warning(
+                "fast_lane level %r is not served by %s (domain: %s); "
+                "falling back to the policy default",
+                effort,
+                base_url,
+                "/".join(supported),
+            )
+            return None
+        if clamped != effort:
+            logger.info(
+                "fast_lane level %r clamped to %r for %s", effort, clamped, base_url
+            )
+        return clamped
+    except Exception:  # a broken clamp must never break the turn (§6.1)
+        logger.debug("fast_lane wire clamp skipped", exc_info=True)
+        return effort
 # Reasoning levels that must route to the SLOW lane even when other markers
 # are absent (complex/legal/irreversible work belongs to the full lane).
 _COMPLEX_ALWAYS_SLOW = frozenset({"critical", "xlarge"})
@@ -417,13 +485,14 @@ def classify_complexity(text: Optional[str]) -> str:
     """Return ``"routine"`` or ``"high"`` for one request (design §5 / D3).
 
     - routine: short (≤~200 chars), no tool-verbs, no legal/irreversible
-      tokens -> reasoning **medium** on the fast path.
+      tokens -> reasoning **low** on the fast path.
     - high: contains tool/task verbs, analysis/refactoring/deploy work, or
       legal/irreversible compliance terms -> reasoning **high**.
 
     Criteria reuse ``adaptive_model_router.classify_request`` semantics so the
-    fast-lane split and adaptive routing stay consistent. ``"low"`` is never
-    a returned value (D3): medium is the floor.
+    fast-lane split and adaptive routing stay consistent. A third level is
+    never returned: the split is two-valued, and the actual effort for each
+    class is resolved in :func:`resolve_fast_path` (config pin > class default).
     """
     if not text or not str(text).strip():
         return "routine"
@@ -460,7 +529,7 @@ class FastLaneDecision:
     source: str = "no-marker"   # which marker triggered slow (diagnostics)
     reason: str = ""            # human-readable why (for logs)
     complexity: str = "routine"  # routine | high (D3 reasoning split)
-    reasoning_effort: str = "medium"  # medium | high (never low on fast path)
+    reasoning_effort: str = DEFAULT_FAST_REASONING  # low by default, pin may raise
     max_iterations: Optional[int] = None  # fast-path cap (≤16)
     run_budget_seconds: Optional[float] = None  # 300s for fast requests
     review_exempt: bool = False  # D5: fast requests create no review card
@@ -474,26 +543,33 @@ def resolve_fast_path(
     max_iterations: int = FAST_MAX_ITERATIONS,
     run_budget_seconds: Optional[float] = FAST_RUN_BUDGET_SECONDS,
     reasoning_pin: Optional[str] = None,
+    wire_base_url: Optional[str] = None,
+    wire_model: Optional[str] = None,
 ) -> FastLaneDecision:
     """Populate the fast-path activation fields for one decision (t_ae312f32).
 
-    Design §4.2 Track S + §5 (D3):
+    Design §4.2 Track S + §5:
     - slow requests: no overrides applied (reasoning stays as configured,
       budget stays unlimited, review stays non-exempt). The decision is
       returned with ``review_exempt=False`` and the fast fields cleared.
-    - fast requests (slow_mode=False): reasoning **medium** for routine class A
-      and **high** for complex work; ``max_iterations`` capped at 16;
-      ``run_budget_seconds=300``; ``review_exempt=True`` (D5). ``low`` is
-      never selected (D3) **unless the executing profile pins it**.
+    - fast requests (slow_mode=False): reasoning **low** for routine class A
+      and **high** for complex work; ``max_iterations`` is not capped (bounded
+      by the soft wall-clock budget); ``run_budget_seconds=300``;
+      ``review_exempt=True`` (D5).
 
     ``reasoning_pin`` is the profile-owned level from
     :func:`resolve_fast_reasoning_pin` (``fast_lane.reasoning_effort`` of the
-    profile that will actually run the turn). It exists because the D3 floor
-    silently overrode an explicitly configured lower level: profile
-    11-fast-answers is pinned at ``low``, yet every api_server turn was
-    rewritten to medium/high (t_71dd1bfc). An explicit pin therefore beats the
-    D3 default, while ``None`` keeps the historical medium/high behaviour for
-    every profile that never asked for a pin.
+    profile that will actually run the turn). It beats the class default, so a
+    profile that pins ``high`` gets ``high`` even for a routine request, and a
+    profile that pins ``low`` is never escalated.
+
+    ``wire_base_url`` / ``wire_model`` make the returned level WIRE-SAFE: when
+    the endpoint declares a closed effort domain (letovo serves
+    ``{none,low,high,xhigh,max}`` and rejects ``medium``/``minimal`` with HTTP
+    400), the level is clamped onto it here, at resolution time, so neither the
+    agent's ``reasoning_config`` nor the session marker can carry a level the
+    backend will refuse. Unknown/absent endpoint -> the level passes through
+    unchanged (custom providers keep their own vocabulary).
 
     ``text`` is the request text used for the complexity split; when omitted
     the decision's ``complexity`` field is kept as-is.
@@ -515,17 +591,29 @@ def resolve_fast_path(
     complexity = (
         classify_complexity(text) if text is not None else decision.complexity
     )
+    # The class default never resolves below ``_REASONING_FLOOR`` — the floor is
+    # the policy's own lower bound, applied to the DEFAULT only. An explicit
+    # profile pin (below) is never raised by it: that refactoring was D3, the
+    # exact defect t_0563b054 removed.
+    _floor_idx = _EFFORT_LADDER.index(_REASONING_FLOOR)
+    _routine_idx = max(_floor_idx, _EFFORT_LADDER.index(FAST_REASONING_ROUTINE))
     effort = (
-        FAST_REASONING_COMPLEX if complexity == "high" else FAST_REASONING_ROUTINE
+        FAST_REASONING_COMPLEX if complexity == "high" else _EFFORT_LADDER[_routine_idx]
     )
-    # Profile-owned pin wins over the D3 class default (t_71dd1bfc): a profile
+    # A profile-owned pin wins over the class default (t_71dd1bfc): a profile
     # that explicitly pins its fast lane to `low` (11-fast-answers) must not be
-    # silently escalated to medium/high. No pin -> historical behaviour.
+    # silently escalated; a profile that pins `high` gets it even for routine.
     _pinned_effort = resolve_fast_reasoning_pin(
         {"reasoning_effort": reasoning_pin} if reasoning_pin else None
     )
     if _pinned_effort:
         effort = _pinned_effort
+    # Wire-domain clamp (t_0563b054): a level the endpoint cannot serve is
+    # mapped/dropped BEFORE it reaches the agent config, so a marker or a
+    # request can never put `medium` on a letovo turn.
+    effort = clamp_fast_effort_to_wire(
+        effort, model=wire_model, base_url=wire_base_url
+    ) or effort
     # Owner decision (variant 2, 2026-10-19): the fast lane bounds fast tasks by
     # WALL-CLOCK TIME, not by LLM-call count. A hard `max_iterations` cap is what
     # caused "нелепые обрывы" of perfectly normal answers (a task that had done
@@ -536,8 +624,8 @@ def resolve_fast_path(
     # wrap-up notice at 80% and nudges the model to deliver from current state —
     # run_agent._maybe_inject_run_budget_wrapup — rather than forcibly killing the
     # turn), so a normal answer is never truncted mid-word; a genuinely stuck task
-    # still self-terminates via capped stale-timeouts. Reasoning stays medium
-    # (routine) / high (complex). Slow requests are unaffected (handled above).
+    # still self-terminates via capped stale-timeouts. Reasoning stays low
+    # (routine) / high (complex), or wherever a profile pin moves it.
     run_budget = (
         float(run_budget_seconds) if run_budget_seconds else FAST_RUN_BUDGET_SECONDS
     )

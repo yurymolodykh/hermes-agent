@@ -3949,11 +3949,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # The APIServerAdapter has no session-state handle here, so the
         # per-request config is the mechanical guarantee; explicit client
         # reasoning (request_reasoning_config) is never overridden.
+        #
+        # This also pins the level against the fast lane (t_0563b054): the
+        # fast-path block below used to rewrite EVERY fast request to its own
+        # level, which silently demoted an explicit client pin and the RGZ
+        # `max` down to the fast level. An explicit decision outranks a
+        # per-request lane heuristic.
+        _reasoning_pinned = request_reasoning_config is not None
         try:
             from agent.rgz_reasoning import rgz_trigger_detected
 
             if request_reasoning_config is None and rgz_trigger_detected(user_message or ""):
                 reasoning_config = {"enabled": True, "effort": "max"}
+                _reasoning_pinned = True
         except Exception:
             logger.debug("rgz_reasoning: api trigger check skipped", exc_info=True)
 
@@ -4001,7 +4009,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if _fast_lane_active:
                 _fast_decision = _fast_lane_resolve(
-                    _fast_decision, _fast_probe, reasoning_pin=_fast_reasoning_pin
+                    _fast_decision,
+                    _fast_probe,
+                    reasoning_pin=_fast_reasoning_pin,
+                    wire_base_url=runtime_kwargs.get("base_url"),
+                    wire_model=model,
                 )
             # OWUI/PWA text marker (A6 §4.2): the «подумай»/«думай» prefix in
             # the request body must be STRIPPED from the text the model runs
@@ -4012,7 +4024,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # text), so slow semantics and prefix-stripping coexist — exactly
             # the owner request "подумай -> slow + префикс вырезан".
             _fast_stripped_message = _fast_lane_strip(user_message or "")
-            _fast_effort = _fast_decision.reasoning_effort or "medium"
+            _fast_effort = _fast_decision.reasoning_effort or "low"
             if _fast_decision.slow_mode:
                 logger.info(
                     "fast_lane=SLOW api_server session=%s source=%s reason=%s",
@@ -4038,7 +4050,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Fast-path overrides (only when the flag says ON):
                     # reasoning config (overrides config reasoning for this
                     # agent), iteration cap, wall-clock budget.
-                    reasoning_config = {"enabled": True, "effort": _fast_effort}
+                    #
+                    # An explicit pin (per-request reasoning parameter, or the
+                    # RGZ `max` guarantee above) is the OPERATOR'S decision for
+                    # this request and outranks the lane heuristic (t_0563b054).
+                    # Only the level is protected: budget/iteration shaping
+                    # still applies, so a pinned turn is not left unbounded.
+                    if not _reasoning_pinned:
+                        reasoning_config = {"enabled": True, "effort": _fast_effort}
+                    else:
+                        logger.info(
+                            "fast_lane=FAST api_server session=%s reasoning=%s "
+                            "kept (explicit pin)",
+                            session_id or "",
+                            (reasoning_config or {}).get("effort")
+                            if isinstance(reasoning_config, dict)
+                            else reasoning_config,
+                        )
                     # Owner decision (variant 2, 2026-10-19): the fast lane must
                     # NOT truncate by LLM-call count — a hard `max_iterations`
                     # cap is what caused "нелепые обрывы" (a task that had done
@@ -8677,6 +8705,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 from agent.fast_lane import (
                     decide_slow_mode as _fl_decide,
                     resolve_fast_path as _fl_resolve,
+                    resolve_fast_reasoning_pin as _fl_resolve_pin,
                     route_profile as _fl_route,
                 )
                 from gateway.run import _load_gateway_config as _fl_load_cfg
@@ -8714,7 +8743,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             _fl_profile,
                             _fl_decision.slow_mode,
                             _fl_decision.source or "-",
-                            _fl_decision.reasoning_effort or "medium",
+                            _fl_decision.reasoning_effort or "low",
                         )
                     else:
                         # Slow (incl. sticky) decision -> stay on the origin
@@ -8730,7 +8759,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 request_profile or "current",
                                 _fl_decision.slow_mode,
                                 _fl_decision.source or "-",
-                                _fl_decision.reasoning_effort or "medium",
+                                _fl_decision.reasoning_effort or "low",
                             )
             except Exception:
                 # Degradation: profile-routing failure must never break the

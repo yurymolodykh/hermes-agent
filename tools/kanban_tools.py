@@ -635,7 +635,11 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
-                _eff, _eff_is_default = kb.effective_card_reasoning_effort(t)
+                _eff, _eff_is_default = kb.effective_card_reasoning_effort(
+                    t, conn=conn, child_count=getattr(t, "child_count", None)
+                )
+                _stored = str(t.reasoning_effort or "").strip().lower()
+                _auto = _stored == kb.AUTO_EFFORT_PIN
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
@@ -657,7 +661,15 @@ def _handle_show(args: dict, **kw) -> str:
                     # inheritance — a legacy NULL row is not "profile decides").
                     "reasoning_effort": t.reasoning_effort,
                     "effective_reasoning_effort": _eff,
-                    "reasoning_effort_source": "default" if _eff_is_default else "pin",
+                    "reasoning_effort_source": (
+                        "auto" if _auto else ("default" if _eff_is_default else "pin")
+                    ),
+                    # Planning-node shape signal (t_cabee680): True when the
+                    # card is declared OR latched a node, i.e. when its auto
+                    # level comes from "I post children" rather than from the
+                    # children that exist at this instant.
+                    "planning_node": bool(getattr(t, "planning_node", False)),
+                    "goal_mode": bool(getattr(t, "goal_mode", False)),
                 }
 
             def _run_dict(r):
@@ -1572,6 +1584,9 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    planning_node, planning_bool_error = _parse_bool_arg(args, "planning_node")
+    if planning_bool_error:
+        return tool_error(planning_bool_error)
     # ``do_not_deliver`` marks a SYNTHETIC card (F7 readback verification
     # fixtures, watcher-created bookkeeping cards) as never being a delivery
     # subject for terminal/branch-summary routing. Ordinary orchestrator
@@ -1671,10 +1686,12 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                reasoning_effort=args.get("reasoning_effort"),
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
+                planning_node=planning_node,
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
@@ -2584,6 +2601,21 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "planning_node": {
+                "type": "boolean",
+                "description": (
+                    "Declare this card a PLANNING NODE: it decomposes work "
+                    "and will post children. With reasoning_effort='auto' the "
+                    "card then resolves to max IMMEDIATELY, whether or not "
+                    "its children already exist — this is what makes a "
+                    "mid-chain node's level independent of execution order. "
+                    "A card observed with children is latched as a node "
+                    "automatically, so set this only for a node whose "
+                    "children are still to come. Defaults to false "
+                    "(execution card -> low). Has no effect on an explicit "
+                    "reasoning pin."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": (
@@ -2602,6 +2634,24 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                    "auto", "none", "minimal", "low", "medium",
+                    "high", "xhigh", "max", "ultra",
+                ],
+                "description": (
+                    "Thinking depth for the dispatched worker. 'auto' stores "
+                    "the RULE and resolves it at each spawn from the card's "
+                    "shape: 09/15 review gate -> max; 01-orchestrator, a "
+                    "planning_node card, a card with children, goal_mode, or "
+                    "a РГЗ phrase -> max; otherwise low. An explicit level "
+                    "always wins over auto. Omit to use the card default "
+                    "(high, or max for a review-gate assignee). "
+                    "medium/minimal/ultra are clamped onto the served wire "
+                    "domain."
                 ),
             },
             "board": _board_schema_prop(),

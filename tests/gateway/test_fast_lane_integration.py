@@ -7,10 +7,10 @@ unit files test_fast_lane_markers.py / test_fast_lane_fast_path.py).
 
 The activation seam under test is :meth:`APIServerAdapter._create_agent`
 (gateway/platforms/api_server.py), the documented fast-path entry point from
-design §4.2 Track S / §5 (D3) / §7 (D5):
+design §4.2 Track S / §5 / §7 (D5):
 
   * fast request (no slow markers) ->
-      reasoning_config medium (routine) / high (complex), NEVER low;
+      reasoning_config low (routine) / high (complex);
       max_iterations = unlimited sentinel (never truncated by call count —
       variant 2, owner 2026-10-19); run_budget_seconds=300 (soft time orienteer);
       agent.review_exempt=True; session marker fast_lane=True review_exempt=True
@@ -18,9 +18,10 @@ design §4.2 Track S / §5 (D3) / §7 (D5):
   * slow request (OWUI deepthink, "гигантская задача", TG «подумай») ->
       fast-path fields NOT applied: budget uncapped, review NOT exempt,
       reasoning stays as configured, no run_budget_seconds in agent kwargs.
-  * client effort=low on a fast request -> neutralized to medium (D3 edge:
-      "low" never reaches the agent on the fast path).
-  * fast request complex -> reasoning high (D3 split routine=medium/"high).
+  * an explicit client reasoning pin on a fast request is HONOURED (t_0563b054):
+      the lane heuristic never rewrites an operator-chosen level, while budget
+      and review-exemption shaping still apply.
+  * fast request complex -> reasoning high.
 
 The heavy runtime resolution (provider creds, gateway config, AIAgent) is
 mocked exactly like the pre-existing test_create_agent_forwards_runtime_config
@@ -92,14 +93,14 @@ def _agent(adapter, **kwargs):
 
 
 def test_fast_request_applies_fast_path_parameters(monkeypatch):
-    """A routine fast request gets reasoning medium, NO hard call-count cap
+    """A routine fast request gets reasoning low, NO hard call-count cap
     (unlimited sentinel), a soft 300s run budget, and review_exempt=True —
     the D5 signal for 'no review card'. (Variant 2: bound by TIME, not calls.)"""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     agent = _agent(adapter, user_message="сколько будет 2+2?")
 
     assert isinstance(agent, object)
-    assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
     assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
     assert captured["run_budget_seconds"] == 300
     assert agent.review_exempt is True
@@ -119,18 +120,29 @@ def test_fast_request_complex_uses_high_reasoning(monkeypatch):
     assert agent.review_exempt is True
 
 
-def test_fast_request_never_uses_low_reasoning(monkeypatch):
-    """D3 edge: an explicit client effort=low on a fast request must be
-    neutralized to medium — 'low' never reaches the agent on the fast path."""
+def test_fast_request_honours_explicit_client_pin(monkeypatch):
+    """An explicit client reasoning pin on a fast request is HONOURED.
+
+    t_0563b054: the fast lane used to rewrite EVERY fast request to its own
+    level, silently demoting an operator-chosen level. An explicit per-request
+    reasoning parameter outranks the lane heuristic; only the budget and
+    review-exemption shaping still apply."""
     adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
     model_options = {"reasoning": {"enabled": True, "effort": "low"}}
     _agent(adapter, user_message="какой статус t_001?", model_options=model_options)
 
-    # model_options low maps to a request reasoning_config lower than 'high',
-    # but the fast-path override must land on medium (never low).
-    assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
-    assert captured["reasoning_config"]["effort"] != "low"
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
     assert captured["max_iterations"] == 9223372036854775807  # TURN_LIMIT_UNLIMITED
+
+
+def test_fast_request_without_pin_stays_wire_safe(monkeypatch):
+    """No explicit pin -> the lane level lands on the letovo wire domain."""
+    adapter, captured, _ = _make_adapter_with_fakes(monkeypatch)
+    _agent(adapter, user_message="какой статус t_001?")
+
+    effort = captured["reasoning_config"]["effort"]
+    assert effort not in ("medium", "minimal")
+    assert effort == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +215,7 @@ def test_fast_request_persists_review_exempt_marker(monkeypatch):
     marker = fake_db.patch_session_model_config.call_args[0][1]
     assert marker["fast_lane"] is True
     assert marker["review_exempt"] is True
-    assert marker["reasoning_effort"] == "medium"
+    assert marker["reasoning_effort"] == "low"
     # The exact D5 predicate the forcer uses:
     assert session_is_fast_lane(marker) is True
 
@@ -236,11 +248,11 @@ def test_slow_request_persists_non_exempt_marker(monkeypatch):
     [
         # Routine class-A: NO hard call-count cap — bounded by soft time budget
         # (variant 2: the fast lane no longer truncates by LLM-call count).
-        ("сколько будет 2+2?", "medium"),
-        ("статус задачи", "medium"),
+        ("сколько будет 2+2?", "low"),
+        ("статус задачи", "low"),
         # «деплой сервиса» has no complex verb (deploy is only in the English
         # list; Russian deploy verbs are настрой/разверни/установи) -> routine.
-        ("деплой сервиса", "medium"),
+        ("деплой сервиса", "low"),
         # Complex work: same time-bound — no call-count truncation, soft 300s.
         ("проанализируй всё и создай отчёт", "high"),
     ],

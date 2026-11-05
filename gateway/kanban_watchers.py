@@ -2139,8 +2139,20 @@ class GatewayKanbanWatchersMixin:
             return None
         if not decision["deliver"]:
             # Branch closed `success` but its own review did not pass
-            # (reviewer deliberately withheld). Nothing may be planned for the
+            # (reviewer deliberately withheld) — OR the итог is older than the
+            # freshness window (t_fc08695e). Nothing may be planned for the
             # success lane; the verdict (if any) comes from the reviewer card.
+            if decision.get("kind") == "stale":
+                _fr = decision.get("freshness") or {}
+                logger.info(
+                    "kanban branch summary: root %s on board %s итог expired "
+                    "(%.1f h old > %.1f h limit) — not delivered; this is a "
+                    "message about an old card, not a mission result",
+                    root_id, board_slug,
+                    float(_fr.get("age_hours") or 0.0),
+                    float(_fr.get("max_age_hours") or 0.0),
+                )
+                return None
             logger.info(
                 "kanban branch summary: root %s on board %s has no passed "
                 "review (%s, verdict=%s); success итог withheld",
