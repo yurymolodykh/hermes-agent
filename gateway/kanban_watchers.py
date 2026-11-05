@@ -1997,10 +1997,29 @@ class GatewayKanbanWatchersMixin:
                             sub.get("chat_id"), sub.get("thread_id") or "",
                         )
                         try:
+                            # Both per-tick flags are reset before the attempt:
+                            # a stale error/suppression from a PREVIOUS sub must
+                            # not be read as this sub's outcome (t_fe7c3f21).
+                            self._kanban_last_branch_error = None
+                            self._kanban_last_branch_suppressed = False
                             ok = await self._deliver_branch_summary(
                                 plan, sub, notifier_profile,
                             )
                             last_error = getattr(self, "_kanban_last_branch_error", None)
+                            suppressed = bool(
+                                getattr(self, "_kanban_last_branch_suppressed", False)
+                            )
+                            if suppressed:
+                                # t_fe7c3f21: подавление по контракту владельца —
+                                # штатное решение, а не сбой доставки. Канал
+                                # остаётся pending (итог ещё должен уйти в TG при
+                                # мёртвом OWUI), но бюджет MAX_FAILURES на нём не
+                                # сгорает: иначе 12 pending-тиков дропали канал
+                                # до того, как OWUI успевал умереть, и итог
+                                # терялся на обоих лейнах.
+                                fail_counts.pop(sub_key, None)
+                                drop_reasons.pop(sub_key, None)
+                                continue
                             if not ok and last_error:
                                 drop_reasons[sub_key] = last_error
                         except Exception as exc:
@@ -2404,6 +2423,16 @@ class GatewayKanbanWatchersMixin:
             # bound TG chat.  ``delivery_dedup`` lives in the live kanban DB
             # (ensure_dedup_table/ensure at engine init) — a missing table
             # fails closed to a send (never silently skips the owner итог).
+            #
+            # t_fe7c3f21: the marker means ONE thing — the TG lane actually
+            # ACCEPTED the итог.  It must NOT be written when the итог was
+            # merely withheld by the owner contract (``tg_suppressed``): a
+            # suppressed итог still owes the owner a delivery path, and OWUI
+            # can die on a later tick (``unbound``/``failed``).  Writing the
+            # marker there made ``dedup_seen`` true forever, the engine was
+            # never consulted again (``owui_healthy=False`` never reached it)
+            # and the ack gate closed the channel — the итог was lost on BOTH
+            # lanes (t_f4e43cb2 / t_08a192ec).
             _tg_dedup_key = (
                 f"branch:{root_id}:final:{int(marker_id or 0)}"
                 if plan.get("terminal", True)
@@ -2427,6 +2456,14 @@ class GatewayKanbanWatchersMixin:
                 # owner's terminal итог (and enqueue dedup still guards the
                 # OWUI lane).
                 _dedup_marked = _tg_dedup_key
+            # Три состояния, а не два (t_fe7c3f21):
+            #   delivered  — tg_delivered is True      -> dedup ``mirror``;
+            #   suppressed — tg_suppressed is True     -> маркер НЕ пишется,
+            #                канал остаётся pending: мёртвый OWUI позже
+            #                доставит итог в TG;
+            #   failed     — tg_delivered is False     -> маркер НЕ пишется,
+            #                ретрай на следующем тике.
+            _tg_suppressed_this_tick = False
             if _dedup_marked is not None:
                 _mirror_res = None
                 # t_b154af7d: default is "no failure".  Initialised BEFORE the
@@ -2465,6 +2502,19 @@ class GatewayKanbanWatchersMixin:
                         _mirror_res is not None
                         and getattr(_mirror_res, "tg_delivered", None) is False
                     )
+                    # t_fe7c3f21: подавление по контракту владельца — это НЕ
+                    # доставка.  Итог ещё не дошёл до владельца ни на одном
+                    # лейне, поэтому once-only маркер писать нельзя: если OWUI
+                    # умрёт позднее, TG обязан остаться последним путём
+                    # (docstring теста
+                    # ``test_pending_owui_still_mirrors_tg_once_and_keeps_channel``
+                    # ровно это и обещает).  Журнальная запись подавления при
+                    # этом остаётся однократной — её пишет движок, и только
+                    # при переходе в подавленное состояние (см.
+                    # ``DeliveryEngine._suppressed_once``).
+                    _tg_suppressed_this_tick = bool(
+                        getattr(_mirror_res, "tg_suppressed", False)
+                    )
                     if _tg_failed:
                         _err = (
                             getattr(_mirror_res, "tg_send_error", "")
@@ -2478,6 +2528,16 @@ class GatewayKanbanWatchersMixin:
                             "dedup'd — send failed (%s); channel stays pending "
                             "for retry",
                             platform_str, root_id, _err,
+                        )
+                    elif _tg_suppressed_this_tick:
+                        # Маркер намеренно НЕ пишется: подавленный итог ещё
+                        # должен уйти в TG при мёртвом OWUI.
+                        logger.info(
+                            "kanban branch summary: TG mirror for %s/%s "
+                            "suppressed by owner contract — dedup marker "
+                            "withheld so a dead OWUI can still fall back to "
+                            "TG (marker %s)",
+                            platform_str, root_id, marker_id,
                         )
                     else:
                         if getattr(_mirror_res, "tg_delivered", None) is True:
@@ -2543,13 +2603,25 @@ class GatewayKanbanWatchersMixin:
             # OWUI ack gate (decoupled from the TG mirror above):
             # - acknowledged: OWUI row persisted -> ack the channel, done.
             # - pending: OWUI drain not acked yet -> keep the channel pending
-            #   (return False) so a later tick sees acknowledged and acks; the
-            #   TG mirror already fired once (dedup-marked) so recurring ticks
-            #   never double-ping.  Bounded by MAX_FAILURES in the caller.
+            #   (return False) so a later tick sees acknowledged and acks.
+            #   t_fe7c3f21: on a pending tick the TG mirror was either
+            #   SUPPRESSED by the owner contract (nothing sent, dedup marker
+            #   withheld on purpose so a dead OWUI can still fall back to TG)
+            #   or actually sent once and dedup-marked.  Either way recurring
+            #   ticks never double-ping; only a real failure burns budget.
             # - failed / unbound (dead session): nothing more can ACK on the
             #   OWUI lane; the terminal итог reached the owner via the TG
             #   mirror, so stop retrying and close the channel (advance).
             if _owui_state == "pending":
+                # t_fe7c3f21: a tick where the итог was withheld by the owner
+                # contract is a DECISION, not a delivery failure.  Report it so
+                # the caller does not burn the shared MAX_FAILURES budget on
+                # it: after 12 pending ticks the channel used to be dropped
+                # (acked) while the итог had never reached the owner on ANY
+                # lane, so a later dead OWUI had nothing left to fall back to.
+                self._kanban_last_branch_suppressed = bool(
+                    _tg_suppressed_this_tick
+                )
                 return False
             await _to_thread_process_service(
                 self._ack_branch_summary, board, root_id,

@@ -1465,6 +1465,15 @@ class DeliveryEngine:
         decision_type: Optional[str]   # one of EVENT_TYPES or None
         reason: str = ""
         text: str = ""
+        #: True when the message was DELIVERED nowhere on purpose: the owner
+        #: contract (2026-11-04) suppresses a successful text-only итог in the
+        #: TG mirror because a live OWUI lane already carries it.  This is NOT
+        #: a send and NOT a failure — the three states a caller must tell apart
+        #: are ``tg_delivered is True`` (delivered), ``tg_suppressed is True``
+        #: (withheld by policy) and ``tg_delivered is False`` (attempted and
+        #: failed).  t_fe7c3f21: the branch watcher used to fold "suppressed"
+        #: into "done" and burned the once-only dedup marker, so a later dead
+        #: OWUI could never fall back to TG — the итог was lost on both lanes.
         tg_suppressed: bool = False
         event_id: Optional[int] = None
         #: True when the TG lane actually accepted the message (adapter
@@ -1910,6 +1919,45 @@ class DeliveryEngine:
             )
         return r
 
+    def _suppressed_once(self, root_id: str, marker_id: Any, board: Any = None) -> bool:
+        """True when this branch итог's suppression was not journaled yet.
+
+        t_fe7c3f21: the owner-contract suppression fires on EVERY watcher tick
+        while OWUI stays ``pending``, so the suppression journal must be
+        written once per branch marker instead of once per tick — otherwise
+        ``delivery-policy-suppressed.log`` stops being an audit of the
+        decision.  The once-only fact is stored in ``delivery_dedup`` under
+        its OWN ``cause_hash`` (``suppressed``), deliberately separate from
+        the delivery fact (``mirror``): journaling the suppression once must
+        never be read as "the итог was delivered".
+
+        A DB problem fails open to journaling (an un-audited suppression is
+        worse than a duplicate line).
+        """
+        from hermes_cli import kanban_db as _kb
+
+        key = f"branch:{root_id}:final:{int(marker_id or 0)}"
+        try:
+            conn = _kb.connect(board=board)
+        except Exception:
+            return True
+        try:
+            try:
+                ensure_dedup_table(conn)
+            except Exception:
+                return True
+            if dedup_seen(conn, key, "branch_final", "suppressed"):
+                return False
+            dedup_mark(conn, key, "branch_final", "suppressed")
+            return True
+        except Exception:
+            return True
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _root_completed_empty_summary(self, plan: dict) -> bool:
         """True when the branch root has a recorded ``completed`` event whose
         handoff summary is empty (a genuinely contentless closure: no summary
@@ -2174,36 +2222,52 @@ class DeliveryEngine:
                 and str(plan.get("kind") or "success") == "success"
                 and owui_healthy is not False
             ):
-                from hermes_cli.delivery_policy import PolicyDecision
-                log_suppression(
-                    app="kanban",
-                    who=str(sub.get("user_id") or sub.get("chat_id") or ""),
-                    target=f"telegram:{tg_lane}",
-                    decision=PolicyDecision(
-                        action="suppress",
-                        reason="success итог without artifact (owner contract 2026-11-04)",
-                        detail=(
-                            "успешный terminal-итог без файла-артефакта — "
-                            "служебное сообщение, в Telegram не дублируется "
-                            "(вердикт остаётся в OWUI). Отказы приёмки и "
-                            "падения (refusal/failure) этому гейту не подлежат"
-                        ),
-                    ),
-                    snippet=(final_msg or "")[:200],
-                    extra={
-                        "task_id": root_id,
-                        "event_kind": "branch_summary",
-                        "event_id": plan.get("marker_id") or 0,
-                        "owui_to_tg": True,
-                        "branch_kind": str(plan.get("kind") or "success"),
-                    },
-                )
-                logger.info(
-                    "delivery engine: terminal успешный итог %s without "
-                    "artifact — OWUI only (no TG mirror, owner contract "
-                    "2026-11-04)", root_id,
-                )
                 res.tg_suppressed = True
+                # Журнал подавления — однократный на карточку-маркер
+                # (t_fe7c3f21).  Подавление повторяется на КАЖДОМ pending-тике
+                # watcher'а, пока OWUI не подтвердит доставку; без этой
+                # защиты `delivery-policy-suppressed.log` получал бы по строке
+                # за тик и журнал перестал бы быть аудитом решения.
+                #
+                # ВАЖНО: это отдельный cause_hash от признака доставки
+                # (``branch_final``/``mirror``) — однократность журнала НЕ
+                # означает, что итог считается доставленным.
+                if self._suppressed_once(root_id, plan.get("marker_id"), board):
+                    from hermes_cli.delivery_policy import PolicyDecision
+                    log_suppression(
+                        app="kanban",
+                        who=str(sub.get("user_id") or sub.get("chat_id") or ""),
+                        target=f"telegram:{tg_lane}",
+                        decision=PolicyDecision(
+                            action="suppress",
+                            reason="success итог without artifact (owner contract 2026-11-04)",
+                            detail=(
+                                "успешный terminal-итог без файла-артефакта — "
+                                "служебное сообщение, в Telegram не дублируется "
+                                "(вердикт остаётся в OWUI). Отказы приёмки и "
+                                "падения (refusal/failure) этому гейту не подлежат"
+                            ),
+                        ),
+                        snippet=(final_msg or "")[:200],
+                        extra={
+                            "task_id": root_id,
+                            "event_kind": "branch_summary",
+                            "event_id": plan.get("marker_id") or 0,
+                            "owui_to_tg": True,
+                            "branch_kind": str(plan.get("kind") or "success"),
+                        },
+                    )
+                    logger.info(
+                        "delivery engine: terminal успешный итог %s without "
+                        "artifact — OWUI only (no TG mirror, owner contract "
+                        "2026-11-04)", root_id,
+                    )
+                else:
+                    logger.debug(
+                        "delivery engine: terminal успешный итог %s already "
+                        "journaled as suppressed for marker %s",
+                        root_id, plan.get("marker_id"),
+                    )
                 return res
             try:
                 resx = await send_tg(tg_adapter, tg_lane, final_msg)
