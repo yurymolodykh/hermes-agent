@@ -4988,6 +4988,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "try again in a moment."
                             )
                         agent._buffer_status(_exhausted_msg)
+                        # Transient-stream exhaustion: surface the failure text
+                        # through the normal assistant-text channel. Without
+                        # this the turn ends with an EMPTY final_response
+                        # (the status buffer is display-only), and OpenAI-
+                        # compatible frontends such as Open WebUI render a
+                        # blank/eternally-pending message (incident 2026-11-06:
+                        # 5 sessions, empty assistant bubbles, no error shown).
+                        agent._transient_failure_notice = _exhausted_msg
                     else:
                         _err_lower = str(e).lower()
                         _is_stream_unsupported = (

@@ -1896,6 +1896,33 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+#: Explicit user-facing text for a run that ended with NO renderable answer and
+#: reported no failure at all (neither ``failed`` nor ``partial``). Shared by
+#: both ``/v1/chat/completions`` paths so the streaming and non-streaming
+#: contracts cannot drift apart. Incident 2026-11-06 (Open WebUI): such a run
+#: used to reach the client as an empty assistant message (JSON ``content: ""``
+#: / an SSE stream with zero content deltas), which frontends render as a
+#: blank, eternally-pending bubble with no error — the user just never gets an
+#: answer and has nothing to act on.
+EMPTY_RESPONSE_NOTICE = (
+    "Модель не вернула текст ответа (провайдер не отдал ответ "
+    "за отведённые попытки). Повторите запрос — прогон не "
+    "считается выполненным."
+)
+
+
+def _empty_response_notice(result: Any) -> str:
+    """Explicit text for an empty-but-not-failed agent run.
+
+    Prefers the agent's own diagnostic (``failure_notice``, e.g. transient
+    provider-stream exhaustion after N attempts) and falls back to the generic
+    :data:`EMPTY_RESPONSE_NOTICE`. Redacted because it crosses the HTTP
+    boundary like any other error text.
+    """
+    notice = result.get("failure_notice") if isinstance(result, dict) else None
+    return _redact_api_error_text(notice or EMPTY_RESPONSE_NOTICE)
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -6604,6 +6631,22 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_err_msg = result.get("error")
         err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
+        # Empty final text with no failure flag: the agent run produced nothing
+        # renderable (e.g. transient provider stream exhaustion where only a
+        # display-only status line was buffered). Returning "" here makes
+        # OpenAI-compatible frontends render a blank, eternally-pending bubble
+        # with no error — the exact Open WebUI symptom of 2026-11-06. Degrade
+        # into an explicit, user-readable failure instead of silence.
+        if not final_response and not is_failed and not is_partial:
+            final_response = _empty_response_notice(result)
+            logger.warning(
+                "chat/completions: empty final_response without failure flag — "
+                "substituted explicit empty-response notice (session=%s, "
+                "notice_from=%s)",
+                session_id,
+                "agent" if result.get("failure_notice") else "fallback",
+            )
+
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
@@ -8866,6 +8909,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     _eff_sid = getattr(agent, "session_id", session_id)
                     if isinstance(_eff_sid, str) and _eff_sid:
                         result["session_id"] = _eff_sid
+                    # Transient-stream exhaustion notice (see
+                    # chat_completion_helpers: transient retries exhausted).
+                    # The agent only buffered it as a display status; carry it
+                    # on the result so the OpenAI-compatible handler can answer
+                    # with explicit text instead of an empty message.
+                    _tfn = getattr(agent, "_transient_failure_notice", None)
+                    if _tfn and not result.get("final_response"):
+                        result["failure_notice"] = _tfn
                     # Signal whether context compression occurred during this turn
                     # so _build_response_conversation_history can skip the
                     # prior-concatenation path and store the compressed transcript
