@@ -332,6 +332,66 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_notify_target(conn, args: argparse.Namespace) -> Optional[dict]:
+    """Chat that must receive terminal events for a task created from the CLI.
+
+    Resolution order:
+      1. ``--notify-platform/--notify-chat-id/--notify-thread-id`` (explicit wins);
+      2. the chat context inherited by this process (``HERMES_SESSION_PLATFORM`` /
+         ``HERMES_SESSION_CHAT_ID``, else ``HERMES_SESSION_KEY`` -> ``tui``);
+      3. for a dispatcher-owned worker creating a follow-up card: the already
+         subscribed chat of the card it is working on (the origin chat), then
+         ``kanban.default_notify_chat``;
+      4. ``kanban.default_notify_chat`` as ``platform:chat_id``.
+
+    Returns ``add_notify_sub`` kwargs, or None when nothing can be resolved (cron,
+    tests, a bare shell). Never raises: bookkeeping must not fail card creation.
+    """
+    if getattr(args, "no_notify", False):
+        return None
+    platform = (getattr(args, "notify_platform", None) or "").strip()
+    chat_id = (getattr(args, "notify_chat_id", None) or "").strip()
+    thread_id = (getattr(args, "notify_thread_id", None) or "").strip()
+    creator_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if creator_task:
+        # A worker's own session is throwaway; its card's subscribers are the
+        # operator chats that asked for the work in the first place.
+        try:
+            subs = list(kbn.list_notify_subs(conn, creator_task))
+        except Exception:
+            subs = []
+        if subs and not (platform and chat_id):
+            newest = subs[-1]
+            platform = platform or newest.get("platform") or ""
+            chat_id = chat_id or newest.get("chat_id") or ""
+            thread_id = thread_id or (newest.get("thread_id") or "")
+    else:
+        platform = platform or os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
+        chat_id = chat_id or os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
+        thread_id = thread_id or os.environ.get("HERMES_SESSION_THREAD_ID", "").strip()
+        if not (platform and chat_id):
+            session_key = os.environ.get("HERMES_SESSION_KEY", "").strip()
+            if session_key:
+                platform, chat_id = "tui", session_key
+    if not (platform and chat_id):
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            raw = str(cfg_get(load_config(), "kanban", "default_notify_chat", default="") or "").strip()
+        except Exception:
+            raw = ""
+        if raw and ":" in raw:
+            platform, chat_id = (part.strip() for part in raw.split(":", 1))
+    if not (platform and chat_id):
+        return None
+    return dict(
+        platform=platform, chat_id=chat_id, thread_id=thread_id or None,
+        chat_type=os.environ.get("HERMES_SESSION_CHAT_TYPE") or None,
+        user_id=os.environ.get("HERMES_SESSION_USER_ID") or None,
+        notifier_profile=_profile_author(),
+        delivery_mode=None if platform == "tui" else "notify+wake",
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -379,8 +439,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        # Subscribe the chat that asked for this work (CLI, inherited session
+        # context, or a worker's origin chat) so failures never land silently.
+        sub_target = _cli_notify_target(conn, args)
+        subscribed = False
+        if sub_target:
+            try:
+                kbn.add_notify_sub(conn, task_id=task_id, **sub_target)
+                subscribed = True
+            except Exception as exc:  # bookkeeping must never fail creation
+                print(f"⚠  kanban: notify-subscribe failed: {exc}", file=sys.stderr)
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        payload = _task_to_dict(task)
+        payload["notify_subscribed"] = subscribed
+        if sub_target:
+            payload["notify_target"] = f"{sub_target['platform']}:{sub_target['chat_id']}"
+        _print_json(payload)
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle

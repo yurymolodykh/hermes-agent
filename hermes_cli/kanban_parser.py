@@ -186,6 +186,15 @@ _SPECS = [
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        _arg("--notify-platform",
+             help="Platform of the chat that should receive status pings for this task. "
+                  "Default: the chat this command runs in (inherited session context), "
+                  "else kanban.default_notify_chat."),
+        _arg("--notify-chat-id",
+             help="Chat id to subscribe for status pings (pair with --notify-platform)."),
+        _arg("--notify-thread-id", help="Thread/topic id inside the subscribed chat"),
+        _arg("--no-notify", action="store_true",
+             help="Do not subscribe any chat to this task's status events"),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
