@@ -5443,14 +5443,59 @@ def _restart_all_as_host(owner, system: bool, detach: bool = False, owe_online_n
     run_gateway(verbose=0, replace=True)
 
 
+def _defer_restart_out_of_tree(args) -> None:
+    """Schedule the restart from OUTSIDE this process's tree and exit; OPS-12.
+
+    Called only when this process sits in the gateway's cgroup (a Kanban worker, a foreground job).
+    Restarting here would SIGKILL the caller mid-turn and every sibling worker with it, so the
+    restart is handed to a transient user timer and this process returns normally:
+
+    * ``exit 0`` — for a worker that means "the turn succeeded"; the card keeps its work instead of
+      being booked as a crash (exit 130) and spending its failure budget.
+    * ``--on-active`` (not ``--scope``) — the command must run AFTER the caller is gone; a scope
+      would start it inside this tree's lifetime.
+    * The scheduled unit carries its own copy of the flags that matter (``--all``, ``--system``),
+      and sets ``in_tree`` so the spawned ``gateway restart`` takes the normal path instead of
+      deferring again (an unbounded deferral loop).
+
+    When the host cannot schedule one (no user D-Bus / no systemd-run), this refuses loudly and
+    exits nonzero WITHOUT restarting: silently restarting in-tree is the defect being fixed.
+    """
+    from hermes_cli.gateway_deferred_restart import DeferredRestartUnavailable, schedule_deferred_restart
+
+    extra: list[str] = []
+    if getattr(args, "all", False):
+        extra.append("--all")
+    if getattr(args, "system", False):
+        extra.append("--system")
+    if getattr(args, "force", False):
+        extra.append("--force")
+    if getattr(args, "detach", False):
+        extra.append("--detach")
+    try:
+        unit = schedule_deferred_restart("restart", extra_args=extra)
+    except DeferredRestartUnavailable as exc:
+        print_error(
+            "Refusing to restart the gateway from a process inside its own service cgroup.\n"
+            f"  {exc}\n"
+            "  Restarting here would kill this turn and every sibling worker.\n"
+            "  Run it from a shell outside the gateway, or as a detached timer:\n"
+            "    systemd-run --user --on-active=5 --collect --unit hermes-deferred-restart -- hermes gateway restart"
+        )
+        sys.exit(1)
+    _print_lines(
+        "",
+        f"✓ Gateway restart scheduled outside this process's cgroup (unit {unit}, starts in a few seconds).",
+        "  This process keeps running; the restart happens after it exits its turn.",
+    )
+
+
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
     # OPS-12: a restart issued from a process INSIDE the gateway cgroup (a Kanban worker, a
     # foreground job) kills its own process tree on stop. Schedule it outside the tree instead —
     # never restart in-place and never silently exit 130 mid-turn.
-    from hermes_cli.gateway_deferred_restart import (
-        DeferredRestartUnavailable, in_gateway_cgroup, schedule_deferred_restart,
-    )
+    from hermes_cli.gateway_deferred_restart import in_gateway_cgroup
     if in_gateway_cgroup() and not getattr(args, "in_tree", False):
         _defer_restart_out_of_tree(args)
         return

@@ -14,10 +14,10 @@ and exits its turn cleanly, so its card keeps its work.
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
 # A transient timer needs a moment to be registered by the user manager before the caller may exit;
@@ -62,8 +62,14 @@ def _systemd_run_available() -> bool:
 
 def schedule_deferred_restart(
     verb: str = "restart", *, delay_seconds: int = DEFAULT_DELAY_SECONDS, extra_args: Optional[list[str]] = None,
+    hermes_home: Optional[str] = None,
 ) -> str:
     """Schedule ``hermes gateway <verb>`` in a transient user timer; return the unit name.
+
+    The timer's service starts in its OWN cgroup, so the restart it runs happens outside the caller's
+    tree. ``hermes_home`` is pinned into the unit's environment: the user manager does not inherit the
+    caller's ``HERMES_HOME``, and without it the scheduled restart would target the default home even
+    when the caller served a profile.
 
     Raises :class:`DeferredRestartUnavailable` when the host cannot create one — the caller must
     then warn and refuse rather than restart in-tree and kill its own turn.
@@ -80,9 +86,18 @@ def schedule_deferred_restart(
         f"--on-active={int(delay_seconds)}",
         "--unit", unit,
         "--property", "Type=oneshot",
-        "--", hermes_bin, "gateway", verb,
-        *(extra_args or []),
     ]
+    home = hermes_home or os.environ.get("HERMES_HOME", "")
+    if home:
+        argv += ["--setenv", f"HERMES_HOME={home}"]
+    # Same reasoning for the profile: the user manager inherits neither, and a restart scheduled
+    # from a worker of profile X must restart X's gateway, not the default one.
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        argv += ["--setenv", f"HERMES_PROFILE={profile}"]
+    # ``--in-tree`` keeps the scheduled command on the ordinary restart path: it is already outside
+    # the gateway's cgroup, and re-deferring would hand the work to yet another timer forever.
+    argv += ["--", hermes_bin, "gateway", verb, "--in-tree", *(extra_args or [])]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
     if proc.returncode != 0:
         raise DeferredRestartUnavailable(
@@ -96,7 +111,11 @@ def _hermes_binary() -> str:
     candidate = shutil.which("hermes")
     if candidate:
         return candidate
-    # ``hermes-agent/.hermes/bin/hermes`` ships with the checkout; fall back to the module runner.
+    # A worker started from the checkout runs ``python -m hermes_cli.main``; reuse that interpreter.
+    launcher = Path(sys.executable or "")
+    module_main = launcher.parent / "hermes"
+    if module_main.is_file():
+        return str(module_main)
     raise DeferredRestartUnavailable("cannot locate the hermes entry point to schedule a restart")
 
 

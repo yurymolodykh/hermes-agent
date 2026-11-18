@@ -170,6 +170,10 @@ def build_gateway_parser(
     _flag(gateway_restart, "--detach", help=(
         "Without an installed service, start the replacement in the background (as `gateway ensure` "
         "does) instead of in this terminal; used by apps that run the restart as a short-lived client"))
+    # OPS-12: internal, set by the deferred out-of-tree restart timer. A restart issued from inside
+    # the gateway's own cgroup is rescheduled outside it; the scheduled command runs already outside
+    # and must take this ordinary path, or it would defer to yet another timer forever.
+    _flag(gateway_restart, "--in-tree", help=argparse.SUPPRESS)
     _add_compat_platform_flag(gateway_restart)
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")

@@ -3056,10 +3056,17 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    max_retries: Optional[int] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    if max_retries is not None and int(max_retries) < 1:
+        # Same rule as ``kanban create``: 1 trips on the first failure, never 0.
+        raise ValueError("max_retries must be >= 1")
     changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+        field for field, value in (
+            ("title", title), ("body", body), ("priority", priority),
+            ("max_retries", max_retries),
+        )
         if value is not None
     ]
     with write_txn(conn):
@@ -3072,6 +3079,11 @@ def edit_task(
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if max_retries is not None:
+            # The per-task circuit-breaker override ``_record_task_failure`` reads; a card's own
+            # budget (``max_retries``) wins over ``kanban.failure_limit``.
+            assignments.append("max_retries = ?")
+            params.append(int(max_retries))
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
@@ -3908,14 +3920,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
-        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
+        _ctx_attachments, _ctx_checkpoint, _ctx_comments, _ctx_header, _ctx_parent_results,
+        _ctx_prior_attempts, _ctx_role_history,
     )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
+    _ctx_checkpoint(lines, task)
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)

@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import hermes_cli.kanban_db as _kb
@@ -25,6 +26,7 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+_CTX_MAX_CHECKPOINT_BYTES = 6 * 1024  # the prior attempt's PROGRESS.md in the same workspace
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -124,6 +126,39 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
         size_str = f", {size_kb} KB" if size_kb else ""
         ctype = f", {att.content_type}" if att.content_type else ""
         lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_checkpoint(lines: list[str], task: Task) -> None:
+    """The prior attempt's own progress notes, read from its workspace (OPS-12).
+
+    A long card that loses its worker to a gateway restart, a duration cap or an operator reclaim is
+    re-spawned with a fresh context but the SAME workspace. Without this section the new attempt
+    starts from nothing and redoes work already done — the reason a retry budget alone did not save
+    a restarted card. ``PROGRESS.md`` in the workspace is the agreed hand-off file: the worker writes
+    it as it goes, this reads it back. Best-effort and read-only: an unreadable file never fails a
+    spawn, and nothing outside the task's own workspace is read.
+    """
+    path = (task.workspace_path or "").strip()
+    if not path or task.workspace_kind == "dir":
+        # ``dir`` workspaces are shared with other cards; a PROGRESS.md there is not this card's.
+        return
+    checkpoint = Path(path).expanduser() / "PROGRESS.md"
+    try:
+        if not checkpoint.is_file():
+            return
+        text = checkpoint.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if not text.strip():
+        return
+    lines.append("## Progress checkpoint from a previous attempt")
+    lines.append(
+        "_Written by this card's previous attempt in the same workspace "
+        f"(`{checkpoint}`). Treat it as the attempt's own notes — verify before relying on it, "
+        "and keep it current as you work so a future attempt can resume._"
+    )
+    lines.append(_ctx_cap(text, _CTX_MAX_CHECKPOINT_BYTES))
     lines.append("")
 
 

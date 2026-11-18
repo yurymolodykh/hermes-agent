@@ -1025,17 +1025,20 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    max_retries = getattr(args, "max_retries", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, result, max_retries)):
+        return _err("kanban edit: provide --title, --body, --priority, --max-retries, or --result", 2)
+    if max_retries is not None and max_retries < 1:
+        return _err(f"kanban edit: --max-retries must be >= 1 (got {max_retries})", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
+            result=result, summary=summary, metadata=metadata, max_retries=max_retries,
         )
     return _ok_or_err(
         ok,
