@@ -88,6 +88,37 @@ def test_restart_refuses_when_it_cannot_leave_the_tree(gw, monkeypatch):
     assert exc.value.code == 1
 
 
+def test_in_gateway_cgroup_recognises_a_renamed_service_unit(monkeypatch, tmp_path):
+    """A renamed unit (gateway.service, stand unit, @profile) must still be detected.
+
+    The hardcoded ``hermes-gateway.service`` match silently disabled the deferral on
+    any other unit name, so an in-cgroup restart ran in-tree and killed the worker's
+    own turn with exit 130 — the exact failure this module exists to prevent.
+    """
+    from hermes_cli import gateway_deferred_restart as defer
+
+    cgroup = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/stand-gw.service\n"
+    monkeypatch.setattr(defer, "_self_cgroup", lambda: cgroup)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
+    monkeypatch.setattr(defer, "_in_cgroup_of_running_gateway", lambda text: True)
+    assert defer.in_gateway_cgroup() is True
+
+    # Same unit name but a DETACHED process (different cgroup) must not be deferred.
+    monkeypatch.setattr(defer, "_in_cgroup_of_running_gateway", lambda text: False)
+    assert defer.in_gateway_cgroup() is False
+
+
+def test_in_gateway_cgroup_matches_the_live_gateway_cgroup_not_its_name(monkeypatch):
+    """Unit-agnostic: identity comes from the live gateway PID's own cgroup."""
+    from hermes_cli import gateway_deferred_restart as defer
+
+    own = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/stand-gw.service\n"
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
+    monkeypatch.setattr(defer, "_cgroup_of_pid", lambda pid: own)
+    assert defer._in_cgroup_of_running_gateway(own) is True
+    assert defer._in_cgroup_of_running_gateway("0::/user.slice/other.slice/a.service\n") is False
+
+
 def test_out_of_cgroup_restart_takes_the_normal_path(gw, monkeypatch):
     """A shell outside the cgroup is not affected: the guard must not fire for it."""
     from hermes_cli import gateway_deferred_restart as defer

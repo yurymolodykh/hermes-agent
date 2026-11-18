@@ -288,7 +288,17 @@ class ManagedWorker:
             stopper.cancel()
             arrived.cancel()
 
-    def interrupt(self):
+    def interrupt(self, message=None, *, hard_cancel=False, tool_reason=None, require_generation=None):
+        """Stop this managed turn.
+
+        The signature matches ``InterruptControlMixin.interrupt`` because the same producers call
+        both: ``agent/interrupt_compat.request_hard_interrupt`` passes a message positionally when it
+        stops a session, and the narrower ``interrupt(self)`` raised
+        ``TypeError: ManagedWorker.interrupt() takes 1 positional argument but 2 were given`` while
+        the profile was being stopped — the stop never reached the worker. A managed worker is a
+        separate process whose only stop channel is the control frame, so the wording stays local to
+        the gateway that asked for the stop.
+        """
         self.control({'type': 'stop'})
 
     def respond(self, kind, prompt_id, value):

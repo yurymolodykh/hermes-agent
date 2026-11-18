@@ -29,18 +29,57 @@ class DeferredRestartUnavailable(RuntimeError):
     """No way to schedule the restart outside this process's tree on this host."""
 
 
+def _self_cgroup() -> str:
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def _cgroup_of_pid(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def _in_cgroup_of_running_gateway(self_cgroup: str) -> bool:
+    """True when this process sits in the cgroup of the gateway named by the PID file.
+
+    The unit name is not a reliable oracle: installations rename it
+    (``gateway.service``, ``hermes-gateway@<profile>.service``, a stand unit) and a
+    hardcoded ``hermes-gateway.service`` match silently disabled the deferral, so the
+    restart ran in-tree and the worker's own turn died with exit 130. Comparing the
+    cgroup of the live gateway PID is unit-agnostic.
+    """
+    try:
+        from gateway.status import get_running_pid
+        pid = get_running_pid(cleanup_stale=False)
+    except Exception:
+        return False
+    if not pid:
+        return False
+    gateway_cgroup = _cgroup_of_pid(pid)
+    if not gateway_cgroup.strip():
+        return False
+    return gateway_cgroup == self_cgroup
+
+
 def in_gateway_cgroup() -> bool:
     """True when this process runs inside the gateway's service cgroup.
 
     A restart from here tears the caller down with it, so it must be deferred. The check is the
-    systemd unit of our own cgroup — not an env marker, which a CLI legitimately inherits.
+    systemd unit of our own cgroup — not an env marker, which a CLI legitimately inherits — and
+    falls back to comparing against the live gateway's own cgroup for renamed units.
     """
-    try:
-        with open("/proc/self/cgroup", encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
+    text = _self_cgroup()
+    if not text:
         return False
-    return "hermes-gateway.service" in text
+    if "hermes-gateway.service" in text:
+        return True
+    return _in_cgroup_of_running_gateway(text)
 
 
 def _systemd_run_available() -> bool:
