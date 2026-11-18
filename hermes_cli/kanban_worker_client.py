@@ -231,8 +231,11 @@ def _submit():
         board_db = os.environ['HERMES_KANBAN_DB']
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
-            # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.
-            if key.startswith('HERMES_KANBAN_') and key not in ('HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS'):
+            # The busy timeout and the owner-silence budget are host tuning knobs, not task identity:
+            # the answer budget reads the latter, so stripping it would silently pin every worker to
+            # the 10-minute floor and quietly undo HERMES_KANBAN_OWNER_WAIT_SECONDS.
+            if key.startswith('HERMES_KANBAN_') and key not in (
+                    'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS', 'HERMES_KANBAN_OWNER_WAIT_SECONDS'):
                 os.environ.pop(key)
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)

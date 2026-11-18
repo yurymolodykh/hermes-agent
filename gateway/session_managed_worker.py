@@ -235,10 +235,16 @@ class ManagedWorker:
     def control(self, frame):
         if self.closed.is_set():
             raise RuntimeStoreError('managed_worker_lost')
-        if frame == {'type': 'stop'}:
+        if frame.get('type') == 'stop':
             if self.stopped_at is None:
                 self.stopped_at = time.monotonic()
             self.stop.set()
+            # The cause must reach the CHILD, not only this object: the child writes the durable
+            # ``worker_result`` (its exit code and interrupt cause) that the crash sweep reads, so an
+            # owner-only ``stop_cause`` left every host-caused stop looking like a plain crash
+            # (OPS-15: cards blocked on a restart that never touched their work).
+            if frame.get('cause') is None and self.stop_cause:
+                frame = {**frame, 'cause': self.stop_cause}
         try:
             self.commands.put_nowait(frame)
         except queue.Full as exc:

@@ -186,11 +186,15 @@ class WorkerControls:
         self.reader = threading.Thread(target=self.read, name='managed-controls', daemon=True)
         self.reader.start()
 
-    def stop(self):
+    def stop(self, cause=None):
         self.stopped.set()
         if self.agent is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(self.agent)  # parity with the canonical Stop (SessionAuthority.interrupt)
+            # The cause rides into the agent's own interrupt message: without it the turn settles
+            # "interrupted" with no reason, the durable ``worker_result`` carries no
+            # ``interrupt_message``, and the crash sweep books a gateway restart as a card failure
+            # (OPS-15). ``None`` keeps a user's Stop indistinguishable from one, which is correct.
+            request_hard_interrupt(self.agent, cause)  # parity with the canonical Stop (SessionAuthority.interrupt)
         with self.lock:
             for state in self.clarifications.values():
                 state['answer'] = _INTERRUPTED
@@ -201,8 +205,11 @@ class WorkerControls:
         try:
             while True:
                 frame = read_frame(sys.stdin.buffer)
-                if frame == {'type': 'stop'}:
-                    self.stop()
+                # ``cause`` is present only when the OWNER (not a user) stopped this turn for a
+                # restart/shutdown; it is bounded and never model-visible beyond the interrupt note.
+                if isinstance(frame, dict) and frame.get('type') == 'stop' and set(frame) <= {'type', 'cause'}:
+                    cause = frame.get('cause')
+                    self.stop(cause if isinstance(cause, str) and len(cause) <= 200 else None)
                     continue
                 if frame == {'type': 'finish'}:
                     self.finish.set()
