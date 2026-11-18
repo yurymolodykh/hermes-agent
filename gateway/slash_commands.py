@@ -597,7 +597,8 @@ class GatewaySlashCommandsMixin(
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
         from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
         via_service = is_gateway_supervisor_process() or is_container_restart_context()
-        self.request_restart(detached=not via_service, via_service=via_service)
+        self.request_restart(detached=not via_service, via_service=via_service,
+                             initiator="chat /restart command")
         return None if sent else ack
 
     async def _handle_autoprune_command(self, event: MessageEvent) -> str:

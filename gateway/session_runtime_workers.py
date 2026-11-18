@@ -29,6 +29,19 @@ def managed_worker_units(authority):
             for sid, worker in list(getattr(authority, '_managed_workers', {}).items()) if not worker.closed.is_set()]
 
 
+def kanban_submitted_count(runner):
+    """How many live managed workers of *runner* are Kanban-submitted (OPS-15).
+
+    A Kanban submitter dials inside ``outside_restart_wait()``, so the owner refuses it for the whole
+    restart after-turn wait: the wait would hold a turn that only its own refusal keeps alive. This
+    count lets that wait exclude them, without widening the ``active_work`` entry shape every
+    observer already parses.
+    """
+    return sum(1 for authority in all_authorities(runner)
+               for worker in list(getattr(authority, '_managed_workers', {}).values())
+               if not worker.closed.is_set() and getattr(worker, 'kanban_submitted', False))
+
+
 def uncounted_runtime_work_units(runner, pid):
     """One ``active_work`` entry per unit ``uncounted_runtime_work`` counts. Managed workers are named
     (``managed_worker_units``); the rest of that work carries only the gateway's *pid*."""

@@ -1545,15 +1545,35 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             and (idle := _idle_seconds(agent)) is not None and idle >= timeout
         )
 
+    def _restart_starved_managed_count(self) -> int:
+        """Managed workers whose SUBMITTER cannot reach this owner while the restart wait is open.
+
+        OPS-15 (18.11 20:01): a Kanban submitter dials inside ``outside_restart_wait()``, so this
+        owner refuses it for the whole after-turn wait. The wait therefore holds the turn that only
+        its own refusal is keeping alive — a circular wait that the submitter's owner-silence budget
+        always loses, killing the turn and "draining" work that never finished. Waiting on these
+        units buys them nothing (they cannot progress while we wait) and costs the cards everything,
+        so they are excluded exactly like a restart-safe external cron worker. ``stop()`` then
+        signals them with the restart cause, which the crash sweep requeues without charging the
+        card's failure budget (OPS-12).
+        """
+        try:
+            from gateway.session_runtime_workers import kanban_submitted_count
+            return kanban_submitted_count(self)
+        except Exception:
+            return 0
+
     def _awaitable_work_count(self) -> int:
         """Active work minus the units the restart wait must not hold for.
 
-        Two disjoint exclusions: wedged turns (idle past ``agent.gateway_timeout`` / past the cron
-        in-flight allowance — restart is their remedy, #115469) and cron runs executing in a
+        Three disjoint exclusions: wedged turns (idle past ``agent.gateway_timeout`` / past the cron
+        in-flight allowance — restart is their remedy, #115469); cron runs executing in a
         restart-safe external worker (``_restart_safe_cron_count``), which outlives this process
-        either way. Cron runs are counted per profile-scoped run by the scheduler, not by
-        subtracting from the bare-ID active count: two profiles can run the same job ID, and one
-        excluded run must not hide the other.
+        either way; and Kanban managed turns whose own submitter is refused by this wait
+        (``_restart_starved_managed_count``), which cannot progress while the wait is open. Cron
+        runs are counted per profile-scoped run by the scheduler, not by subtracting from the bare-ID
+        active count: two profiles can run the same job ID, and one excluded run must not hide the
+        other.
         """
         non_cron = (
             self._running_agent_count()
@@ -1562,7 +1582,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             + self._active_deferred_agent_worker_count()
         )
         return (
-            max(0, non_cron - self._wedged_chat_agent_count())
+            max(0, non_cron - self._wedged_chat_agent_count() - self._restart_starved_managed_count())
             + self._restart_wait_cron_counts()["awaitable"]
         )
 
@@ -1671,13 +1691,64 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def _termination_initiator(self) -> str:
+        """Who asked this process to stop, in one short phrase, for the loud termination line.
+
+        ``reason`` on ``request_restart`` names the requester where the call site knows it; this
+        fallback covers the signal path, where the only evidence is the process's own state.
+        """
+        if getattr(self, "_restart_command_source", None) is not None:
+            return "chat /restart command"
+        if getattr(self, "_signal_initiated_shutdown", False):
+            return "external signal (SIGTERM/SIGINT)"
+        if getattr(self, "_stop_requested_by_signal", False):
+            return "signal from the service manager (stop/restart verb)"
+        return "in-process request"
+
+    def _announce_termination(self, initiator: str, reason: str) -> None:
+        """One loud line BEFORE anything is refused or drained: who, why, how much work is live.
+
+        A silent exit with code 0 while work was in flight is a defect (OPS-15): the 18.11 20:01
+        restart drained five live Kanban turns and logged only "active work drained", which read
+        as a clean finish although the work had died of owner-silence. Every termination path
+        funnels through ``request_restart``/``stop`` and lands here first, so an operator reading
+        the journal can always answer "who ended this and what did it cost".
+        """
+        try:
+            active = self._active_work_count()
+            units = self._describe_active_work()
+        except Exception:  # never let the announcement break the stop it describes
+            active, units = -1, []
+        detail = ""
+        if units:
+            detail = " units=" + ", ".join(
+                f"{u.get('kind')}:{u.get('session') or u.get('job_id') or u.get('pid')}" for u in units[:12])
+        exit_hint = ""
+        if active != -1:  # an unreadable count must not make a claim about the exit path
+            if self._restart_requested and self._restart_via_service:
+                exit_hint = f"; exit will be {GATEWAY_SERVICE_RESTART_EXIT_CODE} (systemd relaunches)"
+            elif self._restart_requested:
+                exit_hint = "; exit will be 0 (self-relaunch or manual start)"
+        logger.warning(
+            "GATEWAY TERMINATION: initiator=%s reason=%s active_work=%d%s%s",
+            initiator, reason, active, detail, exit_hint,
+        )
+
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        initiator: str = "") -> bool:
         if self._restart_task_started:
             return False
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
+        # Say it BEFORE the drain window opens: from here on new turns are refused and the wait
+        # may end in an interrupted teardown, so this is the last moment the log can be honest.
+        self._announce_termination(
+            initiator or self._termination_initiator(),
+            "restart requested" + (" (service-relaunched)" if via_service else " (in-process)"),
+        )
+        self._termination_announced = True
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
         self._draining = True
         from gateway.drain_control import open_restart_wait
@@ -1821,6 +1892,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
+        # OPS-15: a termination must always name its initiator and live work in the journal. A
+        # restart already announced itself where it opened its drain window; every other path
+        # (SIGTERM, the stop verb, a service manager) is announced here, before anything drains.
+        if not getattr(self, "_termination_announced", False):
+            self._announce_termination(
+                self._termination_initiator(),
+                "stop requested" + (" (restart)" if self._restart_requested else " (shutdown)"),
+            )
+        self._termination_announced = True
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False

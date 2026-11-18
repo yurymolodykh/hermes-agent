@@ -3344,6 +3344,8 @@ class GatewayRunner(
     _restart_via_service: bool = False
     _detached_restart_helper_started: bool = False
     _restart_command_source: Optional[SessionSource] = None
+    # OPS-15: whether the loud GATEWAY TERMINATION line was already written for this stop.
+    _termination_announced: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
     _profile_failed_platforms: Optional[dict[str, dict[Platform, asyncio.Task]]] = None
@@ -4802,7 +4804,8 @@ def _start_gateway_make_restart_signal_handler(runner):
             "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
             "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
             "config reload.")
-        runner.request_restart(detached=False, via_service=True)
+        runner.request_restart(detached=False, via_service=True,
+                               initiator="SIGUSR1 (systemctl reload / hermes gateway restart)")
     return restart_signal_handler
 
 

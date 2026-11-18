@@ -19,9 +19,28 @@ from typing import Optional
 # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
 # again is safe: ``kanban.run`` is idempotent per attempt and ``prompt.receipt`` is a read.
-# ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
-# gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
-OWNER_WAIT_S = 180.0
+#
+# OPS-15 (18.11 20:01): ``OWNER_WAIT_S`` was 180s, which was SHORTER than a gateway restart's own
+# after-turn wait can be — and while that wait is open the owner refuses this submitter's socket, so
+# the submitter killed itself after exactly 183-187s and took its managed turn down with it. The gate
+# has to outlast a legitimate restart, so the floor is 10 minutes (``OWNER_WAIT_FLOOR_S``) and it is
+# tunable upward; a restart that takes longer than this is a real failure and must still be reported.
+OWNER_WAIT_S = 600.0
+OWNER_WAIT_FLOOR_S = 600.0
+# Exit code of a submitter that outlived the owner: EX_UNAVAILABLE. It is NOT a card failure — the
+# owner was absent, not the work wrong — so the crash sweep requeues without spending the budget.
+OWNER_LOST_EXIT_CODE = 69
+
+
+def owner_wait_seconds():
+    """The owner-silence budget: ``HERMES_KANBAN_OWNER_WAIT_SECONDS``, floored at 10 minutes."""
+    try:
+        configured = float(os.environ.get('HERMES_KANBAN_OWNER_WAIT_SECONDS') or 0)
+    except ValueError:
+        configured = 0.0
+    return max(configured, OWNER_WAIT_FLOOR_S) if configured else OWNER_WAIT_S
+
+
 _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
 # retired authority's successor holds the admission the next connection reads.
@@ -65,8 +84,10 @@ async def run(params, board_db):
     # A lost socket is not a lost attempt, and exiting here would let ``_watch_submitter`` end the
     # owner's in-flight turn, so the next connection resumes whatever the last one reached. The
     # wait is bounded from the owner's last answer: an owner that keeps answering keeps the
-    # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
+    # worker, and one that stays silent past ``owner_wait_seconds()`` (>=10 min) fails the worker
+    # honestly — with a checkpoint on the card and an exit code the sweep does not charge.
     claim = _Claim(answered=time.monotonic())
+    owner_wait = owner_wait_seconds()
     failures = 0
     while True:
         seen = claim.answered
@@ -89,18 +110,49 @@ async def run(params, board_db):
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
             if not _restartable(exc):
                 raise
-            if claim.silent_for() >= OWNER_WAIT_S:
+            if claim.silent_for() >= owner_wait:
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                _checkpoint_owner_lost(params, board_db, claim, owner_wait, detail)
+                print(f'Kanban owner lost for {claim.silent_for():.0f}s '
+                      f'(budget {owner_wait:.0f}s): {detail}', file=sys.stderr)
+                # EX_UNAVAILABLE, not 1: the owner was gone, the card's work was not wrong. The
+                # crash sweep sees this code and requeues without spending the failure budget.
+                return OWNER_LOST_EXIT_CODE
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+
+
+def _checkpoint_owner_lost(params, board_db, claim, owner_wait, detail) -> None:
+    """Leave a durable note on the card that this attempt stopped because its owner vanished.
+
+    The card must not read this as "my work failed". The note names the owner-silence budget and how
+    long the owner was actually silent, so a human (or the next attempt's worker context) can tell a
+    long restart from a wedged gateway. Best-effort: a note that cannot be written must never
+    replace the exit code the sweep depends on.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        note = {
+            'kind': 'owner_lost',
+            'owner_silent_s': round(claim.silent_for(), 1),
+            'budget_s': round(owner_wait, 1),
+            'session_id': claim.session_id,
+            'admission_id': claim.admission_id,
+            'detail': str(detail)[:300],
+        }
+        with connect_closing(Path(board_db)) as conn:
+            kb._append_event(conn, params['task_id'], 'checkpoint', note, run_id=params['run_id'])
+            conn.commit()
+    except Exception as exc:  # never mask the exit code the crash sweep reads
+        print(f'Kanban owner-lost checkpoint not written: {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
 def _restartable(exc):

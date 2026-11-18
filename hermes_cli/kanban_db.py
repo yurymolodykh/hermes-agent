@@ -314,6 +314,12 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
+# Worker exit "owner lost" (OPS-15): the profile owner stayed silent past the submitter's budget
+# (``hermes_cli.kanban_worker_client.OWNER_WAIT_FLOOR_S``, >=10 min). The owner was absent, the
+# card's work was not wrong, so the crash sweep requeues WITHOUT counting a failure. 69 ==
+# BSD EX_UNAVAILABLE (the service the worker needed was not there).
+KANBAN_OWNER_LOST_EXIT_CODE = 69
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""

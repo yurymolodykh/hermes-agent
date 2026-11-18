@@ -156,6 +156,10 @@ class ManagedWorker:
         self.write_lock = threading.Lock()
         self.commands = queue.Queue(maxsize=16)
         self.closed = threading.Event()
+        # OPS-15: True when a Kanban submitter owns this turn. Its submitter is refused by the
+        # gateway's restart after-turn wait, so that wait must not hold for it (see
+        # ``GatewayRunner._restart_starved_managed_count``).
+        self.kanban_submitted = False
         # Latched the moment Stop is admitted, before any pipe write: the owner's read loop
         # supervises it even while the child has not yet said hello or read its bootstrap.
         self.stop = asyncio.Event()
@@ -665,6 +669,11 @@ async def execute_managed(authority, ref, row, policy):
         return ''
     worker, process = spawned
     workers = authority._managed_workers
+    # OPS-15: a Kanban turn's submitter dials inside ``outside_restart_wait()``, so THIS owner
+    # refuses it for the whole restart after-turn wait — the wait would hold a turn only its own
+    # refusal keeps alive. Mark the worker so ``_restart_starved_managed_count`` can exclude it
+    # instead of waiting out a circular wait that always ends in the submitter's death.
+    worker.kanban_submitted = getattr(policy, 'source', None) == 'kanban'
     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
     authority.adopt_agent(ref.session_id, row['generation'], worker)

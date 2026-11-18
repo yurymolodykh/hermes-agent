@@ -251,6 +251,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == _kb.KANBAN_OWNER_LOST_EXIT_CODE:
+        return ("owner_lost", code)
     return ("nonzero_exit", code)
 
 
@@ -1052,6 +1054,9 @@ class _DeadWorker:
     host_interrupted: bool = False
     """The gateway that owned this turn stopped it for a restart/shutdown: the host's
     condition, not the card's work. Requeued WITHOUT counting a failure, like a quota wall."""
+    owner_lost: bool = False
+    """``KANBAN_OWNER_LOST_EXIT_CODE``: the submitter outlived its owner's silence budget. The
+    owner was absent, not the work wrong — requeued WITHOUT counting a failure (OPS-15)."""
 
     @property
     def run_outcome(self) -> str:
@@ -1059,6 +1064,9 @@ class _DeadWorker:
         # doesn't show a phantom crash for a quota wall.
         if self.rate_limited:
             return "rate_limited"
+        # An absent owner is an infrastructure requeue, not a card failure.
+        if self.owner_lost:
+            return "owner_lost"
         # A restart/shutdown interruption is an infrastructure requeue, not a card failure.
         return "interrupted" if self.host_interrupted else "crashed"
 
@@ -1167,6 +1175,17 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
         )
+    if kind == "owner_lost":
+        # The owner stayed silent past the submitter's >=10 min budget (OPS-15). The gateway was
+        # absent, not the card's work wrong — requeue silently, exactly like a quota wall.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} outlived its owner's silence budget (exit {code}) — requeued without "
+            "counting a failure",
+            "owner_lost",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            owner_lost=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1258,7 +1277,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation or dead.host_interrupted:
+            if dead.rate_limited or dead.protocol_violation or dead.host_interrupted or dead.owner_lost:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1290,7 +1309,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
-        if dead.host_interrupted:
+        if dead.host_interrupted or dead.owner_lost:
             continue  # a host-caused requeue is not evidence of a systemic card fault
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
@@ -1301,6 +1320,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             # condition, not the card's work. Already requeued above with no failure
             # counted, so it must not consume the unified budget or trip the breaker —
             # otherwise every gateway restart blocks every running card (OPS-12).
+            continue
+        if dead.owner_lost:
+            # The owner was silent past the submitter's budget (OPS-15): already requeued with
+            # no failure counted, and an absent host is not evidence of a card fault.
             continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
