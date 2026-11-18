@@ -161,9 +161,11 @@ def memory_node_id(card: dict[str, Any], index: int) -> str:
 def _memory_cards() -> list[dict[str, Any]]:
     """``MEMORY.md`` / ``USER.md`` entries as the memory tool parses them; every
     entry becomes one card (MEMORY.md cards first, then USER.md)."""
-    from tools.memory_tool import MemoryStore
+    from tools.memory_tool import MemoryStore, get_memory_dir
 
-    base = get_hermes_home() / "memories"
+    # The subject's own bucket: memory is per subject (ACCESS-MODEL D13), so the graph must
+    # not read the shared base dir and show one person's notes to another.
+    base = get_memory_dir()
     cards: list[dict[str, Any]] = []
     for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
         path = base / fname

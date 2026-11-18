@@ -1,0 +1,147 @@
+{
+  "_readme": [
+    "Every place in the production trees that runs an ARBITRARY command (a shell command string)",
+    "or replaces the process image with an arbitrary argv. Fixed-argv spawns (git, rg, uname) are",
+    "not listed: their argv is decided by us, not by the turn, so a kernel boundary adds nothing.",
+    "",
+    "status 'confined'    -> hermes_acl.policy.wrap_argv is applied, so the kernel confines the",
+    "                        child (filesystem roots, no network) when acl.enabled=true.",
+    "status 'out-of-scope'-> deliberately outside the boundary. The reason MUST say why; a",
+    "                        reviewer has to be able to disagree with it.",
+    "",
+    "Keyed by file with spawn_sites = the number of sites the scanner finds there. A count is",
+    "stable under line drift and changes exactly when someone adds or removes a command site —",
+    "the event this inventory exists to catch. Update it DELIBERATELY: if the new child is not",
+    "confined, the entry's status and reason are what make that visible in review."
+  ],
+  "version": 1,
+  "generated_by": "hermes_acl.spawn_inventory.scan_all",
+  "files": [
+    {
+      "path": "agent/secret_sources/command.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "/bin/sh -c <operator's secret-command from config> with a hard 3 s timeout, to mint a credential. The command is written by the host owner in config.yaml about their own machine; there is no second subject whose files it could reach."
+    },
+    {
+      "path": "gateway/shutdown_forensics.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Shutdown forensics: a FIXED script we ship, run while the gateway dies to flush a dump to a log the owner reads. Nothing from a turn; bounding it with Landlock would also deny it the /proc and /sys reads it exists to collect."
+    },
+    {
+      "path": "hermes_cli/web_routers/profiles.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Builds 'sh -lc <command>' to open a terminal WINDOW on the owner's desktop (xterm/gnome-terminal). The launcher execs a terminal EMULATOR, so a shim on this argv would confine the emulator and the shell inside it would inherit the emulator's own process, not the shim's. Recorded as a residual gap: the desktop launcher is not confined."
+    },
+    {
+      "path": "tools/browser_session_sandbox.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Runs a FIXED stop script (pid + start time as arguments) as a DIFFERENT USER in the sandbox namespace via streams.run_in. The isolation there is the user+namespace boundary, which the shim cannot cross anyway (a different uid cannot be confined by our ruleset file)."
+    },
+    {
+      "path": "tools/environments/local.py",
+      "spawn_sites": 2,
+      "status": "confined",
+      "reason": "THE foreground terminal path (_run_bash). The argv builder at 1159 is wrapped at 1166 before Popen at 1169; this is the boundary the whole task is about."
+    },
+    {
+      "path": "tools/process_registry.py",
+      "spawn_sites": 1,
+      "status": "confined",
+      "reason": "_scope_argv builds the login-shell argv and wraps it with wrap_argv before the pipe/PTY spawn (spawn_local -> _spawn_job / PtyProcessCls.spawn). The scanner reports the builder, not the spawn, because the argv reaches _spawn_job as a parameter."
+    },
+    {
+      "path": "tools/bot_desktop/runtime.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "'bash <launcher script>' with a FIXED script path and no command string from the turn; the launcher is a program we ship. Confining it would also kill the per-profile screen it exists to keep alive after its starter dies (start_new_session)."
+    },
+    {
+      "path": "tools/tts_command_provider.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "spawn_owned(<operator-configured TTS command>, shell=True) — the command comes from config.yaml, written by the host OWNER about their own machine, not from a turn. It runs in the owner's own profile with the owner's own files; there is no second subject to isolate."
+    },
+    {
+      "path": "agent/skill_preprocessing.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Runs a SKILL's install/verify command. A skill is operator- or library-supplied code with full Python access to the same process — confining only its shell helper would imply an isolation that the surrounding skill execution does not provide. Named in ACCEPTED-RISKS instead."
+    },
+    {
+      "path": "agent/command_token_source.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Mints a credential via the operator's own configured token command (config.yaml, owner scope). Same reasoning as tts_command_provider: the owner's own helper, no second subject."
+    },
+    {
+      "path": "gateway/run_inbound_hooks.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Runs an INBOUND HOOK: operator-written shell in config for a messaging event, with a 30 s bound. Owner configuration, not a turn. Confining it is conceivable but the hook's contract is 'run this on my host as me'."
+    },
+    {
+      "path": "gateway/session_shell.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Runs a session's configured init/warm-up shell ONCE at session creation from the session record, not from a turn. Listed for review: if that record becomes turn-influenced, this becomes a confined site."
+    },
+    {
+      "path": "hermes_cli/bang_shell.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "'!cmd' typed by the HUMAN at the CLI prompt — the human is the owner of the machine, running in their own terminal with their own privileges. There is no boundary to draw against themselves."
+    },
+    {
+      "path": "hermes_cli/goals.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Gate command from the operator's goal definition in config; owner scope, no second subject."
+    },
+    {
+      "path": "hermes_cli/mcp_catalog.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Catalog BOOTSTRAP commands run by an explicit `hermes mcp add` on the owner's own machine, with the catalog's own scripts. Owner-scope install action."
+    },
+    {
+      "path": "tui_gateway/methods_tools.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "Slash-command shell for the TUI host process: the owner's own interactive surface, same reasoning as bang_shell. Its tool calls reach the agent's terminal path, which IS confined."
+    },
+    {
+      "path": "hermes_cli/_early_recovery.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "os.execv re-exec of the SAME interpreter during early-recovery (before any config or session exists, so no acl policy can be loaded yet). Replacing the image cannot be wrapped: a shim would exec and the parent would be gone."
+    },
+    {
+      "path": "hermes_cli/gateway.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "os.execvp('sleep', ['sleep','infinity']) — a container keep-alive with a fixed argv. Nothing from a turn; also the last statement of a boot path."
+    },
+    {
+      "path": "hermes_cli/main_container.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "os.execvp into a container runtime (docker exec ...). The isolation boundary there is the CONTAINER, which is strictly stronger than Landlock; adding a shim would confine the client, not the workload."
+    },
+    {
+      "path": "hermes_cli/main_dashboard.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "os.execvpe re-exec of this same process for CPU profiling (argv built by us, fixed). Nothing from a turn."
+    },
+    {
+      "path": "hermes_cli/relaunch.py",
+      "spawn_sites": 1,
+      "status": "out-of-scope",
+      "reason": "os.execvp re-exec of this same program after an update; argv is ours. Replacing the image cannot be wrapped."
+    }
+  ]
+}

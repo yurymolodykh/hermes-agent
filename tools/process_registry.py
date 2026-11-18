@@ -1115,6 +1115,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
         gateway and its messaging control plane)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
+        # Access boundary INSIDE any systemd wrapper below: the shim must confine the payload, not
+        # the wrapper. acl.enabled=false -> argv returned unchanged.
+        from hermes_acl.policy import wrap_argv as _acl_wrap_argv
+        argv = _acl_wrap_argv(argv, workspace=getattr(session, "cwd", None) or None)
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():

@@ -35,9 +35,111 @@ logger = logging.getLogger(__name__)
 _memory_surface_flags: ContextVar[Optional[tuple[bool, bool]]] = ContextVar("memory_surface_flags", default=None)
 
 
+NOUSER_BUCKET = "_nouser"
+
+
+def memory_subject() -> tuple[str, bool]:
+    """``(subject, quarantine)`` for the memory store of THIS turn.
+
+    Memory enters the system prompt at agent init, before any tool call, so a permission check
+    can never gate it (ACCESS-MODEL D2). The only workable boundary is *whose* files are read:
+    the directory is chosen per subject instead of the profile sharing one ``memories/`` dir.
+
+    * subject — ``HERMES_SESSION_ACTOR_ID``, "who asked this turn". Deliberately NOT
+      ``HERMES_SESSION_USER_ID``: that is the session ROUTE (kanban/cron/send_message rebuild
+      routes from it) and is empty in a shared chat. A turn merged from two senders clears the
+      actor, so it has no subject and lands in the quarantine bucket — never on the first sender.
+    * quarantine — True when the caller is on a messaging surface, or once any session has been
+      bound in this process. The second half covers the background self-improvement review, a raw
+      ``threading.Thread`` that does NOT inherit the session ContextVars: its subject is empty, and
+      without this flag a review of Alice's turn would write into the shared base dir.
+
+    An unresolvable session context FAILS CLOSED (quarantine), never the shared base.
+    """
+    uid = ""
+    quarantine = False
+    try:
+        from gateway.session_context import (get_session_env, session_context_engaged,
+                                             session_is_messaging_surface)
+        uid = (get_session_env("HERMES_SESSION_ACTOR_ID", "") or "").strip()
+        quarantine = bool(session_is_messaging_surface() or session_context_engaged())
+    except Exception:  # no gateway module at all: the file store must still resolve
+        logger.debug("memory subject: session context unavailable", exc_info=True)
+        uid, quarantine = "", True
+    return uid, quarantine
+
+
+def _subject_dirname(subject: str) -> str:
+    """Filesystem-safe directory name for a subject; ``""`` when nothing usable is left.
+
+    A subject like ``tg:111`` or ``auth:v1:[provider,issuer,user]`` must not be used verbatim:
+    ``:``, ``[`` and ``/`` are path syntax on some filesystems and ``..``/``.`` would escape the
+    bucket. Everything outside ``[A-Za-z0-9._-]`` collapses to ``_``, then a name that is only
+    dots (or starts with a dot) is rejected — the caller then gets the quarantine bucket.
+    """
+    raw = (subject or "").strip()
+    if not raw:
+        return ""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in raw)
+    if not safe.strip(".") or safe.startswith("."):
+        return ""
+    return safe[:96]
+
+
+def _acl_enabled() -> bool:
+    """``acl.enabled`` — the single switch the rest of the access model uses (``hermes_acl_scope``).
+
+    Per-subject memory is part of that model, so it turns on with the same switch: with
+    ``acl.enabled=false`` (the default) every path resolves exactly as before, which is what a
+    single-user installation and every CLI/desktop surface of the host owner already get.
+    """
+    try:
+        from hermes_acl_scope import acl_enabled
+        return bool(acl_enabled())
+    except Exception:  # no config layer (bare import in a tool script): stay legacy
+        logger.debug("memory subject: acl switch unavailable", exc_info=True)
+        return False
+
+
 def get_memory_dir() -> Path:
-    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import)."""
-    return get_hermes_home() / "memories"
+    """Memories dir for the CURRENT subject, resolved per call (HERMES_HOME may switch after import).
+
+    With ``acl.enabled=true``: ``<home>/memories/u/<subject>`` when a subject is known;
+    ``<home>/memories/u/_nouser`` when the turn has a session but no usable actor (messaging
+    surface, merged turn, background thread); and the legacy ``<home>/memories`` only for a
+    process that never bound a session at all — CLI, cron, desktop. The shared base is never a
+    fallback for a session that simply lacks an actor: that would commingle users.
+
+    With ``acl.enabled=false``: always ``<home>/memories``, byte-identical to the previous
+    behaviour.
+    """
+    base = get_hermes_home() / "memories"
+    if not _acl_enabled():
+        return base
+    subject, quarantine = memory_subject()
+    safe = _subject_dirname(subject)
+    if safe:
+        return base / "u" / safe
+    return base / "u" / NOUSER_BUCKET if quarantine else base
+
+
+def memory_dirs_all() -> list[Path]:
+    """Every memories dir of this profile: the legacy base plus one bucket per subject.
+
+    Owner-level maintenance (``hermes memory reset``, the dashboard's memory panel) must see all
+    of them — after per-subject isolation the rows people care about live in ``u/<subject>``, and
+    a reset that only touched the legacy base would silently erase nothing.
+    """
+    base = get_hermes_home() / "memories"
+    dirs = [base]
+    # Buckets exist only if per-subject memory ran at some point; list them regardless of the
+    # current switch, because this is the owner's "delete everything" view, not a write path.
+    per_subject = base / "u"
+    try:
+        dirs.extend(sorted(p for p in per_subject.iterdir() if p.is_dir()))
+    except OSError:
+        pass
+    return dirs
 
 
 from tools.memory_tool_store import (
