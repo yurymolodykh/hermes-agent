@@ -1049,17 +1049,37 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    host_interrupted: bool = False
+    """The gateway that owned this turn stopped it for a restart/shutdown: the host's
+    condition, not the card's work. Requeued WITHOUT counting a failure, like a quota wall."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.rate_limited:
+            return "rate_limited"
+        # A restart/shutdown interruption is an infrastructure requeue, not a card failure.
+        return "interrupted" if self.host_interrupted else "crashed"
+
+
+# The stop causes a gateway records on a turn it ended itself (``gateway.run``'s
+# ``_INTERRUPT_REASON_GATEWAY_RESTART`` / ``_INTERRUPT_REASON_GATEWAY_SHUTDOWN``, carried to the
+# board as ``worker_result.interrupt_message``). A user's Stop has none of these, so only a
+# host-caused interruption is exempt from the failure budget.
+_HOST_INTERRUPT_MARKERS = ("gateway restarting", "gateway shutting down")
+
+
+def _host_interrupt_cause(interrupt_message) -> bool:
+    """True when *interrupt_message* names a gateway restart/shutdown as the stop cause."""
+    text = str(interrupt_message or "").strip().lower()
+    return any(marker in text for marker in _HOST_INTERRUPT_MARKERS)
+
 
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
+    board: Optional[str] = None, interrupt_message=None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1068,6 +1088,19 @@ def _classify_dead_worker(
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
     dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
+    if _host_interrupt_cause(interrupt_message):
+        # The owning gateway stopped this turn for its restart/shutdown. Nothing about the
+        # card's work failed, so requeue it with no failure counted — exactly like a quota
+        # wall: any restart of the gateway would otherwise block every running card.
+        cause = str(interrupt_message)[:200]
+        return _DeadWorker(
+            dead.kind, dead.code,
+            f"pid {pid} interrupted by its gateway ({cause}) — requeued without counting a failure",
+            "interrupted",
+            {"pid": pid, "claimer": claimer, "exit_code": dead.code,
+             "interrupt_message": cause, "host_interrupted": True},
+            host_interrupted=True,
+        )
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1171,7 +1204,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (
+            apply_attempt_note, managed_run_exit_code, managed_run_interrupt_cause, owner_reclaim_blocked,
+        )
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1191,7 +1226,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            interrupt_cause = managed_run_interrupt_cause(conn, row["id"], pid, row["claim_lock"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board,
+                                         interrupt_message=interrupt_cause)
             apply_attempt_note(conn, row["id"], pid, dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -1221,12 +1258,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.host_interrupted:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+                # board UI and retry worker need the corrective message. A host
+                # interruption (gateway restart/shutdown) is the host's condition,
+                # not the card's, so it must not spend the failure budget either.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -1251,10 +1290,18 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.host_interrupted:
+            continue  # a host-caused requeue is not evidence of a systemic card fault
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
+        if dead.host_interrupted:
+            # The owning gateway stopped this turn for a restart/shutdown: the host's
+            # condition, not the card's work. Already requeued above with no failure
+            # counted, so it must not consume the unified budget or trip the breaker —
+            # otherwise every gateway restart blocks every running card (OPS-12).
+            continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()

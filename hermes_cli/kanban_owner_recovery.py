@@ -295,3 +295,27 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     result, bound = latest('worker_result'), latest('worker_bound')
     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
     return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None
+
+
+def managed_run_interrupt_cause(conn, task_id, worker_pid, claim_lock):
+    """The stop cause the owner recorded for the task's CURRENT run, under the same proof as
+    :func:`managed_run_exit_code`; ``''`` when the run has no ``worker_result`` or it is not ours.
+
+    A gateway restart/shutdown records its reason; a user's Stop records none. The crash sweep
+    uses it to requeue a host-caused interruption without spending the card's failure budget.
+    """
+    def latest(kind):
+        row = conn.execute(
+            "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
+            "WHERE t.id=? AND e.task_id=t.id AND e.kind=? ORDER BY e.id DESC LIMIT 1", (task_id, kind)).fetchone()
+        try:
+            payload = json.loads(row['payload']) if row else {}
+        except ValueError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    result, bound = latest('worker_result'), latest('worker_bound')
+    pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
+    if result.get('claim_lock') == claim_lock and result.get('pid') in pids:
+        return result.get('interrupt_message') or ''
+    return ''

@@ -5445,6 +5445,15 @@ def _restart_all_as_host(owner, system: bool, detach: bool = False, owe_online_n
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
+    # OPS-12: a restart issued from a process INSIDE the gateway cgroup (a Kanban worker, a
+    # foreground job) kills its own process tree on stop. Schedule it outside the tree instead —
+    # never restart in-place and never silently exit 130 mid-turn.
+    from hermes_cli.gateway_deferred_restart import (
+        DeferredRestartUnavailable, in_gateway_cgroup, schedule_deferred_restart,
+    )
+    if in_gateway_cgroup() and not getattr(args, "in_tree", False):
+        _defer_restart_out_of_tree(args)
+        return
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return

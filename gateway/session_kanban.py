@@ -276,16 +276,21 @@ def _run_worker_turns(agent, frame, history):
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
     code, last_output = 1, ''
+    interrupted_cause = ''
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+        # The owner records WHICH stop it sent (a gateway restart/shutdown, or a user Stop);
+        # without it the dispatcher books a restart's interrupted turn as a card failure.
+        if isinstance(result, dict) and result.get('interrupted'):
+            interrupted_cause = str(result.get('interrupt_message') or '')[:200]
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, interrupt_message=interrupted_cause)
 
 
 def record_start_failure(frame, exc):
@@ -298,7 +303,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, interrupt_message=''):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -307,9 +312,13 @@ def _record_worker_result(context, code, last_output):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+            payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                       'last_output': last_output}
+            if interrupt_message:
+                # Which stop ended the turn (a gateway restart/shutdown vs the user's Stop), so the
+                # crash sweep can exempt a host-caused interruption from the card's failure budget.
+                payload['interrupt_message'] = interrupt_message
+            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
