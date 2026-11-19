@@ -69,4 +69,9 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_upgrade.add_argument(
         "--no-browser", action="store_true", help="Do not auto-open a browser for sign-in")
     auth_upgrade.add_argument("--timeout", type=float, help="Network timeout in seconds")
+
+    # `auth users ...` — the dashboard users file (a second credential source, additive).
+    from hermes_cli.subcommands.auth_users import build_auth_users_parser
+    build_auth_users_parser(auth_subparsers)
+
     auth_parser.set_defaults(func=cmd_auth)

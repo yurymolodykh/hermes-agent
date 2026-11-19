@@ -1034,6 +1034,11 @@ DEFAULT_CONFIG = {
             "username": "",
             "password_hash": "",  # scrypt$...
             "password": "",
+            # A file of user records (login/aliases/password_hash/role/disabled/gen/telegram_id),
+            # an ADDITIONAL source beside the pair above — see hermes_cli/dashboard_users.py.
+            # Relative paths resolve under HERMES_HOME. Must be mode 0600: a group/world-readable
+            # file is refused at startup rather than loaded. `hermes auth users` manages it.
+            "users_file": "",
             "secret": "",
             "session_ttl_seconds": 0,  # 0 → plugin default (12h)
         },
