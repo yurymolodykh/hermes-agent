@@ -9,9 +9,12 @@ instead of exiting.
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Iterable, Optional
 
 from agent.delegation_context import owned_kanban_task
+
+logger = logging.getLogger(__name__)
 
 
 # Every tool that ends this worker's responsibility for the card, not just the two that
@@ -37,6 +40,58 @@ def kanban_stop_nudge_enabled() -> bool:
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
     return bool(owned_kanban_task())
+
+
+def worker_card_closed(task_id: Optional[str] = None, run_id: Optional[str] = None) -> bool:
+    """True when this worker's attempt no longer owns the card.
+
+    A worker that hands the card off (``kanban_complete`` / ``kanban_block`` /
+    ``kanban_request_review``) has finished its responsibility, but nothing ends its
+    conversation turn: the model keeps calling tools, burns the remaining iteration
+    budget and finally exits as ``timed_out`` — an alarm on a card that was already
+    closed minutes earlier, and a second handoff event on top of the real one.
+
+    The authority is the board, not the transcript: the card's own run must still be
+    OPEN and still be THIS process's run. A card whose ``current_run_id`` is NULL
+    (closed by a terminal transition) or names a successor run is not ours to keep
+    working.
+
+    Fails CLOSED to False — an unreadable board must never truncate a live turn.
+    """
+    tid = (task_id or owned_kanban_task() or "").strip()
+    if not tid:
+        return False
+    db_path = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    if not db_path:
+        try:
+            from hermes_cli.kanban_db import kanban_db_path
+            db_path = str(kanban_db_path())
+        except Exception:
+            return False
+    pinned_run = (run_id if run_id is not None else os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        import sqlite3
+        from pathlib import Path
+        conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("kanban handoff check: board read failed for %s", tid, exc_info=True)
+        return False
+    if row is None:
+        return False
+    status = str(row[0] or "")
+    current_run = row[1]
+    if status not in {"running"} or current_run is None:
+        # Any non-running status, or a card whose run was closed by the handoff.
+        return True
+    if pinned_run and str(current_run) != pinned_run:
+        # A successor attempt owns the card now; this one must not keep working it.
+        return True
+    return False
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -98,4 +153,5 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal",
+           "worker_card_closed"]

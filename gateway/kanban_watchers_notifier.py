@@ -44,7 +44,10 @@ def _pin_first():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+# ``commented`` is here so a handoff note written after a card closed still reaches the
+# subscribed chat — deliberately absent from ``_WAKE_KINDS``: a comment is information for
+# the human, it must never start a worker turn (that is the OPS-16 bug this guards).
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "commented")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -57,6 +60,28 @@ def diagnostic_event(ev) -> bool:
     if ev.kind in {"blocked", "block_loop_detected"}:
         return (ev.payload or {}).get("kind") != "needs_input"
     return ev.kind == "status" and (ev.payload or {}).get("status") in {"blocked", "triage"}
+
+
+# Failure kinds that are only meaningful while the card still needs someone. On a card that
+# already reached a terminal status they are a stale echo of an attempt that outlived its own
+# handoff — paging the owner about them is a false alarm on closed work.
+_STALE_ON_CLOSED_CARD_KINDS = frozenset({"crashed", "timed_out", "gave_up"})
+_CLOSED_CARD_STATUSES = frozenset({"done", "archived"})
+
+
+def event_is_stale_for_closed_card(ev, task) -> bool:
+    """True when ``ev`` reports a failure for a card that is already terminal.
+
+    The worker hands the card off, its conversation turn keeps running for a while, and
+    the leftover attempt is then booked as ``timed_out``/``crashed``/``gave_up`` — after
+    the card is ``done``. That event describes an attempt nobody can act on, so it must
+    not become a ping or a wake in the owner's chat. The card's own status at delivery
+    time is the evidence: a failure on a card still ``running``/``ready``/``review`` is
+    real and always delivered.
+    """
+    if ev.kind not in _STALE_ON_CLOSED_CARD_KINDS:
+        return False
+    return str(getattr(task, "status", "") or "") in _CLOSED_CARD_STATUSES
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -318,6 +343,18 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        # A failure booked on a card that is already terminal is a stale echo of an attempt
+        # that outlived its own handoff — dropping it here keeps the cursor moving while
+        # neither pinging nor waking the owner about closed work.
+        kept = [ev for ev in events if not event_is_stale_for_closed_card(ev, task)]
+        if len(kept) != len(events):
+            logger.info(
+                "kanban notifier: dropped %d stale failure event(s) for closed card %s",
+                len(events) - len(kept), sub["task_id"],
+            )
+        if not kept:
+            return None
+        events = kept
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
@@ -482,6 +519,12 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    "commented": lambda ev, n: (
+        t("gateway.kanban.ping.commented", head=n.head,
+          author=_clip(ev, "author", "gateway.kanban.ping.comment_author", 60),
+          preview=_clip(ev, "preview", "gateway.kanban.ping.comment_body", 600)),
+        None, None,
+    ),
 }
 
 

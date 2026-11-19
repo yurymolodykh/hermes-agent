@@ -21,6 +21,25 @@ logger = logging.getLogger("agent.conversation_loop")
 
 # Post-response housekeeping tools: a round made only of these mutes tool progress.
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
+# Closing line for a turn ended because the worker already handed the card off.
+KANBAN_HANDOFF_FINAL_RESPONSE = (
+    "Карточка передана дальше — этот ход завершён (бюджет итераций не тратится на закрытую карточку)."
+)
+
+
+def _worker_card_closed() -> bool:
+    """True when this dispatcher-owned worker no longer owns its card.
+
+    Cheap gate: only dispatcher-owned workers (``HERMES_KANBAN_TASK``) ever read the
+    board, and only when the kanban toolset is live. Never raises — a board hiccup must
+    not truncate a legitimately running turn.
+    """
+    try:
+        from agent.kanban_stop import worker_card_closed
+        return worker_card_closed()
+    except Exception:
+        logger.debug("kanban handoff check failed", exc_info=True)
+        return False
 # Rounds whose visible line is the turn's reply if the follow-up is empty (no empty-response nudge):
 # housekeeping, and setup_beat, whose card already blocked for the user's answer.
 _LINE_IS_REPLY_TOOLS = _HOUSEKEEPING_TOOLS | {"setup_beat"}
@@ -191,6 +210,22 @@ def run_tool_round(
         # alive, so SSE/TUI clients see the explanation. A held turn shows it as the final only.
         if final_response:
             agent._safe_print(f"\n{final_response}\n")
+            if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
+                with suppress(Exception):
+                    agent.stream_delta_callback(final_response)
+                    agent.stream_delta_callback(None)
+        return _verdict("break")
+
+    # The worker handed the card off (completed / blocked / review / scheduled): its turn is
+    # over even though the model is willing to keep going. Without this the remaining
+    # iterations burn to the cap and the run is booked `timed_out` on a card that was closed
+    # minutes earlier — a false alarm and a second handoff event. Authority is the board's run
+    # identity, not the transcript, so a reclaimed or superseded attempt stops too.
+    if _worker_card_closed():
+        _turn_exit_reason = "kanban_handoff_complete"
+        if not (final_response or "").strip():
+            final_response = KANBAN_HANDOFF_FINAL_RESPONSE
+            append_message(messages, {"role": "assistant", "content": final_response})
             if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)

@@ -25,6 +25,7 @@ import sys
 import logging
 import time
 from contextvars import ContextVar, Token
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -1674,6 +1675,11 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+# How much of a comment body travels in the ``commented`` event for delivery to a chat.
+# Long notes stay whole in ``task_comments``; the event only carries what a ping can render.
+_COMMENT_PREVIEW_CHARS = 600
+
+
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -1688,7 +1694,17 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        # The bounded preview is what lets a subscribed chat receive the note itself rather
+        # than a bare "someone commented". Redacted at the source: board events are durable
+        # and the notifier delivers them outside the profile that wrote the comment.
+        preview = body.strip()
+        if len(preview) > _COMMENT_PREVIEW_CHARS:
+            preview = preview[:_COMMENT_PREVIEW_CHARS].rstrip() + "…"
+        with suppress(Exception):
+            from agent.redact import redact_sensitive_text
+            preview = redact_sensitive_text(preview, force=True)
+        _append_event(conn, task_id, "commented",
+                      {"author": author, "len": len(body), "preview": preview})
         return int(cur.lastrowid or 0)
 
 

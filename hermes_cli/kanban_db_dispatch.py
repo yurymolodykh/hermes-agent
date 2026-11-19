@@ -1479,6 +1479,18 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # A card that already reached a terminal status is nobody's failure. The caller can
+        # arrive late (a worker that kept burning iterations after its own `kanban_complete`,
+        # a timeout sweep that raced the handoff): counting it would raise
+        # `consecutive_failures` on a closed card and emit a `timed_out` event on top of the
+        # real `completed`, which the notifier then pings to the owner's chat as an alarm.
+        # Nothing about such a run is actionable, so touch neither the row nor the event log.
+        if str(row["status"] or "") in ("done", "archived"):
+            _kb._log.debug(
+                "kanban dispatch: ignoring %s accounting for %s — card is already %s",
+                outcome, task_id, row["status"],
+            )
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

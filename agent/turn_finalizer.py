@@ -58,6 +58,19 @@ def _record_kanban_budget_exhausted(
     from multiple exit paths.
     """
     try:
+        from agent.kanban_stop import worker_card_closed
+        if worker_card_closed(kanban_task):
+            # The worker already handed the card off and is only burning the leftover
+            # iterations: its run is closed, so there is nothing to book as a failure.
+            # Recording it would stamp `timed_out` on a `done` card and alarm the owner.
+            logger.debug(
+                "kanban worker %s exhausted its budget after handing the card off — not recording a failure",
+                kanban_task,
+            )
+            return
+    except Exception:
+        logger.debug("kanban handoff check failed for %s", kanban_task, exc_info=True)
+    try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_dispatch as _kbd
@@ -442,10 +455,15 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
             and _stripped[-1:] not in _SENTENCE_END
         )
         if _is_empty_terminal or _is_partial_fragment or str(_turn_exit_reason) == "partial_stream_recovery":
+            _store = getattr(agent, "_session_db", None)
             _explanation = agent._format_turn_completion_explanation(
                 _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
-                db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
+                db_path=getattr(_store, "db_path", None),
                 model=str(getattr(agent, "model", "") or ""),
+                # A managed worker's store is a byte-capped journal, not state.db: name the file and
+                # the ceiling so an outbox_full refusal is actionable instead of "disk might be full".
+                journal_path=getattr(_store, "path", None),
+                journal_limit=getattr(_store, "max_bytes", None),
             )
             if _explanation:
                 # Replace the bare sentinel; keep a partial fragment and append why.
