@@ -3562,6 +3562,9 @@ explainer:
     corrupt: "상태 데이터베이스에서 구조적 손상이 보고되어(재시작 시 대화 기록이 사라질 수 있어요) 턴을 멈췄어요. 디스크 공간을 확보해도 도움이 되지 않아요. 복구 방법:\n1. `hermes {profile_arg}doctor --fix` 실행\n2. 게이트웨이를 중지한 뒤 다음으로 복구:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (복구 가능하다고 나오면) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 복구 시 손상된 파일의 스냅샷을 먼저 만들어요. 실행 중인 state.db에 `sqlite3 ... \".recover\"`를 절대 실행하지 마세요. 취약한 sqlite3 CLI가 손상을 더 키울 수 있어요\n3. {backups_dir}/의 백업에서 복원\n그런 다음 메시지를 다시 보내 주세요."
     fts_index: "세션 검색 인덱스(FTS5)가 손상되었고 분리할 수 없어서 턴을 멈췄고 이 메시지는 저장되지 않았어요. 메시지 저장소 자체는 손상되지 않았으니 복구 도구를 실행하거나 백업을 복원하지 마세요. `hermes {profile_arg}doctor --fix`를 실행하거나(또는 Hermes를 재시작하면 열 때 인덱스를 수리해요) 메시지를 다시 보내 주세요."
     disk: "Hermes가 이 대화를 디스크에 저장할 수 없어서 메시지를 잃지 않도록 멈췄어요. 디스크가 가득 찼을 가능성이 커요. 공간을 확보하거나 {home}/state.db의 권한을 고친 뒤 메시지를 다시 보내 주세요."
+    outbox_full: "이 턴은 이 워커 자체의 쓰기 저널이 상한 {journal_limit}({journal_path})에 도달해 멈췄어요. 디스크가 가득 찬 것도, 다른 Hermes 프로세스가 데이터베이스를 잡고 있는 것도 아니에요. 저널은 한 번의 실행 전용 고정 크기 버퍼예요. 그때까지 기록에 쓰인 내용은 그대로이고, 이번 턴의 마지막 단계만 저장되지 않았어요. 메시지를 다시 보내 주세요. 매우 긴 실행이라면 /new로 새 세션을 시작하고, 반복되면 `outbox_full`을 알려 주세요."
+    outbox_busy: "이 턴은 이 워커의 쓰기 저널이 아직 사용 중이어서 멈췄어요(이전 항목이 아직 확인되지 않았거나 다른 프로세스가 저널 파일을 잡고 있어요). 데이터베이스 자체는 정상이에요. 몇 초 기다렸다가 메시지를 다시 보내 주세요. 계속되면 `hermes {profile_arg}doctor`를 실행하세요."
+    permission_denied: "세션 저장소에 쓸 수 없어 Hermes가 멈췄어요. 파일 권한이 접근을 거부하고 있어요. 디스크 공간을 확보해도 해결되지 않아요. 사용 중인 계정이 {home}/state.db를 소유하고 그 디렉터리에 쓸 수 있는지 확인한 뒤 메시지를 다시 보내 주세요."
     default: "Hermes가 이 대화를 저장할 수 없어서 메시지를 잃지 않도록 멈췄어요. 가능한 원인: 드라이브 공간 부족, 또는 다른 Hermes 프로세스가 데이터베이스를 잡고 있는 경우예요. 다른 Hermes 창을 닫고 `hermes {profile_arg}doctor`로 저장소를 확인한 뒤 메시지를 다시 보내 주세요."
   file_mutation:
     header: "⚠️ 파일 변경 검증기: 위의 문구가 어떻게 보이든, 이번 턴에 파일 편집 {count}건이 실패했어요. `git status`나 `read_file`로 실제 반영된 내용을 확인하세요."

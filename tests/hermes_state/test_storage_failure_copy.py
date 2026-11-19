@@ -19,6 +19,11 @@ from hermes_state_user_copy import describe_storage_failure, storage_failure_det
         (sqlite3.DatabaseError("database disk image is malformed"), "storage_corrupt", "hermes doctor --fix"),
         (OSError(28, "No space left on device"), "disk_full", "Free some disk space"),
         (None, "storage_unavailable", "hermes doctor --fix"),
+        # A managed worker's byte-capped journal is not state.db: neither "check the database"
+        # nor "free some disk space" is the right answer, and the code must say which it was.
+        ("outbox_full", "storage_journal_full", "Send the message again"),
+        ("outbox_in_use", "storage_busy", "send your message again"),
+        ("[Errno 13] Permission denied", "storage_permission_denied", "Freeing disk space will not help"),
     ],
 )
 def test_each_cause_has_a_stable_code_and_an_action(exc, code, command):

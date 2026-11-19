@@ -3562,6 +3562,9 @@ explainer:
     corrupt: "這一輪已停止，因為狀態資料庫回報結構損毀（重新啟動後對話紀錄將會遺失）。釋放磁碟空間沒有幫助。復原選項：\n1. 執行 `hermes {profile_arg}doctor --fix`\n2. 停止閘道，然後用以下指令復原：\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   （若回報可復原）hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 復原會先為損毀的檔案建立快照；切勿對執行中的 state.db 執行 `sqlite3 ... \".recover\"`，有漏洞的 sqlite3 CLI 可能使其損毀得更嚴重\n3. 從 {backups_dir}/ 中的備份還原\n然後再傳送一次訊息。"
     fts_index: "這一輪已停止，因為工作階段搜尋索引（FTS5）已損毀且無法卸離，因此這則訊息未儲存。訊息儲存區本身未受損：不要執行復原工具或還原備份。請執行 `hermes {profile_arg}doctor --fix`（或重新啟動 Hermes，開啟時會修復索引），然後再傳送一次訊息。"
     disk: "Hermes 無法將此對話儲存到磁碟，為避免遺失你的訊息而停止。磁碟可能已滿：請釋放一些空間（或修正 {home}/state.db 的權限），然後再傳送一次訊息。"
+    outbox_full: "這一輪已停止，因為這個 worker 自己的寫入日誌達到了 {journal_limit} 上限（{journal_path}）。這不是磁碟空間不足，也不是另一個 Hermes 程序佔用資料庫：該日誌是單次執行專用的固定大小緩衝。先前寫入紀錄的內容完好，只是這一輪最後一步沒有落盤。請重新傳送訊息；對於超長執行，請用 /new 開啟新的工作階段；若重複出現，請回報 `outbox_full`。"
+    outbox_busy: "這一輪已停止，因為這個 worker 的寫入日誌仍被佔用（先前的項目尚未確認，或另一個程序持有該日誌檔）。資料庫本身沒有問題。請等待幾秒後重新傳送訊息；若持續出現，請執行 `hermes {profile_arg}doctor`。"
+    permission_denied: "Hermes 已停止，因為無法寫入工作階段儲存：檔案權限拒絕了存取。釋放磁碟空間沒有幫助。請確認你的使用者擁有 {home}/state.db 並可在其目錄中寫入，然後重新傳送訊息。"
     default: "Hermes 無法儲存此對話，為避免遺失你的訊息而停止。可能原因：磁碟空間不足，或另一個 Hermes 程序正佔用資料庫。請關閉其他 Hermes 視窗，執行 `hermes {profile_arg}doctor` 檢查儲存狀態，然後再傳送一次訊息。"
   file_mutation:
     header: "⚠️ 檔案變更驗證器：本輪有 {count} 個檔案編輯失敗，無論上方文字如何描述皆以此為準。請執行 `git status` 或 `read_file` 確認實際寫入的內容。"

@@ -62,6 +62,36 @@ class TestPersistenceFailureRecoveryMessage:
         assert "/reset" not in response
         assert "send it again" in response.lower()
 
+    def test_outbox_full_copy_reaches_the_user_verbatim(self):
+        """A worker-journal refusal must not be flattened into "storage was temporarily
+        unavailable": the explainer already names the journal and its cap, and that is the whole
+        point of the fix (the flattened line sent an operator hunting a full disk)."""
+        explainer = (
+            "⚠️ No reply: the turn was stopped because this worker's own write journal reached its "
+            "4.0 MiB limit (~/.hermes/profiles/p/worker-outboxes/w/pending.json)."
+        )
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "session_persistence_failed:outbox_full",
+            "error": explainer,
+            "api_calls": 40,
+        }
+        assert _normalize_empty_agent_response(agent_result, "", history_len=10) == explainer
+
+    def test_raw_outbox_error_without_rendered_copy_still_avoids_reset(self):
+        """A bare 'outbox_full' (no rendered explanation) keeps the neutral recovery line."""
+        agent_result = {
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "session_persistence_failed:outbox_full",
+            "error": "outbox_full",
+            "api_calls": 1,
+        }
+        response = _normalize_empty_agent_response(agent_result, "", history_len=10)
+        assert "outbox_full" not in response and "send it again" in response.lower()
+        assert "/reset" not in response
+
     def test_legacy_shape_error_text_mentioning_session_storage(self):
         """Legacy failed results carry no failure_reason but an error text
         naming session storage — they must get the same recovery message."""

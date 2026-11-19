@@ -98,8 +98,19 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "outbox_full", "outbox_busy",
+    "permission_denied", "unknown",
 )
+
+# The managed worker's private retry journal (``worker-outboxes/<execution>/pending.json``) is
+# byte-capped (``RuntimeSessionStore(max_bytes=4 MiB)``); hitting the cap is neither a full disk
+# nor another process holding state.db — the advice and the artifact differ, so it is its own bucket.
+_OUTBOX_FULL_MARKERS = ("outbox_full",)
+# The same journal held by another owner, or one entry still unacknowledged: retryable, not damage.
+_OUTBOX_BUSY_MARKERS = ("outbox_in_use", "pending_receipt", "outbox_scope_mismatch",
+                        "outbox_closed", "unsafe_outbox")
+_PERMISSION_MARKERS = ("permission_denied", "permission denied", "operation not permitted",
+                       "errno 13")
 
 
 # "Database FILE structurally damaged" substrings. "database disk image is
@@ -283,10 +294,16 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     # RPC-wrapped errors lose their exception type; retain the same sidecar/main-file split.
     (("deleted state.db-wal", "deleted state.db-shm"), "deleted_wal"),
     (("was replaced underneath",), "replaced"),
+    # Worker-journal refusals before any storage bucket: their text names neither disk nor lock,
+    # and "outbox_full" must never be answered with "free some disk space".
+    (_OUTBOX_FULL_MARKERS, "outbox_full"),
+    (_OUTBOX_BUSY_MARKERS, "outbox_busy"),
     (_DB_CORRUPTION_MARKERS, "corrupt"),
     (("locked", "busy"), "locked"),
     # A flush rejected by the session-row FK: the row was removed under a live agent (#123583).
     (("foreign key constraint failed",), "session_row_missing"),
+    # Permissions: the store cannot write at all, and freeing disk space is not the fix.
+    (_PERMISSION_MARKERS, "permission_denied"),
 )
 
 

@@ -150,6 +150,11 @@ def _disk_full(candidate: Any) -> bool:
 def _result_layer(reason: str, error_text: str, provider: str) -> str:
     if reason in _REASON_TO_LAYER:
         return _REASON_TO_LAYER[reason]
+    if reason.startswith("session_persistence_failed"):
+        # Turn-session storage refusals (lock, compression lease, outbox journal, permissions) are
+        # internal to this process: no provider exists in the story, so a client must not answer
+        # them with "switch provider". The disk-full text is caught before this point.
+        return LAYER_GATEWAY
     if reason in _TRANSPORT_REASONS and _is_custom_endpoint(provider):
         return LAYER_ENDPOINT
     return LAYER_STREAMING if _looks_like_stream_drop(error_text) else LAYER_PROVIDER

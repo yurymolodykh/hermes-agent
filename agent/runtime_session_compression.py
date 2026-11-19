@@ -1,5 +1,13 @@
 """Concrete worker compression APIs; scope and receipts stay in RuntimeSessionStore."""
 
+# The columns the owner's staleness re-verification (``held_row_mismatches``) actually reads:
+# row identity, the persist marker the fence requires, the loader-lens identity payload and the
+# row digest. Everything else in ``HANDOFF_MESSAGE_FIELDS`` is dead weight on the wire.
+_CAS_FIELDS = frozenset({
+    "role", "content", "tool_call_id", "tool_calls", "_row_id", "message_uid",
+    "_db_row_snapshot", "_tool_call_uids", "_tool_call_uid",
+})
+
 
 def _handoff_rows(messages):
     """Project live compaction dicts onto the owner's closed handoff fields.
@@ -77,12 +85,15 @@ class RuntimeSessionCompressionMixin:
         carried = [dict(m) for m in carried_messages or [] if isinstance(m, dict)]
         unresolved = None if unresolved_held is None else [dict(m) for m in unresolved_held if isinstance(m, dict)]
         # The lease-less staleness fence (#124102): the owner re-verifies the caller's held rows
-        # inside its commit transaction. The projection keeps the closed handoff fields plus the
-        # persistence marker the CAS compare reads; anything else stays worker-local.
+        # inside its commit transaction. Only the columns that compare actually reads travel — the
+        # row identity (``_row_id``/``message_uid``), the persist marker, the payload columns of the
+        # loader-lens identity compare and the row digest. Shipping the whole handoff projection here
+        # made ``compression.archive`` carry the same transcript twice (measured: 4.62 MB against the
+        # 4 MiB journal cap, ``outbox_full`` on a long run); the identity-only frame is ~26 KB of it.
         from hermes_state_runtime import HANDOFF_MESSAGE_FIELDS
         cas = None if held_for_cas is None else [
             {k: v for k, v in m.items()
-             if k in HANDOFF_MESSAGE_FIELDS or k == '_db_persisted'}
+             if k in _CAS_FIELDS or (k == '_db_persisted' and v)}
             for m in held_for_cas if isinstance(m, dict)]
         result = self._apply('compression.archive', dict(messages=_handoff_rows(compacted_messages),
             model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,

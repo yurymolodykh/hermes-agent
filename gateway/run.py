@@ -3082,6 +3082,16 @@ def _normalize_empty_agent_response(
         # Persistence failures: suggesting /reset would destroy context without fixing storage.
         failure_reason = str(agent_result.get("failure_reason") or "")
         if failure_reason.startswith("session_persistence_failed") or "session storage" in error_str:
+            # The turn explainer already named the exact cause (journal cap, permissions, lock) in the
+            # user's language, with the artifact path. Deliver that instead of flattening every cause
+            # into one "temporarily unavailable" line — the flattening is what sent an operator looking
+            # for a full disk while a 4 MiB worker journal was the real limit.
+            _cause = failure_reason.partition(":")[2]
+            if _cause in ("outbox_full", "outbox_busy", "permission_denied") and str(error_detail).startswith(
+                    t("explainer.no_reply_prefix")):
+                # A rendered turn explanation (the explainer prefixes it with the "No reply:" marker),
+                # not a raw exception string: pass it through verbatim.
+                return str(error_detail)
             if failure_reason.endswith(":disk") or "disk" in error_str:
                 return t("gateway.errors.session_storage_unavailable_disk")
             return t("gateway.errors.session_storage_unavailable")

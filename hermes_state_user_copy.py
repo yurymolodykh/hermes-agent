@@ -76,6 +76,27 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
         "another process is compressing this session",
         "Send your message again once compression finishes.",
     ),
+    # A managed worker's private retry journal (``worker-outboxes/<execution>/pending.json``) is
+    # byte-capped. Saying "check the database" or "free disk space" here sends the operator to a
+    # healthy file: the journal, not state.db, refused the write.
+    "outbox_full": (
+        "storage_journal_full",
+        "this run's own write journal reached its fixed size cap; the session database itself is fine",
+        "Send the message again (the completed steps are already saved), or start a fresh session for "
+        "a very long run. The journal path and cap are in the log line for this failure.",
+    ),
+    "outbox_busy": (
+        "storage_busy",
+        "this run's write journal was busy (an earlier entry was still unacknowledged, or another "
+        "process owns the journal file)",
+        "Wait a moment and send your message again; if it persists, run `hermes {profile_arg}doctor`.",
+    ),
+    "permission_denied": (
+        "storage_permission_denied",
+        "the session store refused the write because file permissions deny access",
+        "Freeing disk space will not help: make sure your user owns the session store and may write "
+        "in its directory, then try again.",
+    ),
     "compression_closed": (
         "storage_session_rotated",
         "this session was rotated by context compression",

@@ -6,6 +6,7 @@ summarises why a turn ended without a final answer. Every method resolves throug
 import os
 import re
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.i18n import t
@@ -50,11 +51,35 @@ _EXIT_REASON_PREFIX_EXPLANATIONS = tuple(
 )
 
 # ``session_persistence_failed`` refined by the classified cause (lock contention ≠ disk full).
-_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk"})
+_PERSISTENCE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease", "session_row_missing", "locked", "replaced", "deleted_wal", "corrupt", "fts_index", "disk", "outbox_full", "outbox_busy", "permission_denied"})
 
 
 def _persistence_explanation_key(cause: Optional[str]) -> str:
     return f"explainer.persistence.{cause}" if cause in _PERSISTENCE_CAUSES else "explainer.persistence.default"
+
+
+def _display_storage_path(path) -> str:
+    """``~/...`` form of an operator path for chat copy (mirrors ``display_hermes_home``), or ""."""
+    if not path:
+        return ""
+    try:
+        resolved = Path(str(path)).expanduser()
+        return "~/" + resolved.relative_to(Path.home()).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _human_bytes(value) -> str:
+    """``4 МиБ``-style ceiling for user copy; "" when unknown."""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
 
 
 def _file_mutation_identity(path: str, task_id: Optional[str]) -> str:
@@ -233,6 +258,7 @@ class TurnExplainersMixin:
     @staticmethod
     def _format_turn_completion_explanation(
         turn_exit_reason: str, persistence_cause: Optional[str] = None, db_path=None, model: str = "",
+        journal_path=None, journal_limit=None,
     ) -> str:
         """User-facing explanation for an abnormal turn ending, or "" for normal / unknown reasons.
 
@@ -262,6 +288,9 @@ class TurnExplainersMixin:
             fill: dict[str, str] = {
                 "home": display_hermes_home(), "profile_arg": profile_cli_selector(),
                 "recovery_docs": STORAGE_RECOVERY_DOCS_URL, "db_path": "", "backups_dir": "",
+                "cause": str(persistence_cause or "unknown"),
+                "journal_path": _display_storage_path(journal_path) or "",
+                "journal_limit": _human_bytes(journal_limit),
             }
             if persistence_cause in ("corrupt", "fts_index"):
                 from hermes_constants import get_default_hermes_root
@@ -269,6 +298,12 @@ class TurnExplainersMixin:
 
                 fill["db_path"] = str(db_path or _default_db_path())
                 fill["backups_dir"] = str(get_default_hermes_root() / "backups")
+            if persistence_cause == "outbox_full":
+                # Only the store knows exactly where its journal is; show the operator path and the
+                # ceiling that refused the write instead of "free some disk space". Without a store
+                # handle (cron suppression renders this copy too) name the shape, never state.db.
+                fill["journal_path"] = (fill["journal_path"]
+                                        or f"{display_hermes_home()}/worker-outboxes/<execution>/pending.json")
             body = t(_persistence_explanation_key(persistence_cause), **fill)
         else:
             body = None
