@@ -19,9 +19,11 @@ import os
 import secrets
 import sys
 import time
+from dataclasses import replace
 from typing import Optional
 
 from hermes_cli.dashboard_auth import DashboardAuthProvider, InvalidCredentialsError, RefreshExpiredError, Session
+from hermes_cli import dashboard_users as users_mod
 from plugins.dashboard_auth._shared import (
     NonInteractiveMixin, SkipRegistration, load_config_section, register_provider, resolve_env_or_cfg)
 
@@ -34,11 +36,13 @@ _DEFAULT_TTL_SECONDS = 12 * 60 * 60
 _REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
 
 # Interactive-login scrypt parameters (~16 MiB, a few ms); n must be a power of two.
-_SCRYPT_N = 2**14
-_SCRYPT_R = 8
-_SCRYPT_P = 1
-_SCRYPT_DKLEN = 32
-_SCRYPT_SALT_BYTES = 16
+# ``hash_password``/``_verify_password`` stay here (public API, used by operators and tests);
+# the users file shares the same implementation through hermes_cli.dashboard_users.
+_SCRYPT_N = users_mod.SCRYPT_N
+_SCRYPT_R = users_mod.SCRYPT_R
+_SCRYPT_P = users_mod.SCRYPT_P
+_SCRYPT_DKLEN = users_mod.SCRYPT_DKLEN
+_SCRYPT_SALT_BYTES = users_mod.SCRYPT_SALT_BYTES
 
 # HMAC-SHA256 digest is appended to signed tokens as a fixed-length suffix
 # (no separator — binary HMAC bytes can't be confused with a delimiter).
@@ -52,35 +56,26 @@ LAST_SKIP_REASON: str = ""
 def hash_password(password: str) -> str:
     """Return a ``scrypt$n$r$p$<salt_b64>$<dk_b64>`` hash string. Public so operators can
     precompute ``password_hash`` for config.yaml (the plaintext then never sits at rest):
-    ``python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('pw'))"``."""
-    salt = secrets.token_bytes(_SCRYPT_SALT_BYTES)
-    dk = hashlib.scrypt(
-        password.encode("utf-8"), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_DKLEN, maxmem=0)
-    salt_b64, dk_b64 = base64.b64encode(salt).decode(), base64.b64encode(dk).decode()
-    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt_b64}${dk_b64}"
+    ``python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('pw'))"``.
+
+    Delegates to :mod:`hermes_cli.dashboard_users`, so the plugin, the users file and
+    ``hermes auth users`` write one format through one implementation.
+    """
+    return users_mod.hash_password(password)
 
 
 def _verify_password(password: str, encoded: str) -> bool:
-    """Constant-time scrypt verify. False on any malformed hash string."""
-    try:
-        scheme, n_s, r_s, p_s, salt_b64, dk_b64 = encoded.split("$")
-        if scheme != "scrypt":
-            return False
-        n, r, p = int(n_s), int(r_s), int(p_s)
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(dk_b64)
-    except (ValueError, TypeError):
-        return False
-    try:
-        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=len(expected), maxmem=0)
-    except (ValueError, MemoryError):
-        return False
-    return hmac.compare_digest(actual, expected)
+    """Constant-time scrypt verify. False on any malformed hash string.
+
+    Deliberately scrypt-ONLY, as it always was: an imported bcrypt/argon2 hash is handled by the
+    users-file path, where the same call can also rewrite it in our format.
+    """
+    return users_mod.verify_scrypt(password, encoded)
 
 
 # Verified against when the username is unknown so "no such user" and "wrong
 # password" take comparable time.
-_DUMMY_HASH = hash_password("dummy-password-for-constant-time-verify")
+_DUMMY_HASH = users_mod.dummy_scrypt_hash()
 
 
 # ---- Token signing (stateless HMAC-signed blobs) ----
@@ -113,7 +108,15 @@ def _unsign(token: str, secret: bytes, kind: str) -> Optional[dict]:
 # ---- Provider ----
 
 class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
-    """Username/password provider with stateless HMAC-signed sessions."""
+    """Username/password provider with stateless HMAC-signed sessions.
+
+    Two credential sources, one login path:
+
+    * ``users_file`` (``dashboard.basic_auth.users_file``) — many people, looked up by login or
+      alias. A record found here is authoritative for that login; a login it does not know falls
+      through to the single pair below, so existing installations keep working unchanged.
+    * ``username``/``password_hash`` — the single pair, exactly as before.
+    """
 
     name = "basic"
     display_name = "Username & Password"
@@ -123,29 +126,150 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
         "BasicAuthProvider is password-only; there is no OAuth redirect flow. "
         "The login page POSTs to /auth/password-login instead.")
 
-    def __init__(self, *, username: str, password_hash: str, secret: bytes, ttl_seconds: int = _DEFAULT_TTL_SECONDS) -> None:
-        if not username:
-            raise ValueError("username must be non-empty")
-        if not password_hash:
+    def __init__(self, *, username: str, password_hash: str, secret: bytes, ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+                 users_file: str = "") -> None:
+        if not username and not users_file:
+            raise ValueError("username must be non-empty when no users_file is configured")
+        if username and not password_hash:
             raise ValueError("password_hash must be non-empty")
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
         self._username = username
         self._password_hash = password_hash
+        self._has_single_pair = bool(username and password_hash)
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
+        self._users = users_mod.UserStore(users_mod.resolve_users_file_path(users_file))
+
+        self._reported_unknown_format: set[str] = set()
+
+    # ---- users file --------------------------------------------------------
+
+    def users_snapshot(self) -> users_mod.UsersLoadResult:
+        """The current users file as loaded (cached until it changes on disk)."""
+        return self._users.load()
+
+    def users_problems(self) -> list[users_mod.UsersProblem]:
+        return list(self._users.load().problems)
 
     # ---- password login ----------------------------------------------------
 
     def complete_password_login(self, *, username: str, password: str) -> Session:
-        # Always run a scrypt verify (real hash if the username matches, else the dummy)
-        # and compare the username with compare_digest too, so neither the username nor
-        # its length leaks via timing.
+        """Authenticate *username* against the users file, then the single pair.
+
+        Timing contract, on EVERY path, exactly one scrypt work unit and one
+        :func:`hmac.compare_digest` on the login:
+
+        * users-file record, scrypt hash — one scrypt verify;
+        * users-file record, bcrypt/argon2 hash — the foreign verify plus one scrypt (the re-hash
+          on success, a dummy verify on failure);
+        * users-file record, unrecognised hash — one scrypt verify against the dummy;
+        * a login the file does not know — the single pair exactly as before, one scrypt verify.
+
+        So a login that is unknown, disabled, wrong-password, or in a foreign format all cost the
+        same single scrypt pass.
+        """
+        record = self._find_user(username)
+        if record is not None:
+            password_ok = self._verify_user_record(record, password)
+            if not record.disabled and password_ok:
+                return self._mint_session(record.login)
+            raise InvalidCredentialsError("invalid username or password")
+
+        # No users-file record: the single configured pair, exactly as before. Adding a users file
+        # does NOT retire the original login — an existing installation keeps working unchanged.
+        if not self._has_single_pair:
+            # A users-file-only deployment: still pay one scrypt verify so an unknown login costs
+            # the same as a known one.
+            _verify_password(password, self._dummy())
+            raise InvalidCredentialsError("invalid username or password")
         username_ok = hmac.compare_digest(username.encode("utf-8"), self._username.encode("utf-8"))
-        password_ok = _verify_password(password, self._password_hash if username_ok else _DUMMY_HASH)
+        password_ok = _verify_password(password, self._password_hash if username_ok else self._dummy())
         if not (username_ok and password_ok):
             raise InvalidCredentialsError("invalid username or password")
         return self._mint_session(self._username)
+
+    @staticmethod
+    def _dummy() -> str:
+        """The throwaway hash, built once at import so the FIRST unknown login is not twice as
+        slow as every later one."""
+        return _DUMMY_HASH
+
+    def _find_user(self, username: str) -> Optional[users_mod.UserRecord]:
+        """The users-file record for *username*, or None (also when the file is unusable).
+
+        An unusable file yields None for every login, which routes everyone to the single pair
+        (fail-closed with respect to the file, and never a half-loaded table).
+        """
+        loaded = self._users.load()
+        if loaded.ok:
+            return loaded.by_login(username)
+        if loaded.exists and loaded.problems:
+            logger.error(
+                "dashboard-auth-basic: users file %s is unusable (%s); no user from it may sign in.",
+                loaded.path, "; ".join(str(p) for p in loaded.problems))
+        return None
+
+    def _verify_user_record(self, record: users_mod.UserRecord, password: str) -> bool:
+        """Verify *password* for *record* at a cost of exactly one scrypt work unit.
+
+        A foreign format that verifies is rewritten in scrypt form in the same pass, so the
+        migration costs the login nothing extra and needs no separate command.
+        """
+        kind = users_mod.hash_kind(record.password_hash)
+
+        if kind == users_mod.HASH_UNKNOWN:
+            users_mod.verify_scrypt(password, self._dummy())
+            self._report_unknown_format(record)
+            return False
+
+        if kind == users_mod.HASH_SCRYPT:
+            return users_mod.verify_scrypt(password, record.password_hash)
+
+        # bcrypt / argon2: read-only formats from the import.
+        try:
+            ok = users_mod.verify_password(password, record.password_hash)
+        except users_mod.UnsupportedHashFormat as exc:
+            logger.error("dashboard-auth-basic: login %r cannot be verified: %s", record.login, exc)
+            users_mod.verify_scrypt(password, self._dummy())
+            return False
+
+        if not ok:
+            # Pay the scrypt unit a scrypt user's failed attempt pays, so a foreign-format
+            # account's wrong-password path is not measurably cheaper.
+            users_mod.verify_scrypt(password, self._dummy())
+            return False
+
+        # Success: this scrypt hash IS the cost, and it is also the rewrite.
+        self._rehash_record(record, password)
+        return True
+
+    def _report_unknown_format(self, record: users_mod.UserRecord) -> None:
+        """One warning line per login, naming the login and never the hash."""
+        if record.login in self._reported_unknown_format:
+            return
+        self._reported_unknown_format.add(record.login)
+        logger.warning(
+            "dashboard-auth-basic: unknown password hash format for login %r; this person cannot "
+            "sign in until the hash is rewritten (hermes auth users passwd).", record.login)
+
+    def _rehash_record(self, record: users_mod.UserRecord, password: str) -> None:
+        """Rewrite *record*'s verified hash in scrypt form, atomically."""
+        try:
+            updated = replace(record, password_hash=users_mod.hash_password(password))
+            if not self._users.replace_record(updated):
+                logger.warning(
+                    "dashboard-auth-basic: login %r verified but its record vanished before the "
+                    "hash could be re-written; the old hash stays in place.", record.login)
+                return
+            logger.info(
+                "dashboard-auth-basic: login %r signed in with a %s hash, re-written as scrypt.",
+                record.login, users_mod.hash_kind(record.password_hash))
+        except Exception:
+            # A failed rewrite must never fail a login that already verified.
+            logger.exception(
+                "dashboard-auth-basic: could not re-write the hash for login %r; it stays in its "
+                "old format and will be retried on the next sign-in.", record.login)
 
     # ---- session lifecycle -------------------------------------------------
 
@@ -243,7 +367,11 @@ def _resolve_secret(cfg_section: dict) -> bytes:
 
 
 def _settings() -> dict:
-    """Resolve BasicAuthProvider kwargs from env/config; raises ``SkipRegistration``."""
+    """Resolve BasicAuthProvider kwargs from env/config; raises ``SkipRegistration``.
+
+    ``users_file`` is a SECOND source. When it is configured the provider registers even with no
+    ``username``/``password_hash`` pair, and when a pair is also configured both keep working.
+    """
     section = _load_config_basic_auth_section()
 
     def setting(env_name: str, cfg_key: str) -> str:
@@ -253,43 +381,78 @@ def _settings() -> dict:
     password_hash = setting("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "password_hash")
     plaintext = setting("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "password")
     ttl_raw = setting("HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", "session_ttl_seconds")
-    if not username:
+    users_file = str(section.get("users_file") or "").strip()
+
+    if users_file:
+        users_path = users_mod.resolve_users_file_path(users_file)
+        try:
+            loaded = users_mod.load_users_file(users_path)
+        except users_mod.UsersFilePermissionError as exc:
+            # Refusing to load is the point: say why, loudly, and do not register.
+            raise SkipRegistration(str(exc), level="error") from exc
+        if not loaded.exists:
+            logger.warning(
+                "dashboard-auth-basic: dashboard.basic_auth.users_file is set to %s but the file "
+                "does not exist; only the single username/password pair (if any) can sign in.",
+                users_path)
+        for problem in loaded.problems:
+            logger.error("dashboard-auth-basic: users file %s: %s", users_path, problem)
+        for warning in loaded.warnings:
+            logger.warning("dashboard-auth-basic: users file: %s", warning)
+        if loaded.exists and loaded.problems:
+            logger.error(
+                "dashboard-auth-basic: users file %s is unusable; NO user from it may sign in "
+                "until it is fixed. The single username/password pair still works.", users_path)
+
+    if not username and not users_file:
         raise SkipRegistration(
             "dashboard.basic_auth.username is not set (and HERMES_DASHBOARD_BASIC_AUTH_USERNAME "
             "is empty). Set a username and a password (or password_hash) under "
             "dashboard.basic_auth in config.yaml to enable username/password dashboard "
             "login, or use the OAuth provider, or pass --insecure to skip the auth gate.")
-    if not password_hash and not plaintext:
-        raise SkipRegistration(
-            "dashboard.basic_auth.username is set but neither password_hash nor password "
-            "is configured. Provide one of them (password_hash is preferred — compute it "
-            "with plugins.dashboard_auth.basic.hash_password).",
-            level="warning")
+    if username and not password_hash and not plaintext:
+        if users_file:
+            # The pair is half-configured but a users file carries the logins: use the file and
+            # say the pair is ignored, rather than refusing to start.
+            logger.warning(
+                "dashboard-auth-basic: dashboard.basic_auth.username is set without a password; "
+                "the single pair is ignored and only users_file logins can sign in.")
+            username = ""
+        else:
+            raise SkipRegistration(
+                "dashboard.basic_auth.username is set but neither password_hash nor password "
+                "is configured. Provide one of them (password_hash is preferred — compute it "
+                "with plugins.dashboard_auth.basic.hash_password).",
+                level="warning")
     # Precedence: env password (hashed in-memory) overrides any config password_hash so
     # operators can rotate without editing config; a config password_hash wins over a
-    # config-only plaintext password (preferred at-rest form).
-    plaintext_from_env = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
-    if plaintext_from_env:
-        password_hash = hash_password(plaintext_from_env)
-        logger.info("dashboard-auth-basic: hashed env-supplied password in-memory (overrides any config password_hash).")
-    elif not password_hash:
-        password_hash = hash_password(plaintext)
-        logger.info(
-            "dashboard-auth-basic: hashed plaintext password in-memory. "
-            "For production, precompute dashboard.basic_auth.password_hash "
-            "and remove the plaintext password from config.")
+    # config-only plaintext password (preferred at-rest form). A users-file-only deployment has
+    # no username here, so the whole pair is skipped rather than hashed from an empty string.
+    if username:
+        plaintext_from_env = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
+        if plaintext_from_env:
+            password_hash = hash_password(plaintext_from_env)
+            logger.info("dashboard-auth-basic: hashed env-supplied password in-memory (overrides any config password_hash).")
+        elif not password_hash:
+            password_hash = hash_password(plaintext)
+            logger.info(
+                "dashboard-auth-basic: hashed plaintext password in-memory. "
+                "For production, precompute dashboard.basic_auth.password_hash "
+                "and remove the plaintext password from config.")
     try:
         ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
     except ValueError:
         ttl = _DEFAULT_TTL_SECONDS
-    return {"username": username, "password_hash": password_hash, "secret": _resolve_secret(section), "ttl_seconds": ttl}
+    return {"username": username, "password_hash": password_hash, "secret": _resolve_secret(section),
+            "ttl_seconds": ttl, "users_file": users_file}
 
 
 def register(ctx) -> None:
-    """Register ``BasicAuthProvider`` when username + (password or
-    password_hash) are configured; a no-op for OAuth / ``--insecure`` setups."""
+    """Register ``BasicAuthProvider`` when a single pair or a users file provides logins; a no-op
+    for OAuth / ``--insecure`` setups."""
     global LAST_SKIP_REASON
     LAST_SKIP_REASON = ""
     kwargs, LAST_SKIP_REASON = register_provider(ctx, logger, _TAG, BasicAuthProvider, _settings)
     if kwargs is not None:
-        logger.info("dashboard-auth-basic: registered password provider (username=%s)", kwargs["username"])
+        logger.info("dashboard-auth-basic: registered password provider (username=%s, users_file=%s)",
+                    kwargs["username"] or "-", kwargs["users_file"] or "-")

@@ -915,11 +915,28 @@ def auth_upgrade_command(args) -> None:
 
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
-    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
+    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command,
+    "status": auth_status_command,
     "logout": auth_logout_command, "upgrade": auth_upgrade_command}
 
 
+def _auth_users_dispatch(args) -> None:
+    """Hand ``hermes auth users <verb>`` to the users-file surface.
+
+    Kept out of ``_AUTH_ACTIONS`` because those verbs are about the provider credential pool while
+    these are about people; a shared dict would make ``auth users list`` collide with
+    ``auth list`` on the ``auth_action`` destination.
+    """
+    handler = getattr(args, "func", None)
+    if handler is None:  # pragma: no cover - the parser always sets one
+        raise SystemExit("hermes auth users: choose list, add, passwd, disable, enable or import")
+    raise SystemExit(handler(args) or 0)
+
+
 def auth_command(args) -> None:
+    if getattr(args, "auth_action", "") == "users":
+        _auth_users_dispatch(args)
+        return
     handler = _AUTH_ACTIONS.get(getattr(args, "auth_action", ""))
     if handler is not None:
         handler(args)

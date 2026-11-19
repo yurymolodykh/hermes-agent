@@ -337,6 +337,15 @@ wake = [
   "sounddevice==0.5.6",
   "numpy==2.5.4",
 ]
+# Read-only support for password hashes the users file may inherit from an older host
+# (`$2b$`/`$2a$` → bcrypt, `$argon2*` → argon2). This code only ever WRITES scrypt; these two
+# are needed to verify an imported hash once, then re-hash it in our format. Lazy-installed and
+# deliberately NOT in [all]: an install that has no such hashes never needs them.
+# `passlib` is NOT used — it is unmaintained and would add a third hash implementation.
+password-formats = [
+  "bcrypt==5.0.0",
+  "argon2-cffi==25.1.0",
+]
 # Platform sub-extras / alias extras — declared so pm.extras.ANCHORS names
 # only real extras (contract: tests/pm/test_extras.py). Each is
 # lazy-installed at first use via pm.ensure_import(name) and therefore
