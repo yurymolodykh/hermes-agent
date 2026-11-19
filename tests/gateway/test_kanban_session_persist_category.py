@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 
 import pytest
 
@@ -42,49 +43,37 @@ def _bound_claim(tmp_path, monkeypatch):
     return path, context
 
 
-def _result(payload):
-    path, context = _bound_claim_for(payload)
-    return path, context
-
-
 @pytest.fixture
 def claim(tmp_path, monkeypatch):
     return _bound_claim(tmp_path, monkeypatch)
 
 
-def test_session_persist_failure_is_its_own_category(claim, monkeypatch):
+def _run_turn(claim, monkeypatch, payload):
+    from types import SimpleNamespace
     path, context = claim
-    failed = {"failed": True, "failure_reason": "session_persistence_failed:locked",
-              "final_response": "⚠️ Нет ответа: Hermes не смог сохранить этот разговор"}
-    monkeypatch.setattr(session_kanban, "_run_task_turns", lambda *_a: failed)
-    frame = {"policy": {"kanban_json": json.dumps(context)}}
+    monkeypatch.setattr(session_kanban, "_run_task_turns", lambda *_a: payload)
+    session_kanban.run_worker_turns(SimpleNamespace(), {"policy": {"kanban_json": json.dumps(context)}}, [])
+    return session_kanban.worker_result(path, context)
 
-    session_kanban.run_worker_turns(object(), frame, [])
 
-    result = session_kanban.worker_result(path, context)
+def test_session_persist_failure_is_its_own_category(claim, monkeypatch):
+    result = _run_turn(claim, monkeypatch, {
+        "failed": True, "failure_reason": "session_persistence_failed:locked",
+        "final_response": "⚠️ Нет ответа: Hermes не смог сохранить этот разговор"})
     assert result["exit_code"] != 0, "сбой записи сессии не может выглядеть успехом"
     assert result["failure_kind"] == FAILURE_KIND_SESSION_PERSIST
     assert result["last_output"].startswith(SESSION_PERSIST_MARKER), result["last_output"]
 
 
 def test_a_clean_turn_carries_no_failure_kind(claim, monkeypatch):
-    path, context = claim
-    monkeypatch.setattr(session_kanban, "_run_task_turns",
-                        lambda *_a: {"completed": True, "final_response": "готово"})
-    session_kanban.run_worker_turns(object(), {"policy": {"kanban_json": json.dumps(context)}}, [])
-
-    result = session_kanban.worker_result(path, context)
+    result = _run_turn(claim, monkeypatch, {"completed": True, "final_response": "готово"})
     assert result["exit_code"] == 0
     assert "failure_kind" not in result
 
 
 def test_a_generic_failure_is_turn_error(claim, monkeypatch):
-    path, context = claim
-    monkeypatch.setattr(session_kanban, "_run_task_turns",
-                        lambda *_a: {"failed": True, "final_response": "нет доступа к файлу"})
-    session_kanban.run_worker_turns(object(), {"policy": {"kanban_json": json.dumps(context)}}, [])
-
-    result = session_kanban.worker_result(path, context)
+    result = _run_turn(claim, monkeypatch,
+                       {"failed": True, "final_response": "нет доступа к файлу"})
     assert result["failure_kind"] == FAILURE_KIND_TURN_ERROR
 
 
@@ -103,7 +92,7 @@ def test_failure_kind_classification(payload, expected):
 
 def test_explanation_names_measured_facts_not_possible_causes(tmp_path):
     """Дефект 2, п.3: сообщение называет то, что РЕАЛЬНО проверено."""
-    from agent.turn_explainers import storage_facts, TurnExplainersMixin
+    from agent.turn_explainers import TurnExplainersMixin, storage_facts
 
     db = tmp_path / "state.db"
     db.write_bytes(b"")
@@ -111,9 +100,7 @@ def test_explanation_names_measured_facts_not_possible_causes(tmp_path):
     text = "\n".join(facts)
     assert any("свобод" in f.lower() or "free space" in f.lower() for f in facts), text
     assert any(str(db) in f for f in facts), text
-    # Свободный байт — проверка шла, а не «возможно, диск полон».
-    import re
-    assert re.search(r"\d", text), text
+    assert re.search(r"\d", text), text  # свободное место названо числом
 
     out = TurnExplainersMixin._format_turn_completion_explanation(
         "session_persistence_failed", "locked", db_path=db)
