@@ -10,7 +10,8 @@ import time
 from contextlib import contextmanager
 import hermes_yaml as yaml
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from urllib.parse import quote
 from fastapi.staticfiles import StaticFiles
 from starlette import status
 from starlette._utils import get_route_path
@@ -38,6 +39,49 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     ``hermes_cli.dashboard_auth.prefix`` so gate, OAuth, cookies and SPA mount agree)."""
     from hermes_cli.dashboard_auth.prefix import normalise_prefix
     return normalise_prefix(raw)
+
+
+def webapp_default_profile() -> str:
+    """The working profile a fresh Webapp tab must open on, or "" for the gateway's own.
+
+    A Webapp tab whose address carries no ``?profile=`` falls back to the profile the server process
+    runs as — and a multiplexing gateway always runs as ``default``, so a new tab lands on the root
+    home instead of the working profile. ``HERMES_WEBAPP_DEFAULT_PROFILE`` names that profile; it is
+    read from the process environment (the service manager owns it) and ignored unless the name is a
+    live profile, so a typo can never strand the tab on a profile the gateway does not serve.
+    """
+    name = (os.environ.get("HERMES_WEBAPP_DEFAULT_PROFILE") or "").strip()
+    if not name or name in ("default", "custom"):
+        return ""
+    try:
+        from hermes_cli.profiles import profile_exists
+        if not profile_exists(name):
+            _log.warning(
+                "HERMES_WEBAPP_DEFAULT_PROFILE names profile %r, which is not installed; the "
+                "Webapp keeps the profile its gateway runs as", name)
+            return ""
+    except Exception:  # a profile probe must never break serving the SPA
+        return ""
+    return name
+
+
+def webapp_entry_redirect(full_path: str, request: Request, state: Any,
+                          prefix: str = "") -> Optional[Response]:
+    """307 the Webapp entry document to its configured working profile, else None.
+
+    Only the Webapp surface and only the bare entry path: the dashboard has its own launch-profile
+    handshake (``--open-profile``), and an address that already names a profile is the operator's
+    choice. Deep links are left alone — the SPA keeps the address current once the tab is open.
+    """
+    if full_path or getattr(state, "ui_surface", None) != "webapp":
+        return None
+    if "profile" in request.query_params:
+        return None
+    preferred = webapp_default_profile()
+    if not preferred:
+        return None
+    return RedirectResponse(f"{prefix}/?profile={quote(preferred)}",
+                            status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 def _layer_hex(palette: dict[str, Any], key: str, default: str) -> str:
@@ -271,6 +315,11 @@ def mount_spa(application: FastAPI):
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+        # A fresh Webapp tab (address without ``?profile=``) opens on the configured working profile
+        # instead of the profile the multiplexing gateway itself runs as (``default``).
+        entry_redirect = webapp_entry_redirect(full_path, request, application.state, prefix)
+        if entry_redirect is not None:
+            return entry_redirect
         # An unmatched /api/* path is a missing endpoint, not a client-side route: return a
         # real 404 JSON instead of index.html (which breaks JSON clients with a SyntaxError).
         if full_path == "api" or full_path.startswith("api/"):

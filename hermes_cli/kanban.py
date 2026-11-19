@@ -332,6 +332,54 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _board_operator_chat(conn) -> Optional[dict]:
+    """Последний доказанно рабочий чат доски: подписка, уже получавшая уведомления.
+
+    Зачем: карточку может создать процесс без контекста чата (cron, скрипт,
+    служебный воркер без подписок). Тогда адресат берётся не из воздуха, а из
+    факта — из подписки, которая уже доставляла события доски. Владелец такой
+    подписки (``notifier_profile``) сохраняется, иначе уведомление пойдёт от
+    чужого профиля.
+    """
+    try:
+        row = conn.execute(
+            "SELECT platform, chat_id, thread_id, chat_type, user_id, notifier_profile,"
+            "       delivery_metadata"
+            "  FROM kanban_notify_subs"
+            " WHERE platform != 'tui' AND chat_id != ''"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    import json as _json
+    meta = {}
+    try:
+        raw_meta = row["delivery_metadata"]
+    except (IndexError, KeyError, TypeError):
+        raw_meta = None
+    if raw_meta:
+        try:
+            meta = _json.loads(raw_meta) or {}
+        except (ValueError, TypeError):
+            meta = {}
+    try:
+        return dict(
+            platform=str(row["platform"] or ""), chat_id=str(row["chat_id"] or ""),
+            thread_id=(str(row["thread_id"]) if row["thread_id"] else None),
+            chat_type=(str(row["chat_type"]) if row["chat_type"] else meta.get("chat_type")),
+            user_id=(str(row["user_id"]) if row["user_id"] else None),
+            notifier_profile=(str(row["notifier_profile"]) if row["notifier_profile"] else None),
+            delivery_mode="notify+wake",
+            delivery_metadata=meta or None,
+        )
+    except (IndexError, KeyError, TypeError):
+        # Не Row-фабрика или иная схема: лучше без подписки с явным
+        # предупреждением при создании, чем падение создания карточки.
+        return None
+
+
 def _cli_notify_target(conn, args: argparse.Namespace) -> Optional[dict]:
     """Chat that must receive terminal events for a task created from the CLI.
 
@@ -342,7 +390,11 @@ def _cli_notify_target(conn, args: argparse.Namespace) -> Optional[dict]:
       3. for a dispatcher-owned worker creating a follow-up card: the already
          subscribed chat of the card it is working on (the origin chat), then
          ``kanban.default_notify_chat``;
-      4. ``kanban.default_notify_chat`` as ``platform:chat_id``.
+      4. ``kanban.default_notify_chat`` as ``platform:chat_id``;
+      5. the board's proven operator chat — a subscription that already delivered
+         board events. This covers a programmatic creator with no chat context
+         (cron, script, worker without subscribers): silence is worse than a
+         proven address, and the owner's chat is where board failures belong.
 
     Returns ``add_notify_sub`` kwargs, or None when nothing can be resolved (cron,
     tests, a bare shell). Never raises: bookkeeping must not fail card creation.
@@ -381,6 +433,10 @@ def _cli_notify_target(conn, args: argparse.Namespace) -> Optional[dict]:
             raw = ""
         if raw and ":" in raw:
             platform, chat_id = (part.strip() for part in raw.split(":", 1))
+    if not (platform and chat_id):
+        fallback = _board_operator_chat(conn)
+        if fallback:
+            return fallback
     if not (platform and chat_id):
         return None
     return dict(
@@ -449,11 +505,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 subscribed = True
             except Exception as exc:  # bookkeeping must never fail creation
                 print(f"⚠  kanban: notify-subscribe failed: {exc}", file=sys.stderr)
+        elif not getattr(args, "no_notify", False):
+            # No chat context and no proven board chat: say so at creation time
+            # instead of letting the card fail silently later.
+            print(
+                f"⚠  kanban: {task_id} создана БЕЗ АДРЕСАТА — уведомления о падении "
+                "в чат не пойдут. Задайте kanban.default_notify_chat или "
+                "`hermes kanban notify-subscribe`.",
+                file=sys.stderr,
+            )
     if getattr(args, "json", False):
         payload = _task_to_dict(task)
         payload["notify_subscribed"] = subscribed
         if sub_target:
             payload["notify_target"] = f"{sub_target['platform']}:{sub_target['chat_id']}"
+        elif not getattr(args, "no_notify", False):
+            payload["notify_target"] = None
+            payload["notify_address_missing"] = True
         _print_json(payload)
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
