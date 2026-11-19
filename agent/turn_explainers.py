@@ -113,6 +113,7 @@ def storage_facts(db_path) -> list[str]:
                        free=_human_bytes(usage.free), total=_human_bytes(usage.total)))
     except OSError:
         facts.append(t("explainer.storage.free_space_unknown", path=str(parent)))
+    writable = []
     for target in (path, parent):
         try:
             if not target.exists():
@@ -123,7 +124,12 @@ def storage_facts(db_path) -> list[str]:
             ok = False
         facts.append(t("explainer.storage.writable" if ok else "explainer.storage.not_writable",
                        path=str(target)))
-    if path.is_file():
+        if ok:
+            writable.append(target)
+    # A lock probe can only mean something when the write itself was permitted: on a read-only file
+    # sqlite refuses before it ever contends, and "another process holds the database" would blame a
+    # phantom while the real cause is the permission above.
+    if path.is_file() and path in writable:
         try:
             conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=0.5)
             try:
