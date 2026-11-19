@@ -9,7 +9,7 @@ MEMORY (your personal notes) [1% — 43/2,200 chars]
 ══════════════════════════════════════════════
 B-note: bob keeps telemetry in cold storage
 
-Active Hermes profile: 03-software-engineer. This session reads and writes /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mem-verify-w5uh3sw4/. The default profile's data lives at /home/hermes/.hermes/skills/, /home/hermes/.hermes/plugins/, /home/hermes/.hermes/cron/, /home/hermes/.hermes/memories/ — those belong to a different session run from a different shell. Do NOT modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
+Active Hermes profile: 03-software-engineer. This session reads and writes /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mem-verify-yp7try__/. The default profile's data lives at /home/hermes/.hermes/skills/, /home/hermes/.hermes/plugins/, /home/hermes/.hermes/cron/, /home/hermes/.hermes/memories/ — those belong to a different session run from a different shell. Do NOT modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
 
 Conversation started: Thursday, November 19, 2026 (Europe/Moscow, MSK, UTC+03:00)
 Platform: cli
@@ -19,6 +19,6 @@ Platform: cli
 Host: Linux (7.2.15-76070215-generic)
 User home directory: /home/hermes
 Current working directory: /home/hermes/workspaces/03-software-engineer
-Scratch directory: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mem-verify-w5uh3sw4/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
+Scratch directory: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mem-verify-yp7try__/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
 
 <!-- End Hermes runtime environment -->

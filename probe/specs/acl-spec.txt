@@ -12,16 +12,15 @@ fs rw /dev
 fs rw /tmp
 fs rw /var/tmp
 fs rw /run/user
-fs rx /home/hermes/.hermes/hermes-agent/.venv
-fs rx /home/hermes/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu
-fs rw /home/hermes/hermes-worktrees/t_296c8418
-fs x /home/hermes/hermes-worktrees
+fs rx /home/hermes/.hermes/installs/1033103711a43260/test-environment/gen-c63917ff86354d119f82f0c95a80f4d7/venv
+fs rx /home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64
+fs rw /home/hermes/.hermes/hermes-agent
+fs x /home/hermes/.hermes
 fs x /home/hermes
 fs x /home
 fs x /home/hermes/.hermes/profiles/03-software-engineer/cache
 fs x /home/hermes/.hermes/profiles/03-software-engineer
 fs x /home/hermes/.hermes/profiles
-fs x /home/hermes/.hermes
 fs rw /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch
 net deny
-net allow connect 55553
+net allow connect 54031
