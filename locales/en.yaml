@@ -3688,6 +3688,7 @@ explainer:
     not_writable: "{path}: NOT writable by this user (permissions deny the write)"
     lock_free: "{path}: accepted a write lock (no other process holds it)"
     lock_held: "{path}: could NOT take a write lock — another process holds the database"
+    missing: "{path}: does not exist"
   file_mutation:
     header: "⚠️ File-mutation verifier: {count} file edit(s) FAILED this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm what actually landed."
     entry: "  • `{path}` — [{tool}] {preview}"

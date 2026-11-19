@@ -58,6 +58,14 @@ def _persistence_explanation_key(cause: Optional[str]) -> str:
     return f"explainer.persistence.{cause}" if cause in _PERSISTENCE_CAUSES else "explainer.persistence.default"
 
 
+# Causes whose real answer is capacity, permissions or lock contention — the only ones where
+# probing the store's filesystem tells the operator something. Corruption (``corrupt``,
+# ``fts_index``, ``replaced``, ``deleted_wal``), a lease/rotation stop, the worker's own journal
+# (``outbox_full``/``outbox_busy``) and ``session_row_missing`` are none of those: there, disk-space
+# or lock advice misdirects and the cause's own copy already names the artifact.
+_STORAGE_PROBE_CAUSES = frozenset({"disk", "permission_denied", "locked", "unknown", None})
+
+
 def _display_storage_path(path) -> str:
     """``~/...`` form of an operator path for chat copy (mirrors ``display_hermes_home``), or ""."""
     if not path:
@@ -105,28 +113,27 @@ def storage_facts(db_path) -> list[str]:
                        free=_human_bytes(usage.free), total=_human_bytes(usage.total)))
     except OSError:
         facts.append(t("explainer.storage.free_space_unknown", path=str(parent)))
-    for target in (path, path.parent):
+    for target in (path, parent):
         try:
-            if target.exists():
-                ok = os.access(str(target), os.R_OK | os.W_OK)
-            else:
-                ok = False
+            if not target.exists():
+                facts.append(t("explainer.storage.missing", path=str(target)))
+                continue
+            ok = os.access(str(target), os.R_OK | os.W_OK)
         except OSError:
             ok = False
         facts.append(t("explainer.storage.writable" if ok else "explainer.storage.not_writable",
                        path=str(target)))
-    try:
-        if path.exists():
-            with suppress(Exception):
-                conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=0.5)
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.rollback()
-                    facts.append(t("explainer.storage.lock_free", path=str(path)))
-                finally:
-                    conn.close()
-    except Exception:
-        facts.append(t("explainer.storage.lock_held", path=str(path)))
+    if path.is_file():
+        try:
+            conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=0.5)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.rollback()
+                facts.append(t("explainer.storage.lock_free", path=str(path)))
+            finally:
+                conn.close()
+        except Exception:
+            facts.append(t("explainer.storage.lock_held", path=str(path)))
     return facts
 
 
@@ -355,11 +362,13 @@ class TurnExplainersMixin:
             body = t(_persistence_explanation_key(persistence_cause), **fill)
             # Name what was CHECKED, not what might be wrong: "possible causes" wasted an operator's
             # evening hunting disk space while the real cause was a locked database (19.11.2026).
-            facts = [] if persistence_cause in ("outbox_full", "outbox_busy") else storage_facts(
-                db_path or fill.get("db_path"))
-            if facts:
-                body = body + "\n\n" + t("explainer.storage.header") + "\n" + "\n".join(
-                    f"  • {fact}" for fact in facts)
+            # Only causes whose answer can lie in capacity / permissions / lock contention get the
+            # probes: for corruption or an FTS-scoped failure disk-space advice is actively wrong.
+            if persistence_cause in _STORAGE_PROBE_CAUSES:
+                facts = storage_facts(db_path or fill.get("db_path"))
+                if facts:
+                    body = body + "\n\n" + t("explainer.storage.header") + "\n" + "\n".join(
+                        f"  • {fact}" for fact in facts)
         else:
             body = None
         return t("explainer.no_reply_prefix") + body if body else ""
