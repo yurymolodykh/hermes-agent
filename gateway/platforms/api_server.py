@@ -2489,13 +2489,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return {}, _error_response("Request body must be a JSON object", 400)
         return body, None
 
-    async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[dict[str, Any]], Optional[web.Response]]:
+    async def _get_existing_session_or_404(
+        self, session_id: str, request: Any = None,
+    ) -> tuple[Optional[dict[str, Any]], Optional[web.Response]]:
+        """The stored session, or the SAME 404 a missing id gets.
+
+        ``request`` carries the caller's owner scope (``hermes_acl_scope.request_owner_scope``). A
+        row outside that scope is answered exactly like a row that does not exist — 404
+        ``session_not_found``, never 403 — so the surface cannot be used as an oracle for which ids
+        belong to someone else.
+        """
         db = await self._ensure_session_db_async()
         if db is None:
             return None, self._session_db_unavailable()
         session = await asyncio.to_thread(db.get_session, session_id)
         if not session:
             return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
+        if request is not None:
+            from hermes_acl_scope import request_owner_scope
+            scope = request_owner_scope(request)
+            from hermes_acl_scope import describe_scope, row_outside_scope
+            if scope is not None and row_outside_scope(session, scope):
+                logger.warning("api_server: session %s refused — outside the caller's owner scope %s",
+                               session_id, describe_scope(scope))
+                return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> list[dict[str, Any]]:
@@ -2532,13 +2549,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False)
 
+        # The profile's API key authenticates the PROFILE; a person inside it is named by a
+        # trusted identity header (see hermes_acl_scope). ``None`` = unscoped legacy listing.
+        from hermes_acl_scope import request_owner_scope
+        owner_scope = request_owner_scope(request)
+
         async def _list() -> list:
             # include_pinned back-fills pins past the recency window; search_query pushes the
             # title needle into SQL (substring) so a hidden/old row is found, exact match below.
             rows = await asyncio.to_thread(
                 db.list_sessions_rich, source=source, limit=limit, offset=offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+                search_query=title_filter, include_hidden=include_hidden, user_id=owner_scope)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
@@ -2594,6 +2616,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
         source = self._normalize_session_source(body.get("source") or "api_server")
+        # Owner stamp: with a scope active, a session created here belongs to the caller — otherwise
+        # it would carry no owner and be invisible (fail closed) to the very person who made it.
+        from hermes_acl_scope import request_owner_scope
+        _owner_scope = request_owner_scope(request)
+        owner_stamp = _owner_scope[0] if _owner_scope else None
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -2618,10 +2645,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return None, conflict
             conn.execute(
                 """INSERT INTO sessions (
-                   id, source, model, model_config, system_prompt, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                   id, source, model, model_config, system_prompt, started_at, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, source, model_name, json.dumps(model_config) if model_config else None,
-                 system_prompt, time.time()))
+                 system_prompt, time.time(), owner_stamp))
             if title is not None:
                 clean_title = db.sanitize_title(str(title))
                 if clean_title:
@@ -2644,7 +2671,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_get_session(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}."""
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session, err = await self._get_existing_session_or_404(request.match_info["session_id"], request)
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
@@ -2653,7 +2680,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_patch_session(self, request: web.Request) -> web.Response:
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(session_id, request)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2693,7 +2720,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_delete_session(self, request: web.Request) -> web.Response:
         """DELETE /api/sessions/{session_id}."""
         session_id = request.match_info["session_id"]
-        _session, err = await self._get_existing_session_or_404(session_id)
+        _session, err = await self._get_existing_session_or_404(session_id, request)
         if err:
             return err
         db = await self._ensure_session_db_async()
@@ -2730,7 +2757,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_messages(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}/messages."""
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await self._get_existing_session_or_404(session_id, request)
         if err:
             return err
         db = await self._ensure_session_db_async()
@@ -2766,9 +2793,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_fork_session(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
-        if err:
-            return err
+        source, err = await self._get_existing_session_or_404(source_id, request)
+        if err or source is None:
+            return err or _error_response(f"Session not found: {source_id}", 404, code="session_not_found")
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2787,7 +2814,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         await asyncio.to_thread(
             db.create_session, fork_id, "api_server", model=source.get("model"),
             system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
+            model_config={"_branched_from": source_id},
+            user_id=source.get("user_id"))  # a fork keeps its source's owner, never a new one
         await asyncio.to_thread(db.end_session, source_id, "branched")
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
@@ -2814,7 +2842,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if key_err is not None:
             return None, key_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(session_id, request)
         if err:
             return None, err
         body, err = await self._read_json_body(request)
@@ -3246,7 +3274,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_model_lock(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await self._get_existing_session_or_404(session_id, request)
         if err:
             return err
         body, err = await self._read_json_body(request)

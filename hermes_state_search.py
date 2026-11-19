@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_errors import is_malformed_db_error
@@ -258,16 +258,24 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
 def _search_filter_clauses(
     where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
     exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    user_id: str | Sequence[str] | None = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
     ``sessions.started_at`` (inclusive / exclusive) inside the query so LIMIT cannot be
-    filled by out-of-window hits."""
+    filled by out-of-window hits. ``user_id`` applies the OWNER scope in SQL (see
+    ``hermes_state_sessions._owner_scope_clause``): ``None`` unfiltered, empty = no rows — so a
+    caller's search cannot differ from a genuine miss, and no hit outside the scope is ever read."""
     if not include_inactive:
         where.append("(m.active = 1 OR m.compacted = 1)")
     # display_kind="hidden" rows are model-facing scaffolding the person never saw; a hit would confuse.
     where.append("COALESCE(m.display_kind, '') <> 'hidden'")
+    from hermes_state_sessions import _owner_scope_clause
+    owner_clause, owner_params = _owner_scope_clause(user_id)
+    if owner_clause:
+        where.append(owner_clause)
+        params.extend(owner_params)
     if source_filter is not None:
         where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
         params.extend(source_filter)
@@ -1156,6 +1164,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        user_id: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
@@ -1165,7 +1174,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, user_id=user_id)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1179,6 +1188,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        user_id: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1186,7 +1196,8 @@ class SessionSearchMixin:
         CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
         by default; compaction-archived rows ARE included; ``include_inactive`` = every row.
         ``after_ts``/``before_ts`` bound ``sessions.started_at`` on every route (FTS5, CJK,
-        trigram, LIKE fallback, unindexed-gap supplement)."""
+        trigram, LIKE fallback, unindexed-gap supplement). ``user_id`` is the OWNER scope pushed
+        into every route's SQL (``None`` unfiltered, empty sequence = no rows)."""
         result_fields = self._search_message_fields(fields)
         if not query or not query.strip():
             return []
@@ -1195,7 +1206,7 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts, user_id=user_id)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
@@ -1209,7 +1220,8 @@ class SessionSearchMixin:
             return []
 
         order_by_sql = _FTS_ORDER_BY.get(sort.strip().lower() if isinstance(sort, str) else None, "ORDER BY rank")
-        route = dict(order_by_sql=order_by_sql, limit=limit, offset=offset, **filters)
+        route: dict[str, Any] = dict(
+            order_by_sql=order_by_sql, limit=limit, offset=offset, **filters)
         # Tool rows and FTS_TRIGRAM_EXCLUDED_SOURCES sessions are excluded from the trigram
         # index (see FTS_TRIGRAM_SQL); an explicit filter for them must scan the base table.
         wants_unindexed_rows = (bool(role_filter) and "tool" in role_filter) or (
@@ -1285,7 +1297,7 @@ class SessionSearchMixin:
         like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
         like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
-                                         "after_ts", "before_ts")}
+                                         "after_ts", "before_ts", "user_id")}
         _search_filter_clauses(like_where, like_params, **filters)
         # instr() for the snippet uses the first search token.
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],

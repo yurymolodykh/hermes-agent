@@ -111,17 +111,46 @@ def _where_sql(clauses: list[str], lead: str = "") -> str:
     return f"{lead}WHERE {' AND '.join(clauses)}" if clauses else ""
 
 
+def _owner_scope_clause(user_id: str | Sequence[str] | None) -> tuple[str, list[Any]]:
+    """WHERE arm restricting ``sessions s`` to the OWNER scope *user_id*, or ``("", [])`` unscoped.
+
+    *user_id* is a subject or the several stored owner stamps that subject may hold (a
+    Telegram sender label ``tg:111`` and the ``auth:v1:[...]`` subject a login minted are
+    the same person — the caller resolves that set with :func:`gateway.owner_identity.same_owner`).
+    Three cases, and the empty one is deliberate:
+
+    * ``None`` — no scope requested (CLI / desktop / TUI of the host owner): no clause, so the
+      listing keeps its exact previous SQL.
+    * non-empty — ``COALESCE(s.user_id, '') IN (...)``: a row owned by the subject matches, a row
+      with NO owner stamp (NULL / ``''``: legacy rows, kanban/cron/tool sessions) never does.
+    * empty sequence — the caller has an identity it could not establish: ``1 = 0``, no rows.
+      Fail closed, never "no filter means everything"."""
+    if user_id is None:
+        return "", []
+    owners = [user_id] if isinstance(user_id, str) else list(user_id)
+    owners = [str(owner) for owner in owners if isinstance(owner, str) and owner]
+    if not owners:
+        return "1 = 0", []
+    return (f"COALESCE(s.user_id, '') IN ({', '.join('?' for _ in owners)})", owners)
+
+
 def _session_filter_where(
     *, exclude_children: bool = False, source: str | None = None, sources: list[str] | None = None,
     session_key: str | None = None, exclude_sources: list[str] | None = None, cwd_prefix: str | None = None,
     min_message_count: int = 0, archived_only: bool = False, include_archived: bool = False,
     include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
-    workspace_key: str | None = None,
+    workspace_key: str | None = None, user_id: str | Sequence[str] | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared ``sessions s`` WHERE builder so counts line up with listed rows. ``exclude_children``
     hides sub-agent runs and compression continuations but keeps branch/reset children
     (``_LISTABLE_CHILD_SQL``); ``include_subagents`` re-admits the sub-agent runs only
-    (``sessions.show_subagents``). Clause order is part of the SQL text contract."""
+    (``sessions.show_subagents``). Clause order is part of the SQL text contract.
+
+    ``user_id`` is the OWNER scope (a subject, or the several owner stamps of one subject):
+    ``None`` adds no clause — the unscoped listing every local surface (CLI, desktop, TUI)
+    keeps using — while an EMPTY sequence is the fail-closed nobody case (``1 = 0``): a
+    caller whose identity could not be established sees no row at all, not every row.
+    Rows carrying no owner stamp (NULL / ``''``) never match a scope."""
     where: list[str] = []
     params: list[Any] = []
     if exclude_children and include_subagents:
@@ -149,6 +178,10 @@ def _session_filter_where(
         if values:
             where.append(clause)
             params.extend(values)
+    owner_clause, owner_params = _owner_scope_clause(user_id)
+    if owner_clause:
+        where.append(owner_clause)
+        params.extend(owner_params)
     if archived_only:
         where.append("s.archived = 1")
     elif not include_archived:
@@ -1130,6 +1163,7 @@ class SessionSessionsMixin:
         timeout_seconds: float = 3.0,
         candidate_limit: int | None = None,
         lineage_limit: int | None = None,
+        user_id: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Latency-bounded recent-conversation browse (``session_search()``): preselect a small candidate set
         from the indexed durable activity timestamp (fallback ``started_at``), resolve only those across
@@ -1137,8 +1171,12 @@ class SessionSessionsMixin:
         uses ``UNION`` plus a total-row ceiling so a corrupt cycle or a deep/branching lineage cannot defeat
         the bound; a lineage that hits the ceiling before a terminal root/tip is omitted, not expanded.
         A cooperative SQLite progress deadline interrupts sustained work past ``timeout_seconds`` and raises
-        ``TimeoutError`` (cheap statements may finish between callbacks). Supports only the agent-tool
-        browse filters; rich callers keep using :meth:`list_sessions_rich`."""
+        ``TimeoutError`` (cheap statements may finish between callbacks).        Supports only the agent-tool
+        browse filters; rich callers keep using :meth:`list_sessions_rich`.
+
+        ``user_id`` is the OWNER scope (``None`` unscoped, empty = nothing) and is applied to the
+        candidate set AND to the root/tip rows the lineage walk returns, so a continuation child
+        carrying another owner cannot surface through its root."""
         limit = max(1, int(limit))
         timeout_seconds = max(0.0, float(timeout_seconds))
         if candidate_limit is None:
@@ -1154,6 +1192,10 @@ class SessionSessionsMixin:
             f"{_delegate_from_json('s.model_config')} IS NULL",
         ]
         candidate_params: list[Any] = []
+        owner_where, owner_params = _owner_scope_clause(user_id)
+        if owner_where:
+            candidate_clauses.append(owner_where)
+            candidate_params.extend(owner_params)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             candidate_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -1175,6 +1217,11 @@ class SessionSessionsMixin:
             AND COALESCE(child.source, '') != 'tool'
         """
 
+        owner_tip_sql, owner_tip_params = _owner_scope_clause(user_id)
+        if owner_tip_sql:
+            # Re-anchor the alias for the result rows: the walk returned roots AND tips, and a
+            # root of one owner must not carry a tip (continuation child) of another.
+            owner_tip_sql = " AND " + owner_tip_sql.replace("s.user_id", "tip.user_id")
         query = f"""
             WITH RECURSIVE
             recent_candidates(id) AS (
@@ -1256,7 +1303,7 @@ class SessionSessionsMixin:
               AND s.archived = 0
               AND s.hidden = 0
               AND {_LISTABLE_CHILD_SQL}
-              AND {_delegate_from_json('s.model_config')} IS NULL
+              AND {_delegate_from_json('s.model_config')} IS NULL{owner_tip_sql}
             ORDER BY rt.activity DESC, s.started_at DESC, tip.id DESC
             LIMIT ?
         """
@@ -1264,6 +1311,7 @@ class SessionSessionsMixin:
             candidate_limit,
             lineage_limit,
             lineage_limit,
+            *owner_tip_params,
             limit,
         ]
         deadline = time.monotonic() + timeout_seconds
@@ -1314,7 +1362,7 @@ class SessionSessionsMixin:
         id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False,
         include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False,
         include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
-        workspace_key: str | None = None,
+        workspace_key: str | None = None, user_id: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
         by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
@@ -1322,6 +1370,8 @@ class SessionSessionsMixin:
         filters except archived: a pin is an explicit keep, so a pinned row stamped
         archived must still return. ``local_created_sources`` restricts ``source='local'``
         rows to those surfaces before LIMIT/OFFSET. ``workspace_key``: the ``hermes -c`` folder rule.
+        ``user_id`` scopes the page to one owner (:func:`_owner_scope_clause`): ``None`` keeps the
+        unscoped listing, and an empty sequence lists nothing (fail closed).
 
         Storage interface: port as ``list_sessions_rich`` (``workspace_key`` is ``session.list``'s
         ``workspace`` filter)."""
@@ -1330,7 +1380,7 @@ class SessionSessionsMixin:
             exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
-            local_created_sources=local_created_sources, workspace_key=workspace_key,
+            local_created_sources=local_created_sources, workspace_key=workspace_key, user_id=user_id,
         )
         # The archived-only view is the recovery surface for rows that dropped out of every
         # default list: a session that is archived AND hidden (Bot Mode marks its sessions
@@ -1439,7 +1489,7 @@ class SessionSessionsMixin:
                 session_key=session_key, exclude_sources=exclude_sources, cwd_prefix=cwd_prefix,
                 min_message_count=min_message_count, archived_only=False, include_archived=True,
                 include_subagents=include_subagents, local_created_sources=local_created_sources,
-                workspace_key=workspace_key,
+                workspace_key=workspace_key, user_id=user_id,
             )
             if not include_hidden and not archived_only:
                 pinned_clauses.append("s.hidden = 0")
@@ -1583,14 +1633,15 @@ class SessionSessionsMixin:
         self, source: str | None = None, sources: list[str] | None = None, cwd_prefix: str | None = None,
         min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False,
         exclude_children: bool = False, exclude_sources: list[str] | None = None, include_subagents: bool = False,
-        local_created_sources: Sequence[str] | None = None,
+        local_created_sources: Sequence[str] | None = None, user_id: str | Sequence[str] | None = None,
     ) -> int:
-        """Count sessions with list_sessions_rich's filters so a paired "load more" total matches."""
+        """Count sessions with list_sessions_rich's filters so a paired "load more" total matches.
+        ``user_id`` carries the same owner scope (``None`` unscoped, empty = nothing)."""
         where_clauses, params = _session_filter_where(
             exclude_children=exclude_children, source=source, sources=sources,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
-            local_created_sources=local_created_sources,
+            local_created_sources=local_created_sources, user_id=user_id,
         )
         if exclude_children:
             from hermes_state_local import exclude_superseded_segments

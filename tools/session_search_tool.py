@@ -124,6 +124,44 @@ def _resolve_lineage(db, session_id: str) -> str:
     return _resolve_to_parent(db, session_id)[0]
 
 
+def _caller_scope() -> Optional[list[str]]:
+    """Owner scope of THIS turn: ``None`` unscoped, else the caller's owner stamps (possibly empty).
+
+    The subject is ``HERMES_SESSION_ACTOR_ID`` — who asked — not ``HERMES_SESSION_USER_ID``, which is
+    the session ROUTE and is empty in a shared chat. A turn merged from two senders has no actor at
+    all, so the scope is empty and the tool finds nothing (see ``hermes_acl_scope``).
+    """
+    from hermes_acl_scope import caller_owner_scope
+    return caller_owner_scope()
+
+
+def _readable(db, session_id: str, scope: Optional[list[str]]) -> bool:
+    """Whether *session_id* may be served to a caller holding *scope*.
+
+    Both levels are checked, and that is the whole point: the LINEAGE ROOT's owner and the HIT's own
+    owner. A compression continuation inherits routing columns from its parent, but nothing
+    guarantees it, so a root owned by the caller with a child owned by somebody else must not be
+    read — and a child the caller owns under a foreign root must not be either. ``scope is None``
+    (acl disabled) allows everything, as before.
+    """
+    if scope is None:
+        return True
+    if not scope:
+        return False
+    from hermes_acl_scope import row_outside_scope
+    root = _resolve_lineage(db, session_id) or session_id
+    for sid in {root, session_id}:
+        meta = _get_session_meta(db, sid)
+        if not meta or row_outside_scope(meta, scope):
+            return False
+    return True
+
+
+def _hidden_by_scope(db, session_id: str, scope: Optional[list[str]]) -> bool:
+    """Not-found twin of :func:`_readable` for paths that answer a miss differently."""
+    return not _readable(db, session_id, scope)
+
+
 def _parse_iso_bound(value: Optional[str]) -> Optional[int]:
     """Parse an ISO date/datetime OR a relative duration into a UTC unix timestamp.
 
@@ -354,11 +392,20 @@ def _hydrate_hit(db, lineage_root: str, match_info: dict[str, Any], result_detai
 def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort: Optional[str],
               detail: str, current_session_id: str | None = None, link_profile: str | None = None,
               after_ts: Optional[int] = None, before_ts: Optional[int] = None,
-              exclude_session_ids: Optional[list[str]] = None) -> str:
-    """Discovery shape: FTS5 plus adaptive or full result hydration."""
+              exclude_session_ids: Optional[list[str]] = None,
+              scope: Optional[list[str]] = None) -> str:
+    """Discovery shape: FTS5 plus adaptive or full result hydration.
+
+    *scope* is pushed into the FTS query itself (``search_messages(user_id=...)``), so hits outside
+    the caller's owner stamps never enter the ranking — the response for a query that only matches
+    somebody else's session is then byte-identical to a genuine miss, which is what keeps the tool
+    from being an oracle. Every hydrated hit is re-checked (:func:`_readable`) because hydration
+    follows the lineage, not the FTS row."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
     title_result = _title_match_result(db, query, current_lineage_root)
+    if title_result and not _readable(db, title_result["session_id"], scope):
+        title_result = None  # a title match is a read too: same owner rule, same silent miss
     # FTS rows are time-bounded in SQL (_search_filter_clauses); the title match bypasses that
     # query, so it is the one place the window is re-checked in Python.
     if title_result:
@@ -369,7 +416,8 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
     raw_results, err = _loud(lambda: db.search_messages(
         query=query, role_filter=role_filter or ["user", "assistant"],
         exclude_sources=list(_HIDDEN_SESSION_SOURCES), limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort,
-        fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts), "FTS5 search failed: %s", "Search failed")
+        fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts, user_id=scope),
+        "FTS5 search failed: %s", "Search failed")
     if err:
         return err
     # Demote cron rows below interactive ones BEFORE dedup so a high-volume cron corpus
@@ -397,6 +445,8 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
         if raw_sid in excluded_roots or resolved_sid in excluded_roots:
             continue
+        if not _readable(db, raw_sid, scope):
+            continue  # belt and braces: the FTS row names this session, the lineage may differ
         # Skip the current session lineage — UNLESS the hit's transcript has left live context. Three
         # sub-cases: Legacy compression rotation: the FTS hit lives in a session that itself ended with
         # end_reason='compression'. That session's content has been replaced by a summary in the
@@ -416,6 +466,8 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         seen_sessions.setdefault(resolved_sid, {**r, "_lineage_root": resolved_sid})
     for lineage_root, match_info in seen_sessions.items():
         if match_info.get("_title_only"):
+            continue
+        if not _readable(db, match_info.get("session_id") or lineage_root, scope):
             continue
         # Adaptive: only the top-ranked result is fully hydrated.
         entry = _hydrate_hit(db, lineage_root, match_info, "full" if detail == "full" or not results else "compact")
@@ -444,10 +496,14 @@ def _resolve_profile_db(profile: str):
     return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str | None = None) -> str:
-    """Read shape: whole session, or ``head`` + ``tail`` messages with a scroll pointer."""
+def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str | None = None,
+                  scope: Optional[list[str]] = None) -> str:
+    """Read shape: whole session, or ``head`` + ``tail`` messages with a scroll pointer.
+
+    A session outside the caller's owner scope answers ``session_id not found`` — the SAME error a
+    nonexistent id gets, verbatim, so the caller cannot tell "someone else's" from "no such row"."""
     meta = _get_session_meta(db, session_id)
-    if not meta:
+    if not meta or not _readable(db, session_id, scope):
         return tool_error(f"session_id not found: {session_id}", success=False)
     rows, err = _loud(lambda: db.get_messages(session_id), "get_messages failed for %s: %s", "failed to load session",
                       session_id)
@@ -462,7 +518,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
                                "Pass around_message_id (any id above) to scroll the middle.")} if truncated else {}))
 
 
-def _read_scoped(db, sid: str, profile: Optional[str]) -> str:
+def _read_scoped(db, sid: str, profile: Optional[str], scope: Optional[list[str]] = None) -> str:
     """Read shape scoped to ONE store: the caller's profile, or the profile it named.
 
     A miss is a miss. Profiles are isolated islands, so a bare id never falls through to
@@ -470,15 +526,21 @@ def _read_scoped(db, sid: str, profile: Optional[str]) -> str:
     transcript to any caller holding the id (#106761). The hint tells the model how to
     ask properly: ``@session:<profile>/<id>`` or ``profile=``.
     """
-    result = _read_session(db, sid, link_profile=profile)
+    result = _read_session(db, sid, link_profile=profile, scope=scope)
     if json.loads(result).get("success") is not False or profile:
         return result
     return tool_error(f"session_id not found in this profile: {sid}. If it belongs to another "
                       "profile, pass profile=<name> (or the @session:<profile>/<id> link).", success=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str | None = None, link_profile: str | None = None) -> str:
-    """Browse shape: metadata for the most recent sessions (no LLM, no FTS5)."""
+def _list_recent_sessions(db, limit: int, current_session_id: str | None = None,
+                         link_profile: str | None = None,
+                         scope: Optional[list[str]] = None) -> str:
+    """Browse shape: metadata for the most recent sessions (no LLM, no FTS5).
+
+    *scope* restricts the page to the caller's owner stamps (``None`` unscoped, empty = nothing):
+    a caller whose identity cannot be established browses an empty list, which reads exactly like a
+    profile with no sessions instead of disclosing somebody else's."""
     def _browse():
         # Never use list_sessions_rich(order_by_last_active=True) here: it walks every
         # compression chain and derives activity/previews before LIMIT, which can
@@ -491,7 +553,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str | None = None,
             raise RuntimeError("session database does not support bounded recent-session browse")
         sessions = bounded_list(
             limit=limit + 15,  # extra so we can skip current / compression roots
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES), timeout_seconds=3.0)
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES), timeout_seconds=3.0, user_id=scope)
         current_root, has_compression_hop = (
             _resolve_to_parent(db, current_session_id) if current_session_id else (None, False))
         # Compression continuation: the root was summarised into the live child, so hide
@@ -529,8 +591,12 @@ def _anchor_in_live_context(db, anchor_state, anchor_sid: str, current_session_i
 
 
 def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
-            current_session_id: str | None = None) -> str:
-    """Scroll shape: a window centered on an anchor (no FTS5, no bookends)."""
+            current_session_id: str | None = None, scope: Optional[list[str]] = None) -> str:
+    """Scroll shape: a window centered on an anchor (no FTS5, no bookends).
+
+    Owner-scoped: the anchor's OWNING session and the requested session must both be in *scope*
+    (``_readable``), and the transparent lineage rebind below re-checks the descendant it rebinds
+    TO — otherwise a caller could name its own parent and be handed a foreign child's window."""
     try:
         around_message_id = int(around_message_id)
     except (TypeError, ValueError):
@@ -542,8 +608,13 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
     if current_session_id and _anchor_in_live_context(db, anchor_state, owning or session_id, current_session_id):
         return tool_error("scroll rejected: anchor lives in the current session lineage (already in your active context)", success=False)
     session_meta = _get_session_meta(db, session_id)
-    if not session_meta:
+    if not session_meta or not _readable(db, session_id, scope):
         return tool_error(f"session_id not found: {session_id}", success=False)
+    if owning and owning != session_id and not _readable(db, owning, scope):
+        # The anchor lives in another session of this lineage: refuse with the plain anchor miss
+        # (never "that child belongs to someone else").
+        return tool_error(f"around_message_id {around_message_id} not in session_id {session_id}",
+                          success=False)
     view, err = _loud(lambda: db.get_messages_around(session_id, around_message_id, window=window),
                       "get_messages_around failed: %s", "failed to load messages")
     if err:
@@ -553,9 +624,9 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
     if not messages and owning and owning != session_id:
         # Lineage rebind: the caller paired a parent session_id with a message id
         # living in a descendant — serve the owner's window transparently.
-        rebind_view = _same_lineage(db, session_id, owning) and _quiet(
+        rebind_view = (_same_lineage(db, session_id, owning) and _readable(db, owning, scope) and _quiet(
             lambda: db.get_messages_around(owning, around_message_id, window=window),
-            None, "rebind get_messages_around failed: %s", with_exc=True)
+            None, "rebind get_messages_around failed: %s", with_exc=True))
         if rebind_view and rebind_view.get("window"):
             extra["warning"] = (f"around_message_id {around_message_id} lives in {owning} "
                                 f"(child of {session_id}); rebound transparently")
@@ -576,17 +647,19 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
 
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail,
-              after=None, before=None, exclude_session_ids=None) -> str:
-    """Mode dispatch (see module docstring); scroll wins when an anchor is set."""
+              after=None, before=None, exclude_session_ids=None, scope=None) -> str:
+    """Mode dispatch (see module docstring); scroll wins when an anchor is set.
+
+    *scope* is the caller's owner scope for every shape (``None`` unscoped, empty = nothing)."""
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
-            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
-        return _read_scoped(db, session_id.strip(), profile)
+            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id, scope)
+        return _read_scoped(db, session_id.strip(), profile, scope)
     browse = not query or not isinstance(query, str) or not query.strip()
     # Browse lists enough recent sessions to pick from; discovery returns a few ranked hits.
     limit = _clamp_int(limit, 10 if browse else 3, 1, 10)
     if browse:
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile, scope=scope)
     sort_norm = sort.strip().lower() if isinstance(sort, str) else None
     try:
         after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
@@ -597,7 +670,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
         detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
         current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
-        exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+        exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids), scope=scope)
 
 
 def session_search(query: str = "", role_filter: str | None = None, limit: int | None = None, db=None,
@@ -643,10 +716,14 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
+    # Owner scope for every shape, resolved once from the turn's ACTOR (see _caller_scope). It is
+    # applied to a cross-profile DB too: another profile's rows belong to people as well, and
+    # "explicit profile" names a store, not a different set of people.
+    scope = _caller_scope()
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+                         after=after, before=before, exclude_session_ids=exclude_session_ids, scope=scope)
     finally:
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
