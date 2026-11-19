@@ -112,6 +112,62 @@ def test_unknown_refusal_falls_back_to_the_last_log_line(capsys, worker_log):
     assert "worker log ends: exit: provider returned 500" in message
 
 
+def test_unknown_refusal_says_unreadable_not_empty_when_the_log_cannot_be_read(tmp_path, monkeypatch):
+    """Дефект 1, критерий 2: ``None`` от ``read_worker_log`` — не доказательство пустого лога.
+
+    ``read_worker_log`` возвращает ``None`` и когда файла нет, и когда чтение упало с ``OSError``
+    (внутренний ``except OSError``). Клиент превращал оба случая в ``''`` и печатал
+    «worker log empty» о логе, который существует и не был прочитан (ревью 19.11.2026, лог с
+    ``chmod 0``). Проверяемый факт обязан различать эти два мира.
+    """
+    import os
+    from hermes_cli import kanban_db
+
+    log = tmp_path / "t.log"
+    log.write_text("⚠️ Нет ответа: Hermes не смог сохранить этот разговор\n", encoding="utf-8")
+    log.chmod(0)
+    try:
+        if os.access(log, os.R_OK):  # root читает что угодно — сценарий недостижим
+            pytest.skip("running as a user that can read a 0-mode file")
+        monkeypatch.setattr(kanban_db, "worker_log_path", lambda task_id, *, board=None: log)
+        with pytest.raises(GatewayClientError) as err:
+            _exit_code("unknown", {})
+    finally:
+        log.chmod(0o600)
+    message = str(err.value)
+    assert "worker log unreadable" in message, message
+    assert "worker log empty" not in message, message
+
+
+def test_unknown_refusal_says_unreadable_when_the_read_fails_without_a_permission_trick(
+        tmp_path, monkeypatch):
+    """Тот же разрыв без ``chmod``: файл есть, а чтение всё равно вернуло ``None``."""
+    from hermes_cli import kanban_db
+
+    log = tmp_path / "t.log"
+    log.write_text("непустой лог\n", encoding="utf-8")
+    monkeypatch.setattr(kanban_db, "worker_log_path", lambda task_id, *, board=None: log)
+    monkeypatch.setattr(kanban_db, "read_worker_log", lambda *a, **k: None)
+    with pytest.raises(GatewayClientError) as err:
+        _exit_code("unknown", {})
+    message = str(err.value)
+    assert "worker log unreadable" in message, message
+    assert "worker log empty" not in message, message
+
+
+def test_unknown_refusal_says_empty_only_when_the_file_is_absent(tmp_path, monkeypatch):
+    """Обратный случай: файла действительно нет — тогда «worker log empty» правда."""
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "worker_log_path",
+                        lambda task_id, *, board=None: tmp_path / "absent.log")
+    with pytest.raises(GatewayClientError) as err:
+        _exit_code("unknown", {})
+    message = str(err.value)
+    assert "worker log empty" in message, message
+    assert "worker log unreadable" not in message, message
+
+
 def test_terminal_receipt_is_unchanged(capsys):
     """Регрессия: обычный terminal-путь читает worker_result ровно как раньше."""
     assert _exit_code("terminal", {"claim_lock": "cl", "exit_code": 0,

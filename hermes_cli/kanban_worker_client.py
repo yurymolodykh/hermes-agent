@@ -250,7 +250,20 @@ def _unknown_cause(params, board_db):
         from hermes_cli import kanban_db as kb
         import re
         log = kb.read_worker_log(params['task_id'], tail_bytes=4000,
-                                 board=params.get('board')) or ''
+                                 board=params.get('board'))
+        if log is None:
+            # ``read_worker_log`` says None for two different worlds — the file is missing, and the
+            # read failed (its own ``except OSError``). Collapsing them to '' made the refusal claim
+            # "worker log empty" about a log that exists and was never read (reviewer, 19.11.2026:
+            # a chmod 0 log produced a false, checkable statement).
+            try:
+                path = kb.worker_log_path(params['task_id'], board=params.get('board'))
+                exists = path.exists()
+            except OSError as exc:
+                parts.append(f'worker log unreadable: {exc}')
+                return '; '.join(parts)
+            parts.append(f'worker log unreadable: {path}' if exists else 'worker log empty')
+            return '; '.join(parts)
         # The worker's own last words before it gave up, minus CLI chrome.
         lines = [ln.strip() for ln in log.splitlines() if ln.strip()]
         for line in reversed(lines):
