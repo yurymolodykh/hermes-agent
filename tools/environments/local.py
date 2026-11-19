@@ -1158,6 +1158,12 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        # Access boundary: with acl.enabled=false this returns the SAME list object (zero cost,
+        # zero change). With it on, the kernel confines this child and everything it spawns —
+        # filesystem roots from the policy, and NO network by default (Landlock net rights,
+        # probed on this kernel; see hermes_acl/policy.py).
+        from hermes_acl.policy import wrap_argv as _acl_wrap_argv
+        args = _acl_wrap_argv(args, workspace=self.cwd)
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
         proc = subprocess.Popen(

@@ -6,6 +6,7 @@ are imported lazily inside the functions that use them (avoids an import cycle).
 
 from pm import install_hint
 import sys
+from pathlib import Path
 
 
 def _cmd_memory_off():
@@ -20,8 +21,12 @@ def _cmd_memory_off():
 
 
 def _cmd_memory_reset(args):
-    from hermes_constants import get_hermes_home, display_hermes_home
-    mem_dir = get_hermes_home() / "memories"
+    from hermes_constants import display_hermes_home
+    from tools.memory_tool import memory_dirs_all
+    # Memory is per subject (ACCESS-MODEL D13): the files live in memories/u/<subject>/ as well as
+    # in the legacy base. A reset that only looked at the base would report "nothing to reset"
+    # while every real note survived — the owner's destructive command must cover every bucket.
+    mem_dirs = memory_dirs_all()
     target = getattr(args, "target", "all")
     files_to_reset = []
     if target in {"all", "memory"}:
@@ -29,15 +34,16 @@ def _cmd_memory_reset(args):
     if target in {"all", "user"}:
         files_to_reset.append(("USER.md", "user profile"))
 
-    existing = [(f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()]
+    existing = [(d, f, desc) for d in mem_dirs for f, desc in files_to_reset if (d / f).exists()]
     if not existing:
         print(f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n")
         return
 
     print("\n  This will permanently erase the following memory files:")
-    for f, desc in existing:
-        size = (mem_dir / f).stat().st_size
-        print(f"    ◆ {f} ({desc}) — {size:,} bytes")
+    for d, f, desc in existing:
+        size = (d / f).stat().st_size
+        bucket = d.relative_to(mem_dirs[0]) if d != mem_dirs[0] else Path(".")
+        print(f"    ◆ {bucket / f} ({desc}) — {size:,} bytes")
 
     if not getattr(args, "yes", False):
         try:
@@ -49,12 +55,12 @@ def _cmd_memory_reset(args):
             print("  Cancelled.\n")
             return
 
-    for f, desc in existing:
-        (mem_dir / f).unlink()
+    for d, f, desc in existing:
+        (d / f).unlink()
         print(f"  ✓ Deleted {f} ({desc})")
 
     print("\n  Memory reset complete. New sessions will start with a blank slate.")
-    print(f"  Files were in: {display_hermes_home()}/memories/\n")
+    print(f"  Files were in: {display_hermes_home()}/memories/ (base and u/<subject>/)\n")
 
 
 def cmd_memory(args):

@@ -501,11 +501,13 @@ async def get_memory_status(profile: Optional[str] = None):
         cfg = load_config()
         mem = cfg.get("memory")
         active = _normalize_memory_provider_name(mem.get("provider")) if isinstance(mem, dict) else ""
-        mem_dir = get_hermes_home() / "memories"
+        from tools.memory_tool import memory_dirs_all
+        # Memory is per subject (ACCESS-MODEL D13): sum the legacy base AND every u/<subject>/
+        # bucket, or the panel reports 0 bytes while the real notes sit in a subject dir.
+        mem_dirs = memory_dirs_all()
         files = {}  # sizes so the UI can show what a reset would erase
         for fname, key in _MEMORY_FILES:
-            path = mem_dir / fname
-            files[key] = path.stat().st_size if path.exists() else 0
+            files[key] = sum(p.stat().st_size for d in mem_dirs if (p := d / fname).exists())
         return {"active": active, "providers": _discover_memory_provider_statuses(), "builtin_files": files}
 
     return await config_scoped_to_thread(profile, _run)
@@ -540,16 +542,21 @@ async def reset_memory(body: MemoryReset, profile: Optional[str] = None):
     profile = destructive_profile(profile, "POST /api/memory/reset")
 
     def _run():
-        mem_dir = get_hermes_home() / "memories"
+        from tools.memory_tool import memory_dirs_all
+        # Every bucket: the base and each u/<subject>/ (ACCESS-MODEL D13). Deleting only the base
+        # would report success while every real note survived.
+        mem_dirs = memory_dirs_all()
         deleted = []
-        for fname, key in _MEMORY_FILES:
-            path = mem_dir / fname
-            if target in {"all", key} and path.exists():
-                try:
-                    path.unlink()
-                    deleted.append(fname)
-                except OSError as exc:
-                    raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
+        for d in mem_dirs:
+            for fname, key in _MEMORY_FILES:
+                path = d / fname
+                if target in {"all", key} and path.exists():
+                    try:
+                        path.unlink()
+                    except OSError as exc:
+                        raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
+                    if fname not in deleted:
+                        deleted.append(fname)
         return {"ok": True, "deleted": deleted}
 
     return await config_scoped_to_thread(profile, _run)

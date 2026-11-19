@@ -609,6 +609,11 @@ class SearchMixin:
         from tools.environments.local import _kill_process_group_posix, _make_run_env
         cwd = getattr(self.env, "cwd", None) or self.cwd
         args = shlex.split(" ".join(argv))
+        # rg is a direct spawn that bypasses both the shell and _scope_argv: without the shim here
+        # a symlink or a crafted argument walks the search outside the allowed roots while the
+        # in-process path check on the query still says "allowed".
+        from hermes_acl.policy import wrap_argv as _acl_wrap_argv
+        args = _acl_wrap_argv(args, workspace=cwd)
         try:
             proc = subprocess.Popen(
                 args, cwd=cwd, env=_make_run_env(self.env.env), stdin=subprocess.DEVNULL,

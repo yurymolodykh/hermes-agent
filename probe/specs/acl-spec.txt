@@ -1,0 +1,27 @@
+version 1
+fs rx /usr
+fs rx /bin
+fs rx /sbin
+fs rx /lib
+fs rx /lib64
+fs rx /lib32
+fs rx /etc
+fs rx /opt
+fs r /proc
+fs rw /dev
+fs rw /tmp
+fs rw /var/tmp
+fs rw /run/user
+fs rx /home/hermes/.hermes/hermes-agent/.venv
+fs rx /home/hermes/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu
+fs rw /home/hermes/hermes-worktrees/t_296c8418
+fs x /home/hermes/hermes-worktrees
+fs x /home/hermes
+fs x /home
+fs x /home/hermes/.hermes/profiles/03-software-engineer/cache
+fs x /home/hermes/.hermes/profiles/03-software-engineer
+fs x /home/hermes/.hermes/profiles
+fs x /home/hermes/.hermes
+fs rw /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch
+net deny
+net allow connect 55553
