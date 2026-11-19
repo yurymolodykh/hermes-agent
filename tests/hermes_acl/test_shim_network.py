@@ -82,11 +82,21 @@ class _Listeners:
 
 def _spec(tmp_path: Path, *, net_mode: str = "deny", net_required: bool = False,
           allow: list[tuple[str, int]] | None = None) -> Path:
+    # The tmp root is NOT always /tmp: scripts/run_tests.sh moves TMPDIR to the disk-backed
+    # /var/tmp so CI does not fill RAM-backed tmpfs. A hardcoded "/tmp" grant therefore works
+    # locally and fails in CI — the child cannot write its report and the assertion sees ENOENT.
+    # Grant the directory pytest actually gave us, so the spec follows the runner.
     built = spec_mod.build(
-        [("/", "rx"), ("/dev", "rw"), ("/tmp", "rw")],
+        [("/", "rx"), ("/dev", "rw"), (str(_tmp_root(tmp_path)), "rw")],
         net_mode=net_mode, net_required=net_required, net=allow or [],
     )
     return spec_mod.write(built, tmp_path / "spec.txt")
+
+
+def _tmp_root(tmp_path: Path) -> Path:
+    """The writable tmp root above *tmp_path*: ``/tmp/x/y`` -> ``/tmp``, ``/var/tmp/a`` -> ``/var/tmp``."""
+    parts = tmp_path.resolve().parts
+    return Path(*parts[:2]) if parts[:1] == ("/",) else tmp_path
 
 
 def _run_python_shim(tmp_path: Path, spec_path: Path, script: str, args: list[str] | None = None,
@@ -96,7 +106,7 @@ def _run_python_shim(tmp_path: Path, spec_path: Path, script: str, args: list[st
     cmd = [sys.executable, "-m", "hermes_acl.shim", "--spec", str(spec_path), "--",
            sys.executable, str(script_path), *(args or [])]
     env = {**os.environ, "PYTHONPATH": str(REPO), **(extra_env or {})}
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO), timeout=180)
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO), timeout=180, check=False)
 
 
 def _run_native_shim(tmp_path: Path, spec_path: Path, script: str, args: list[str] | None = None,
@@ -109,7 +119,7 @@ def _run_native_shim(tmp_path: Path, spec_path: Path, script: str, args: list[st
     script_path.write_text(script, encoding="utf-8")
     cmd = [binary, "--spec", str(spec_path), "--", sys.executable, str(script_path), *(args or [])]
     return subprocess.run(cmd, capture_output=True, text=True,
-                          env={**os.environ, **(extra_env or {})}, timeout=180)
+                          env={**os.environ, **(extra_env or {})}, timeout=180, check=False)
 
 
 IMPLS = {"python": _run_python_shim, "native": _run_native_shim}
@@ -181,7 +191,7 @@ class TestNetworkIsDeniedByDefault:
             script = tmp_path / "client.py"
             script.write_text(CLIENT, encoding="utf-8")
             r = subprocess.run([sys.executable, str(script), str(lis.ports[0]), str(lis.ports[1])],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, check=False)
         assert r.returncode == 0, r.stderr
         assert f"port{lis.ports[0]}=CONNECTED" in r.stdout
         assert f"port{lis.ports[1]}=CONNECTED" in r.stdout
@@ -207,7 +217,7 @@ inner = "import socket;s=socket.socket();s.settimeout(3)\n"
 inner += f"try:\n s.connect(('127.0.0.1',{int(sys.argv[2])}));print('GC=CONNECTED')\n"
 inner += "except PermissionError as e:\n print(f'GC=DENIED:{e.errno}')\n"
 inner += "except ConnectionRefusedError:\n print('GC=REFUSED')\n"
-r = subprocess.run([sys.executable, "-c", inner], capture_output=True, text=True)
+r = subprocess.run([sys.executable, "-c", inner], capture_output=True, text=True, check=False)
 print(r.stdout.strip())
 """
             r = run_shim(tmp_path, spec_path, script, [str(lis.ports[0]), str(lis.ports[1])])
@@ -265,7 +275,7 @@ class TestRefusalsAreFailClosed:
                 pytest.skip("no C compiler on this host")
             cmd = [binary, "--spec", str(spec_path), "--", sys.executable, "-c", code]
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO),
-                           env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120)
+                           env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120, check=False)
         assert r.returncode == shim_mod.EXIT_REFUSED, r.stderr
         assert not marker.exists(), "the command must NOT run when the policy is unusable"
 
@@ -273,7 +283,7 @@ class TestRefusalsAreFailClosed:
         spec_path = _spec(tmp_path)
         r = subprocess.run([sys.executable, "-m", "hermes_acl.shim", "--spec", str(spec_path), "--"],
                            capture_output=True, text=True, cwd=str(REPO),
-                           env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120)
+                           env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120, check=False)
         assert r.returncode == shim_mod.EXIT_USAGE
 
     @requires_net
@@ -281,17 +291,17 @@ class TestRefusalsAreFailClosed:
         """``net required`` turns an unsupported kernel into a refusal, not a quiet downgrade."""
         spec_path = _spec(tmp_path, net_required=True)
         code = (
-            "import sys;sys.path.insert(0,%r)\n"
+            f"import sys;sys.path.insert(0,{str(REPO)!r})\n"
             "from hermes_acl import shim, landlock\n"
             "landlock.net_supported = lambda: {'supported': False, 'reason': 'simulated'}\n"
             "try:\n"
-            "    shim.apply(shim.load_spec(%r))\n"
+            f"    shim.apply(shim.load_spec({str(spec_path)!r}))\n"
             "    print('NO-REFUSAL')\n"
             "except shim.ShimError as e:\n"
             "    print('REFUSED:', e)\n"
-        ) % (str(REPO), str(spec_path))
+        )
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                           cwd=str(REPO), env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120)
+                           cwd=str(REPO), env={**os.environ, "PYTHONPATH": str(REPO)}, timeout=120, check=False)
         assert "REFUSED:" in r.stdout, r.stdout + r.stderr
 
     def test_native_shim_refuses_required_net_on_an_old_kernel(self, tmp_path):
@@ -306,7 +316,7 @@ class TestRefusalsAreFailClosed:
         spec_mod.write(spec_mod.build([("/", "rx")], net_required=True), spec_path)
         assert "net required" in spec_path.read_text(encoding="utf-8")
         r = subprocess.run([binary, "--spec", str(spec_path), "--", "/bin/true"],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, check=False)
         assert r.returncode == 0, r.stderr
 
 
@@ -327,7 +337,7 @@ class TestReport:
                 pytest.skip("no C compiler on this host")
             cmd = [binary, "--spec", str(spec_path), "--", sys.executable, "-c", code]
         env = {**os.environ, "PYTHONPATH": str(REPO), "HERMES_ACL_SHIM_REPORT": str(report)}
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO), timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO), timeout=120, check=False)
         assert r.returncode == 0, r.stderr
         data = json.loads(report.read_text(encoding="utf-8"))
         assert data["net_enabled"] is True
@@ -413,7 +423,7 @@ class TestOverhead:
             xs = []
             for _ in range(n):
                 t = time.perf_counter()
-                subprocess.run(argv, capture_output=True)
+                subprocess.run(argv, capture_output=True, check=False)
                 xs.append((time.perf_counter() - t) * 1000)
             return statistics.median(xs)
 

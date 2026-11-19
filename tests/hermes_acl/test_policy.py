@@ -175,11 +175,11 @@ class TestTheBoundaryActuallyHolds:
 
         allowed = subprocess.run([binary, "--spec", str(spec_path), "--", "/bin/cat",
                                   str(workspace / "visible.txt")],
-                                 capture_output=True, text=True, timeout=120)
+                                 capture_output=True, text=True, timeout=120, check=False)
         assert "PUBLIC" in allowed.stdout, allowed.stderr
 
         refused = subprocess.run([binary, "--spec", str(spec_path), "--", "/bin/cat",
-                                  str(secret)], capture_output=True, text=True, timeout=120)
+                                  str(secret)], capture_output=True, text=True, timeout=120, check=False)
         assert "PRIVATE-77" not in refused.stdout, (
             "the confined child read a file outside its workspace — the policy grants too much")
         assert refused.returncode != 0

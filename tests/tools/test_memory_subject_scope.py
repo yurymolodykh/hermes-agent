@@ -284,7 +284,7 @@ class TestLegacyCompatibility:
         for var in ("HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_USER_ID", "HERMES_PLATFORM"):
             env.pop(var, None)
         code = self._CODE % str(Path(__file__).resolve().parents[2])
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=180)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=180, check=False)
         assert r.returncode == 0, r.stderr
         subject_line, dir_line = r.stdout.strip().splitlines()[:2]
         return home, subject_line, dir_line
@@ -309,12 +309,12 @@ class TestLegacyCompatibility:
         for var in ("HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_USER_ID", "HERMES_PLATFORM"):
             env.pop(var, None)
         code = (
-            "import sys; sys.path.insert(0, %r)\n"
+            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
             "from tools.memory_tool import MemoryStore\n"
             "s = MemoryStore(memory_char_limit=500, user_char_limit=300, memory_enabled=True)\n"
             "s.load_from_disk(); print(s.add('memory', 'cli-note: legacy path'))\n"
-        ) % str(Path(__file__).resolve().parents[2])
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=180)
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=180, check=False)
         assert r.returncode == 0, r.stderr
         return home
 
@@ -330,14 +330,14 @@ class TestLegacyCompatibility:
         Also flipped ON in the same shape, so the two runs differ in exactly one thing.
         """
         code = (
-            "import sys; sys.path.insert(0, %r)\n"
+            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
             "from gateway.session_context import set_session_vars\n"
             "set_session_vars(platform='telegram', source='telegram', chat_id='42', chat_type='dm',\n"
             "                 user_id='tg:alice', actor_id='tg:alice', session_id='s1')\n"
             "from tools.memory_tool import get_memory_dir, memory_subject\n"
             "print(memory_subject())\n"
             "print(get_memory_dir())\n"
-        ) % str(Path(__file__).resolve().parents[2])
+        )
 
         def run(acl: bool):
             home = tmp_path / ("home-on" if acl else "home-off")
@@ -346,7 +346,7 @@ class TestLegacyCompatibility:
                 (home / "config.yaml").write_text("acl:\n  enabled: true\n", encoding="utf-8")
             env = {**os.environ, "HERMES_HOME": str(home), "HOME": str(tmp_path / "user")}
             r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                               env=env, timeout=180)
+                               env=env, timeout=180, check=False)
             assert r.returncode == 0, r.stderr
             subject_line, dir_line = r.stdout.strip().splitlines()[:2]
             return home, subject_line, dir_line
