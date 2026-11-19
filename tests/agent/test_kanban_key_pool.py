@@ -856,11 +856,17 @@ class TestMaxCardsPerKey:
 
         kp.mark_key_failed("t_a", 401, reason="auth_rejected", pid=os.getpid())
 
-        # The failing card's slot is gone; the innocent card keeps its own.
+        # The failing card keeps its own slot (marked bad) — a live card must
+        # never lose the key it is still running on (defect D1) — and the
+        # innocent card keeps its own untouched.
         rows = kp.pool_status()["reservations"]
-        assert [(r["task_id"], r["key_id"]) for r in rows] == [("t_b", 2)]
-        # The key is quarantined, so the freed slot is NOT handed out again —
-        # with no other card key the next card must be refused, not squeezed in.
+        assert [(r["task_id"], r["key_id"], r["status"]) for r in rows] == [
+            ("t_a", 2, "bad"),
+            ("t_b", 2, "active"),
+        ]
+        # The key is quarantined, so neither the bad slot nor the second slot
+        # is handed out again — with no other card key the next card must be
+        # refused, not squeezed in.
         with pytest.raises(kp.KeyPoolError) as exc:
             kp.reserve_for_card("t_c", 3, pid=live_pid())
         assert "Quarantined" in str(exc.value), str(exc.value)
@@ -2100,6 +2106,105 @@ class TestNoSilentKeySwap:
 
         again = kp.reserve_for_card("t_c", 3, pid=4103)
         assert again.key_id == 2
+
+    def test_quarantine_does_not_free_a_live_cards_key(self, tmp_path, live_pid):
+        """D1: at limit 1 quarantine used to delete the LIVE card's only slot.
+
+        Production runs ``max_cards_per_key = 1``, so a key holds exactly one
+        slot. ``mark_key_failed`` used to drop that slot; ``kept`` was then
+        empty and the whole reservation record vanished. As soon as
+        ``quarantine_until`` elapsed the key returned to circulation and was
+        handed to a second card while the first was still working on it —
+        the "one card = one key" invariant inverted.
+
+        Existing tests could not catch this: they reserved with dead pids
+        (4001/4101/4201) and/or used ``max_cards_per_key=2``. Here the owner
+        is a REAL live pid and the limit is the production 1.
+        """
+        write_keys(tmp_path, card_keys=2, max_cards_per_key=1)
+        owner = live_pid()
+        held = kp.reserve_for_card("t_live", 162, pid=owner)
+        assert held.key_id == 2
+
+        marked = kp.mark_key_failed("t_live", 429, reason="rate_limited", pid=owner)
+        assert marked is not None
+
+        # The live card's slot must survive the quarantine, in the ``bad``
+        # state so it still counts against the key's capacity.
+        rows = kp.pool_status()["reservations"]
+        assert [(r["task_id"], r["key_id"], r["status"]) for r in rows] == [
+            ("t_live", 2, "bad"),
+        ]
+        key_row = next(k for k in kp.pool_status()["keys"] if k["key_id"] == 2)
+        assert (key_row["used"], key_row["limit"]) == (1, 1), (
+            "the quarantined key is still fully occupied by its live card"
+        )
+
+        # While the window lasts: the second card goes to the other key.
+        nxt = kp.reserve_for_card("t_next", 163, pid=live_pid())
+        assert nxt.key_id == 3
+
+        # The decisive half — the window EXPIRES. The key is no longer
+        # quarantined, but its only slot belongs to a card that is still
+        # alive, so the key must stay unavailable; it may not be re-issued.
+        state_file = Path(os.environ[kp.ENV_KEYPOOL_STATE])
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        for record in state["failed_keys"].values():
+            record["quarantine_until"] = int(time.time()) - 5
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        kp.reset_process_cache()
+
+        with pytest.raises(kp.KeyPoolError) as exc:
+            kp.reserve_for_card("t_third", 164, pid=live_pid())
+        assert "#2: 1/1" in str(exc.value), str(exc.value)
+
+        # And the card that owns the key still resolves to it itself.
+        again = kp.reserve_for_card("t_live", 162, pid=owner)
+        assert (again.key_id, again.reused) == (2, True)
+
+        # Requirement 7 is untouched: a *new* card is kept off the rejected
+        # key for the whole window, which is proven above (it went to #3).
+
+    def test_the_quarantined_slot_is_freed_by_the_cards_own_release(
+        self, tmp_path, live_pid
+    ):
+        """The backstop for the kept slot: the card's release, not the timer."""
+        write_keys(tmp_path, card_keys=1, max_cards_per_key=1)
+        owner = live_pid()
+        kp.reserve_for_card("t_live", 1, pid=owner)
+        kp.mark_key_failed("t_live", 429, reason="rate_limited", pid=owner)
+
+        released = kp.release_for_task("t_live", pid=owner)
+        assert [r["key_id"] for r in released] == [2]
+        assert kp.pool_status()["reservations"] == []
+
+        # Once the window lapses the key is legitimately free again and the
+        # next card gets it — the release, not the quarantine, is what frees it.
+        state_file = Path(os.environ[kp.ENV_KEYPOOL_STATE])
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        for record in state["failed_keys"].values():
+            record["quarantine_until"] = int(time.time()) - 5
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        assert kp.reserve_for_card("t_after", 2, pid=live_pid()).key_id == 2
+
+    def test_the_quarantined_slot_is_freed_when_the_live_owner_dies(
+        self, tmp_path, live_pid
+    ):
+        """PID backstop: a killed worker must not pin the key forever."""
+        write_keys(tmp_path, card_keys=1, max_cards_per_key=1)
+        owner = live_pid()
+        kp.reserve_for_card("t_live", 1, pid=owner)
+        kp.mark_key_failed("t_live", 429, reason="rate_limited", pid=owner)
+
+        live_pid.kill(owner)
+
+        state_file = Path(os.environ[kp.ENV_KEYPOOL_STATE])
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        for record in state["failed_keys"].values():
+            record["quarantine_until"] = int(time.time()) - 5
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        assert kp.reserve_for_card("t_after", 2, pid=live_pid()).key_id == 2
 
     def test_clear_quarantine(self, tmp_path):
         write_keys(tmp_path, card_keys=1)

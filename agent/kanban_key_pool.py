@@ -1550,9 +1550,14 @@ def mark_key_failed(
 
     * the failure is written to the state file's ``failed_keys`` map, which is
       the audit trail (§4 of the report) and survives restarts;
-    * the reservation is released, so the key is not held hostage by a run
-      that is about to die — but a *quarantine* keeps it out of the next
-      reservation until it expires (or forever, for a dead 401/403 key);
+    * the card's OWN slot is kept, flipped to ``bad`` (defect D1: deleting it
+      freed the key for a second card while the first was still running on it,
+      which at the production limit of one card per key inverted the
+      "one card = one key" invariant). A ``bad`` slot still counts against the
+      key's capacity, so the key stays unavailable until the card releases it
+      (``release_for_task`` / ``release_for_pid``) or the PID/TTL backstop
+      reaps it — and a *quarantine* keeps it out of the next reservation for
+      new cards until it expires (or forever, for a dead 401/403 key);
     * this process's binding flips to ``bad``, so every further resolution in
       it raises instead of quietly working off some other key.
 
@@ -1646,15 +1651,21 @@ def mark_key_failed(
                 "key_label": entry.get("key_label") or f"key-{kid}",
                 "quarantine_until": quarantine_until,
             }
-            # The failing card loses its slot; the OTHER card on this key keeps
-            # its own slot record, but the key is quarantined so no new card
-            # enters it. Dropping the whole key record here would silently
-            # cancel a live sibling card's reservation.
-            kept = [s for s in _key_slots(entry) if s is not victim]
-            if kept:
-                entry["slots"] = kept
-            else:
-                reservations.pop(key_entry, None)
+            # The failing card keeps its slot while its own process is alive.
+            # Deleting it was defect D1: at the production limit of one card
+            # per key the key has exactly one slot, so ``kept`` came out empty,
+            # the whole reservation record vanished, and the moment
+            # ``quarantine_until`` elapsed the key went back into circulation
+            # and was handed to a second card while the first was still
+            # running on it. Marking the slot ``bad`` keeps it counted as
+            # occupied, so the key is not free for anyone else. The slot is
+            # removed by the card's own release (``release_for_task`` from
+            # ``_release_card_key`` / ``release_for_pid`` on exit) or, if the
+            # process dies without releasing, by the PID/TTL backstop in
+            # ``_sweep_locked``. The OTHER card on a shared key keeps its own
+            # slot untouched.
+            victim["status"] = _STATUS_BAD
+            victim["quarantined_at"] = int(now)
             break
         if marked is not None:
             _write_state(path, state)
