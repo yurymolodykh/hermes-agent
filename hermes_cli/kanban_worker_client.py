@@ -219,6 +219,12 @@ def _unknown_cause(params, board_db):
     """
     import sqlite3
     from contextlib import closing
+    # The log scan below is the ONLY source when the board is unreadable or silent, so it must not
+    # share a swallow-all with the board read. Every failure is appended as part of the answer
+    # instead of being dropped: "the worker log is empty" must never be said about a log we did not
+    # manage to read (the reviewer caught exactly that, 19.11.2026: an unimported marker raised
+    # inside `any(...)` and `except Exception: pass` turned the whole branch into dead code).
+    from hermes_cli.turn_exit import SESSION_PERSIST_MARKER
     parts = []
     try:
         from pathlib import Path
@@ -235,11 +241,11 @@ def _unknown_cause(params, board_db):
                 payload = json.loads(row[1] or '{}')
                 detail = str(payload.get('worker_output') or payload.get('error')
                              or payload.get('reason') or '')[:200]
-            except Exception:
+            except (ValueError, TypeError):
                 detail = ''
             parts.append(f'last board event `{row[0]}`' + (f': {detail}' if detail else ''))
-    except Exception:
-        pass
+    except (OSError, sqlite3.Error) as exc:
+        parts.append(f'board unreadable: {exc}')
     try:
         from hermes_cli import kanban_db as kb
         import re
@@ -254,8 +260,10 @@ def _unknown_cause(params, board_db):
         if lines:
             last = re.sub(r"\s+", " ", lines[-1])[-200:]
             parts.append(f'worker log ends: {last}')
-    except Exception:
-        pass
+        else:
+            parts.append('worker log empty')
+    except (OSError, sqlite3.Error) as exc:
+        parts.append(f'worker log unreadable: {exc}')
     return '; '.join(parts)
 
 
@@ -276,8 +284,11 @@ def _exit_code(receipt, params, board_db):
         raise GatewayClientError(
             'Kanban execution unknown; retained by owner — the admission never settled and no '
             'worker_result was recorded for this attempt'
+            # Never assert an unverified fact here: `_unknown_cause` reports what it actually saw
+            # (a board event, a log line, or the read failure itself), so the absence of a cause
+            # means both sources were consulted and silent — not that the log "is empty".
             + (f'. Cause: {cause}' if cause else
-               '. Cause unknown: the board has no run event explaining it and the worker log is empty'))
+               '. Cause unknown: neither the board nor the worker log could explain this attempt'))
     return result.get('exit_code', 1)
 
 

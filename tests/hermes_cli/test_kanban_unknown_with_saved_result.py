@@ -53,14 +53,63 @@ def test_unknown_with_a_failed_saved_result_keeps_its_own_exit_code(capsys):
     assert "execution unknown" not in out
 
 
-def test_unknown_without_a_saved_result_still_refuses_and_names_the_reason(capsys):
-    """Дефект 1, критерий 2: записи нет — отказ, но сообщение объясняет «почему»."""
+@pytest.fixture(name="worker_log")
+def worker_log_fixture(monkeypatch):
+    """Подменить лог воркера — единственный носитель причины, когда доски нет."""
+    from hermes_cli import kanban_db
+    def install(text):
+        monkeypatch.setattr(kanban_db, "read_worker_log", lambda *a, **k: text)
+    return install
+
+
+def test_unknown_without_any_source_refuses_and_does_not_claim_a_silent_log(capsys, worker_log):
+    """Дефект 1, критерий 2 (база): записи нет, оба источника молчат — отказ, без ложных фактов."""
+    worker_log("")
     with pytest.raises(GatewayClientError) as err:
         _exit_code("unknown", {})
     message = str(err.value)
     assert "unknown" in message
-    # Сообщение обязано нести причину, а не только констатацию отказа.
-    assert "причин" in message.lower() or "cause" in message.lower() or "reason" in message.lower()
+    assert "cause" in message.lower() or "причин" in message.lower()
+    # Утверждать «лог пуст» можно только после того, как его прочитали: это проверено выше.
+    assert "worker log empty" in message
+
+
+def test_unknown_refusal_quotes_the_real_cause_from_the_worker_log(capsys, worker_log):
+    """Дефект 1, критерий 2: причина известна из лога — она обязана попасть в сообщение.
+
+    Ревизия 4b5a67b85f не импортировала ``SESSION_PERSIST_MARKER``: ``NameError`` внутри
+    ``any(...)`` глотался ``except Exception: pass``, и сообщение утверждало «the worker log is
+    empty» при непустом логе. Тест ловит именно это: он требует фрагмент НАСТОЯЩЕЙ причины.
+    """
+    worker_log("...\n⚠️ Нет ответа: Hermes не смог сохранить этот разговор и остановился\n")
+    with pytest.raises(GatewayClientError) as err:
+        _exit_code("unknown", {})
+    message = str(err.value)
+    assert "не смог сохранить" in message, message
+    assert "worker log: " in message
+    # Доска здесь недоступна (/nonexistent.db) — это должно быть сказано, а не выдумано.
+    assert "board unreadable" in message
+
+
+def test_unknown_refusal_reads_the_persist_marker_alone(capsys, worker_log):
+    """Маркер ``[session-persist-failed]`` распознаётся сам по себе — значит он импортирован.
+
+    Косвенная проверка импорта: без него строка-маркер не опознаётся и ветка чтения лога мертва.
+    """
+    from hermes_cli.turn_exit import SESSION_PERSIST_MARKER
+    worker_log(f"{SESSION_PERSIST_MARKER} turn aborted: session store refused the write\n")
+    with pytest.raises(GatewayClientError) as err:
+        _exit_code("unknown", {})
+    assert SESSION_PERSIST_MARKER in str(err.value)
+
+
+def test_unknown_refusal_falls_back_to_the_last_log_line(capsys, worker_log):
+    """Лог без известных маркеров: причина всё равно берётся из его последней строки."""
+    worker_log("starting turn\nexit: provider returned 500\n")
+    with pytest.raises(GatewayClientError) as err:
+        _exit_code("unknown", {})
+    message = str(err.value)
+    assert "worker log ends: exit: provider returned 500" in message
 
 
 def test_terminal_receipt_is_unchanged(capsys):
