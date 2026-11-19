@@ -274,13 +274,19 @@ def _run_worker_turns(agent, frame, history):
             return agent.run_conversation(frame['text'], conversation_history=history, **worker_display_kwargs(),
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
-    from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+    from hermes_cli.turn_exit import credential_failure_flags, failure_kind, turn_exit_code, SESSION_PERSIST_MARKER
     code, last_output = 1, ''
     interrupted_cause = ''
+    kind = None
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
+        kind = failure_kind(result)
+        if kind == 'session_persist' and last_output and not last_output.startswith(SESSION_PERSIST_MARKER):
+            # The turn's own words stay, but the CATEGORY leads: a session that could not be saved
+            # reads as a normal chat reply otherwise, and the board guesses at the cause (19.11.2026).
+            last_output = f'{SESSION_PERSIST_MARKER} {last_output}'
         # The owner records WHICH stop it sent (a gateway restart/shutdown, or a user Stop);
         # without it the dispatcher books a restart's interrupted turn as a card failure.
         if isinstance(result, dict) and result.get('interrupted'):
@@ -288,9 +294,11 @@ def _run_worker_turns(agent, frame, history):
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        kind = 'turn_error'
         raise
     finally:
-        _record_worker_result(context, code, last_output, interrupt_message=interrupted_cause)
+        _record_worker_result(context, code, last_output, interrupt_message=interrupted_cause,
+                              failure_kind=kind)
 
 
 def record_start_failure(frame, exc):
@@ -303,7 +311,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output, interrupt_message=''):
+def _record_worker_result(context, code, last_output, interrupt_message='', failure_kind=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -314,6 +322,11 @@ def _record_worker_result(context, code, last_output, interrupt_message=''):
             # result in the immutable attempt event stream instead.
             payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
                        'last_output': last_output}
+            if failure_kind:
+                # One stable word for the category of the failure (`session_persist`, `turn_error`,
+                # `tool_denied`, `turn_interrupted`): the board alerts and counts by it instead of
+                # re-parsing free text. Absent on a clean turn.
+                payload['failure_kind'] = failure_kind
             if interrupt_message:
                 # Which stop ended the turn (a gateway restart/shutdown vs the user's Stop), so the
                 # crash sweep can exempt a host-caused interruption from the card's failure budget.

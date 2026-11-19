@@ -82,6 +82,54 @@ def _human_bytes(value) -> str:
     return ""
 
 
+def storage_facts(db_path) -> list[str]:
+    """Measured storage facts for a persistence failure, one line per CHECK.
+
+    The generic "possible causes: the disk may be full or another process holds the database" sent
+    an operator looking for space that was never the problem. Each entry here is a probe that
+    actually ran, with its own answer (free bytes, the file that refused a write, whether the
+    database can be locked for writing). An unprobeable check is omitted, never guessed.
+    """
+    import shutil
+    import sqlite3
+    from pathlib import Path
+
+    facts: list[str] = []
+    path = Path(str(db_path)).expanduser() if db_path else None
+    if path is None:
+        return facts
+    parent = path.parent if path.parent.is_dir() else path
+    try:
+        usage = shutil.disk_usage(str(parent))
+        facts.append(t("explainer.storage.free_space", path=str(parent),
+                       free=_human_bytes(usage.free), total=_human_bytes(usage.total)))
+    except OSError:
+        facts.append(t("explainer.storage.free_space_unknown", path=str(parent)))
+    for target in (path, path.parent):
+        try:
+            if target.exists():
+                ok = os.access(str(target), os.R_OK | os.W_OK)
+            else:
+                ok = False
+        except OSError:
+            ok = False
+        facts.append(t("explainer.storage.writable" if ok else "explainer.storage.not_writable",
+                       path=str(target)))
+    try:
+        if path.exists():
+            with suppress(Exception):
+                conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=0.5)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.rollback()
+                    facts.append(t("explainer.storage.lock_free", path=str(path)))
+                finally:
+                    conn.close()
+    except Exception:
+        facts.append(t("explainer.storage.lock_held", path=str(path)))
+    return facts
+
+
 def _file_mutation_identity(path: str, task_id: Optional[str]) -> str:
     """One key per on-disk target: the file tools' task-resolved absolute path, case-folded
     on case-insensitive hosts. A failure recorded as ``notes.md`` and the write that later
@@ -305,6 +353,13 @@ class TurnExplainersMixin:
                 fill["journal_path"] = (fill["journal_path"]
                                         or f"{display_hermes_home()}/worker-outboxes/<execution>/pending.json")
             body = t(_persistence_explanation_key(persistence_cause), **fill)
+            # Name what was CHECKED, not what might be wrong: "possible causes" wasted an operator's
+            # evening hunting disk space while the real cause was a locked database (19.11.2026).
+            facts = [] if persistence_cause in ("outbox_full", "outbox_busy") else storage_facts(
+                db_path or fill.get("db_path"))
+            if facts:
+                body = body + "\n\n" + t("explainer.storage.header") + "\n" + "\n".join(
+                    f"  • {fact}" for fact in facts)
         else:
             body = None
         return t("explainer.no_reply_prefix") + body if body else ""

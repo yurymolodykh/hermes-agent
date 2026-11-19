@@ -3680,6 +3680,14 @@ explainer:
     outbox_busy: "the turn was stopped because this worker's write journal was still busy (an earlier entry had not been acknowledged yet, or another process owns the journal file). The database itself is fine. Wait a few seconds and send your message again; if it keeps happening, run `hermes {profile_arg}doctor`."
     permission_denied: "Hermes stopped because it could not write to the session store: the file permissions deny access. Freeing storage space will not help. Make sure your user owns {home}/state.db and may write in its directory, then send your message again."
     default: "Hermes couldn't save this conversation, so it stopped rather than lose your messages. Possible causes: the drive is out of room, or another Hermes process is holding the database. Close other Hermes windows, run `hermes {profile_arg}doctor` to check storage, then send your message again."
+  storage:
+    header: "Checked just now:"
+    free_space: "free space on {path}: {free} of {total}"
+    free_space_unknown: "free space on {path}: could not be measured"
+    writable: "{path}: writable by this user"
+    not_writable: "{path}: NOT writable by this user (permissions deny the write)"
+    lock_free: "{path}: accepted a write lock (no other process holds it)"
+    lock_held: "{path}: could NOT take a write lock — another process holds the database"
   file_mutation:
     header: "⚠️ File-mutation verifier: {count} file edit(s) FAILED this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm what actually landed."
     entry: "  • `{path}` — [{tool}] {preview}"

@@ -2,6 +2,22 @@
 
 Worker identity is supplied by the caller, not inferred from a daemon's environment.
 """
+from typing import Optional
+
+# A persistence failure is not one bucket: the card, the board and the operator's alerts need the
+# category, not a guess from an empty response (19.11.2026: a failed session write looked like a
+# normal chat reply, exit 1, and the run was booked as a generic crash).
+SESSION_PERSIST_MARKER = "[session-persist-failed]"
+# ``failure_kind`` values written into ``worker_result``. Kept stable: alerting and statistics read them.
+FAILURE_KIND_SESSION_PERSIST = "session_persist"
+FAILURE_KIND_TOOL_DENIED = "tool_denied"
+FAILURE_KIND_TURN_ERROR = "turn_error"
+FAILURE_KIND_INTERRUPTED = "turn_interrupted"
+
+# Reasons whose botching is the operator's tool policy, not the card's work.
+_TOOL_DENIED_REASONS = frozenset({"approval_denied", "tool_denied", "permission_denied",
+                                  "guardrail_halt", "data_policy_denied"})
+
 
 # Provider walls do not spend a Kanban task's retry budget.
 TRANSIENT_PROVIDER_REASONS = frozenset({
@@ -40,6 +56,30 @@ def turn_exit_code(
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
     return 1
+
+
+def failure_kind(result, *, interrupted_cause: str = "") -> Optional[str]:
+    """Category of a failed turn, for ``worker_result.failure_kind`` — ``None`` on a clean turn.
+
+    A card that failed says *why* in one stable word: the board can alert and count by category
+    without re-parsing free text. ``session_persist`` is the case that motivated this
+    (19.11.2026): a session that could not be saved looked like an ordinary reply.
+    """
+    if not isinstance(result, dict):
+        return FAILURE_KIND_TURN_ERROR
+    if result.get("interrupted"):
+        return FAILURE_KIND_INTERRUPTED
+    failed = bool(result.get("failed") or result.get("partial") or result.get("completed") is False)
+    if not failed:
+        return None
+    reason = str(result.get("failure_reason") or "")
+    if reason.startswith("session_persistence_failed") or result.get("turn_exit_reason") == "session_persistence_failed":
+        return FAILURE_KIND_SESSION_PERSIST
+    if reason.partition(":")[0] in _TOOL_DENIED_REASONS:
+        return FAILURE_KIND_TOOL_DENIED
+    if result.get("error") and SESSION_PERSIST_MARKER in str(result.get("error")):
+        return FAILURE_KIND_SESSION_PERSIST
+    return FAILURE_KIND_TURN_ERROR
 
 
 def credential_failure_flags(exc) -> dict:

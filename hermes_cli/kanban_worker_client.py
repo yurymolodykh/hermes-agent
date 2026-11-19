@@ -196,15 +196,88 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
+def _saved_result(params, board_db):
+    """This attempt's ``worker_result`` (claim_lock matched), or ``{}`` when there is none.
+
+    The board is the primary source: the owner writes the result inside the attempt, so it is
+    readable even when the admission never settled. An unreadable board is "no record", never an
+    exception on the submitter's exit path.
+    """
+    from gateway.session_kanban import worker_result
+    try:
+        return worker_result(board_db, params) or {}
+    except Exception:
+        return {}
+
+
+def _unknown_cause(params, board_db):
+    """Best-effort "why" for an ``unknown`` receipt with no saved result, or ``''``.
+
+    The receipt only says the admission did not settle; the card and the worker log still know
+    what happened. Reads, in order: the run's latest explanatory event on the board, then the tail
+    of the worker's own log for this task. Never raises — the refusal message must still print.
+    """
+    import sqlite3
+    from contextlib import closing
+    parts = []
+    try:
+        from pathlib import Path
+        uri = Path(board_db).resolve().as_uri() + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            row = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind NOT IN ('worker_result', 'heartbeat', 'checkpoint') "
+                "ORDER BY id DESC LIMIT 1", (params['task_id'], params['run_id'])).fetchone()
+        if row:
+            detail = ''
+            try:
+                import json
+                payload = json.loads(row[1] or '{}')
+                detail = str(payload.get('worker_output') or payload.get('error')
+                             or payload.get('reason') or '')[:200]
+            except Exception:
+                detail = ''
+            parts.append(f'last board event `{row[0]}`' + (f': {detail}' if detail else ''))
+    except Exception:
+        pass
+    try:
+        from hermes_cli import kanban_db as kb
+        import re
+        log = kb.read_worker_log(params['task_id'], tail_bytes=4000,
+                                 board=params.get('board')) or ''
+        # The worker's own last words before it gave up, minus CLI chrome.
+        lines = [ln.strip() for ln in log.splitlines() if ln.strip()]
+        for line in reversed(lines):
+            if any(marker in line for marker in (SESSION_PERSIST_MARKER, 'Нет ответа', 'No reply',
+                                                 'не смог сохранить', "couldn't save")):
+                return '; '.join(parts + [f'worker log: {line[-300:]}'])
+        if lines:
+            last = re.sub(r"\s+", " ", lines[-1])[-200:]
+            parts.append(f'worker log ends: {last}')
+    except Exception:
+        pass
+    return '; '.join(parts)
+
+
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
-    from gateway.session_kanban import worker_result
-    result = worker_result(board_db, params)
+    # Primary source FIRST: ``worker_result`` is written inside the attempt, and it outranks the
+    # admission's settlement. ``unknown`` means the admission did not settle — it does NOT mean the
+    # work did not happen. Reading the receipt first used to erase a saved failure and replace it
+    # with "the board did not recognise the worker" (19.11.2026, run 102: the session failed to
+    # persist, exit 1 and its message were on the board, and the next attempt reported only
+    # `Kanban execution unknown`).
+    result = _saved_result(params, board_db)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
+    if receipt['status'] == 'unknown' and not result:
+        cause = _unknown_cause(params, board_db)
+        raise GatewayClientError(
+            'Kanban execution unknown; retained by owner — the admission never settled and no '
+            'worker_result was recorded for this attempt'
+            + (f'. Cause: {cause}' if cause else
+               '. Cause unknown: the board has no run event explaining it and the worker log is empty'))
     return result.get('exit_code', 1)
 
 
