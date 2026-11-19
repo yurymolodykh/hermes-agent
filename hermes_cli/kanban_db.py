@@ -237,7 +237,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "skipped_keypool_capped",
 )
 
 
@@ -2659,6 +2659,31 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _release_card_key(task_id: str) -> None:
+    """Return *task_id*'s reserved API key to the pool (best-effort).
+
+    Part of the per-card key pool (``agent/kanban_key_pool.py``). Kept in the
+    kernel rather than in the tool layer so every terminal transition releases —
+    ``kanban_complete``, ``kanban_block``, ``hermes kanban complete``, and any
+    direct ``complete_task``/``block_task`` caller.
+
+    Scoped to the CARD, not to the calling process: a reviewer or an operator
+    profile that closes/blocks a card must still free the key its worker held
+    (otherwise the key stays reserved until the TTL backstop). It cannot free a
+    foreign key — the release matches ``task_id`` only.
+
+    Never raises: a release failure degrades to the PID/TTL backstop, and a
+    book-keeping error must not turn a successful completion into an error.
+    No-op when the pool is not configured.
+    """
+    try:
+        from agent.kanban_key_pool import release_for_task
+
+        release_for_task(task_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("kanban key-pool release for %s failed: %s", task_id, exc)
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2758,6 +2783,11 @@ def complete_task(
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
+    # Return this card's reserved API key to the pool. Best-effort and
+    # task-scoped: whichever process performs the terminal transition frees the
+    # key for THIS card, and no other. Never blocks a completion — the PID/TTL
+    # backstop reaps the reservation. No-op without a pool config.
+    _release_card_key(task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -3243,6 +3273,10 @@ def block_task(
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    # A blocked card is no longer running, so its reserved key goes back to the
+    # pool immediately rather than waiting for the TTL backstop. Same
+    # best-effort, task-scoped contract as the completion path.
+    _release_card_key(task_id)
     return True
 
 

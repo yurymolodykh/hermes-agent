@@ -485,5 +485,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
                                     "list` to see all boards.")
     _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
+    # ``hermes kanban keypool …`` (per-card API-key pool). Registered through its
+    # own builder so the pool's control surface stays in one module; imported
+    # lazily so a broken pool module can never break the rest of the CLI tree.
+    try:
+        from hermes_cli.subcommands.kanban_keypool import build_keypool_parser
+
+        _kanban_subs = next(a for a in kanban_parser._actions
+                            if isinstance(a, argparse._SubParsersAction))
+        build_keypool_parser(_kanban_subs)
+    except Exception:  # pragma: no cover - optional control surface
+        pass
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser

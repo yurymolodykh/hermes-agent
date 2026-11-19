@@ -32,6 +32,38 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
+# The full dispatcher envelope a genuine kanban worker carries (set by the
+# dispatcher in ``hermes_cli.kanban_db_dispatch._build_worker_env``). A bare
+# ``HERMES_KANBAN_TASK`` is NOT evidence of a worker: a long-lived process
+# started inside an old worker context inherits it.
+_DISPATCHER_WORKER_ENV_REQUIRED = (
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_PROFILE",
+)
+
+
+def is_dispatcher_worker_env() -> bool:
+    """True only when this process carries the full dispatcher worker envelope.
+
+    A genuine dispatcher-spawned kanban worker has ``HERMES_KANBAN_TASK`` plus the
+    run/board/workspace/profile keys the dispatcher sets for every worker. An
+    interactive session that merely inherited a stale ``HERMES_KANBAN_TASK`` from a
+    long-lived parent (a gateway launched inside an old worker env) is NOT a
+    dispatcher worker and must never be treated as one. Cheap first fence: needs no
+    board access, safe on any hot path.
+    """
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    session_source = (os.environ.get("HERMES_SESSION_SOURCE") or "").strip()
+    if session_source and session_source != "kanban":
+        return False
+    for key in _DISPATCHER_WORKER_ENV_REQUIRED:
+        if not (os.environ.get(key) or "").strip():
+            return False
+    return True
+
 
 def kanban_stop_nudge_enabled() -> bool:
     """On when ``HERMES_KANBAN_TASK`` is set for the dispatcher-owned worker, unless
@@ -153,5 +185,5 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal",
-           "worker_card_closed"]
+__all__ = ["build_kanban_stop_nudge", "is_dispatcher_worker_env", "kanban_stop_nudge_enabled",
+           "session_called_kanban_terminal", "worker_card_closed"]

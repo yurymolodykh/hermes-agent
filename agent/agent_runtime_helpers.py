@@ -979,6 +979,38 @@ def recover_with_credential_pool(
     rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
     usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
     pool = agent._credential_pool
+    # Per-card key pool: a card that holds a reserved key must not be rotated
+    # onto another account mid-run. Without this guard a 429/401 on a card key
+    # would silently rotate the agent onto a DIFFERENT key, defeating the
+    # reservation and making the audit record lie. The failure is recorded
+    # against the card's own key and the run fails loudly instead.
+    #
+    # Deliberately ABOVE the ``pool is None`` early return: a custom endpoint
+    # (e.g. letovo) resolves with no credential pool at all, so a guard after
+    # that return would be dead on the production configuration — the card's
+    # key would never be quarantined and the same dead key handed to the next
+    # card. Marking the key is about the CARD'S reservation, not the pool object.
+    try:
+        # ``active_card_binding``, not the raw process binding: an in-process
+        # cron run inside a worker inherits the worker's binding but is not the
+        # card, and must neither be blocked by it nor quarantine its key.
+        from agent.kanban_key_pool import active_card_binding, mark_current_key_failed
+
+        _kp_binding = active_card_binding()
+    except Exception:  # pragma: no cover - pool module unavailable
+        _kp_binding = None
+    if _kp_binding is not None and getattr(_kp_binding, "role", "") == "card":
+        logger.error(
+            "Credential pool rotation blocked: task %s holds reserved key #%s (%s) "
+            "and must not switch keys mid-run (status=%s)",
+            getattr(_kp_binding, "task_id", "?"), getattr(_kp_binding, "key_id", "?"),
+            getattr(_kp_binding, "label", "?"), status_code)
+        try:
+            mark_current_key_failed(status_code, reason="credential_rotation_blocked")
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("key-pool: marking the key bad failed", exc_info=True)
+        return False, has_retried_429
+
     if pool is None:
         return False, has_retried_429
     # The pool belongs to the PRIMARY provider: acting on fallback errors would corrupt its state

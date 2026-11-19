@@ -181,6 +181,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        # ``keypool`` is pure pool bookkeeping (no board tables): dispatch it before
+        # init_db so `hermes kanban keypool status` still answers on a corrupt or
+        # absent board DB — exactly when the operator needs to look at keys.
+        if action == "keypool":
+            from hermes_cli.subcommands.kanban_keypool import cmd_keypool
+
+            return int(cmd_keypool(args) or 0)
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
