@@ -39,8 +39,11 @@ def kanban_home(monkeypatch):
     with open(os.path.join(test_home, "profiles", "alpha", "config.yaml"), "w") as fh:
         fh.write("{}\n")
     monkeypatch.setenv("HERMES_HOME", test_home)
+    # Only the board modules are rebound: purging every ``hermes_cli`` module
+    # would hand other test modules a fresh ``runtime_provider`` that their
+    # monkeypatches no longer reach.
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod == "hermes_constants":
+        if mod.startswith("hermes_cli.kanban_db") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db, kanban_db_connect, kanban_db_dispatch
 
