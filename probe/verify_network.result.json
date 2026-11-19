@@ -1,0 +1,29 @@
+{
+  "kernel": {
+    "abi": 10,
+    "supported": true,
+    "rights": [
+      "bind_tcp",
+      "connect_tcp",
+      "bind_udp",
+      "connect_send_udp"
+    ],
+    "errno": 0,
+    "reason": "handled_access_net accepted"
+  },
+  "results": {
+    "baseline_allowed": "CONNECTED",
+    "baseline_denied": "CONNECTED",
+    "confined_default": "DENIED(errno=13)",
+    "confined_allowed": "CONNECTED",
+    "confined_other_port": "DENIED(errno=13)"
+  },
+  "checks": {
+    "baseline actually connects (the test can fail)": true,
+    "baseline connects to the second port too": true,
+    "confined default: DENIED with EACCES": true,
+    "confined with an allow rule: CONNECTED": true,
+    "allow rule is port-scoped (other port still DENIED)": true
+  },
+  "failed": []
+}

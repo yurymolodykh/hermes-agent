@@ -57,7 +57,7 @@ def build_native(*, force: bool = False) -> Optional[str]:
     _cache_dir().mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.run([cc, "-O2", "-o", str(out), str(NATIVE_SOURCE)],
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("acl shim: compiler failed: %s", exc)
         return None
