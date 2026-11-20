@@ -58,6 +58,30 @@
 является только владелец хоста; второй вошедший получает `profile_scope='profile'` (не может
 выбрать чужой профиль по имени) и обычные права своего субъекта. Сокет не отключается.
 
+### 3a. Сокет: скоуп субъекта на строку — `gateway/session_subject_scope.py` (новый)
+
+Снятия гранта мало: `SessionAuthority.authorize` сравнивал владельца строки с вызывающим
+**только для `Platform.LOCAL`**. Мессенджерный маршрут (Telegram, Discord, Slack, …) проваливался
+мимо проверки, поэтому второй человек на хосте открывал чужой чат по прямому id, а `attach`
+начинал стримить его живой поток.
+
+`gateway/session_subject_scope.py` (82 стр.) считает владельца **тем же** кодом, что REST
+(`hermes_acl_scope.owner_stamps` + `row_outside_scope`), чтобы обе поверхности не могли
+разойтись в ответе «чей это ряд»:
+
+* `actor_stamps(actor)` — стемпы субъекта; пустой субъект или непригодный реестр привязок → `[]`
+  («не совпадает ни с чем», fail closed, а не «всё»);
+* `session_stamp(...)` — стемп владельца: живой `source.user_id`, иначе `sessions.user_id`;
+* `foreign_session_in_multi_user(...)` — `False` при выключенном флаге, для владельца хоста и для
+  своего ряда; `True` для всего остального, **включая ряд без владельца** (поверхность со
+  скоупом не раскрывает транскрипт, чей владелец не указан).
+
+`SessionAuthority.authorize` вызывает его после существующей LOCAL-проверки и отказывает
+`not_found` — тем же ответом, что получает несуществующий id, чтобы сокет не стал оракулом
+существования идентификаторов.
+
+Заодно `session_listing._stored_closed` (листинг закрытых строк) переведён на `is_host_operator`.
+
 ### 4. SQL-слой: счётчики тоже в области владельца
 
 * `hermes_state_owner_scope.py` (новый) — общие правила scope-SQL: `None` = без ограничения,
@@ -102,25 +126,64 @@
 | Резолв личности владельца | `test_host_owner_identity_resolution`, `test_bindings_registry_names_the_owner_as_owner_branch` |
 | Профильная привязка сокета | `test_socket_scope_is_profile_bound_for_a_non_owner` |
 
+Сокет: скоуп субъекта по ручкам (`tests/gateway/test_session_subject_scope.py`, 19 тестов):
+
+| Что | Верб сокета | Тест |
+|---|---|---|
+| Модуль скоупа: стемпы субъекта | — | `test_actor_stamps_are_the_subjects_own_stamps` |
+| Пустой субъект ничего не совпадает | — | `test_an_actor_without_a_subject_matches_nothing` |
+| Непригодный реестр = отказ, не исключение | — | `test_an_unusable_registry_is_a_refusal_not_an_exception` |
+| Владелец берётся из живого источника | — | `test_the_live_source_names_the_owner_before_the_stored_row` |
+| Холодный ряд — из `sessions.user_id` | — | `test_a_cold_row_falls_back_to_its_stored_stamp` |
+| Флаг выключен — ничего не меняется | — | `test_the_flag_off_answers_no_foreign_row_at_all` |
+| Владельцу доступно всё | — | `test_the_host_owner_keeps_the_whole_store` |
+| Свой ряд внутри скоупа | — | `test_an_own_row_is_inside_the_scope` |
+| Чужой ряд вне скоупа | — | `test_a_foreign_row_is_outside_the_scope` |
+| Ряд без владельца тоже отказан | — | `test_an_unowned_row_is_refused_too` |
+| Листинг только своих | `session.list` | `test_the_listing_shows_only_the_callers_rows` |
+| Чужой id = отсутствующий id | `session.resume` | `test_a_foreign_id_is_refused_exactly_like_a_missing_one` |
+| Подписка отказана до join | `attach` | `test_attach_is_refused_with_the_same_answer` |
+| Владелец читает все ряды | `session.list`, `attach` | `test_the_owner_still_reads_every_row` |
+| Второй человек — не оператор | грант | `test_a_second_person_is_not_a_host_operator` |
+| **Критерий 4**: событие B не доходит до A (своё — доходит) | поток событий | `test_a_foreign_sessions_event_never_reaches_the_socket` |
+| Владелец получает свои события | поток событий | `test_the_owner_socket_still_receives_the_rows_it_owns` |
+| Канонический локальный ряд: создать через шлюз, открыть/не открыть | `session.list`, `session.resume`, поток | `test_a_second_person_cannot_open_a_canonical_local_session` |
+| Флаг выключен — однопользовательский сокет как раньше | `session.resume` | `test_the_flag_off_keeps_the_single_user_socket` |
+
 ## Результаты прогонов
 
 ### Новые тесты
 
 `tests/hermes_cli/test_session_route_owner_scope.py` — **33 теста**, все зелёные.
+`tests/gateway/test_session_subject_scope.py` — **19 тестов**, все зелёные.
 
 ```
-$ pytest tests/hermes_cli/test_session_route_owner_scope.py -q
-33 passed in 16.95s
+$ pytest tests/gateway/test_session_subject_scope.py -q
+19 passed in 10.13s
 ```
+
+Красные на базе (без сокетного скоупа, коммит `7b9634c390`): **13 failed, 6 passed** —
+`session.info`/`resume`/`events.since` открывали чужой ряд, листинг A содержал чужое,
+модуля `gateway.session_subject_scope` не существовало. Зелёные с правкой: 19 passed.
 
 ### Затронутые модули
 
 ```
-$ pytest tests/hermes_cli/test_session_route_owner_scope.py \
+$ pytest tests/gateway/test_session_subject_scope.py \
+         tests/hermes_cli/test_session_route_owner_scope.py \
          tests/gateway/test_session_owner_scope.py \
          tests/gateway/test_session_operator_scope.py -q
-72 passed in 41.47s
+91 passed in 42.15s
 ```
+
+Смежные сокетные наборы (authority connection/principal/listing/reconnect/approval/cold route,
+listener lazy dashboard, ws-upgrade failure, detach end_reason, commands session scope) —
+**61 passed** на ветке и **61 passed** на базе, набор падений совпадает (пусто).
+
+Широкий смежный прогон (session api, list live hidden, list allowed sources, stored picker,
+stored reads + consistency, info, hygiene, route identity, authenticated identity) —
+**17 failed / 74 passed / 1 error на ветке и ровно те же 17+1 на базе** (`7b9634c390`):
+падения предсуществующие (home-гард и логика stored-reads), ни одного нового.
 
 Ранее, вместе со смежными: `tests/hermes_cli/test_session_timeline.py`,
 `test_session_message_page_owner.py`, `test_foreign_sessions.py`,
@@ -170,21 +233,79 @@ $ pytest tests/hermes_cli/test_session_route_owner_scope.py \
 
 Полный вывод: `PROBE-step4-output.txt`.
 
+### Живая проба сокета — критерии 4 и 5
+
+`verify-step4-socket.py` (изолированный `HERMES_HOME`, настоящие `SessionAuthority` /
+`AuthorityConnection` / `socket_operator`, `acl.multi_user: true`):
+
+```
+== ЖИВАЯ ПРОБА СОКЕТА ШАГ 4 (МПД Т5) ==
+владелец (subject): uid:1001
+
+-- грант сокета (socket_operator): alice=False owner=True
+-- actor сокета A: subject=person/alice caps=['session:approve', 'session:control',
+                                            'session:create', 'session:read',
+                                            'session:respond', 'session:submit']
+
+-- A(alice) по прямому id: своя / чужая / несуществующая --
+  ручка                      своя         чужая (bob)    нет такой    кадры совпали
+  session.info               OK           not_found      not_found    да
+  session.resume             OK           not_found      not_found    да
+  session.events.since       OK           not_found      not_found    да
+  session.mutate             OK           not_found      not_found    да
+
+-- списки: что видит каждый сокет --
+  A(alice)   session.list=['alice-chat']
+             session.active_list=['alice-chat']
+  owner      session.list=['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+             session.active_list=['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+  A(alice) session.prune=permission_denied (ожидается permission_denied)
+
+-- поток событий: что реально дошло до сокета A --
+  своё событие A(alice) дошло: да
+  чужие события в сокете A: нет
+  события в сокете владельца: ['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+
+-- владелец: открытие по прямому id --
+  owner→alice-chat: OK    owner→bob-chat: OK
+  owner→owner-chat: OK    owner→unowned-chat: OK
+
+-- отказ не оракул: чужой id против несуществующего --
+  идентичны: да  (not_found)
+
+ИТОГ: OK
+```
+
+Та же проба на базе `7b9634c390` (до сокетного скоупа) **падает** и печатает дыру:
+
+```
+-- A(alice) по прямому id --
+  session.info           OK  OK  not_found  кадры совпали: НЕТ
+  session.resume         OK  OK  not_found  кадры совпали: НЕТ
+  session.events.since   OK  OK  not_found  кадры совпали: НЕТ
+EXIT 1
+```
+
+Полный вывод: `PROBE-step4-socket-output.txt`.
+
+
 ## Код-здоровье
 
-`python scripts/check --only health`: **новых находок нет**. Набор «файл+правило» на ветке —
-подмножество базы (на одну меньше: вынесенный `hermes_state_empty_hygiene.py` снял
-`FILE_LINES` с `hermes_state_sessions.py`). Три оставшихся `BLE001` в `hermes_acl_scope.py`
-(`owner_stamps`, `caller_subject`, `row_outside_scope`) — предсуществующие, на базе те же.
+`python -m scripts.code_health --base 7b9634c390`: **0 blocking, 0 advisory**.
+Одна находка `BLE001` в `gateway/session_subject_scope.py` разрешена строковым комментарием
+`# health: allow BLE001 -- an unreadable row is treated as unowned (fail closed)` (ревьюер
+проверяет причину).
 
 `python scripts/check` целиком: FAILED в тех же пяти проверках, что и на базе
 (`footguns, no-tmp, install-root, ruff, health`) — это состояние репозитория, не регрессия.
+`ruff` на изменённых файлах напрямую — All checks passed.
 
 ## Ограничения и что осталось
 
 * `manual_review`: подключение живого браузера к сокету второго пользователя против
-  запущенного шлюза с `acl.multi_user: true` — проверено на уровне `socket_operator` и
-  `session_scope`, но не в браузере.
+  запущенного шлюза с `acl.multi_user: true` — проверено на уровне `socket_operator`,
+  `SessionAuthority.authorize` и `AuthorityConnection.dispatch` (настоящий веер событий), но не
+  в браузере через `/api/ws` поверх TCP.
 * Включение `acl.multi_user: true` для всех — по-прежнему решение владельца (шаг 3 оставил
   флаг выключенным); эта поставка ничего не включает сама.
 * `session:operator` при выключенном МПД сохраняет прежний смысл намеренно: контракт-тест
@@ -214,7 +335,10 @@ $ pytest tests/hermes_cli/test_session_route_owner_scope.py \
 * `hermes_cli/web_routers/_session_acl.py` — шов прав на 18 путей
 * `hermes_state_owner_scope.py` — общие scope-SQL правила
 * `hermes_state_empty_hygiene.py` — `SessionEmptyHygieneMixin` (вынесен)
+* `gateway/session_subject_scope.py` — скоуп субъекта для сокета
 * `tests/hermes_cli/test_session_route_owner_scope.py` — 33 теста
-* `verify-step4-live.py`, `PROBE-step4-output.txt`, `REPORT-step4.md`
+* `tests/gateway/test_session_subject_scope.py` — 19 тестов
+* `verify-step4-live.py`, `PROBE-step4-output.txt`, `verify-step4-socket.py`,
+  `PROBE-step4-socket-output.txt`, `REPORT-step4.md`
 
 Живая установка `~/.hermes` не тронута: все пробы — на копиях в scratch-каталоге профиля.

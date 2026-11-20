@@ -1,0 +1,36 @@
+== ЖИВАЯ ПРОБА СОКЕТА ШАГ 4 (МПД Т5) ==
+HERMES_HOME пробы: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mpd4-ws-asfcotu8/.hermes
+владелец (subject): uid:1001
+
+-- грант сокета (socket_operator): alice=False owner=True
+-- actor сокета A: subject=person/alice caps=['session:approve', 'session:control', 'session:create', 'session:read', 'session:respond', 'session:submit']
+
+-- A(alice) по прямому id: своя / чужая / несуществующая --
+  ручка                      своя         чужая (bob)    нет такой    кадры совпали
+  session.info               OK           not_found      not_found    да
+  session.resume             OK           not_found      not_found    да
+  session.events.since       OK           not_found      not_found    да
+  session.mutate             OK           not_found      not_found    да
+
+-- списки: что видит каждый сокет --
+  A(alice)   session.list=['alice-chat']
+             session.active_list=['alice-chat']
+  owner      session.list=['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+             session.active_list=['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+  A(alice) session.prune=permission_denied (ожидается permission_denied)
+
+-- поток событий: что реально дошло до сокета A --
+  своё событие A(alice) дошло: да
+  чужие события в сокете A: нет
+  события в сокете владельца: ['alice-chat', 'bob-chat', 'owner-chat', 'unowned-chat']
+
+-- владелец: открытие по прямому id --
+  owner→alice-chat: OK
+  owner→bob-chat: OK
+  owner→owner-chat: OK
+  owner→unowned-chat: OK
+
+-- отказ не оракул: чужой id против несуществующего --
+  идентичны: да  (not_found)
+
+ИТОГ: OK
