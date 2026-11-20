@@ -598,15 +598,16 @@ class _KanbanNotification:
 
     async def _wake_failed(self, fmt: str, exc: Exception, *, check: tuple = ()) -> None:
         """Bump the failure counter on a failed wake. ``check`` is the refusal's own diagnosis
-        (``field``/``detail``/``reason``), appended to the message the warning prints so the line
+        (``field``/``detail``/``reason``), folded into the exception the warning prints so the line
         names the check that refused instead of only "wake failed"."""
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
         from gateway.wake import WakeNotAccepted
+        show_tb = not isinstance(exc, WakeNotAccepted)  # a refusal is explained, not a crash
         field, detail, reason = check or (None, None, getattr(exc, 'reason', None))
         if field or detail:
             exc = RuntimeError(f'{reason or "refused"} field={field} detail={detail}')
         await self.delivery_failed(fmt, (self.task_id, self.platform_str), drop_fmt, exc,
-                                   exc_info=not isinstance(exc, WakeNotAccepted))
+                                   exc_info=show_tb)
 
     # -- formatting --
 
