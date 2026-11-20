@@ -275,7 +275,59 @@ async def _serve_bearer(request: Request, call_next: Callable[[Request], Awaitab
     if bearer_session is not None:
         request.state.session = bearer_session
         return await call_next(request)
+    revoked = _revoked_detail(request, access_token=bearer, provider_hint=None)
+    if revoked:
+        return _revoked_response(request, revoked)
     return _unauth_response(request, reason="invalid_or_expired_session")
+
+
+def _revoked_response(request: Request, detail: str) -> Response:
+    """401 naming a REVOKED sign-in, distinct from an expired one.
+
+    "Your password changed, your account was disabled, or your account was deleted" is a
+    different fact from "your session lapsed", and an operator staring at a device that keeps
+    asking to sign in needs to be able to tell them apart. The cookies are cleared so the
+    browser does not keep presenting a dead credential.
+    """
+    audit_log(AuditEvent.SESSION_REJECTED, reason="credential_revoked", path=request.url.path,
+              ip=_client_ip(request))
+    prefix = prefix_from_request(request)
+    if request.url.path.startswith("/api/"):
+        login_url = f"{prefix}/login"
+        return JSONResponse(
+            {"error": "session_revoked", "detail": "Unauthorized",
+             "reason": "credential_revoked", "revoked": detail, "login_url": login_url},
+            status_code=401)
+    response = RedirectResponse(url=f"{prefix}/login", status_code=302)
+    clear_session_cookies(response, prefix=prefix,
+                          gateway=webapp_sign_in.cookie_gateway(request))
+    return response
+
+
+def _revoked_detail(request: Request, *, access_token: str | None, provider_hint: str | None) -> str:
+    """Which rule revoked the presented access token, or ``""`` when nothing did.
+
+    Asks the providers that expose ``credential_status`` (today: the password provider, the only
+    one whose credentials have a generation). An unknown token, an expired one or a provider that
+    cannot answer all yield ``""`` — an ordinary expiry must keep its ordinary response.
+    """
+    if not access_token:
+        return ""
+    for provider in list_session_providers():
+        if provider_hint and provider.name != provider_hint:
+            continue
+        status = getattr(provider, "credential_status", None)
+        if status is None:
+            continue
+        try:
+            verdict, detail = status(access_token)
+        except Exception:  # health: allow BLE001 -- a provider that cannot answer must fall through
+            # to the ordinary expiry response, not turn every request into a 500.
+            _log.debug("credential_status raised for provider %r", provider.name, exc_info=True)
+            continue
+        if verdict == "revoked":
+            return detail or "revoked"
+    return ""
 
 
 async def gated_auth_middleware(
@@ -348,6 +400,9 @@ async def gated_auth_middleware(
             # Uncertain (provider unreachable), not rejected: keep the cookies.
             return unreachable_response(str(e))
         if refreshed is None:
+            raised = _revoked_detail(request, access_token=at, provider_hint=provider_hint)
+            if raised:
+                return _revoked_response(request, raised)
             return _session_expired_response(request)
         return await _serve_refreshed(request, call_next, *refreshed)
 

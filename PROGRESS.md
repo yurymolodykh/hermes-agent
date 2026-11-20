@@ -1,29 +1,31 @@
-# t_e81e8826 — МПД шаг 2: реестр привязок «персона → профили»
+# PROGRESS — t_00544442 (МПД шаг 3)
 
-## Состояние: РЕАЛИЗОВАНО И ПРОВЕРЕНО, готово к коммиту/ревью
+## Состояние: РАБОТА ЗАВЕРШЕНА (код, тесты, живая проба, отчёт, коммит)
 
-- [x] Среда: worktree, ветка `feature/mpd-step2-bindings` (от `feature/multiuser-access` e3d1ec0a52)
-- [x] Test venv: `~/.hermes/installs/019d0d114d22b7e6/test-environment/gen-33b3d260ac3140808236b257c2f566fd/venv/bin/python` (pytest 9.1.1)
-- [x] Замер на копиях: 717 сессий в 26 БД; штампы `uid:1001`=437, `cron-owner`=267, `<none>`=6, `api`=4, telegram 125805788/449439313/543447681 = 1/1/1
-- [x] Код: `hermes_acl_bindings.py` (762) — формат, fail-closed load, бэкап, миграция, `same_person`, `person_stamps`, `prime`
-- [x] Интеграция: `owner_identity.same_owner` (+`_same_person_binding`), `hermes_acl_scope.owner_stamps`/`caller_owner_scope`/`request_owner_scope`, `prime` в `gateway/run_bootstrap.py`
-- [x] CLI: `hermes auth bindings list|show|bind|unbind|share|owner` (`hermes_cli/subcommands/auth_bindings.py`)
-- [x] Тесты: 144 passed (104 + 15 + 25), три файла
-- [x] Отчёт: `REPORT-step2.md` — числа 717 → 705, путь бэкапа, до/после на копиях
+* Ветка: `feature/mpd-step3-identity`, worktree `.worktrees/t_00544442`
+* Коммит: `931a460a17` (база — merge шага 2 `feature/mpd-step2-bindings` = `f2596a3524`)
+* Отчёт: `REPORT-step3.md`; вывод живой пробы: `PROBE-step3-output.txt`; проба: `verify-step3-live.py`
 
-## Важное для продолжающего
+## Что сделано
 
-- Флаг привязки профиля — **`--holds`**, не `--profile`: `main._apply_profile_override`
-  вычитывает `--profile/-p` из argv до argparse и перевешивает процесс на другой профиль.
-- Реестр root-anchored (`<root>/acl/profile-bindings.json`), не по профилю. Для сквозных
-  прогонов задавать `acl.bindings_file` в изолированном `config.yaml`, иначе CLI пишет в реальный
-  корень оператора.
-- Предсуществующие падения (не регрессия, воспроизведены на базе): 30 errors в
-  `test_session_owner_scope.py`, 2 failed в `test_webapp_owner_identity.py`, по 2/2/4 в
-  `test_authenticated_session_identity` / `test_legacy_client_label_adoption` /
-  `test_legacy_session_migration`; причина — `tests/home_io_guard.py:160`.
+`hermes_acl_identity.py` (новый, 412 стр.) — логин → субъект, поколение → живость мандата, TTL;
+флаг `acl.multi_user: false` (поставка выключена). Провайдер `basic` — много учёток, отзыв,
+`credential_status`, refresh не переживает поколение. `owner_identity.principal_subject` (П4) —
+узкое исключение для парольного входа. `ws_tickets` — `gen`/`src` в тикете и отказ при consume.
+`middleware` — отдельный 401 `session_revoked`. `hermes_acl_scope.owner_stamps` — `person/<login>`
++ реестр привязок по каждому производному штампу. CLI `auth users revoke|remove`.
 
-## Дальше
+## Проверено
 
-Коммит в `feature/mpd-step2-bindings` с номером карточки, затем передача ревизии
-на независимую проверку (15-sre-qa).
+* 518 passed / 8 skipped в затронутых модулях; новых тестов 139.
+* Живая проба на копиях 26 `state.db`: два логина → `person/probe.alice` / `person/probe.bob`
+  (с выключенным флагом оба → `uid:1001`); отзыв → отказ access-токена, ws-тикета и refresh,
+  повторный вход тем же паролем; удаление записи убивает сессию; владелец видит 723 из 735.
+* Smoke-гейт: 2 failed / 30 errors — те же, что на базе (предсуществующие, `home_io_guard.py:160`).
+* `scripts/check`: 68 блокирующих health-находок и 73 ruff на базе и на ветке — новых нет.
+
+## Что осталось (вне объёма шага)
+
+* Включение `acl.multi_user: true` для всех — отдельное решение владельца.
+* `manual_review`: 401 `session_revoked` в живом браузере (на уровне шлюза проверено).
+* Шаг 4 (права на сессии) не трогался.

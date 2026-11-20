@@ -659,6 +659,36 @@ class UserStore:
             lines.append(record.to_line())
             self._write_text("".join(existing + "\n" for existing in lines))
 
+    def remove_record(self, login: str) -> bool:
+        """Delete the line for *login*, keeping every other line byte-identical.
+
+        Returns False when the login is not in the file. A deleted record is what makes a ticket
+        stop verifying: no record means no generation to compare against, which
+        ``hermes_acl_identity.credential_valid`` reads as a refusal for a users-file credential.
+        """
+        lines = self._read_lines()
+        normalized = _normalize_login(login)
+        kept: list[str] = []
+        removed = False
+        for line in lines:
+            if not line.strip():
+                kept.append(line)
+                continue
+            try:
+                raw = json.loads(line)
+            except ValueError:
+                kept.append(line)
+                continue
+            if (not removed and isinstance(raw, dict)
+                    and _normalize_login(str(raw.get("login") or "")) == normalized):
+                removed = True
+                continue
+            kept.append(line)
+        if not removed:
+            return False
+        self._write_text("".join(existing + "\n" for existing in kept))
+        return True
+
     def next_gen(self, record: UserRecord) -> UserRecord:
         return replace(record, gen=max(0, int(record.gen)) + 1)
 

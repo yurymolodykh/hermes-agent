@@ -1,0 +1,47 @@
+
+=== criterion 2 — two accounts, two passwords, two subjects ===
+users file (copy): /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/t_00544442/live2/users/users.jsonl  records=25
+probe.alice  -> user_id='probe.alice'  subject='person/probe.alice'
+probe.bob    -> user_id='probe.bob'  subject='person/probe.bob'
+subjects differ: True
+neither is the host owner ('uid:1001'): True
+alice's account refuses bob's password: True
+
+-- the same two logins with the flag OFF (the shipped default) --
+off: probe.alice -> 'uid:1001'   probe.bob -> 'uid:1001'   collapsed to one: True
+
+=== criterion 3 — revocation reaches the device ===
+before: verify_session -> accepted
+before: ws ticket minted, gen=1
+revoke: user01 gen 1 -> 2 (password untouched)
+after:  verify_session -> REFUSED
+after:  gate status='revoked' detail='refused:generation_superseded:1!=2'
+after:  ws ticket refused: credential revoked
+after:  refresh refused: RefreshExpiredError
+after:  same password signs back in at gen=2
+
+=== criterion 3b — deleting the record kills the session ===
+bob record removed: verify_session -> REFUSED
+
+=== criterion 4 — the owner keeps their own sessions ===
+owner record: login='yury' role='owner' gen=1
+owner subject: 'uid:1001' == host owner: True
+owner scope stamps (1): ['uid:1001']
+state.db files scanned: 26
+sessions total=735  visible to the owner=453  invisible=282
+owner session still verifies: True
+
+=== criterion 4b — with the step-2 bindings registry, the owner sees their earlier rows too ===
+distinct live stamps: ['125805788', '449439313', '543447681', 'api', 'cron-owner', 'uid:1001']
+registry subjects for the owner (3): ['uid:1001', 'cron-owner', '125805788']
+owner scope stamps (4): ['uid:1001', 'person/yury', 'cron-owner', '125805788']
+sessions total=735  visible to the owner=723  invisible=12
+user appendix — one user's scope is disjoint from the owner's: []
+
+=== lifetimes ===
+multi_user ON : session_ttl=604800s refresh_ttl=604800s
+multi_user OFF: session_ttl=43200s refresh_ttl=2592000s
+
+=== live installation untouched ===
+live users file mtime unchanged: 1795121798
+acl.multi_user in live config: see `grep multi_user ~/.hermes/config.yaml`

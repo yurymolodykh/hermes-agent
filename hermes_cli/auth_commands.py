@@ -929,7 +929,8 @@ def _auth_users_dispatch(args) -> None:
     """
     handler = getattr(args, "func", None)
     if handler is None:  # pragma: no cover - the parser always sets one
-        raise SystemExit("hermes auth users: choose list, add, passwd, disable, enable or import")
+        raise SystemExit(
+            "hermes auth users: choose list, add, passwd, disable, enable, revoke, remove or import")
     raise SystemExit(handler(args) or 0)
 
 

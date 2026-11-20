@@ -25,11 +25,28 @@ def principal_subject(identity: dict) -> str:
     minted (provider ``local``: Desktop, the TUI, the CLI, a managed worker) keeps its subject; every
     login (a Webapp tab, the loopback session token, the server's own PTY child, or a dashboard login
     a standalone backend forwards in a local ticket) is the owner. An identity naming nobody stays
-    unbound, exactly as before."""
-    from gateway.session_identity import authenticated_subject, parse_authenticated_subject
+    unbound, exactly as before.
+
+    Multi-user mode (``acl.multi_user``) is the one exception, and it is narrow: a PASSWORD login
+    that the users file knows and whose record is not ``role: owner`` acts as ``person/<login>``
+    (``hermes_acl_identity.resolve_identity_subject``). Every other credential — a federated
+    login, the loopback session token, a native grant — keeps the rule above, so enabling the mode
+    cannot silently re-label a subject whose rows are already stamped.
+    """
+    from gateway.session_identity import authenticated_subject
+
     subject = authenticated_subject(identity)
     if not identity.get('user_id'):
         return subject
+    legacy = _legacy_principal_subject(identity, subject)
+    from hermes_acl_identity import resolve_identity_subject
+
+    return resolve_identity_subject(identity, legacy=legacy)
+
+
+def _legacy_principal_subject(identity: dict, subject: str) -> str:
+    """The single-user rule, kept verbatim as the fallback multi-user mode wraps."""
+    from gateway.session_identity import parse_authenticated_subject
     provider = str(identity.get('provider') or '').strip()
     if provider == 'local':
         login = parse_authenticated_subject(subject)

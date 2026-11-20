@@ -1,6 +1,6 @@
 """``hermes auth users`` — the users file from the command line.
 
-Six verbs over ``dashboard.basic_auth.users_file``:
+Eight verbs over ``dashboard.basic_auth.users_file``:
 
 * ``list``    — login, role, status, whether aliases/telegram exist. Never a hash, never a password.
 * ``add``     — create a record; the password arrives on stdin or from a masked prompt, never argv
@@ -8,6 +8,10 @@ Six verbs over ``dashboard.basic_auth.users_file``:
 * ``passwd``  — replace a password; raises ``gen`` by one (the generation is what step 3 uses to
                 drop devices holding an older credential generation).
 * ``disable`` / ``enable`` — flip ``disabled``; both raise ``gen`` as well.
+* ``revoke``  — raise ``gen`` WITHOUT touching the password: sign the person out everywhere and
+                let them back in with the password they already know.
+* ``remove``  — delete the record; every ticket minted for it stops verifying, which is the
+                owner's chosen way to switch somebody off (their data stays).
 * ``import``  — read a Windows-host export and merge by telegram id / e-mail, keeping old logins
                 as aliases and never overwriting an existing hash without ``--overwrite``.
 
@@ -28,7 +32,7 @@ from hermes_cli import dashboard_users as du
 
 def _users_no_verb(args) -> int:
     """`hermes auth users` with no verb: say what the verbs are."""
-    print("hermes auth users: choose list, add, passwd, disable, enable or import",
+    print("hermes auth users: choose list, add, passwd, disable, enable, revoke, remove or import",
           file=sys.stderr)
     return 2
 
@@ -74,6 +78,24 @@ def build_auth_users_parser(subparsers) -> None:
     p_enable = sub.add_parser("enable", help="Re-enable a user (raises gen)")
     p_enable.add_argument("login")
     p_enable.set_defaults(func=cmd_users_enable)
+
+    p_revoke = sub.add_parser(
+        "revoke", help="Sign a user out everywhere (raises gen, keeps the password)",
+        description="Bump the user's generation without touching their password: every device "
+                    "already signed in is refused at its next request, and the person signs in "
+                    "again with the password they already know.")
+    p_revoke.add_argument("login")
+    p_revoke.set_defaults(func=cmd_users_revoke)
+
+    p_remove = sub.add_parser(
+        "remove", help="Delete a user (their sessions die with the record)",
+        description="Delete the record. Every ticket minted for it stops verifying immediately "
+                    "(there is no record left to compare a generation against), which is the "
+                    "owner's chosen way to switch somebody off. The person's data is NOT deleted.")
+    p_remove.add_argument("login")
+    p_remove.add_argument("--yes", action="store_true",
+                          help="Do not ask for confirmation (for scripts)")
+    p_remove.set_defaults(func=cmd_users_remove)
 
     p_import = sub.add_parser(
         "import", help="Import a Windows-host export (login|display_name|password_hash|...)",
@@ -262,6 +284,48 @@ def cmd_users_disable(args) -> int:
 
 def cmd_users_enable(args) -> int:
     return _set_disabled(args, disabled=False)
+
+
+def cmd_users_revoke(args) -> int:
+    """Sign a user out everywhere without touching their password (bumps ``gen``)."""
+    store = _store()
+    if store is None:
+        return 1
+    records = _load_checked(store)
+    if records is None:
+        return 1
+    record = store.get(args.login)
+    if record is None:
+        return _fail(f"no user with login {args.login!r}")
+    updated = store.next_gen(record)
+    store.upsert_record(updated)
+    print(f"signed {updated.login} out everywhere; gen {record.gen} -> {updated.gen}")
+    print("devices already signed in are refused at their next request; the password is unchanged")
+    return 0
+
+
+def cmd_users_remove(args) -> int:
+    """Delete a user record. Their sessions die with it; their data does not."""
+    store = _store()
+    if store is None:
+        return 1
+    records = _load_checked(store)
+    if records is None:
+        return 1
+    record = store.get(args.login)
+    if record is None:
+        return _fail(f"no user with login {args.login!r}")
+    if not getattr(args, "yes", False):
+        print(f"delete {record.login!r} ({record.display_name or record.login}, role {record.role})? "
+              "Their sessions stop working at once; their data stays. [y/N] ", end="", flush=True)
+        answer = sys.stdin.readline().strip().lower()
+        if answer not in ("y", "yes"):
+            print("nothing deleted")
+            return 1
+    if not store.remove_record(record.login):
+        return _fail(f"{record.login!r} vanished from the users file before it could be deleted")
+    print(f"deleted {record.login}; its sessions no longer verify")
+    return 0
 
 
 def cmd_users_import(args) -> int:

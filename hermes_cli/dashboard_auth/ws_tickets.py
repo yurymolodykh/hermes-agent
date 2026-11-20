@@ -12,10 +12,13 @@ so browser XSS cannot read it; grants no more than a ticket). In-memory; ``time.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 #: Long enough for ``getWsTicket()`` -> open WS, short enough that a leaked ticket is uninteresting.
 TTL_SECONDS = 30
@@ -38,11 +41,26 @@ def mint_ticket(*, user_id: str, provider: str, issuer: str = "",
     """One-shot base64url ticket (32 random bytes) bound to this identity; ``consume_ticket``
     hands the ``info`` dict back to the WS handler. ``extra`` rides along for routes that need
     server-chosen context (the Bot Desktop bridge pins the RFB socket's profile home here so a
-    client can never pick another profile's screen)."""
+    client can never pick another profile's screen).
+
+    The ticket also carries the credential generation it was minted under (``gen``/``src``), so a
+    socket opened after the person's password changed — or after their account was disabled or
+    deleted — is refused at :func:`consume_ticket` instead of riding the 30-second window.
+    """
     ticket = secrets.token_urlsafe(32)
     info = {"user_id": user_id, "provider": provider, "minted_at": int(time.time()), **(extra or {})}
     if issuer:
         info["issuer"] = issuer
+    try:
+        from hermes_acl_identity import credential_marker
+
+        from_file, generation = credential_marker(user_id)
+        info["src"] = from_file
+        if generation is not None:
+            info["gen"] = generation
+    except Exception:  # health: allow BLE001, S110 -- an identity module that cannot answer adds
+        # no marker rather than failing the mint; consume_ticket then refuses it fail-closed.
+        logger.debug("ws-ticket: no credential marker for %r", user_id, exc_info=True)
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
         _gc_expired_locked()
@@ -50,7 +68,8 @@ def mint_ticket(*, user_id: str, provider: str, issuer: str = "",
 
 
 def consume_ticket(ticket: str) -> dict[str, Any]:
-    """Validate and consume (single-use). Raises :class:`TicketInvalid` on missing/expired/used."""
+    """Validate and consume (single-use). Raises :class:`TicketInvalid` on missing/expired/used,
+    and on a revoked credential (the generation the ticket carries is no longer current)."""
     now = int(time.time())
     with _lock:
         entry = _tickets.pop(ticket, None)
@@ -61,7 +80,17 @@ def consume_ticket(ticket: str) -> dict[str, Any]:
         expires_at, info = entry
         if expires_at < now:
             raise TicketInvalid("expired")
-        return info
+    try:
+        from hermes_acl_identity import credential_valid
+
+        if not credential_valid(info.get("user_id"), info.get("gen"), from_file=info.get("src")):
+            raise TicketInvalid("credential revoked")
+    except TicketInvalid:
+        raise
+    except Exception:  # health: allow BLE001 -- the identity module cannot answer, so the ticket
+        # must not become a way in: refuse it rather than let an unverifiable credential through.
+        raise TicketInvalid("credential unverifiable") from None
+    return info
 
 
 def _gc_expired_locked() -> None:
