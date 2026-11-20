@@ -74,4 +74,8 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     from hermes_cli.subcommands.auth_users import build_auth_users_parser
     build_auth_users_parser(auth_subparsers)
 
+    # `auth bindings ...` — the person→profiles registry (acl.bindings_file).
+    from hermes_cli.subcommands.auth_bindings import build_auth_bindings_parser
+    build_auth_bindings_parser(auth_subparsers)
+
     auth_parser.set_defaults(func=cmd_auth)

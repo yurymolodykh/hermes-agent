@@ -933,9 +933,25 @@ def _auth_users_dispatch(args) -> None:
     raise SystemExit(handler(args) or 0)
 
 
+def _auth_bindings_dispatch(args) -> None:
+    """Hand ``hermes auth bindings <verb>`` to the ACL bindings registry surface.
+
+    Separate from the two dispatches above for the same reason: the destination is its own
+    (``bindings_action``), and a shared dict would make the verbs collide.
+    """
+    handler = getattr(args, "func", None)
+    if handler is None:  # pragma: no cover - the parser always sets one
+        raise SystemExit(
+            "hermes auth bindings: choose list, show, bind, unbind, share or owner")
+    raise SystemExit(handler(args) or 0)
+
+
 def auth_command(args) -> None:
     if getattr(args, "auth_action", "") == "users":
         _auth_users_dispatch(args)
+        return
+    if getattr(args, "auth_action", "") == "bindings":
+        _auth_bindings_dispatch(args)
         return
     handler = _AUTH_ACTIONS.get(getattr(args, "auth_action", ""))
     if handler is not None:
