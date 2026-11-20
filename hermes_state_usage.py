@@ -10,12 +10,24 @@ import logging
 import threading
 import time
 import weakref
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+
+
+def _usage_owner_clause(user_id: str | Sequence[str] | None) -> tuple[str, list[Any]]:
+    """The owner-scope WHERE arm for a usage aggregate — the SAME arm the session listing builds.
+
+    Imported from :mod:`hermes_state_sessions` at call time (that module imports this mixin's
+    owner), so a total can never disagree with the rows it totals: ``None`` unscoped, an empty
+    sequence is ``1 = 0`` (fail closed).
+    """
+    from hermes_state_sessions import _owner_scope_clause
+
+    return _owner_scope_clause(user_id)
 
 
 def _token_update_sql(delta: bool) -> str:
@@ -453,13 +465,21 @@ class SessionUsageMixin:
         )
         return {row["task"]: {k: row[k] for k in row.keys() if k != "task"} for row in rows}
 
-    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> dict[str, float]:
+    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False,
+                     user_id: str | Sequence[str] | None = None) -> dict[str, float]:
         """Tokens and spend across the whole store (one scan), so the sidebar total does not
-        shrink with paging. Spend prefers the billed figure over the estimate."""
+        shrink with paging. Spend prefers the billed figure over the estimate.
+
+        ``user_id`` carries the same owner scope as the sidebar listing (МПД: a shared profile's
+        spend totals must not sum another person's rows): ``None`` unscoped, empty = nothing."""
         where = ["parent_session_id IS NULL", "message_count >= ?"]
         params: list[Any] = [min_message_count]
         if not include_archived:
             where.append("COALESCE(archived, 0) = 0")
+        owner_clause, owner_params = _usage_owner_clause(user_id)
+        if owner_clause:
+            where.append(owner_clause)
+            params.extend(owner_params)
         row = self._read_one(f"""
             SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
                    COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
