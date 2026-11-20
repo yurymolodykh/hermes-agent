@@ -596,9 +596,17 @@ class _KanbanNotification:
         else:
             await self.rewind()
 
-    async def _wake_failed(self, fmt: str, exc: Exception) -> None:
+    async def _wake_failed(self, fmt: str, exc: Exception, *, check: tuple = ()) -> None:
+        """Bump the failure counter on a failed wake. ``check`` is the refusal's own diagnosis
+        (``field``/``detail``/``reason``), appended to the message the warning prints so the line
+        names the check that refused instead of only "wake failed"."""
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
-        await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
+        from gateway.wake import WakeNotAccepted
+        field, detail, reason = check or (None, None, getattr(exc, 'reason', None))
+        if field or detail:
+            exc = RuntimeError(f'{reason or "refused"} field={field} detail={detail}')
+        await self.delivery_failed(fmt, (self.task_id, self.platform_str), drop_fmt, exc,
+                                   exc_info=not isinstance(exc, WakeNotAccepted))
 
     # -- formatting --
 
@@ -842,15 +850,27 @@ class _KanbanNotification:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
                 self.clear_failures()
-            except WakeNotAccepted:
-                # Startup / full queue is not a dead destination. Keep the durable
-                # subscription alive regardless of how long admission takes.
+            except WakeNotAccepted as _wake_exc:
+                # Startup / a full queue is not a dead destination: keep the durable subscription
+                # and retry. A refusal whose FIELD proves the destination store cannot serve this
+                # session at all (an absent or unreadable receipt) never clears — retrying it every
+                # tick is what flooded the journal — so it takes the bounded failure path instead.
+                from gateway.wake import PERMANENT_REFUSAL_FIELDS
+                if getattr(_wake_exc, 'field', None) in PERMANENT_REFUSAL_FIELDS:
+                    await self._wake_failed(
+                        "kanban notifier: wake refused for %s on %s (attempt %d/%d): %s", _wake_exc,
+                        check=(_wake_exc.field, _wake_exc.detail, _wake_exc.reason))
+                    return
+                logger.info(
+                    "kanban notifier: wake deferred for %s on %s (reason=%s field=%s); claim rewound",
+                    self.task_id, self.platform_str, getattr(_wake_exc, 'reason', None),
+                    getattr(_wake_exc, 'field', None))
                 await self.rewind()
                 return
             except Exception as _wk_err:
                 await self._wake_failed(
-                    "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
-                    else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
+                    "kanban notifier: wake-only delivery failed for %s on %s (attempt %d/%d): %s" if is_push
+                    else "kanban notifier: wake self-post failed for %s on %s (attempt %d/%d): %s",
                     _wk_err,
                 )
                 return

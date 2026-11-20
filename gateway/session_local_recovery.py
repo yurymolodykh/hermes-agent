@@ -51,12 +51,19 @@ def local_source(authority, chat_id, user_id):
 
 
 def _refused_check(exc):
-    """``<reason or error> at <function>:<line>``: where a receipt check raised, and why, followed
-    through every chained ``__cause__`` (``restore_policy`` and ``local_receipt`` wrap the check
-    that failed into a bare ``storage_unavailable``)."""
+    """``<reason or error> [field=… detail=…] at <function>:<line>``: where a receipt check raised,
+    and why, followed through every chained ``__cause__`` (``restore_policy`` and ``local_receipt``
+    wrap the check that failed into a bare ``storage_unavailable``). The refusal's ``field`` and
+    ``detail`` are what tell an absent receipt from an unreadable one; without them the log line
+    read ``storage_unavailable at local_receipt:394`` for both."""
     import traceback
     frames = traceback.extract_tb(exc.__traceback__)
     cause = exc.reason if isinstance(exc, RuntimeStoreError) else f'{type(exc).__name__}: {exc}'
+    if isinstance(exc, RuntimeStoreError):
+        if getattr(exc, 'field', None):
+            cause += f' field={exc.field}'
+        if getattr(exc, 'detail', None):
+            cause += f' detail={exc.detail}'
     where = f' at {frames[-1].name}:{frames[-1].lineno}' if frames else ''
     chained = f', caused by {_refused_check(exc.__cause__)}' if exc.__cause__ is not None else ''
     return f'{cause}{where}{chained}'

@@ -1012,7 +1012,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 try:
                     await admit_process_notice(self, authority, adapter, synth_event, evt)
                 except RuntimeStoreError as exc:
-                    raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
+                    raise WakeNotAccepted(str(exc), reason=exc.reason, field=exc.field, detail=exc.detail) from exc
             else:
                 await admit_internal_event(adapter, synth_event)
             return True

@@ -388,17 +388,25 @@ def annotate_local_lineages(sessions, heads):
 
 
 def local_receipt(db, session_id):
+    """*session_id*'s stored receipt. A refusal names WHICH check failed (``field``) and what it
+    saw (``detail``), so the gateway log can tell a receipt this store never held from one whose
+    stored JSON is unreadable instead of reporting both as a bare ``storage_unavailable``."""
+    key = POLICY_PREFIX + session_id
     with db._read_ctx() as conn:
-        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
     if row is None:
-        raise RuntimeStoreError('storage_unavailable')
+        # The store path is the diagnosis: which PROFILE's store lacks the receipt (the log line
+        # already names the session).
+        raise RuntimeStoreError('storage_unavailable', field='receipt_missing',
+                                detail=f'no receipt in {db.db_path}')
     try:
         value = json.loads(row[0])
         if not isinstance(value, dict):
-            raise ValueError('invalid receipt')
+            raise ValueError(f'{type(value).__name__}, not an object')
         return value
     except (TypeError, ValueError) as exc:
-        raise RuntimeStoreError('storage_unavailable') from exc
+        raise RuntimeStoreError('storage_unavailable', field='receipt_corrupt',
+                                detail=f'{db.db_path}: {type(exc).__name__}: {exc}') from exc
 
 
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):

@@ -48,13 +48,23 @@ PERMANENT_REFUSAL_REASONS = frozenset({'not_found', 'invalid_params'})
 class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead. ``reason`` is the
     store's refusal code when the session authority refused it, ``runtime_draining`` when the
-    adapter path refused it during a drain (None: the adapter did not accept);
+    adapter path refused it during a drain (None: the adapter did not accept); ``field``/``detail``
+    name the exact check that refused (the store's own, e.g. ``receipt_missing``);
     ``permanent`` is set once the refusal is proven final (``refusal_proven_permanent``)."""
 
-    def __init__(self, message: str = "internal wake not accepted by adapter", *, reason: Optional[str] = None):
+    def __init__(self, message: str = "internal wake not accepted by adapter", *, reason: Optional[str] = None,
+                 field: Optional[str] = None, detail: Optional[str] = None):
         super().__init__(message)
         self.reason = reason
+        self.field = field
+        self.detail = detail
         self.permanent = False
+
+
+#: ``field`` values that prove the destination cannot receive this wake at all: the profile store
+#: the wake runs in holds no such session (``receipt_missing``) or an unreadable one
+#: (``receipt_corrupt``). Retrying those is a permanent loop, so a durable producer may bound them.
+PERMANENT_REFUSAL_FIELDS = frozenset({'receipt_missing', 'receipt_corrupt'})
 
 
 def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
@@ -145,7 +155,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
                 if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category):
                     return  # committed to the session FIFO: never interrupts the admitted turn
             except RuntimeStoreError as exc:
-                raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
+                raise WakeNotAccepted(str(exc), reason=exc.reason, field=exc.field, detail=exc.detail) from exc
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
                                    metadata={"notification_category": notification_category})
         await admit_internal_event(adapter, synth_event)

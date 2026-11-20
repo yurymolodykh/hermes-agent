@@ -490,7 +490,11 @@ def control_snapshot(authority, ref):
         try:
             states.append(cls.from_json(raw) if raw else None)
         except (ValueError, TypeError, AttributeError) as exc:
-            raise RuntimeStoreError('storage_unavailable') from exc
+            # Name the state that failed and what it held: a bare ``storage_unavailable`` sent an
+            # operator looking for a broken disk while one unparsable ``state_meta`` row was the cause.
+            raise RuntimeStoreError('storage_unavailable', field=f'{kind}_state_corrupt',
+                                    detail=f'{kind}:{target} in {authority.db.db_path}: '
+                                           f'{type(exc).__name__}: {exc}') from exc
     goal_state, loop_state, heartbeat_state = states
     goal = _safe_goal_snapshot(goal_state)
     # Project the persisted barrier, not GoalManager.is_waiting(), which clears
