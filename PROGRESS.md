@@ -1,4 +1,81 @@
-# PROGRESS — t_4997de4c (МПД шаг 4: сессии и сокет)
+# PROGRESS — t_a08e47a4 (МПД шаг 5: профили — свои и общие)
+
+## Состояние: РАБОТА ЗАВЕРШЕНА (код, 73 теста, живая проба 24/24, база красная, отчёт, коммит)
+
+* Ветка: `wt/t_a08e47a4`, worktree `.worktrees/t_a08e47a4`
+* База: `8db3cd6c1c` (верхушка шага 4)
+* Коммит шага 5: **`afaf9d8145`**
+* Отчёт: `REPORT-step5.md`
+* Пробы: `verify-step5-live.py` + `PROBE-step5-output.txt` (24/24 OK),
+  `verify-step5-baseline-red.py` (на базе — 4 утечки)
+
+## Что сделано (шаг 5)
+
+* `hermes_acl_profiles.py` (новый, 389 стр.) — одна точка политики: `visible_profiles`,
+  `allows`, `writable_profiles`, `shared_candidates`, `scope_for`/`scope_for_names`,
+  `require_visible`/`require_writable`/`require_owner`/`require_create`.
+  Owner — всё; человек — свои записи реестра шага 2 + shared; shared видим и используем,
+  но не перенастраиваем; `acl.multi_user=false` → unscoped (прежнее поведение);
+  битый/отсутствующий реестр → fail closed.
+* `hermes_cli/web_routers/profiles.py` — фильтрация `GET /api/profiles`, отказ `POST`
+  (`profile_not_allowed` 403), проверки на всех `/api/profiles/{name}/…` (чужое = 404,
+  shared на запись = 403 `profile_read_only`), `active` не называет чужой sticky и
+  POST owner-only, delete/export/import owner-only, веер `?profile=` только по видимым;
+  кэши `_sidebar_payload` / `_projects_tree_payload` получили видимый набор и owner-скоуп
+  в КЛЮЧ (иначе второй человек в том же процессе получил бы чужой payload).
+* Строки внутри видимого профиля сохраняют свой owner-скоуп: `user_id=owner_scope` в
+  `list_sessions_rich` / `session_count` / `usage_totals` и в дереве проектов
+  (`tui_gateway/methods_projects.py` + `hermes_state_usage.py` —
+  `_usage_owner_clause` → `hermes_state_sessions._owner_scope_clause`, один WHERE-арм).
+* `tests/hermes_cli/test_profile_route_owner_scope.py` (новый, 563 стр., **73 теста**).
+
+## Проверенное (шаг 5)
+
+* 73 passed (`tests/hermes_cli/test_profile_route_owner_scope.py`, 6.8 s).
+* 136 passed (session scope + profile scope + unification + gateway native profile
+  create/registry grant).
+* Смежные 12 наборов: ветка 8 failed / 153 passed / 3 skipped; база — ровно те же 8
+  (предсуществующие `test_dashboard_param_clamps`) — падений не добавлено.
+* Живая проба `verify-step5-live.py`: `ИТОГ: OK — 24/24`; критерии 2,3,4,5 подтверждены
+  кодами и телами (alice → `['01-alice','02-hermes-platform','03-software-engineer']`;
+  POST чужого имени → 403; bob → своя тройка; owner → весь roster).
+* База красная: `verify-step5-baseline-red.py` на `8db3cd6c1c` — LEAK 1..4 все True;
+  новый тестовый файл на базе не собирается (`ModuleNotFoundError: hermes_acl_profiles`).
+* `python -m scripts.code_health --base 8db3cd6c1c` → 0 blocking, 0 advisory.
+* `scripts/check --only health` — ни одной находки в изменённых файлах.
+* `ruff check` по 7 файлам — All checks passed.
+
+## Ограничения (шаг 5)
+
+* `manual_review`: два живых браузера против запущенного шлюза с `acl.multi_user: true`
+  (проверено на уровне роутеров, политики и живых HTTP-кодов, не по TCP).
+* Включение `acl.multi_user: true` — решение владельца, поставка ничего не включает.
+* Тесты гонять на копии дерева вне `~/.hermes` (`/tmp/mpd5/branch`): worktree внутри
+  реального дома, `tests/home_io_guard.py` рубит инициализацию БД. Проба должна брать
+  `HERMES_HOME` в `/tmp`, не в `~/.hermes/...` — иначе `get_default_hermes_root` вернёт
+  реальный `~/.hermes`, и проба увидит настоящий roster.
+* `pre-commit` пропущен: `scripts/hermes-python` в worktree падает на «no bootstrap
+  Python found»; ruff прогнан напрямую.
+* Шаг 6 (файлы) не трогался. Профили между пользователями не переносились.
+
+## Команды для повтора
+
+```bash
+# тесты (копия дерева вне ~/.hermes)
+tar -c --exclude=.git --exclude=.venv --exclude=__pycache__ -f - . | tar -x -f - -C /tmp/mpd5/branch
+cd /tmp/mpd5/branch && HERMES_HOME=$(mktemp -d /tmp/mpd5home.XXXX) \
+  /home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest -q \
+  tests/hermes_cli/test_profile_route_owner_scope.py
+# живая проба
+cd /tmp/mpd5/branch && HERMES_DASHBOARD_SESSION_TOKEN=x \
+  /home/hermes/.hermes/hermes-agent/.venv/bin/python verify-step5-live.py
+# code health
+cd <worktree> && /home/hermes/.hermes/hermes-agent/.venv/bin/python -m scripts.code_health --base 8db3cd6c1c
+```
+
+---
+
+# История: шаг 4 (t_4997de4c)
 
 ## Состояние: РАБОТА ЗАВЕРШЕНА (код, тесты, две живые пробы, отчёт, коммит)
 
@@ -9,7 +86,7 @@
 * Пробы: `verify-step4-live.py` + `PROBE-step4-output.txt`,
   `verify-step4-socket.py` + `PROBE-step4-socket-output.txt`
 
-## Что сделано
+## Что сделано (шаг 4)
 
 Дашборд аутентифицирует профиль, а не человека: cookie выдавала `session:operator` каждому
 входу, а 18 REST-путей `web_routers/sessions.py` владельца не проверяли вовсе.
