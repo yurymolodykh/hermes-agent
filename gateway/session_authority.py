@@ -232,9 +232,16 @@ class SessionAuthority:
         from gateway.config import Platform
         source = self.sessions[ref.session_id].source
         from gateway.owner_identity import is_host_operator, same_owner
+        from gateway.session_subject_scope import foreign_session_in_multi_user
         if (source is not None and source.platform == Platform.LOCAL
                 and not same_owner(source.user_id, actor.subject) and not is_host_operator(actor)):
             raise RuntimeStoreError('permission_denied')
+        if foreign_session_in_multi_user(self, actor, ref.session_id, source):
+            # A second person's socket must not open a MESSAGING row either: the LOCAL branch above
+            # never saw Telegram/Discord/Slack lanes, so ``session.resume`` of their id mounted the
+            # owner's conversation (read and live events) for anyone signed in. ``not_found`` is the
+            # same non-answer a missing id gets, so the socket is not an id oracle.
+            raise RuntimeStoreError('not_found')
         from gateway.session_retirement import touch_restored
         touch_restored(self, ref.session_id)  # a rename or a read brought a retired one back
 
