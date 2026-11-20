@@ -26,8 +26,9 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
+import hermes_acl_profiles as acl_profiles
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
 from hermes_cli.config import get_process_hermes_home
@@ -232,6 +233,23 @@ def _profile_targets(log_label: str) -> list[tuple[str, Path]]:
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
     return targets
+
+
+def _visible_targets(request: Optional[Request], log_label: str) -> list[tuple[str, Path]]:
+    """``_profile_targets`` restricted to the profiles this request may use (МПД Т2).
+
+    The fan-out routes (sessions list/sidebar/projects tree/pull-requests) open EVERY profile's
+    ``state.db``; a second person must not reach a profile that is not theirs. With
+    ``acl.multi_user`` off (or for the host owner) the target list is returned untouched.
+    """
+    targets = _profile_targets(log_label)
+    if request is None:
+        return targets
+    visible = acl_profiles.scope_for(request, [name for name, _home in targets])
+    if visible is None:
+        return targets
+    allowed = set(visible)
+    return [(name, home) for name, home in targets if name in allowed]
 
 
 def _scoped_profile_targets(log_label: str, profile: Optional[str]) -> list[tuple[str, Path]]:
@@ -454,23 +472,31 @@ def _csv_list(value: Optional[str]) -> list[str]:
 
 @sessions_router.get("/api/profiles/sessions")
 def get_profiles_sessions(
+    request: Request,
     # ``le=500`` caps the page size — this endpoint fans out across EVERY profile's state.db.
     # 500 (not 100) because desktop callers use limit=200 and the electron remote-merge
     # over-fetches ``limit + offset``.
     limit: int = Query(20, ge=0, le=500), offset: int = Query(0, ge=0), min_messages: int = 0,
     archived: str = "exclude", order: str = "recent", profile: str = "all",
-    source: str | None = None, sources: str | None = None, exclude_sources: str | None = None, full: bool = False):
+    source: str | None = None, sources: str | None = None, exclude_sources: str | None = None,
+    full: bool = False):
     """Unified, read-only session list aggregated across ALL profiles: opens each profile's
     ``state.db`` directly (no dashboard backend per profile) and tags rows with their owning
     ``profile``. Rows omit ``system_prompt`` / ``model_config`` unless ``full=1`` — same
-    projection as ``/api/sessions``."""
+    projection as ``/api/sessions``.
+
+    ``all`` means "every profile THIS caller may use" (МПД Т2): the fan-out is over the visible
+    set, and a ``?profile=`` naming a profile outside it is refused like an unknown one."""
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    targets = ([_cron_profile_home(profile)] if profile and profile != "all"
-               else _profile_targets("GET /api/profiles/sessions"))
+    if profile and profile != "all":
+        acl_profiles.require_visible(request, profile)
+        targets = [_cron_profile_home(profile)]
+    else:
+        targets = _visible_targets(request, "GET /api/profiles/sessions")
 
     # Source scoping (see /api/sessions): recents pass exclude_sources=cron, the cron-jobs
     # section source=cron — two independent lists so cron sessions can't starve recents.
@@ -489,12 +515,17 @@ def get_profiles_sessions(
     totals: dict[str, int] = {}
     errors: list[dict[str, str]] = []
     now = time.time()
+    # МПД Т2/Т4: a profile in the visible set is a runtime, not a container of one person's rows.
+    # "May use profile 03" therefore never means "may read somebody else's conversation in it" —
+    # rows keep their own owner scope from step 4. ``None`` (acl off) keeps the old query.
+    owner_scope = _request_scope(request)
     for name, home in targets:
         def _read(db, name=name, home=home):
             include_subagents, exclude = subagent_listing_scope(
                 home, source=filters["source"], sources=filters["sources"],
                 exclude_sources=filters["exclude_sources"])
-            scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
+            scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents,
+                      "user_id": owner_scope}
             rows = db.list_sessions_rich(
                 limit=per_profile, offset=0, order_by_last_active=order == "recent",
                 # Same SQL-level blob skip as /api/sessions.
@@ -521,8 +552,8 @@ def get_profiles_sessions(
 
 
 @sessions_router.get("/api/profiles/sessions/sidebar")
-@_sidebar_singleflight_cache
 def get_profiles_sessions_sidebar(
+    request: Request,
     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
     cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str | None = None):
     """Batched sidebar session slices (recents / cron / messaging) — one profile-DB open per
@@ -532,11 +563,42 @@ def get_profiles_sessions_sidebar(
 
     ``recents_profile`` scopes the WHOLE payload, not just recents — the sidebar has one
     scope, so a concrete profile must never show another profile's Telegram threads or
-    cronjobs; ``all`` asks for everything.
+    cronjobs; ``all`` asks for everything THIS caller may use (МПД Т2).
 
     See #42651, #65710, #70629.
     """
+    scope = (recents_profile or "all").strip() or "all"
+    if scope != "all":
+        acl_profiles.require_visible(request, scope)
+    visible = acl_profiles.scope_for(request, [name for name, _home in _profile_targets("sidebar")])
+    # The cache below keys on its ARGUMENTS, so the caller's visible profile set is one of them:
+    # two people sharing a process must never be answered from each other's cached payload.
+    return _sidebar_payload(
+        recents_profile=recents_profile, recents_limit=recents_limit,
+        recents_exclude=recents_exclude, cron_limit=cron_limit,
+        messaging_limit=messaging_limit, messaging_exclude=messaging_exclude,
+        visible=None if visible is None else tuple(visible), owner_scope=_request_scope(request))
+
+
+def _request_scope(request: Optional[Request]) -> Optional[tuple[str, ...]]:
+    """The caller's session owner stamps (``None`` = unscoped rows, the pre-МПД answer)."""
+    if request is None:
+        return None
+    from hermes_acl_scope import request_owner_scope
+    scope = request_owner_scope(request)
+    return None if scope is None else tuple(scope)
+
+
+@_sidebar_singleflight_cache
+def _sidebar_payload(
+    recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
+    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str | None = None,
+    visible: Optional[tuple[str, ...]] = None, owner_scope: Optional[tuple[str, ...]] = None):
+    """The cached body of :func:`get_profiles_sessions_sidebar` (see it for the contract)."""
     targets = _profile_targets("GET /api/profiles/sessions/sidebar")
+    if visible is not None:
+        allowed = set(visible)
+        targets = [(name, home) for name, home in targets if name in allowed]
 
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
@@ -562,12 +624,17 @@ def get_profiles_sessions_sidebar(
             source=source, exclude_sources=exclude or None, limit=cap[key], offset=0,
             min_message_count=1, include_archived=False, archived_only=False,
             order_by_last_active=True, compact_rows=True, include_pinned=True,
-            include_subagents=include_subagents)
+            include_subagents=include_subagents,
+            # МПД Т2/Т4: a SHARED profile is a runtime several people use, so its rows are still
+            # scoped to their own owner stamp — "may use profile 03" never means "may read
+            # somebody else's conversation in it". ``None`` (acl off) keeps the old query.
+            user_id=owner_scope)
 
     def _build_slices(db, cache_key, recents_subagents):
         # ``usage`` is aggregated in SQL rather than over the recents window: the window is a
         # page, and a total that shrank when you scrolled would be worse than no total at all.
-        slices = {"recents": _slice(db, "recents", recents_subagents), "usage": db.usage_totals(),
+        slices = {"recents": _slice(db, "recents", recents_subagents),
+                  "usage": db.usage_totals(user_id=owner_scope),
                   "cron": _slice(db, "cron"), "messaging": _slice(db, "messaging")}
         _sidebar_profile_cache_put(cache_key, slices)
         return slices
@@ -584,7 +651,10 @@ def get_profiles_sessions_sidebar(
         recents_subagents = subagent_listing_scope(home, exclude_sources=recents_exclude_list or None)
         profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), cap["recents"],
                              tuple(recents_exclude_list), cap["cron"], cap["messaging"],
-                             tuple(messaging_exclude_list), recents_subagents[0])
+                             tuple(messaging_exclude_list), recents_subagents[0],
+                             # The cache is per store, so the caller's row scope is part of its
+                             # identity: two people must not read each other's cached slices.
+                             owner_scope)
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
             slices = _read_profile_db(
@@ -716,8 +786,8 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
-@_sidebar_singleflight_cache
-def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000, profile: Optional[str] = None):
+def get_profiles_projects_tree(request: Request, preview_limit: int = 3, session_limit: int = 2000,
+                               profile: Optional[str] = None):
     """Project tree for every profile at once, for the all-profiles sidebar.
 
     ``projects.tree`` over JSON-RPC answers for the backend's own profile only; this runs the
@@ -728,19 +798,41 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     that writes (policy reconciliation), which a read-only fan-out must not do.
 
     ``profile`` limits the scan to that one profile: a native grant may read only its own, so
-    the Desktop merges one such read per profile by each project's ``mergeKey``.
+    the Desktop merges one such read per profile by each project's ``mergeKey``. A profile
+    outside the caller's set is refused like an unknown one (МПД Т2), and the rows inside a
+    visible profile keep their own owner scope — a shared profile is a runtime, not a folder
+    of one person's conversations.
     """
+    scope = (profile or "").strip()
+    if scope:
+        acl_profiles.require_visible(request, scope)
+    visible = acl_profiles.scope_for(request, [name for name, _home in _profile_targets("projects/tree")])
+    return _projects_tree_payload(
+        preview_limit=preview_limit, session_limit=session_limit, profile=profile or None,
+        visible=None if visible is None else tuple(visible), owner_scope=_request_scope(request))
+
+
+@_sidebar_singleflight_cache
+def _projects_tree_payload(preview_limit: int = 3, session_limit: int = 2000,
+                           profile: Optional[str] = None, visible: Optional[tuple[str, ...]] = None,
+                           owner_scope: Optional[tuple[str, ...]] = None):
+    """The cached body of :func:`get_profiles_projects_tree` (see it for the contract)."""
     from tui_gateway import server as gateway_server
     merged: dict[str, dict[str, Any]] = {}
     scoped_session_ids: list[str] = []
     errors: list[dict[str, str]] = []
 
-    for name, home in _scoped_profile_targets("GET /api/profiles/projects/tree", profile):
+    targets = _scoped_profile_targets("GET /api/profiles/projects/tree", profile)
+    if visible is not None:
+        allowed = set(visible)
+        targets = [(name, home) for name, home in targets if name in allowed]
+    for name, home in targets:
         def _read(db, name=name, home=home):
             with _hermes_home_scope(home):
                 tree, _active_id = gateway_server._build_project_tree(
                     db, preview_limit=preview_limit, hydrate=False,
-                    session_limit=session_limit, include_discovered=False)
+                    session_limit=session_limit, include_discovered=False,
+                    user_id=owner_scope)
                 _merge_profile_tree(merged, tree["projects"], name, preview_limit)
                 scoped_session_ids.extend(tree["scoped_session_ids"])
         _read_profile_db(name, home, errors, _read)
@@ -769,14 +861,18 @@ def _pr_url_from_tool_output(content: str) -> Optional[tuple[int, str]]:
 
 
 @sessions_router.post("/api/profiles/sessions/pull-requests")
-def post_profiles_sessions_pull_requests(body: SessionPrScanBody, profile: Optional[str] = None):
+def post_profiles_sessions_pull_requests(body: SessionPrScanBody, request: Request,
+                                         profile: Optional[str] = None):
     """The PR each of these sessions opened, recovered from its own transcript: a session
     that starts in the main checkout and works in a worktree has no branch of its own, so
     its PR is invisible to the branch join — but ``gh pr create`` ran in the conversation
-    (see ``_pr_url_from_tool_output``). Read-only across every profile."""
+    (see ``_pr_url_from_tool_output``). Read-only across every profile THIS caller may use."""
     wanted = list(dict.fromkeys(s for s in (body.ids or []) if s))[:2000]
     if not wanted:
         return {"pull_requests": {}, "scanned": []}
+    scope = (profile or "all").strip() or "all"
+    if scope != "all":
+        acl_profiles.require_visible(request, scope)
 
     found: dict[str, dict[str, Any]] = {}
 
@@ -787,7 +883,13 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, profile: Optio
                 # Oldest-first, so a later `gh pr create` (the replacement PR) wins.
                 found[pr["session_id"]] = {"number": parsed[0], "url": parsed[1]}
 
-    for name, home in _scoped_profile_targets("POST /api/profiles/sessions/pull-requests", profile):
+    if scope == "all":
+        # Only the profiles this caller may use: a foreign session id must not be answered
+        # with its PR — the transcript scan would otherwise confirm a session exists (МПД Т2).
+        targets = _visible_targets(request, "POST /api/profiles/sessions/pull-requests")
+    else:
+        targets = [(name, home) for name, home in _profile_targets("pull-requests") if name == scope]
+    for name, home in targets:
         _read_profile_db(name, home, None, _read)
 
     # ``scanned``: every id looked at, so the caller can remember "nothing there".
@@ -806,14 +908,38 @@ def _read_profiles():
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
 
 
+def _scoped_profile_view(payload: dict[str, Any], subject: Optional[str]) -> dict[str, Any]:
+    """Drop the profiles *subject* may not see from a ``GET /api/profiles`` payload.
+
+    Scoping is off (or nothing to filter): the payload is returned untouched, so the coalesced
+    read above is shared by every caller exactly as before. Only the filtered case is per-caller.
+    """
+    rows = payload.get("profiles") or []
+    visible = acl_profiles.scope_for_names(subject, [str(row.get("name") or "") for row in rows])
+    if visible is None:
+        return payload
+    kept = set(visible)
+    return {**payload, "profiles": [row for row in rows if str(row.get("name") or "") in kept]}
+
+
 @router.get("/api/profiles")
-async def list_profiles_endpoint():
-    return await _read_profiles()
+async def list_profiles_endpoint(request: Request):
+    """Every profile — for the host owner, and (``acl.multi_user``) the caller's own + shared ones.
+
+    МПД Т2/Т4: the roster used to be host-wide, so one login enumerated every orchestrator on the
+    box. See :mod:`hermes_acl_profiles` for the rule; with the flag off this is the old answer.
+    """
+    payload = await _read_profiles()
+    return _scoped_profile_view(payload, acl_profiles.request_subject(request))
 
 
 @router.post("/api/profiles")
-async def create_profile_endpoint(body: ProfileCreate):
+async def create_profile_endpoint(body: ProfileCreate, request: Request):
     from hermes_cli import profiles as profiles_mod
+    # МПД Т3: profiles are created by the admin (§6.2). With `acl.profile_self_service` a person
+    # may create exactly their own `01-<login>` root — nothing else, and never a name another
+    # person's record already holds.
+    acl_profiles.require_create(request, body.name)
     explicit_source = (body.clone_from or "").strip()
     if explicit_source:
         # Clone config/skills/SOUL (or full state when clone_all) from the named source.
@@ -888,9 +1014,14 @@ async def create_profile_endpoint(body: ProfileCreate):
 
 
 @router.get("/api/profiles/active")
-async def get_active_profile_endpoint():
+async def get_active_profile_endpoint(request: Request):
     """``active`` is the sticky default written by ``hermes profile use`` (what new CLI
-    invocations pick up); ``current`` is the profile this running dashboard is scoped to."""
+    invocations pick up); ``current`` is the profile this running dashboard is scoped to.
+
+    ``active`` is a HOST-wide sticky value, so for a non-owner (``acl.multi_user``) it may name
+    another person's orchestrator: it is answered only when the caller may see it, and otherwise
+    replaced by a profile they do hold. The answer never becomes a roster leak of its own.
+    """
     from hermes_cli import profiles as profiles_mod
 
     def _run():
@@ -905,14 +1036,43 @@ async def get_active_profile_endpoint():
         return {"active": _or_default(profiles_mod.get_active_profile),
                 "current": _or_default(profiles_mod.get_active_profile_name, on_error="custom")}
 
-    return await run_in_threadpool(_run)
+    body = await run_in_threadpool(_run)
+    if not acl_profiles.multi_user_enabled() or acl_profiles.request_is_owner(request):
+        return body
+    return _own_profile_names(request, body)
+
+
+def _own_profile_names(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Answer the sticky-profile question with names this caller may actually use."""
+    from hermes_cli import profiles as profiles_mod
+    try:
+        names = list(profiles_mod.list_profile_names())
+    except Exception:  # health: allow BLE001 -- a listing failure must not 500 a sidebar poll
+        _log.exception("profile enumeration failed")
+        names = []
+    visible = acl_profiles.scope_for(request, names)
+    if visible is None:
+        return body
+    allowed = set(visible)
+    out = dict(body)
+    for key in ("active", "current"):
+        if out.get(key) not in allowed:
+            # Nothing to point at: an empty answer is the honest one (the SPA then asks for the
+            # caller's own profile list, which is already scoped).
+            out[key] = visible[0] if visible else ""
+    return out
 
 
 @router.post("/api/profiles/active")
-async def set_active_profile_endpoint(body: ProfileActiveUpdate):
+async def set_active_profile_endpoint(body: ProfileActiveUpdate, request: Request):
     """Set the sticky active profile (mirrors ``hermes profile use``); does not retarget the
-    running dashboard, only subsequent CLI commands and gateways."""
+    running dashboard, only subsequent CLI commands and gateways.
+
+    The value is host-wide — every profile's next CLI invocation reads it — so it stays the
+    owner's to set; a second person choosing it would retarget the owner's shell.
+    """
     from hermes_cli import profiles as profiles_mod
+    acl_profiles.require_owner(request, action="owner_only")
     with _profile_errors("POST /api/profiles/active failed"):
         # Stats the target, creates the state directory, writes via temp file + replace.
         await run_in_threadpool(profiles_mod.set_active_profile, body.name)
@@ -920,7 +1080,8 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
 
 
 @router.get("/api/profiles/{name}/setup-command")
-async def get_profile_setup_command(name: str):
+async def get_profile_setup_command(name: str, request: Request):
+    acl_profiles.require_visible(request, name)
     return {"command": _profile_setup_command(name)}
 
 
@@ -941,7 +1102,8 @@ def _linux_terminal_commands(command: str) -> list:
 
 
 @router.post("/api/profiles/{name}/open-terminal")
-async def open_profile_terminal_endpoint(name: str):
+async def open_profile_terminal_endpoint(name: str, request: Request):
+    acl_profiles.require_visible(request, name)
     with _profile_errors("POST /api/profiles/%s/open-terminal failed", name):
         command = _profile_setup_command(name)
 
@@ -963,8 +1125,13 @@ async def open_profile_terminal_endpoint(name: str):
 
 
 @router.patch("/api/profiles/{name}")
-async def rename_profile_endpoint(name: str, body: ProfileRename):
+async def rename_profile_endpoint(name: str, body: ProfileRename, request: Request):
     from hermes_cli import profiles as profiles_mod
+    # A rename moves a directory and re-keys a person's data — the target must be theirs to
+    # reconfigure (a shared profile's SOUL/skills are not one user's to rename), and the NEW name
+    # must not land inside another person's namespace.
+    acl_profiles.require_writable(request, name)
+    acl_profiles.require_create(request, body.new_name)
     with _profile_errors("PATCH /api/profiles/%s failed", name,
                          bad_request=(ValueError, FileExistsError)):
         # Stops a running gateway (10 s poll), renames the directory, lets the profile's memory
@@ -982,7 +1149,7 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
 
 
 @router.delete("/api/profiles/{name}")
-async def delete_profile_endpoint(name: str):
+async def delete_profile_endpoint(name: str, request: Request):
     """The dashboard collects the user's confirmation in its own dialog, so ``yes=True``
     always skips the CLI's interactive prompt.
 
@@ -991,6 +1158,9 @@ async def delete_profile_endpoint(name: str):
     the generic 500 made a dashboard client read a completed delete as a failure (its retry
     then 404'd)."""
     from hermes_cli import profiles as profiles_mod
+    # Deleting removes a profile and its state for everyone who used it: owner-only, never the
+    # "I may use it" grant (МПД Т2 — «чужой недоступен»).
+    acl_profiles.require_owner(request, action="owner_only")
     try:
         with _profile_errors("DELETE /api/profiles/%s failed", name):
             # Polls a running gateway's PID for up to 10 s, then rmtree()s the directory; on the
@@ -1003,7 +1173,9 @@ async def delete_profile_endpoint(name: str):
 
 
 @router.get("/api/profiles/{name}/soul")
-async def get_profile_soul(name: str):
+async def get_profile_soul(name: str, request: Request):
+    # Reading a profile's instructions is reading that profile: a foreign name answers 404.
+    acl_profiles.require_visible(request, name)
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     def _run():
         # Probe and read in one hop (two round-trips would widen the check/read window).
@@ -1018,7 +1190,10 @@ async def get_profile_soul(name: str):
 
 
 @router.put("/api/profiles/{name}/soul")
-async def update_profile_soul(name: str, body: ProfileSoulUpdate):
+async def update_profile_soul(name: str, body: ProfileSoulUpdate, request: Request):
+    # SOUL.md is the profile's INSTRUCTIONS: shared profiles are runtimes everyone uses, so only
+    # their own person's profiles are writable (МПД Т4 — «личное не попадает в общий профиль»).
+    acl_profiles.require_writable(request, name)
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
 
     def _run():
@@ -1040,10 +1215,11 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
 
 
 @router.put("/api/profiles/{name}/description")
-async def update_profile_description_endpoint(name: str, body: ProfileDescriptionUpdate):
+async def update_profile_description_endpoint(name: str, body: ProfileDescriptionUpdate, request: Request):
     """Set or clear a profile's role description (kanban routing signal), stored as
     user-authored (``description_auto: false``) so the auto-describer won't overwrite it."""
     from hermes_cli import profiles as profiles_mod
+    acl_profiles.require_writable(request, name)
     profile_dir = _resolve_profile_dir(name)
     text = (body.description or "").strip()
     with _profile_errors("PUT /api/profiles/%s/description failed", name,
@@ -1054,9 +1230,10 @@ async def update_profile_description_endpoint(name: str, body: ProfileDescriptio
 
 
 @router.put("/api/profiles/{name}/model")
-async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
+async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate, request: Request):
     """Set the main model for a specific profile's config.yaml without touching the dashboard's
     own profile — ``POST /api/model/set`` (main scope) via the HERMES_HOME override."""
+    acl_profiles.require_writable(request, name)
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
@@ -1069,11 +1246,12 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
 
 
 @router.post("/api/profiles/{name}/describe-auto")
-async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
+async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto, request: Request):
     """Auto-generate a profile's description via the auxiliary LLM (mirrors ``hermes profile
     describe <name> --auto``). A failed generation is ``ok: false`` with a reason rather than
     an HTTP error so the UI can surface it inline and let the operator retry."""
     # Resolution stays on the loop: it owns the 400/404 mapping the 500 fallback would flatten.
+    acl_profiles.require_writable(request, name)
     _resolve_profile_dir(name)
 
     def _run():
@@ -1100,8 +1278,11 @@ def _read_desktop_overlay(profile_dir: Path) -> Any:
 
 
 @router.post("/api/profiles/{name}/export")
-async def export_profile_endpoint(name: str, body: ProfileExport):
+async def export_profile_endpoint(name: str, body: ProfileExport, request: Request):
     from hermes_cli import profiles as profiles_mod
+    # An export is a portable SNAPSHOT: it carries the profile's .env (bot tokens, API keys) and
+    # its full state, so it stays the owner's operation — never a shared profile's consumer.
+    acl_profiles.require_owner(request, action="owner_only")
     output = (body.output or "").strip()
     if not output:
         try:
@@ -1118,8 +1299,11 @@ async def export_profile_endpoint(name: str, body: ProfileExport):
 
 
 @router.post("/api/profiles/import")
-async def import_profile_endpoint(body: ProfileImport):
+async def import_profile_endpoint(body: ProfileImport, request: Request):
     from hermes_cli import profiles as profiles_mod
+    # Import writes a whole profile (and its .env) from an archive: owner-only, and the imported
+    # name must not land inside somebody's personal namespace.
+    acl_profiles.require_owner(request, action="owner_only")
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
@@ -1147,9 +1331,10 @@ async def import_profile_endpoint(body: ProfileImport):
 
 
 @router.get("/api/profiles/{name}/desktop-overlay")
-async def get_profile_desktop_overlay(name: str):
+async def get_profile_desktop_overlay(name: str, request: Request):
     """The desktop appearance/interface overlay bundled with an imported profile
     (``desktop.json`` at the profile root), or ``exists: false``."""
+    acl_profiles.require_visible(request, name)
     profile_dir = _resolve_profile_dir(name)
 
     def _run():
