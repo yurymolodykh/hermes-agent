@@ -335,7 +335,10 @@ EXIT 1
 * `hermes_cli/web_routers/_session_acl.py` — шов прав на 18 путей
 * `hermes_state_owner_scope.py` — общие scope-SQL правила
 * `hermes_state_empty_hygiene.py` — `SessionEmptyHygieneMixin` (вынесен)
+* `gateway/session_subject_scope.py` — скоуп субъекта для сокета
 * `tests/hermes_cli/test_session_route_owner_scope.py` — 33 теста
-* `verify-step4-live.py`, `PROBE-step4-output.txt`, `REPORT-step4.md`
+* `tests/gateway/test_session_subject_scope.py` — 19 тестов
+* `verify-step4-live.py`, `PROBE-step4-output.txt`, `verify-step4-socket.py`,
+  `PROBE-step4-socket-output.txt`, `REPORT-step4.md`
 
 Живая установка `~/.hermes` не тронута: все пробы — на копиях в scratch-каталоге профиля.
