@@ -1,0 +1,42 @@
+probe home: /tmp/mpd5-live-05635rcn
+GET /api/profiles as alice -> ['01-alice', '02-hermes-platform', '03-software-engineer']
+OK   2a. subject A does not see 01-B — answer=['01-alice', '02-hermes-platform', '03-software-engineer']
+OK   2b. subject A sees its own root
+GET /api/profiles as bob -> ['01-bob', '02-hermes-platform', '03-software-engineer']
+OK   4a. shared profiles visible to A
+OK   4b. shared profiles visible to B
+OK   4c. A and B see different personal roots
+GET /api/profiles as owner -> ['default', '01-alice', '01-bob', '02-hermes-platform', '03-software-engineer']
+OK   5. owner sees every profile — answer=['default', '01-alice', '01-bob', '02-hermes-platform', '03-software-engineer']
+POST /api/profiles {name:01-bob} as alice -> 403 {"detail":"profile_not_allowed"}
+OK   3a. creating a foreign root is refused
+POST /api/profiles {name:01-alice} as alice -> 403 {"detail":"profile_not_allowed"}
+OK   3b. default policy is admin-only (own root refused too) — acl.profile_self_service is off by default
+POST /api/profiles {name:07-owner-made} as owner -> 200
+OK   3c. the owner may still create
+GET /api/profiles/01-bob/soul as alice -> 404 {"detail":"Profile '01-bob' does not exist."}
+OK   s1. a foreign SOUL is 404
+OK   s2. and shaped exactly like an absent name — absent -> 404 {"detail":"Profile '99-nobody' does not exist."}
+OK   s3. the foreign content never leaks
+PUT /api/profiles/01-bob/soul as alice -> 404 {"detail":"Profile '01-bob' does not exist."}
+OK   s4. writing a foreign SOUL is 404
+OK   s5. and the file is untouched
+PUT /api/profiles/02-hermes-platform/soul as alice -> 403 {"detail":"profile_read_only"}
+OK   s6. a shared profile is visible but read-only
+PUT /api/profiles/01-alice/soul as alice -> 200
+OK   s7. the person writes their own profile
+GET /api/profiles/sessions?profile=01-bob as alice -> 404 {"detail":"Profile '01-bob' does not exist."}
+OK   s8. a foreign ?profile= fan-out is 404
+OK   s9. the own ?profile= fan-out is 200 — 200
+GET /api/profiles/sessions/sidebar?recents_profile=01-bob as alice -> 404
+OK   s10. a foreign sidebar scope is 404
+POST /api/profiles/01-alice/export as alice -> 403 {"detail":"owner_only"}
+OK   s11. export stays owner-only
+DELETE /api/profiles/01-alice as alice -> 403 {"detail":"owner_only"}
+OK   s12. delete stays owner-only
+OK   s13. and the directory survives
+acl off — GET /api/profiles as alice -> ['default', '01-alice', '01-bob', '02-hermes-platform', '03-software-engineer', '07-owner-made']
+OK   l1. acl off lists the whole roster — answer=['default', '01-alice', '01-bob', '02-hermes-platform', '03-software-engineer', '07-owner-made']
+OK   l2. acl off keeps foreign reads — 200
+
+ИТОГ: OK — 24/24 checks
