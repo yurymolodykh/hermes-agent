@@ -287,6 +287,25 @@ class CLIAgentSetupMixin:
             # Only an explicit re-authentication requirement is terminal. Unknown
             # resolver/network failures must not acquire the sticky Kanban block.
             self._credentials_terminal = isinstance(_primary_exc, AuthError) and _primary_exc.relogin_required
+            # Per-card key pool (mission key-pool-per-card): a kanban worker that could not
+            # reserve a free card key is NOT a task failure — the pool is momentarily full
+            # and the card must wait for a key instead of spending its retry budget until it
+            # blocks. Reuse the EXISTING transient-provider contract (the same flag a
+            # provider rate-limit sets -> ``KANBAN_RATE_LIMIT_EXIT_CODE``, EX_TEMPFAIL 75),
+            # which the dispatcher already requeues without counting a failure. No second
+            # exit contract, and a no-op unless the pool is configured.
+            if not self._credentials_rate_limited:
+                try:
+                    from agent.kanban_key_pool import KeyPoolError
+                    from agent.kanban_turn_recovery import kanban_task_id
+
+                    if isinstance(_primary_exc, KeyPoolError) and kanban_task_id() is not None:
+                        self._credentials_rate_limited = True
+                        logger.warning(
+                            "key pool has no free card slot for this worker; the card is "
+                            "requeued (EX_TEMPFAIL) instead of spending a retry")
+                except Exception:  # pragma: no cover - pool/worker helpers unavailable
+                    pass
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else t("cli.startup.provider_resolution_failed")
             if getattr(self, "tool_progress_mode", "full") == "off":
                 print(message, file=sys.stderr)  # quiet/stream-json: stdout is machine-readable

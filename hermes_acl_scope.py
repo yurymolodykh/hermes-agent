@@ -78,7 +78,9 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
     mints. The same person therefore owns rows under more than one stamp, and the mapping is taken
     from the identity formats themselves rather than guessed:
 
-    * the identity as given;
+    * the identity as given, and — in multi-user mode — the subject a *login* resolves to
+      (``hermes_acl_identity.resolve_subject``: ``anna`` → ``person/anna``), so a proxy that names
+      a person by their login scopes exactly as a dashboard sign-in does;
     * for an ``auth:v1:[provider, issuer, user]`` subject, the login label
       ``<provider>:<user>`` (what ``hermes serve`` stamps on a desktop row) and the bare ``user``
       (the platform id a messaging row keeps);
@@ -93,6 +95,7 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
     if not text:
         return []
     stamps: list[str] = [text]
+    stamps.extend(_identity_subject_stamps(text))
     try:
         from gateway.session_identity import parse_authenticated_subject
         parts = parse_authenticated_subject(text)
@@ -104,12 +107,32 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
             stamps.append(f"{provider}:{user}")
         if user:
             stamps.append(user)
-    stamps.extend(_binding_stamps(text))
+    for stamp in list(stamps):
+        stamps.extend(_binding_stamps(stamp))
     seen: list[str] = []
     for stamp in stamps:
         if stamp and stamp not in seen:
             seen.append(stamp)
     return seen
+
+
+def _identity_subject_stamps(identity: str) -> list[str]:
+    """The stamps a multi-user login resolves to (``anna`` → ``person/anna``); ``[]`` otherwise.
+
+    Only consulted while ``acl.multi_user`` is on: with the flag off a login string is opaque, and
+    turning it into a subject would change a scope nobody asked to change.
+    """
+    try:
+        from hermes_acl_identity import multi_user_enabled, resolve_subject
+
+        if not multi_user_enabled():
+            return []
+        subject = resolve_subject(identity, fallback="")
+    except Exception:  # health: allow BLE001 -- a stripped build has no identity module; the
+        # legacy stamp list is then the whole answer, which is the pre-step-3 behaviour.
+        logger.debug("acl scope: login→subject resolution unavailable", exc_info=True)
+        return []
+    return [subject] if subject and subject != identity else []
 
 
 def _binding_stamps(identity: str) -> list[str]:

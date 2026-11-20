@@ -126,6 +126,12 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_keypool_capped: list[str] = field(default_factory=list)
+    """Ready/review task ids deferred this tick because every card API key is
+    occupied (``agent/kanban_key_pool``). The card stays in ``ready`` and is
+    picked up on a later tick when a key frees up — it is NOT blocked and NOT
+    operator-actionable. Spawning it now would only crash the worker at key
+    resolution and burn the retry budget. Empty when no pool is configured."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2131,6 +2137,41 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _keypool_has_free_slot(reserve: int = 0) -> bool:
+    """True when at least ``reserve + 1`` card key slots are free right now.
+
+    A kanban card reserves ONE API key for its whole run and may never fall
+    back to the shared env key. When every card key is occupied, a worker
+    spawned now dies at key resolution (``KeyPoolError``) and burns the retry
+    budget until the card auto-blocks on a transient condition. The dispatcher
+    therefore defers such a card instead of spawning it.
+    Fail-open: any probe error returns True so a broken pool cannot stop
+    dispatch entirely, and no pool config at all returns True (no-op).
+    """
+    try:
+        from agent.kanban_key_pool import load_config, pool_status
+        cfg = load_config()
+        if cfg is None or not cfg.usable:
+            return True
+        status = pool_status() or {}
+        limit = int(status.get("max_cards_per_key") or 1) or 1
+        free = 0
+        for row in (status.get("keys") or []):
+            _lim = int(row.get("limit") or limit)
+            _used = int(row.get("used") or 0)
+            if _used < _lim:
+                free += (_lim - _used)
+        # ``reserve`` counts workers already spawned earlier in THIS tick whose
+        # child process has not written its reservation yet. Without it two
+        # cards spawned back-to-back both see the same free slot, the second
+        # child then dies at key resolution and the card burns a failure.
+        # Checking headroom against the in-tick tally closes that race without
+        # holding the pool lock across spawn().
+        return free > int(reserve or 0)
+    except Exception:
+        return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2145,6 +2186,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    spawned_this_tick: int = 0,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2192,6 +2234,19 @@ def _dispatch_lane_task(
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+        return False
+
+    # Key-pool slot gate: a card reserves ONE API key for its whole run and may
+    # never fall back to the shared env key. When every card key is occupied,
+    # spawning now only produces a worker that dies at key resolution
+    # (KeyPoolError), burns the retry budget and auto-blocks the card on a
+    # transient condition. Defer instead: the card stays in 'ready' and waits for
+    # a later tick. Sits AFTER the guards so a card that is skipped for a reason
+    # of its own (respawn guard) is reported as such, not as key-pool pressure.
+    # ``spawn_fn`` bypasses the gate (tests / custom spawners own their own
+    # workers), and the probe is fail-open with no pool config.
+    if spawn_fn is None and not _keypool_has_free_slot(reserve=spawned_this_tick):
+        result.skipped_keypool_capped.append(task_id)
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2520,7 +2575,8 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready",
+                               spawned_this_tick=spawned, **lane_kwargs):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
@@ -2533,7 +2589,8 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review",
+                               spawned_this_tick=spawned, **lane_kwargs):
             spawned += 1
     return result
 

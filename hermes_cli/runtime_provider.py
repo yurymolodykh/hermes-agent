@@ -1041,7 +1041,7 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
                                             explicit_base_url=explicit_base_url), requested_provider)
 
 
-def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
+def _resolve_runtime_provider_impl(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
                              explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
@@ -1085,6 +1085,39 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     from hermes_cli.runtime_provider_missing_key import raise_if_declared_key_missing
     raise_if_declared_key_missing(requested_provider, runtime, _get_model_config(), _FROZEN_RUNTIME_CONFIG.get(),
                                   explicit_api_key=explicit_api_key)
+    return runtime
+
+
+def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> dict[str, Any]:
+    """Resolve runtime credentials, then apply the per-card Kanban key pool.
+
+    Single chokepoint: every runtime path goes through here, so the per-card key
+    reservation (``agent.kanban_key_pool``) is applied once instead of at each
+    call site. The pool is a no-op unless ``<hermes-root>/kanban-keypool.json``
+    exists and is enabled.
+    """
+    runtime = _resolve_runtime_provider_impl(
+        requested=requested,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+    )
+    if isinstance(runtime, dict):
+        from agent.kanban_key_pool import KeyPoolError, apply_card_key
+
+        try:
+            runtime = apply_card_key(runtime)
+        except KeyPoolError:
+            # Pool is live and this card cannot be keyed: fail loudly rather than
+            # silently share another account's key.
+            raise
+        except Exception:
+            logger.warning(
+                "key-pool: applying the per-card key failed; using the "
+                "unpooled runtime for this resolution",
+                exc_info=True,
+            )
     return runtime
 
 

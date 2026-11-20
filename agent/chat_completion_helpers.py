@@ -2038,6 +2038,35 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    # Per-card key pool: a card that holds a reserved key must not be re-routed
+    # to a fallback provider either. The fallback entry carries its own
+    # credentials, so activating it is a silent key hop on top of a provider
+    # hop — the reservation would stop describing what went to the wire. Fail
+    # loudly instead; the operator sees the real failure and can retry the card
+    # (a new run legitimately gets a new key). No-op without a pool binding.
+    try:
+        # Context-scoped on purpose: a cron run inside a worker inherits the
+        # worker's binding but must keep its own fallback policy.
+        from agent.kanban_key_pool import active_card_binding
+
+        _kp_binding = active_card_binding()
+    except Exception:  # pragma: no cover - pool module unavailable
+        _kp_binding = None
+    if _kp_binding is not None and getattr(_kp_binding, "role", "") == "card":
+        logger.error(
+            "Fallback chain blocked: task %s holds reserved key #%s (%s); a card "
+            "never switches provider/key mid-run (reason=%s)",
+            getattr(_kp_binding, "task_id", "?"), getattr(_kp_binding, "key_id", "?"),
+            getattr(_kp_binding, "label", "?"),
+            getattr(reason, "value", None) or str(reason or "provider_error"))
+        _kp_notice = (
+            f"🔒 Карточка держит зарезервированный ключ #{getattr(_kp_binding, 'key_id', '?')} "
+            f"({getattr(_kp_binding, 'label', '?')}) — переезд на другой ключ/провайдер "
+            f"запрещён, запуск завершается ошибкой.")
+        _buffer = getattr(agent, "_buffer_status", None)
+        if callable(_buffer):
+            _buffer(_kp_notice)
+        return False
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)

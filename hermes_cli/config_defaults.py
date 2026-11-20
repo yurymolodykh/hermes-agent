@@ -2706,12 +2706,16 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    # Owner scope for session history (listing, HTTP API, session_search). Off = the legacy
-    # behaviour where every session of the profile is visible to every caller of that profile.
-    # Turning it on WITHOUT a trusted identity source fails closed: nobody's history is served
-    # until `identity_trust` names how a caller's identity is established.
+    # Owner scope for session history (listing, HTTP API, session_search). Off = legacy: every
+    # session of the profile is visible to every caller. On WITHOUT a trusted identity source
+    # fails closed — nobody's history is served until `identity_trust` says how identity is set.
     "acl": {
         "enabled": False,
+        # Multi-user identity: a password login the users file knows (not role:owner) acts as
+        # person/<login>, and sessions carry the record's generation, so passwd/disable/revoke/
+        # delete throw signed-in devices out at once (sessions then live 7d). FALSE: the first
+        # enablement is the owner's separate decision. See hermes_acl_identity.
+        "multi_user": False,
         # untrusted | trusted-proxy. Only trusted-proxy reads `identity_header`: a proxy in front
         # must set it from an authenticated login. An unsigned header under the profile's shared
         # API_SERVER_KEY is a self-declaration and is never trusted.

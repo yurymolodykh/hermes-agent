@@ -19,6 +19,10 @@ class Session:
     access_token: str
     refresh_token: str
     issuer: str = ""  # Verified issuer; empty for non-federated providers.
+    #: The users-file generation this session's credential was minted under. ``None`` = the
+    #: credential names nobody in a users file (a deployment's single configured pair, a
+    #: federated login), so nothing about it can be revoked by a generation bump.
+    credential_generation: Optional[int] = None
 
 
 @dataclass(frozen=True)

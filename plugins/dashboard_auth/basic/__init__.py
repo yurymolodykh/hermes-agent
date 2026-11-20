@@ -30,8 +30,11 @@ from plugins.dashboard_auth._shared import (
 logger = logging.getLogger(__name__)
 _TAG = "dashboard-auth-basic"
 
-# The middleware transparently refreshes via the 30-day refresh token when the
+# The middleware transparently refreshes via the refresh token when the
 # access token lapses, so the TTL controls refresh frequency, not login length.
+# Both lifetimes resolve through ``hermes_acl_identity``: an explicit
+# ``dashboard.basic_auth.session_ttl_seconds`` wins, and multi-user mode imposes seven days for
+# both so a revoked person cannot rotate their way back in.
 _DEFAULT_TTL_SECONDS = 12 * 60 * 60
 _REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
 
@@ -126,7 +129,7 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
         "BasicAuthProvider is password-only; there is no OAuth redirect flow. "
         "The login page POSTs to /auth/password-login instead.")
 
-    def __init__(self, *, username: str, password_hash: str, secret: bytes, ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+    def __init__(self, *, username: str, password_hash: str, secret: bytes, ttl_seconds: int = 0,
                  users_file: str = "") -> None:
         if not username and not users_file:
             raise ValueError("username must be non-empty when no users_file is configured")
@@ -138,7 +141,14 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
         self._password_hash = password_hash
         self._has_single_pair = bool(username and password_hash)
         self._secret = secret
-        self._ttl = max(60, int(ttl_seconds))
+        # Lifetimes resolve through ``hermes_acl_identity``: an explicit
+        # ``session_ttl_seconds`` wins; without one, multi-user mode gives the access and refresh
+        # tokens seven days each so a revoked person cannot rotate their way past a generation.
+        from hermes_acl_identity import refresh_ttl_seconds, session_ttl_seconds
+
+        self._ttl = max(60, int(ttl_seconds)) if int(ttl_seconds or 0) > 0 else session_ttl_seconds(
+            0, default_seconds=_DEFAULT_TTL_SECONDS)
+        self._refresh_ttl = refresh_ttl_seconds(0, default_seconds=_REFRESH_TTL_SECONDS)
         self._users = users_mod.UserStore(users_mod.resolve_users_file_path(users_file))
 
         self._reported_unknown_format: set[str] = set()
@@ -173,7 +183,7 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
         if record is not None:
             password_ok = self._verify_user_record(record, password)
             if not record.disabled and password_ok:
-                return self._mint_session(record.login)
+                return self._mint_session(record.login, from_file=True, generation=record.gen)
             raise InvalidCredentialsError("invalid username or password")
 
         # No users-file record: the single configured pair, exactly as before. Adding a users file
@@ -187,7 +197,7 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
         password_ok = _verify_password(password, self._password_hash if username_ok else self._dummy())
         if not (username_ok and password_ok):
             raise InvalidCredentialsError("invalid username or password")
-        return self._mint_session(self._username)
+        return self._mint_session(self._username, from_file=False, generation=None)
 
     @staticmethod
     def _dummy() -> str:
@@ -274,18 +284,55 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
     # ---- session lifecycle -------------------------------------------------
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
+        """A signed access token, or ``None`` — including when the credential behind it has been
+        revoked. Every request passes through here, so the generation check lands at the one place
+        that already decides "this request is signed in"."""
         payload = _unsign(access_token, self._secret, "access")
         if payload is None:
             return None
-        return self._session(str(payload.get("sub", "")), int(payload["exp"]), access_token, "")
+        user_id = str(payload.get("sub", ""))
+        from hermes_acl_identity import credential_valid
+
+        if not credential_valid(user_id, payload.get("gen"), from_file=payload.get("src")):
+            logger.info("dashboard-auth-basic: refused a session for %r (%s)", user_id,
+                        _revocation_reason(user_id, payload))
+            return None
+        return self._session(user_id, int(payload["exp"]), access_token, "",
+                             generation=payload.get("gen"))
+
+    def credential_status(self, token: str) -> tuple[str, str]:
+        """``(status, detail)`` for a presented access token, for the gate's refusal message.
+
+        ``("ok"|"unknown", "")`` when nothing is wrong with the *credential* (an expired or
+        foreign token is ``unknown``: that is the ordinary re-login case), and
+        ``("revoked", "<rule>")`` when the token is ours but the person's generation, disabled
+        flag or record has moved past it. The gate turns the second into a distinct 401 so an
+        operator sees "your access was revoked" instead of a generic expiry.
+        """
+        payload = _unsign(token, self._secret, "access")
+        if payload is None:
+            return "unknown", ""
+        from hermes_acl_identity import revoke_reason
+
+        reason = revoke_reason(str(payload.get("sub", "")), payload.get("gen"),
+                               from_file=payload.get("src"))
+        return ("ok", "") if reason == "accepted" else ("revoked", reason)
 
     def refresh_session(self, *, refresh_token: str) -> Session:
+        """Rotate a lapsed session. Refuses (``RefreshExpiredError``) once the credential that
+        minted it is revoked: a refresh token must not outlive the generation that revoked
+        the person, or seven days becomes thirty for somebody who was fired yesterday."""
         if not refresh_token:
             raise RefreshExpiredError("no refresh token present in session")
         payload = _unsign(refresh_token, self._secret, "refresh")
         if payload is None:
             raise RefreshExpiredError("refresh token expired or invalid")
-        return self._mint_session(str(payload.get("sub", self._username)))
+        user_id = str(payload.get("sub", self._username))
+        from hermes_acl_identity import credential_valid
+
+        if not credential_valid(user_id, payload.get("gen"), from_file=payload.get("src")):
+            raise RefreshExpiredError("session credential revoked")
+        return self._mint_session(user_id, from_file=payload.get("src"), generation=payload.get("gen"))
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Stateless tokens — nothing to revoke server-side; the session expires within its TTL. Must not raise.
@@ -293,21 +340,34 @@ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
 
     # ---- internals ---------------------------------------------------------
 
-    def _mint_session(self, user_id: str) -> Session:
+    def _mint_session(self, user_id: str, *, from_file=None, generation=None) -> Session:
         # ``jti`` gives every session its own tokens, even two minted in one second: a listener that
         # drops a session's tokens (the Webapp's sign-out) must not get them back from a later login.
         now = int(time.time())
         exp = now + self._ttl
         jti = secrets.token_urlsafe(16)
+        claims = {"sub": user_id, "jti": jti, "src": bool(from_file) if from_file is not None else False}
+        if generation is not None:
+            claims["gen"] = int(generation)
         return self._session(
             user_id, exp,
-            _sign({"sub": user_id, "kind": "access", "exp": exp, "jti": jti}, self._secret),
-            _sign({"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS, "jti": jti}, self._secret))
+            _sign({**claims, "kind": "access", "exp": exp}, self._secret),
+            _sign({**claims, "kind": "refresh", "exp": now + self._refresh_ttl}, self._secret),
+            generation=claims.get("gen"))
 
-    def _session(self, user_id: str, exp: int, access_token: str, refresh_token: str) -> Session:
+    def _session(self, user_id: str, exp: int, access_token: str, refresh_token: str,
+                 *, generation=None) -> Session:
         return Session(
             user_id=user_id, email="", display_name=user_id, org_id="", provider=self.name,
-            expires_at=exp, access_token=access_token, refresh_token=refresh_token)
+            expires_at=exp, access_token=access_token, refresh_token=refresh_token,
+            credential_generation=None if generation is None else int(generation))
+
+
+def _revocation_reason(user_id: str, payload: dict) -> str:
+    """Audit-safe explanation of a refused session: which rule fired, never the credential."""
+    from hermes_acl_identity import revoke_reason
+
+    return revoke_reason(user_id, payload.get("gen"), from_file=payload.get("src"))
 
 
 # ---- Plugin entry point ----
@@ -439,10 +499,13 @@ def _settings() -> dict:
                 "dashboard-auth-basic: hashed plaintext password in-memory. "
                 "For production, precompute dashboard.basic_auth.password_hash "
                 "and remove the plaintext password from config.")
+    # 0 = "not configured": the provider resolves the lifetime through ``hermes_acl_identity``
+    # (an explicit number wins; multi-user mode gives 7 days; otherwise the 12-hour default), so
+    # baking the default in HERE would silently defeat the multi-user rule.
     try:
-        ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
+        ttl = int(ttl_raw) if ttl_raw else 0
     except ValueError:
-        ttl = _DEFAULT_TTL_SECONDS
+        ttl = 0
     return {"username": username, "password_hash": password_hash, "secret": _resolve_secret(section),
             "ttl_seconds": ttl, "users_file": users_file}
 
