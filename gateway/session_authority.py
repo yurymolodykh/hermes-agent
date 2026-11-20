@@ -231,9 +231,9 @@ class SessionAuthority:
             require_history_access(self, actor, ref.session_id, capability)
         from gateway.config import Platform
         source = self.sessions[ref.session_id].source
-        from gateway.owner_identity import same_owner
+        from gateway.owner_identity import is_host_operator, same_owner
         if (source is not None and source.platform == Platform.LOCAL
-                and not same_owner(source.user_id, actor.subject) and 'session:operator' not in actor.capabilities):
+                and not same_owner(source.user_id, actor.subject) and not is_host_operator(actor)):
             raise RuntimeStoreError('permission_denied')
         from gateway.session_retirement import touch_restored
         touch_restored(self, ref.session_id)  # a rename or a read brought a retired one back

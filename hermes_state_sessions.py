@@ -1654,12 +1654,13 @@ class SessionSessionsMixin:
 
     def session_count_by_source(
         self, *, include_archived: bool = False, archived_only: bool = False,
-        exclude_children: bool = False,
+        exclude_children: bool = False, user_id: str | Sequence[str] | None = None,
     ) -> dict[str, int]:
-        """``{source: count}`` via one GROUP BY; ``exclude_children`` mirrors listing visibility."""
+        """``{source: count}`` via one GROUP BY; ``exclude_children`` mirrors listing visibility.
+        ``user_id`` carries the same owner scope as the listing (``None`` unscoped, empty = nothing)."""
         where_clauses, params = _session_filter_where(
             exclude_children=exclude_children, archived_only=archived_only,
-            include_archived=include_archived,
+            include_archived=include_archived, user_id=user_id,
         )
         if exclude_children:
             from hermes_state_local import exclude_superseded_segments
@@ -1978,50 +1979,6 @@ class SessionSessionsMixin:
         if count:
             emit_session_deleted(self, removed_ids, reason="delete", primary=unique_ids[0] if len(unique_ids) == 1 else None,
                                  sessions_dir=sessions_dir)
-        from hermes_state_media import collect_retired_media
-        collect_retired_media(self)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
-
-    # Shared by count_empty_sessions / delete_empty_sessions so badge and sweep agree. message_count
-    # counts live rows only (rewind/compaction keep dropped turns as active = 0): NOT EXISTS is authority.
-    # The ``NOT EXISTS`` probe is the authority; : ``message_count = 0`` stays as a cheap prefilter. Same
-    # shape as every : other emptiness guard in this module. (#95868)
-    _EMPTY_SESSION_WHERE = (
-        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 AND NOT EXISTS ("
-        "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
-    )
-
-    def count_empty_sessions(self) -> int:
-        """Count of empty, ended, non-archived sessions; ended_at guards a fresh session's first message."""
-        return self._read_one(f"SELECT COUNT(*) FROM sessions WHERE {self._EMPTY_SESSION_WHERE}")[0]
-
-    def delete_empty_sessions(self, sessions_dir: Optional[Path] = None) -> int:
-        """Delete every empty, ended, non-archived session in one transaction, orphaning (not cascading)
-        children; transcript files are swept too."""
-        removed_ids: list[str] = []
-        def _do(conn):
-            session_ids = {row["id"] for row in conn.execute(
-                f"SELECT id FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
-            ).fetchall()}
-            from hermes_state_mutation_retirement import retire_prunable
-            session_ids = retire_prunable(conn, sorted(session_ids))
-            if not session_ids:
-                return 0
-            for chunk in _id_chunks(session_ids):
-                ph = _session_ids_placeholders(chunk)
-                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
-                # DELETE FROM messages: a row inserted between the SELECT and here
-                # would otherwise dangle (clean FK state).
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-                removed_ids.extend(chunk)
-            self._delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
-        count = self._execute_write(_do)
-        if count:
-            emit_session_deleted(self, removed_ids, reason="empty_sweep", sessions_dir=sessions_dir)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
         for sid in removed_ids:

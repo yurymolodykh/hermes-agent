@@ -13,6 +13,8 @@ room controls cannot disagree about who owns a row.
 """
 from __future__ import annotations
 
+from typing import Any
+
 
 def host_owner_subject() -> str:
     """The owner's own OS identity: the subject native Desktop's ticket carries on this host."""
@@ -137,3 +139,49 @@ def owners_agree(first, second) -> bool:
     """Whether two stored owner stamps name the same owner (:func:`same_owner` either way round), for
     checks that compare one stored stamp with another rather than with a caller."""
     return same_owner(first, second) or same_owner(second, first)
+
+
+def is_host_owner(subject: Any) -> bool:
+    """Whether *subject* is THIS host's owner (the person every signed-in surface used to be).
+
+    The multi-user mission splits a password login into ``person/<login>``; such a person is a
+    different subject from :func:`host_owner_subject`, so a check that asks "is this the owner?"
+    must name one rule instead of comparing strings at each call site.
+    """
+    owner = host_owner_subject()
+    return bool(owner) and bool(subject) and owners_agree(str(subject), owner)
+
+
+def identity_is_host_owner(identity: Any) -> bool:
+    """Whether a dashboard ``{user_id, provider, issuer}`` identity resolves to the host owner.
+
+    An identity carrying no subject is NOT the owner: a missing stamp must never grant the
+    owner's bypass (fail closed), exactly as :func:`same_owner` refuses an empty pair.
+    """
+    identity = identity or {}
+    if not identity.get("user_id"):
+        return False
+    return is_host_owner(principal_subject(identity))
+
+
+def is_host_operator(actor: Any) -> bool:
+    """``session:operator`` is the HOST OWNER's capability once multi-user mode is ON.
+
+    The dashboard's cookie session used to hand every signed-in browser ``session:operator``, and
+    three checks treated that capability alone as "may act for any stored owner" — so a second
+    login could read and open the owner's conversations. With ``acl.multi_user`` on, the
+    capability grants the cross-owner bypass only while the actor's own subject IS the host owner;
+    anyone else holding it is a plain principal.
+
+    With the flag off there is only one person on the host (the legacy single-user mode the whole
+    gateway was built for), so the capability keeps its original meaning and nothing changes —
+    a native Desktop socket and the local operator surface still share local sessions.
+    """
+    capabilities = getattr(actor, "capabilities", None) or ()
+    subject = getattr(actor, "subject", "")
+    if "session:operator" not in capabilities:
+        return False
+    from hermes_acl_identity import multi_user_enabled
+    if not multi_user_enabled():
+        return True
+    return is_host_owner(subject)

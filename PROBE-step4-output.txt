@@ -1,0 +1,34 @@
+== ЖИВАЯ ПРОБА ШАГ 4 (МПД Т5) ==
+HERMES_HOME пробы: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/mpd4-probe-m9v9jgp4/.hermes
+владелец (subject): uid:1001
+
+-- A(alice) → сессия B(bob): чтение --
+  A→B  200  leak=no   /api/sessions?limit=50
+  A→B  200  leak=no   /api/sessions/search?q=ONLY
+  A→B  200  leak=no   /api/sessions/stats
+  A→B  404  leak=no   /api/sessions/bob-s1
+  A→B  404  leak=no   /api/sessions/bob-s1/mutation-snapshot
+  A→B  404  leak=no   /api/sessions/bob-s1/latest-descendant
+  A→B  404  leak=no   /api/sessions/bob-s1/messages
+  A→B  404  leak=no   /api/sessions/bob-s1/timeline
+  A→B  404  leak=no   /api/sessions/bob-s1/messages/around?row_id=3
+  A→B  404  leak=no   /api/sessions/bob-s1/export
+  A→B  200  leak=no   /api/sessions/empty/count
+
+-- A(alice): свои пути (200 ожидаемы) --
+  own_ok=True  200 200 200 200 200
+
+-- A(alice) → мутации чужого id --
+  A→B  404  DELETE /api/sessions/bob-s1
+  A→B  404  PATCH /api/sessions/bob-s1
+  A→B  200  POST /api/sessions/bulk-delete
+
+-- A(alice) → общехранилищные операции --
+  A    403  POST /api/sessions/prune
+  A    403  POST /api/sessions/owner-backfill
+
+-- владелец --
+  список владельца: ['owner-s1']
+  prune dry-run: 200
+
+ИТОГ: OK — утечек нет, свои пути работают, чужое не тронуто

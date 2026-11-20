@@ -391,7 +391,8 @@ def _bot_sessions(authority, actor):
     store has not moved, as the pre-unified roster did (#117257): every connection polls every 5 s.
     Discovery is read-only: no legacy restore/unarchive or new SessionDB handle."""
     from tui_gateway.profile_roster_cache import cached_reader_session_fields
-    operator = 'session:operator' in actor.capabilities
+    from gateway.owner_identity import is_host_operator
+    operator = is_host_operator(actor)
     return cached_reader_session_fields(Path(authority.db.db_path).parent, (actor.subject, operator),
                                         lambda: _read_bot_sessions(authority.db, actor.subject, operator))
 

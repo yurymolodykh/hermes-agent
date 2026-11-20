@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
@@ -24,6 +24,7 @@ from hermes_state_common import (
     _MERGE_DISPLAY_META, _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_tool_copy_sql
 from hermes_state_detached_results import SessionDetachedResultsMixin
+from hermes_state_owner_scope import message_count_sql
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
 from hermes_state_identity import (
@@ -1881,10 +1882,17 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                     "replacement_message_uid": replacement_message_uid}
                    if preserve_compaction_handoff else {})}
 
-    def message_count(self, session_id: str | None = None) -> int:
-        """Count messages, optionally for a specific session."""
-        sql = "SELECT COUNT(*) FROM messages" + (" WHERE session_id = ?" if session_id else "")
-        return self._read_one(sql, (session_id,) if session_id else ())[0]
+    def message_count(self, session_id: str | None = None,
+                      user_id: str | Sequence[str] | None = None) -> int:
+        """Count messages, optionally for a specific session, optionally owner-scoped.
+
+        ``user_id`` restricts the count to rows of sessions inside that OWNER scope (the same
+        arm the listing builds; see :mod:`hermes_state_owner_scope`): ``None`` unscoped, an
+        empty sequence counts nothing. A per-session count and an owner scope together count only
+        a row inside the scope, so the number is never an existence oracle for a foreign id.
+        """
+        sql, params = message_count_sql(session_id, user_id)
+        return self._read_one(sql, params)[0]
 
     def has_gateway_input_owner(self, session_id: str, owner: str) -> bool:
         """Probe the accepted-input marker without allocating message bodies or archives."""
