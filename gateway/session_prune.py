@@ -25,7 +25,8 @@ async def prune(connection, ref, params):
     authority, actor = connection.authority, connection.actor
     # Store-wide deletion across every principal's rows: the local operator only (a ticket from
     # this host's private control socket), never a remote or browser grant.
-    if not connection.native_owner or 'session:operator' not in actor.capabilities:
+    from gateway.owner_identity import is_host_operator
+    if not connection.native_owner or not is_host_operator(actor):
         raise RuntimeStoreError('permission_denied')
     if actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')

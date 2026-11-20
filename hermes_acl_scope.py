@@ -196,30 +196,85 @@ def caller_owner_scope() -> Optional[list[str]]:
 def request_owner_scope(request: Any) -> Optional[list[str]]:
     """Owner scope for one HTTP request: ``None`` when unscoped, else stamps (possibly empty).
 
-    The identity header is read ONLY when ``acl.identity_trust`` declares a trusted proxy — the
-    profile key alone authenticates a profile, and an unsigned header under a shared key is a
-    self-declaration. Under the default trust level this returns ``[]`` (fail closed) as soon as
-    scoping is on, which is deliberate: an installation that enables ``acl.enabled`` without
-    declaring how identities are trusted must not serve anyone's history, and must say so. A broken
-    bindings registry is the same class of failure and returns ``[]`` as well.
+    The caller is resolved from the STRONGEST identity the request already carries, in this order:
+
+    * a verified native grant (``request.state.native_http_principal``) — the Desktop's own
+      private one-use ticket;
+    * a verified dashboard login (``request.state.session``) — the cookie/bearer session the
+      auth gate attached, whose subject is the person who signed in;
+    * ``acl.identity_trust``'s identity header — read ONLY when a trusted proxy is declared,
+      because the profile key alone authenticates a profile and an unsigned header under a shared
+      key is a self-declaration.
+
+    Under the default trust level with no verified identity this returns ``[]`` (fail closed) as
+    soon as scoping is on, which is deliberate: an installation that enables ``acl.enabled``
+    without declaring how identities are trusted must not serve anyone's history, and must say so.
+    A broken bindings registry is the same class of failure and returns ``[]`` as well.
     """
     if not acl_enabled():
         return None
+    subject = request_identity_subject(request)
+    if subject is not None:
+        try:
+            return owner_stamps(subject)
+        except _bindings_errors() as exc:
+            logger.warning("acl scope: bindings registry unusable — DENYING this request (%s)", exc)
+            return []
     if identity_trust() != TRUST_TRUSTED_PROXY:
         logger.warning(
-            "acl.enabled is true but acl.identity_trust is %r; refusing an HTTP identity (session "
-            "history stays closed). Configure acl.identity_trust=trusted-proxy behind a proxy that "
-            "sets %s.", identity_trust(), identity_header())
+            "acl.enabled is true but acl.identity_trust is %r and the request carries no verified "
+            "dashboard identity; refusing it (session history stays closed). Configure "
+            "acl.identity_trust=trusted-proxy behind a proxy that sets %s.",
+            identity_trust(), identity_header())
         return []
-    try:
-        value = request.headers.get(identity_header(), "")
-    except Exception:  # a duck-typed request (tests) without headers
-        value = ""
+    headers = getattr(request, "headers", None)
+    value = headers.get(identity_header(), "") if headers is not None else ""
     try:
         return owner_stamps(value)
     except _bindings_errors() as exc:
         logger.warning("acl scope: bindings registry unusable — DENYING this request (%s)", exc)
         return []
+
+
+def request_identity_subject(request: Any) -> Optional[str]:
+    """The verified subject a request acts as, or ``None`` when it carries no verified identity.
+
+    Three stitched identities are compared: the native HTTP grant and the dashboard login, whose
+    subjects must AGREE when both are present (a mismatch is not "one of them is right") — an
+    ambiguous request is refused with ``""``, the fail-closed sentinel every scope resolver turns
+    into "no rows". No header is read here: this is the verified half of
+    :func:`request_owner_scope`.
+    """
+    state = getattr(request, "state", None)
+    native = getattr(state, "native_http_principal", None)
+    session = getattr(state, "session", None)
+    subjects: list[str] = []
+    if native is not None:
+        subject = str((native or {}).get("subject") or "").strip()
+        subjects.append(subject)
+    if session is not None:
+        from gateway.owner_identity import principal_subject
+        subjects.append(str(principal_subject({
+            "user_id": getattr(session, "user_id", ""),
+            "provider": getattr(session, "provider", ""),
+            "issuer": getattr(session, "issuer", "")}) or "").strip())
+    if not subjects:
+        return None
+    first = subjects[0]
+    if any(other != first for other in subjects[1:]):
+        logger.warning("acl scope: native grant and dashboard login name different subjects — DENYING")
+        return ""
+    return first
+
+
+def request_is_host_owner(request: Any) -> bool:
+    """Whether the request's verified identity is the host owner ([] free access to nothing else)."""
+    subject = request_identity_subject(request)
+    if not subject:
+        return False
+    from gateway.owner_identity import is_host_owner
+    return is_host_owner(subject)
+
 
 
 def _bindings_errors() -> tuple[type[BaseException], ...]:

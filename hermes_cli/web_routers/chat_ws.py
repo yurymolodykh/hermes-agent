@@ -647,6 +647,26 @@ def _authority_for_ticket_home(authority, home: str):
     return authority_for_home(getattr(authority, 'runner', None), home)
 
 
+def socket_operator(identity) -> bool:
+    """Whether a dashboard socket acts as the host operator (``session:operator``).
+
+    The upgrade gate verified that this browser SIGNED IN, not that it is the host owner. Handing
+    ``session:operator`` to every such socket is what let one login read another's conversations,
+    so with ``acl.multi_user`` on only the host owner keeps it. With the flag off the host has one
+    person and the old behaviour stands.
+
+    An identity-less socket is NOT promoted: in multi-user mode "nothing was verified" must not
+    become "the operator". The loopback token's own path synthesises the owner's identity before
+    this call, so the owner's page keeps its access.
+    """
+    from gateway.owner_identity import identity_is_host_owner
+    from hermes_acl_identity import multi_user_enabled
+
+    if not multi_user_enabled():
+        return True
+    return bool(identity is not None and identity_is_host_owner(identity))
+
+
 @router.websocket("/api/ws")
 async def gateway_ws(ws: WebSocket) -> None:
     if not await _close_unless_sidecar_allowed(ws, allow_internal=True, socket=GATEWAY_SOCKET):
@@ -671,9 +691,13 @@ async def gateway_ws(ws: WebSocket) -> None:
                     'capabilities': ['session:create', 'session:read', 'session:submit',
                                      'session:control', 'session:approve', 'session:respond']}
     if identity is not None:
-        # The dashboard gate authorizes the whole host (its REST routes take ``?profile=`` for
-        # every profile), so its socket may select any served sibling too.
-        identity = {**identity, 'profile_scope': 'host'}
+        # The dashboard gate authorizes the whole host for the HOST OWNER (its REST routes take
+        # ``?profile=`` for every profile). A second signed-in person is bound to the profile of
+        # the tab they signed into, and is not an operator: ``session:operator`` used to be handed
+        # to every browser, which let one login read another's conversations over this socket.
+        from gateway.owner_identity import identity_is_host_owner
+        owner = identity_is_host_owner(identity)
+        identity = {**identity, 'profile_scope': 'host' if owner else 'profile'}
     ticket_home = getattr(ws, "_hermes_ticket_profile_home", None)
     served = authority
     if ticket_home and authority is None:
@@ -698,11 +722,15 @@ async def gateway_ws(ws: WebSocket) -> None:
     if served is not None:
         from gateway.session_authorities import owner_scope
         profile_scope = owner_scope(served)
+    from gateway.owner_identity import identity_is_host_owner
+    # Multi-user OFF: the host has one person, so the dashboard gate's operator keep is unchanged.
+    # Multi-user ON: the gate verified the SIGN-IN, not the owner — only the host owner is an
+    # operator; a second person's socket acts as their own subject.
     with profile_scope:
         await handle_ws(
             ws,
             auth_identity=identity,
-            operator=True,  # The dashboard upgrade gate above has verified this operator.
+            operator=socket_operator(identity),
             subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
         )
 

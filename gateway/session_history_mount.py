@@ -25,7 +25,8 @@ def _reader(authority, actor, sid):
         binding = history_binding(conn, sid)
     if binding is not None:
         return binding_names(binding, actor.subject)
-    return ('session:operator' in actor.capabilities
+    from gateway.owner_identity import is_host_operator
+    return (is_host_operator(actor)
             or getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) == actor)
 
 

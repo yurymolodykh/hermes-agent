@@ -106,6 +106,8 @@ def _session_mutation_context(request, profile):
     authority = getattr(request.app.state, 'session_authority', None)
     home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
     capabilities = frozenset({'session:read', 'session:control', 'session:create', 'session:operator'})
+    # :func:`is_host_operator` re-checks the SUBJECT, so the grant is harmless to carry; a
+    # non-owner's request therefore acts as a plain principal everywhere the bypass used to apply.
     if authority is None:
         if getattr(request.app.state, 'gateway_runner', None) is not None:
             raise HTTPException(status_code=503, detail='session_authority_unavailable')
