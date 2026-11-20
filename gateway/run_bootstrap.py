@@ -831,6 +831,15 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             runner = GatewayRunner(resolved_config)
         finally:
             unpin_launch_store(_launch_store_pin)
+        # The bindings registry is read ONCE, before any request is served, so a broken file is
+        # reported at boot instead of surfacing as an opaque denial on a user's first read (and so
+        # the mtime cache is warm for the first turn). Never raises: every later rights check denies
+        # on its own, and the process must stay up for an operator to repair the file.
+        def _prime_bindings() -> None:
+            from hermes_acl_bindings import prime
+            prime()
+
+        await asyncio.to_thread(_best_effort, _prime_bindings, "bindings registry prime failed: %s")
         await initialize_gateway_runtime(runner)
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
         # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.

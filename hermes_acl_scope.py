@@ -81,7 +81,10 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
     * the identity as given;
     * for an ``auth:v1:[provider, issuer, user]`` subject, the login label
       ``<provider>:<user>`` (what ``hermes serve`` stamps on a desktop row) and the bare ``user``
-      (the platform id a messaging row keeps).
+      (the platform id a messaging row keeps);
+    * every stamp the bindings registry records for the SAME PERSON (``hermes_acl_bindings``):
+      the owner's ``uid:<n>``, ``cron-owner`` and Telegram id live on their own record, which is
+      what keeps the sessions created before step 3 visible to the person they belong to.
 
     Anything else contributes only itself. No wildcard, no prefix match: an unrecognised stamp
     simply does not match, which fails closed.
@@ -101,11 +104,28 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
             stamps.append(f"{provider}:{user}")
         if user:
             stamps.append(user)
+    stamps.extend(_binding_stamps(text))
     seen: list[str] = []
     for stamp in stamps:
         if stamp and stamp not in seen:
             seen.append(stamp)
     return seen
+
+
+def _binding_stamps(identity: str) -> list[str]:
+    """Every stamp of *identity*'s person per the bindings registry.
+
+    Propagates :class:`hermes_acl_bindings.BindingsError` while ``acl.enabled`` so the caller denies
+    (see :func:`request_owner_scope`): a registry that cannot be validated must stop the rights
+    check, not shrink the answer to one stamp and quietly hide the owner's history. With ACL off a
+    broken file changes nothing, so the registry reports absence instead.
+    """
+    try:
+        from hermes_acl_bindings import person_stamps
+        return list(person_stamps(identity))
+    except ImportError:  # a stripped-down build without the registry module
+        logger.debug("acl scope: hermes_acl_bindings unavailable", exc_info=True)
+        return []
 
 
 def merged_scope(stamps: Sequence[str]) -> list[str]:
@@ -137,11 +157,17 @@ def caller_owner_scope() -> Optional[list[str]]:
     """Owner scope for a tool read: ``None`` when unscoped, else the stamps (possibly empty).
 
     ``None`` (no filter at all) only while ``acl.enabled`` is false. With it on, the subject must be
-    established: an empty subject yields ``[]``, which the store renders as ``1 = 0``.
+    established: an empty subject yields ``[]``, which the store renders as ``1 = 0``. A bindings
+    registry that cannot be validated also yields ``[]`` — the rights check refuses instead of
+    falling back to the narrower stamp set.
     """
     if not acl_enabled():
         return None
-    return owner_stamps(caller_subject())
+    try:
+        return owner_stamps(caller_subject())
+    except _bindings_errors() as exc:
+        logger.warning("acl scope: bindings registry unusable — DENYING session history (%s)", exc)
+        return []
 
 
 def request_owner_scope(request: Any) -> Optional[list[str]]:
@@ -151,7 +177,8 @@ def request_owner_scope(request: Any) -> Optional[list[str]]:
     profile key alone authenticates a profile, and an unsigned header under a shared key is a
     self-declaration. Under the default trust level this returns ``[]`` (fail closed) as soon as
     scoping is on, which is deliberate: an installation that enables ``acl.enabled`` without
-    declaring how identities are trusted must not serve anyone's history, and must say so.
+    declaring how identities are trusted must not serve anyone's history, and must say so. A broken
+    bindings registry is the same class of failure and returns ``[]`` as well.
     """
     if not acl_enabled():
         return None
@@ -165,7 +192,28 @@ def request_owner_scope(request: Any) -> Optional[list[str]]:
         value = request.headers.get(identity_header(), "")
     except Exception:  # a duck-typed request (tests) without headers
         value = ""
-    return owner_stamps(value)
+    try:
+        return owner_stamps(value)
+    except _bindings_errors() as exc:
+        logger.warning("acl scope: bindings registry unusable — DENYING this request (%s)", exc)
+        return []
+
+
+def _bindings_errors() -> tuple[type[BaseException], ...]:
+    """The exception tuple the registry raises for a file it cannot trust.
+
+    Resolved at call time so a build without ``hermes_acl_bindings`` still imports this module; an
+    always-match fallback keeps the ``except`` clause valid but never fires for that build.
+    """
+    try:
+        from hermes_acl_bindings import BindingsError
+        return (BindingsError,)
+    except ImportError:
+        return (_NeverRaised,)
+
+
+class _NeverRaised(Exception):
+    """Placeholder so the ``except`` clause stays valid when the registry module is absent."""
 
 
 def row_outside_scope(session: Any, scope: Sequence[str]) -> bool:

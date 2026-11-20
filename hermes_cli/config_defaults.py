@@ -2717,6 +2717,11 @@ DEFAULT_CONFIG = {
         # API_SERVER_KEY is a self-declaration and is never trusted.
         "identity_trust": "untrusted",
         "identity_header": "X-Hermes-User-Id",
+        # person -> profiles registry (hermes_acl_bindings). Empty = <hermes root>/acl/
+        # profile-bindings.json. Backups land in <parent>/backups/ on every change. Additive: with
+        # no file, owner comparisons behave exactly as before; a broken file makes every
+        # owner-scoped check DENY. Only read while `enabled` is true.
+        "bindings_file": "",
     },
     "_config_version": 53,  # Config schema version - bump this when adding new required fields
 }

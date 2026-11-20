@@ -78,9 +78,10 @@ def _login_subject(value) -> bool:
 def same_owner(stored, subject) -> bool:
     """THE owner rule: whether a stored owner stamp (a room owner, a history binding's subject, an
     admission's principal, a routeless row's ``user_id``) belongs to *subject*. True when equal, when it
-    is the ``<provider>:<user>`` label of *subject*'s own login, or, while *subject* is the host owner,
-    when it is any sign-in stamp an older build stored (an ``auth:v1`` login subject or a served
-    dashboard's ``<provider>:<user>`` label). One-way: a non-owner subject never gains owner stamps.
+    is the ``<provider>:<user>`` label of *subject*'s own login, when it is any sign-in stamp an older
+    build stored (an ``auth:v1`` login subject or a served dashboard's ``<provider>:<user>`` label)
+    while *subject* is the host owner, or when the bindings registry states both name one person.
+    One-way: a non-owner subject never gains owner stamps by the legacy rules.
     Every identity comparison on a stored owner goes through here so readers cannot disagree."""
     if stored == subject:
         return True
@@ -89,7 +90,30 @@ def same_owner(stored, subject) -> bool:
     from hermes_state_mutation_binding import _login_label as label_of
     if stored == label_of(subject):
         return True
-    return subject == host_owner_subject() and (_login_subject(stored) or _login_label(stored))
+    if subject == host_owner_subject() and (_login_subject(stored) or _login_label(stored)):
+        return True
+    return _same_person_binding(stored, subject)
+
+
+def _same_person_binding(stored, subject) -> bool:
+    """The bindings registry's answer for a pair the stamp rules above cannot tie together.
+
+    Only a registry an operator wrote can claim ``uid:1001`` and ``person/yury`` are one person, so
+    this is an explicit statement about identity rather than a widened heuristic: with no registry
+    (or a record naming neither) the answer is False and every caller behaves exactly as before.
+    A registry that exists but cannot be validated REFUSES (False) instead of guessing — on the
+    owner-scope read paths ``hermes_acl_scope`` denies outright, and this predicate must not be the
+    one place a broken registry silently widens access.
+    """
+    try:
+        from hermes_acl_bindings import same_person
+        return same_person(stored, subject)
+    except Exception:  # a missing/broken registry is a refusal, never an exception in a hot path
+        import logging
+        logging.getLogger(__name__).warning(
+            "bindings registry unusable while comparing %r with %r: owner comparison DENIES",
+            stored, subject, exc_info=True)
+        return False
 
 
 def owners_agree(first, second) -> bool:
