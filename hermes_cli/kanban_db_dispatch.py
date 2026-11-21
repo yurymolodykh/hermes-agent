@@ -2047,6 +2047,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    keypool_exempt: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2070,6 +2071,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            keypool_exempt=keypool_exempt,
         )
 
     try:
@@ -2181,6 +2183,7 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     spawned_this_tick: int = 0,
+    keypool_exempt: bool = False,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2226,9 +2229,15 @@ def _dispatch_lane_task(
     # transient condition. Defer instead: the card stays in 'ready' and waits for
     # a later tick. Sits AFTER the guards so a card that is skipped for a reason
     # of its own (respawn guard) is reported as such, not as key-pool pressure.
-    # ``spawn_fn`` bypasses the gate (tests / custom spawners own their own
-    # workers), and the probe is fail-open with no pool config.
-    if spawn_fn is None and not _keypool_has_free_slot(reserve=spawned_this_tick):
+    # ``spawn_fn`` used to bypass the gate wholesale ("tests / custom spawners own
+    # their own workers"). That is wrong for the one thing the gate exists to
+    # protect: a custom spawner still starts a real worker that resolves its key
+    # through ``resolve_runtime_provider`` — the same chokepoint — so an
+    # over-subscribed pool produces exactly the worker the gate is meant to keep
+    # off the board (KeyPoolError at startup, burned retry budget, auto-block on a
+    # transient condition). The exemption is now OPT-IN and named: a spawner that
+    # truly keys its workers another way passes ``keypool_exempt=True``.
+    if not keypool_exempt and not _keypool_has_free_slot(reserve=spawned_this_tick):
         result.skipped_keypool_capped.append(task_id)
         return False
 
@@ -2523,6 +2532,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    keypool_exempt: bool = False,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2578,6 +2588,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        keypool_exempt=keypool_exempt,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

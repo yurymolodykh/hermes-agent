@@ -30,6 +30,11 @@ def _clean_env(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kp.reset_process_cache()
     yield
+    # ``_pool`` writes straight to ``os.environ`` (it predates the fixture);
+    # without this restore the pool path leaks into every later test in the
+    # session and the dispatcher's key-pool gate starts deferring THEIR cards.
+    for key in (kp.ENV_KEYPOOL, kp.ENV_KEYPOOL_STATE):
+        os.environ.pop(key, None)
     kp.reset_process_cache()
 
 
