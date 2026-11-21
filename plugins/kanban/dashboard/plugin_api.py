@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect,
+    status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -130,6 +131,29 @@ def _run_aux(board: Optional[str], module: str, fn: str, task_id: str, author: O
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> kanban_db.Task:
     return _require(kanban_db.get_task, conn, task_id, "task")
+
+
+def _require_owned_task(
+        conn: sqlite3.Connection, task_id: str, request: Optional[Request],
+        *, not_found: Optional[str] = None) -> kanban_db.Task:
+    """The task, if THIS caller may touch its attachments (МПД Т6).
+
+    Attachment ids are small integers, so "download by id" was a walk over every card on the
+    board. Ownership is decided by :func:`hermes_acl_results.require_task` — the same policy the
+    file and memory surfaces use — against the card's ``created_by``/``assignee``. A foreign card
+    answers with the miss an absent id gets, so the sequence is not an enumeration oracle. With
+    ``acl.multi_user`` off (or for the host owner) every card is allowed, as before.
+    """
+    task = _require_task(conn, task_id)
+    from hermes_acl_results import require_task
+
+    try:
+        require_task(request, task, task_id)
+    except HTTPException:
+        if not_found:
+            raise HTTPException(status_code=404, detail=not_found) from None
+        raise
+    return task
 
 
 def _require_run(conn: sqlite3.Connection, run_id: int) -> kanban_db.Run:
@@ -462,22 +486,24 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
 # dashboard, agent toolset, and CLI share one implementation.
 
 @router.get("/tasks/{task_id}/attachments")
-def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
+def list_task_attachments(
+        task_id: str, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        _require_owned_task(conn, task_id, request)
         return {"attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)]}
 
 
 @router.post("/tasks/{task_id}/attachments")
 async def upload_task_attachment(
     task_id: str,
+    request: Request,
     file: UploadFile = File(...),
     board: Optional[str] = Query(None),
     uploaded_by: Optional[str] = Form(None)):
     """Store an upload under ``attachments_root(board)/<task_id>/`` (sanitised,
     collision-resolved name; ``_safe_attachment_name`` ValueError → 400) and record it."""
     with _board_conn(board) as (board, conn), _value_error_400():
-        _require_task(conn, task_id)
+        _require_owned_task(conn, task_id, request)
         safe_name = _safe_attachment_name(file.filename or "")
         dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -503,11 +529,15 @@ async def upload_task_attachment(
 
 
 @router.get("/attachments/{attachment_id}")
-def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def download_attachment(
+        attachment_id: int, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
+        # Ownership is the CARD's, resolved from the blob's task — never the raw attachment id,
+        # which would let a signed-in neighbour walk the integer sequence (МПД Т6).
+        _require_owned_task(conn, att.task_id, request, not_found="attachment not found")
         # Defense in depth against a tampered DB row: the blob must still live under the board's attachments root.
         root = kanban_db.attachments_root(board=board).resolve()
         try:
@@ -521,8 +551,13 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 
 @router.delete("/attachments/{attachment_id}")
-def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def remove_attachment(
+        attachment_id: int, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        _require_owned_task(conn, att.task_id, request, not_found="attachment not found")
         if kanban_db.delete_attachment(conn, attachment_id) is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
