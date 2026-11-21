@@ -11,6 +11,17 @@ import tempfile
 root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
 os.environ.pop('HERMES_DELEGATED_CHILD_CONTEXT', None)
+
+# The board does NOT follow HERMES_HOME (``kanban_home()`` is root-anchored so
+# every profile shares one board), and a probe's tempdir under the native home
+# folds back onto the operator's live root. Pin the board to a throwaway root
+# BEFORE importing kanban_db, or this probe files its cards on the live board
+# (t_e0c9e1ce: "scratch card"/"worktree card" rows paged the owner).
+_BOARD_HOME = Path(tempfile.mkdtemp(prefix='kanban-pr-live-board-'))
+os.environ['HERMES_KANBAN_HOME'] = str(_BOARD_HOME)
+for _drop in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_TASK'):
+    os.environ.pop(_drop, None)
+
 import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
