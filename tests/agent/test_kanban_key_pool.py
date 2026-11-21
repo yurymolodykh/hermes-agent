@@ -2486,6 +2486,43 @@ class TestNoCredentialPoolIsStillMarked:
         nxt = kp.reserve_for_card("t_b", 2, pid=os.getpid())
         assert nxt.key_id != 2
 
+    def test_transport_failure_does_not_quarantine_the_card_key(
+        self, tmp_path, monkeypatch
+    ):
+        """A connection error is not a verdict on the key: rotation stays blocked, the key stays
+        healthy, and the run keeps its binding. Marking it bad on every stream reset (40 of 47
+        quarantine records on the live board were ``HTTP None``) took a healthy account out of
+        the pool and aborted the card on a network blip."""
+        from agent.error_classifier import FailoverReason
+
+        write_keys(tmp_path, card_keys=2)
+        as_card("t_a", 1)
+        kp.apply_card_key(runtime())
+
+        from agent import agent_runtime_helpers as helpers
+
+        class _Agent:
+            provider = "custom"
+            base_url = BASE_URL
+            api_key = "KEY_CARD_2_222"
+            _credential_pool = None
+            _credential_pool_entry_id = None
+
+            def _swap_credential(self, entry):  # pragma: no cover - must not run
+                raise AssertionError("a card must never swap credentials mid-run")
+
+        for reason in (FailoverReason.timeout, FailoverReason.unknown, FailoverReason.server_error):
+            recovered, retried = helpers.recover_with_credential_pool(
+                _Agent(), status_code=None, has_retried_429=False, classified_reason=reason,
+            )
+            assert (recovered, retried) == (False, False)
+
+        assert kp.current_binding().status == "active"
+        assert kp.pool_status()["failed_keys"] == []
+        # The card keeps the same key for its whole run — no hop, no second reservation.
+        again = kp.apply_card_key(runtime())
+        assert again["api_key"] == "KEY_CARD_2_222"
+
     def test_non_card_still_returns_early_with_no_pool(self, tmp_path):
         """The guard must not change behaviour for unpooled/background callers."""
         write_keys(tmp_path)
