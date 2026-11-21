@@ -1158,25 +1158,6 @@ def _clone_file(source_dir: Path, profile_dir: Path, relpath: str) -> None:
 # Files a clone edits in place after copying. A ``--clone-all`` copy preserves symlinks
 # (``symlinks=True``), so a symlinked source ``.env`` would otherwise be edited THROUGH the link and
 # the channel stripping would mutate the SOURCE profile. These are materialized as real files first.
-_CLONE_MATERIALIZE = (".env", "config.yaml", "auth.json", "SOUL.md")
-
-
-def _materialize_symlinked_files(profile_dir: Path) -> list[str]:
-    """Replace symlinked root files the clone will edit with private copies of their targets (a
-    dangling link is dropped). Returns the relative names materialized."""
-    done: list[str] = []
-    for name in _CLONE_MATERIALIZE:
-        path = profile_dir / name
-        if not path.is_symlink():
-            continue
-        target = Path(os.path.realpath(path))
-        path.unlink()
-        if target.is_file():
-            shutil.copy2(target, path)
-        done.append(name)
-    return done
-
-
 def _junction_target(path: str) -> Optional[str]:
     """Target of an NTFS directory junction, else ``None``. A junction is a reparse point, not a
     symlink: ``os.path.islink()`` is False and ``shutil.copytree(symlinks=True)`` descends into it."""
@@ -1224,7 +1205,9 @@ def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> Optional
     """--clone-all: full copytree minus infrastructure/history, then strip runtime files
     and cloned single-use OAuth grants."""
     _copytree_keep_junctions(source_dir, profile_dir, _clone_all_copytree_ignore(source_dir))
-    materialized = _materialize_symlinked_files(profile_dir)
+    from hermes_cli.profiles_initialization import materialize_symlinked_files
+
+    materialized = materialize_symlinked_files(profile_dir)
     if materialized:
         logger.info("profile %s: materialized symlinked %s so the clone never writes through to %s",
                     canon, materialized, source_dir)
@@ -1372,6 +1355,15 @@ def create_profile(
     canon = _canon_valid(name)
     if canon == "default":
         raise ValueError("Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
+    personal_soul = None
+    if soul is None:
+        # A person's own root (``01-<login>``) gets the personal SOUL clone, never the generic
+        # DEFAULT_SOUL_MD and never a cloned orchestrator SOUL: a fresh profile with no role (or
+        # one carrying the board protocol it must not execute) reads as "the agent is broken".
+        # Profiles outside that namespace keep exactly the seeding they had before.
+        from hermes_cli.profiles_initialization import personal_soul_seed
+
+        personal_soul = soul = personal_soul_seed(canon)
     profile_dir = get_profile_dir(canon)
     if profile_dir.exists() and not named_profile_has_identity(profile_dir):
         if named_profile_is_deleted(profile_dir):
@@ -1413,7 +1405,8 @@ def create_profile(
             stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
-        finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description, soul=soul)
+        finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description,
+                              soul=soul, personal_root=personal_soul is not None)
         os.rename(staging, profile_dir)
     except BaseException:
         discard_unpublished_vault_key(clone_key)

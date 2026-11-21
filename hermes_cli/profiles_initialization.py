@@ -1,9 +1,12 @@
 """Initial profile files, written on the staging tree before publication."""
 import contextlib
+import logging
 import os
 import shutil
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def clone_staging_dir(profile_dir: Path) -> Path:
@@ -26,8 +29,51 @@ def discard_unpublished_vault_key(ref: Optional[dict]) -> None:
         delete_key(ref)
 
 
+#: Root files a clone will edit: a symlink to the source's file is replaced with a private copy.
+CLONE_MATERIALIZE = (".env", "config.yaml", "auth.json", "SOUL.md")
+
+
+def materialize_symlinked_files(profile_dir: Path) -> list[str]:
+    """Replace symlinked root files the clone will edit with private copies of their targets (a
+    dangling link is dropped). Returns the relative names materialized.
+
+    Lives here rather than in the ``profiles`` facade, which is over its line cap and may only
+    shrink; the accessor is a staging-tree concern like the rest of this module.
+    """
+    done: list[str] = []
+    for name in CLONE_MATERIALIZE:
+        path = profile_dir / name
+        if not path.is_symlink():
+            continue
+        target = Path(os.path.realpath(path))
+        path.unlink()
+        if target.is_file():
+            shutil.copy2(target, path)
+        done.append(name)
+    return done
+
+
+def personal_soul_seed(profile_name: str) -> Optional[str]:
+    """Personal SOUL text for a person's own root (``01-<login>``); ``None`` for any other name.
+
+    Delegates to :mod:`hermes_acl_soul`, which owns the transformation and the name rule. Kept out
+    of the ``profiles`` facade (which is over its line cap and may only shrink) and best-effort: a
+    failure returns ``None`` so the create path falls back to ``DEFAULT_SOUL_MD`` instead of
+    failing a profile creation over seeding.
+    """
+    from hermes_acl_soul import personal_soul_for
+
+    try:
+        return personal_soul_for(profile_name)
+    except (OSError, ValueError, KeyError):  # unreadable/corrupt source -> bundled base
+        logger.warning("personal SOUL seed for %r failed; using the default SOUL",
+                       profile_name, exc_info=True)
+        return None
+
+
 def finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: bool,
-                           description: Optional[str], soul: Optional[str] = None) -> None:
+                           description: Optional[str], soul: Optional[str] = None,
+                           personal_root: bool = False) -> None:
     """Seed files a fresh profile owns from day one; runs on the staging tree before publish."""
     from hermes_cli.profiles import (
         _seed_file_if_missing, _PLACEHOLDER_ENV, NO_BUNDLED_SKILLS_MARKER,
@@ -35,6 +81,17 @@ def finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: bool
     )
     if soul is not None:
         (profile_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+
+    # A personal root also carries the questionnaire its person fills in on first entry. Best
+    # effort on purpose: the profile is already built by now, and a missing questionnaire must
+    # not fail a create — `hermes_acl_soul.seed_questionnaire` can re-place it later. The staging
+    # dir is named ``.<name>.staging-<pid>``, so the caller states the namespace instead of this
+    # function re-deriving it from the directory name.
+    if personal_root:
+        with contextlib.suppress(Exception):
+            from hermes_acl_soul import seed_questionnaire
+
+            seed_questionnaire(profile_dir)
 
     # Seed an empty .env so the profile owns a credentials file from day one. Without it,
     # profile-scoped env writes (dashboard Channels/Keys pages, `hermes -p <name> auth add`)

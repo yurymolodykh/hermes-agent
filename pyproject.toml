@@ -746,6 +746,10 @@ include = [
 hermes_cli = [
   "observability/schemas/*.json",
   "data/*.json",
+  # The personal-SOUL seed (hermes_acl_soul) reads these at runtime: without the declaration a
+  # sealed wheel ships no questionnaire and no fallback base, and a new personal root silently
+  # falls back to the generic DEFAULT_SOUL_MD.
+  "data/*.md",
   "local_runtime/*.json",
   "process_supervisor.sh",
 ]
