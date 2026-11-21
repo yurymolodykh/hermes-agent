@@ -166,6 +166,12 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    budget_hold: Optional[str] = None
+    """Which concurrency cap stopped this tick before the lane loops ran:
+    ``"max_in_progress"`` (host-level, every slot in use) or ``"max_spawn"``
+    (per-board cap). The tick returns with an otherwise EMPTY result in that
+    case — no skipped bucket is filled — which is why :func:`capacity_bound`
+    needs this marker: a full host cap is saturation, not a stall."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -189,8 +195,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
             counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
+        if res.skipped_per_profile_capped:  # same for an assignee at its own cap
+            counts["per_profile_capped"] = counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
         if res.skipped_env_unready:  # a host condition, named so it is not read as a stall
             counts["env_unready"] = counts.get("env_unready", 0) + len(res.skipped_env_unready)
+        if res.budget_hold:  # a full host/per-board cap: saturation, not a stall
+            counts[f"budget_hold:{res.budget_hold}"] = counts.get(f"budget_hold:{res.budget_hold}", 0) + 1
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -199,6 +209,38 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def capacity_bound(results: Iterable[Optional[DispatchResult]]) -> bool:
+    """True when the tick(s) held NO work back for any reason but capacity.
+
+    A saturated pool is health, not a stall: the dispatcher deferred every
+    ready/review card because the card API keys are all leased
+    (``skipped_keypool_capped``) or the assignee is at
+    ``max_in_progress_per_profile`` (``skipped_per_profile_capped``). The
+    workers already running are proof the host is fine, so the "dispatcher
+    stuck … check profile health (venv, PATH, credentials)" warning must not
+    fire on this tick — that hint sent a 21.11 investigation into a venv that
+    had no defect.
+
+    Any other hold (``env_unready``, respawn guard, ``rate_limited``,
+    ``skipped_locked``, memory pressure, unassigned/nonspawnable rows) makes
+    this ``False``: those stay operator-actionable warnings.
+    """
+    saw_capacity = False
+    for res in results:
+        if res is None:
+            continue
+        if res.respawn_guarded or res.rate_limited or res.skipped_env_unready:
+            return False
+        if res.skipped_locked or res.memory_pressure:
+            return False
+        if res.skipped_unassigned or res.skipped_nonspawnable or res.auto_blocked \
+                or res.crashed or res.stale or res.timed_out:
+            return False
+        if res.budget_hold or res.skipped_keypool_capped or res.skipped_per_profile_capped:
+            saw_capacity = True
+    return saw_capacity
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2389,12 +2431,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.budget_hold = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.budget_hold = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

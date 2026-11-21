@@ -206,7 +206,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_saturated_at": 0}
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -219,7 +219,23 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        # Capacity holds (every card key leased / assignee at its per-profile
+        # cap) are saturation, not a stall: running workers already prove the
+        # host is healthy, so this tick must not advance the "stuck" counter.
+        saturated = ready_pending and not res.spawned and kbd.capacity_bound([res])
+        if saturated:
+            health_state["bad_ticks"] = 0
+            now = int(time.time())
+            if now - health_state["last_saturated_at"] >= 300:
+                held = kbd.describe_suppression([res]) or "capacity"
+                print(
+                    f"[{_fmt_ts(now)}] INFO dispatcher saturated: ready queue non-empty "
+                    f"but every card was deferred by capacity ({held}); workers are "
+                    f"running, this is not a stall.",
+                    file=sys.stderr, flush=True,
+                )
+                health_state["last_saturated_at"] = now
+        elif ready_pending and not res.spawned:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0

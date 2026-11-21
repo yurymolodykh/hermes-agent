@@ -278,6 +278,7 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
+        last_saturated_at = 0
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
@@ -308,7 +309,28 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    # A tick that held every ready card back because the pool /
+                    # per-profile capacity is full is saturated, not stuck: the
+                    # running workers prove the host is healthy. Warn only on
+                    # holds the operator can act on (env, credentials, quota,
+                    # memory, dispatch lock) — the old bare zero-spawn test
+                    # sent a 21.11 investigation into a venv with no defect.
+                    saturated = bool(ready_pending) and not any_spawned and _kbd.capacity_bound(
+                        res for _slug, res in (results or []))
+                    if saturated:
+                        bad_ticks = 0
+                        if int(time.time()) - last_saturated_at >= 300:
+                            held = _kbd.describe_suppression(
+                                res for _slug, res in (results or []))
+                            logger.info(
+                                "kanban dispatcher saturated: ready queue non-empty "
+                                "but every card was deferred by capacity (%s); "
+                                "workers are running, this is not a stall.",
+                                held or "capacity",
+                            )
+                            last_saturated_at = int(time.time())
+                    else:
+                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
