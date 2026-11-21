@@ -95,6 +95,46 @@ def test_named_endpoint_on_another_host_keeps_its_own_credential(monkeypatch):
     assert runtime['api_key'] == 'kb-own-key'   # ...and the endpoint guard leaves it alone
 
 
+def _worker_policy(base_url=BASE_URL, frozen=FROZEN):
+    class Policy(_Policy):
+        def effective(self):
+            return frozen, 'flash-model'
+    return Policy(base_url)
+
+
+def test_worker_route_keeps_the_pooled_key_over_the_launch_key(monkeypatch):
+    """The reserved key is what the request must carry: the launch credential bound to the route
+    (the background key) may not overwrite the pool's verdict."""
+    from agent import kanban_key_pool
+    from gateway.session_worker_construct import worker_route
+
+    _patch_named(monkeypatch)
+    monkeypatch.setattr(kanban_key_pool, 'apply_card_key',
+                        lambda runtime: {**runtime, 'api_key': 'reserved-card-key',
+                                         'key_pool': {'key_id': 4, 'label': 'account-04',
+                                                      'role': 'card'}})
+
+    for launch in (None, 'launch-background-key'):
+        overrides = worker_route(_worker_policy(), {'api_key': launch})
+        assert overrides['api_key'] == 'reserved-card-key', launch
+        assert overrides['base_url'] == BASE_URL
+
+
+def test_worker_route_without_a_pool_audit_still_sends_the_launch_key(monkeypatch):
+    """No pool audit means no pool verdict (pool off, or another endpoint): unchanged behaviour."""
+    from agent import kanban_key_pool
+    from gateway.session_worker_construct import worker_route
+
+    _patch_named(monkeypatch)
+
+    def untouched(runtime):
+        return runtime
+
+    monkeypatch.setattr(kanban_key_pool, 'apply_card_key', untouched)
+    overrides = worker_route(_worker_policy(), {'api_key': 'launch-background-key'})
+    assert overrides['api_key'] == 'launch-background-key'
+
+
 def test_named_endpoint_plumbing_failure_keeps_the_unpooled_runtime(monkeypatch, caplog):
     from agent import kanban_key_pool
     from gateway.session_worker_construct import route_runtime

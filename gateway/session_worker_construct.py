@@ -234,7 +234,14 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
-    return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
+    # The pool's verdict, when it made one, is the credential the request must carry: a card's
+    # reserved key (or the background key for a non-card caller) is the whole point of the pool,
+    # so the launch key bound to the route may not overwrite it. Without a pool audit
+    # (``key_pool`` absent: pool off, or a different endpoint) the launch key keeps winning, as
+    # before — it authenticates the frozen route it was bound with.
+    pooled = runtime.get('key_pool') is not None
+    wire_key = runtime.get('api_key') if pooled else (construct['api_key'] or runtime.get('api_key'))
+    return {'api_key': wire_key, 'base_url': runtime.get('base_url'),
             'api_mode': api_mode}
 
 
