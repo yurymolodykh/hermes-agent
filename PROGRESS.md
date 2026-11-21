@@ -1,3 +1,52 @@
+# PROGRESS — t_44bd1c6a (гонка провижининга: воркер стартует раньше симлинка окружения)
+
+## Состояние: КОД И ПРОВЕРКИ ГОТОВЫ; ОСТАЛОСЬ — КОММИТ
+
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_44bd1c6a`, ветка `wt/t_44bd1c6a`
+* База: `b8c2c25eaf35`
+* Отчёт: `REPORT-worker-env-race.md`
+* Проба: `/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/live_probe_worker_env.py`
+  (14/14 OK на боевом `HERMES_HOME`, включая красный бейзлайн)
+
+### Что сделано
+
+* `hermes_cli/kanban_db_worker_env.py` (новый) — `ensure_tree_install_state(workspace)`: мост
+  install-key на пути спавна; `worker_terminal_timeout_env` (перенос тела из диспетчера);
+  `UNREADY_REASON = "dependency_environment_unready"`; `_dependency_source_root` берёт главный
+  checkout через `git rev-parse --git-common-dir` (не обходом ФС), чтобы мост был В ОДИН хоп.
+* `hermes_cli/kanban_db_capacity.py` (новый) — `count_running_tasks` /
+  `count_running_tasks_other_boards` вынесены из диспетчера (ratchet «facade may only shrink»).
+* `hermes_cli/kanban_db_dispatch.py` — только швы: импорты `_kbenv`/`_kbcap`, поле
+  `DispatchResult.skipped_env_unready`, `_hold_if_workspace_unready` (вызов в
+  `_dispatch_lane_task` ПОСЛЕ материализации workspace и ДО спавна),
+  `_record_nonspawnable_assignee` (вынос из той же функции ради CC ≤ 20), шимы
+  `_worker_terminal_timeout_env` / `count_running_tasks*`, строка `env_unready` в
+  `describe_suppression`.
+* `tests/hermes_cli/test_kanban_worker_env_provisioning.py` (новый, 10 тестов).
+
+### Проверки (все выполнены)
+
+* `10 passed` — новый набор (в копии дерева `/tmp/t44branch`).
+* `54 passed` — новый набор + 8 смежных канбан-наборов (там же; `tests/home_io_guard.py` рубит
+  I/O по реальному дому, поэтому прогон вне `~/.hermes`).
+* Красная база: на `b8c2c25eaf35` с подложенным новым модулем — **5 failed** из 10 (симлинка нет,
+  спавн всё равно происходит, `env_unready` пуст); без модуля — ImportError на сборе.
+* `python -m scripts.code_health --base HEAD` → **0 blocking, 0 advisory**.
+* `ruff check` по 4 файлам — All checks passed.
+* `scripts/boundary_lint.py --check` — те же предсуществующие кроссы, что и на базе (дельта 0).
+* Живая проба на боевом `~/.hermes`: 14/14 OK; свежее дерево получает ссылку за 3 мс, воркерский
+  бут на store-python выходит 0 и видит `ROOT /tmp/t44probe/wt-fresh` (изоляция worktree цела), а
+  дерево-близнец без моста воспроизводит `no dependency environment is committed`.
+
+### Осталось
+
+1. `git add`/`commit` в ветке карточки.
+2. Рестарт шлюза — шаг оркестратора (из карточки не делаем).
+3. `manual_review`: «0 прогонов с `no dependency environment` за 24 ч после внедрения» —
+   наблюдение после рестарта, вперёд агенту недоступно.
+
+---
+
 # PROGRESS — t_f3d28e37 (МПД шаг 6: результаты — файлы, скиллы, память, вложения)
 
 ## Состояние: РАБОТА ЗАВЕРШЕНА (код, 79 тестов, живая проба 25/25, база красная 16 LEAK, отчёт)

@@ -26,6 +26,8 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import kanban_db_capacity as _kbcap
+from hermes_cli import kanban_db_worker_env as _kbenv
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -38,8 +40,8 @@ DEFAULT_FAILURE_LIMIT = 2
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
-# before max_runtime_seconds kills it.
-KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+# before max_runtime_seconds kills it. Re-exported for importers of this module.
+KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = _kbenv.KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS
 
 # A healthy worker is still alive for a while after kanban_complete /
 # kanban_request_review returns (final assistant turn, session persistence), so
@@ -132,6 +134,13 @@ class DispatchResult:
     picked up on a later tick when a key frees up — it is NOT blocked and NOT
     operator-actionable. Spawning it now would only crash the worker at key
     resolution and burn the retry budget. Empty when no pool is configured."""
+    skipped_env_unready: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` deferred because the card's WORKSPACE cannot boot a
+    worker yet — its tree has no committed dependency environment and the shared
+    one could not be linked in (no running install, no source directory, no
+    permission). The card stays ``ready`` and costs no failure: nothing about the
+    card ran, only its environment was missing. See
+    :mod:`hermes_cli.kanban_db_worker_env`."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -180,6 +189,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
             counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
+        if res.skipped_env_unready:  # a host condition, named so it is not read as a stall
+            counts["env_unready"] = counts.get("env_unready", 0) + len(res.skipped_env_unready)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -2003,57 +2014,13 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
-
-    Used by the multi-board sweep to count OTHER boards' workers against the
-    host-level budget — the memory-derived cap bounds the machine, not the
-    board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
-    """
-    try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
-    except Exception:
-        return 0
+    """``kanban_db_capacity.count_running_tasks`` — this board's running workers."""
+    return _kbcap.count_running_tasks(conn)
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
-    """Total ``running`` tasks across every board EXCEPT ``board``.
-
-    Caps bound the HOST, but each board's tick only sees its own DB; without
-    this a derived cap of N gets multiplied by the number of active boards.
-    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
-    """
-    try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
-    except Exception:
-        current_path = None
-    try:
-        boards = _kb.list_boards(include_archived=False)
-    except Exception:
-        return 0
-    total = 0
-    for meta in boards:
-        slug = meta.get("slug") or _kb.DEFAULT_BOARD
-        try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
-            resolved = str(path.resolve())
-            if current_path is not None and resolved == current_path:
-                continue
-            if not path.exists():
-                continue
-            other = _kbc.connect(board=slug)
-            try:
-                total += count_running_tasks(other)
-            finally:
-                with contextlib.suppress(Exception):
-                    other.close()
-        except Exception:
-            continue
-    return total
+    """``kanban_db_capacity.count_running_tasks_other_boards`` — every OTHER board's running workers."""
+    return _kbcap.count_running_tasks_other_boards(board)
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -2156,6 +2123,58 @@ def _release_dead_card_key(task_id: str) -> None:
     _kbkp.release_dead_card_key(task_id)
 
 
+def _record_nonspawnable_assignee(
+    conn: sqlite3.Connection, task_id: str, assignee: str, result: DispatchResult, *, dry_run: bool,
+) -> None:
+    """Bucket a card whose assignee names no profile, and say so on the card once.
+
+    Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving the card in
+    ``ready`` with zero board evidence (#122422). Unlike a respawn guard the condition never expires
+    on its own, so write it once: a repeat only when something else happened on the card since
+    (reassign, comment) — not one row per tick forever, and not one row per foreign home per tick on
+    a shared board (#101015).
+    """
+    result.skipped_nonspawnable.append(task_id)
+    if dry_run:
+        return
+    with _kb.write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+        if (last is None or last["kind"] != "skipped_nonspawnable"
+                or last["payload"] != _kb._json_or_null({"assignee": assignee})):
+            _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+
+
+def _hold_if_workspace_unready(
+    conn: sqlite3.Connection, claimed: Task, workspace: Path, result: DispatchResult, *,
+    failure_limit: int,
+) -> bool:
+    """True when the worker may start; False when its workspace cannot boot one yet.
+
+    The worker boots with ``cwd=workspace`` and, under ``-m``, the cwd is ``sys.path[0]``: a Hermes
+    tree there supplies its own ``hermes_bootstrap`` and therefore its own PM install key. A fresh
+    worktree's key holds nothing until the install link exists, so a worker started now dies on
+    bootstrap with ``no dependency environment is committed`` (measured: 60-72 s) and spends the
+    card's failure budget on a HOST condition. Bridge the key here — the workspace path is final, the
+    worker has not started — and refuse the spawn outright when the bridge cannot be made; the timer
+    in ``card-worktree-provision`` stays a backstop for trees this dispatcher never spawns into.
+    """
+    ready, reason = _kbenv.ensure_tree_install_state(workspace)
+    if ready:
+        return True
+    _kb._log.warning("kanban dispatcher: %s held back, its workspace cannot start a worker: %s",
+                     claimed.id, reason)
+    if _record_task_failure(
+        conn, claimed.id, reason,
+        outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        infrastructure=True,
+    ):
+        result.auto_blocked.append(claimed.id)
+    result.skipped_env_unready.append((claimed.id, reason))
+    return False
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2183,20 +2202,7 @@ def _dispatch_lane_task(
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
-        result.skipped_nonspawnable.append(task_id)
-        # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
-        # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
-        # condition never expires on its own, so write it once: a repeat only when something
-        # else happened on the card since (reassign, comment) — not one row per tick forever,
-        # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+        _record_nonspawnable_assignee(conn, task_id, assignee, result, dry_run=dry_run)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2264,6 +2270,8 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    if not _hold_if_workspace_unready(conn, claimed, workspace, result, failure_limit=failure_limit):
+        return False
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
@@ -2692,29 +2700,9 @@ def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
 ) -> Optional[str]:
-    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
-
-    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
-    raise only the child's default so a long command isn't killed by the
-    generic terminal default first.
-    """
-    if max_runtime_seconds is None:
-        return None
-    try:
-        runtime = int(max_runtime_seconds)
-    except (TypeError, ValueError):
-        return None
-    if runtime <= 0:
-        return None
-
-    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
-    try:
-        existing = int(str(current_timeout).strip()) if current_timeout else 0
-    except (TypeError, ValueError):
-        existing = 0
-    if existing >= desired:
-        return None
-    return str(desired)
+    """``kanban_db_worker_env.worker_terminal_timeout_env`` (kept as the module's public name:
+    ``gateway.session_kanban`` and ``kanban_db_context`` import it from here)."""
+    return _kbenv.worker_terminal_timeout_env(max_runtime_seconds, current_timeout)
 
 
 @contextlib.contextmanager
