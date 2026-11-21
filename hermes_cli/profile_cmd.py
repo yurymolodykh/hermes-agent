@@ -210,6 +210,13 @@ def _profile_create(args):
     except (ValueError, FileExistsError, FileNotFoundError) as e:
         _die(f"Error: {e}")
     print(f"\nProfile '{name}' created at {profile_dir}")
+    # A personal root (``01-<login>``) was seeded with the personalization questionnaire; name it
+    # so the person can fill it in instead of guessing what the generic SOUL came from.
+    from hermes_acl_soul import QUESTIONNAIRE_FILENAME
+
+    questionnaire = profile_dir / QUESTIONNAIRE_FILENAME
+    if questionnaire.is_file():
+        print(f"Personalization questionnaire: {questionnaire}")
     if cloned:
         if clone_all:
             print(f"Full copy from {source_label} (excluding session history, cron jobs, backups, and snapshots).")

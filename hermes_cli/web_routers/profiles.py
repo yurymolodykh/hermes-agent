@@ -37,7 +37,7 @@ from hermes_cli.web_server_config import (
     _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
 )
 from hermes_cli.web_server_gateway import _strip_session_list_rows
-from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, config_scoped_to_thread
 from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
 )
@@ -46,7 +46,7 @@ from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_sta
 from starlette.concurrency import run_in_threadpool
 from hermes_cli.web_models import (
     ProfileCreate, ProfileActiveUpdate, ProfileExport, ProfileImport, ProfileRename,
-    ProfileSoulUpdate, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
+    ProfileSoulUpdate, ProfileSoulQuestionnaire, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
     SessionPrScanBody)
 from hermes_cli.web_server_profiles import _config_profile_scope, _hermes_home_scope
 
@@ -177,6 +177,22 @@ def _disable_unselected_skills(profile_dir: Path, keep: list[str]) -> int:
 # Returned by the offloaded file readers below to mean "the file is not there", which a plain
 # ``None`` cannot express: ``desktop.json`` may legitimately hold the document ``null``.
 _MISSING = object()
+
+
+def _questionnaire_path(profile_dir: Path) -> str:
+    """The questionnaire's on-disk path when the profile has one, else ``""``.
+
+    Only a personal root is seeded with it (``hermes_acl_soul``); reporting the path for any
+    profile would tell a client to open a file that does not exist.
+    """
+    try:
+        from hermes_acl_soul import QUESTIONNAIRE_FILENAME
+
+        path = Path(profile_dir) / QUESTIONNAIRE_FILENAME
+        return str(path) if path.is_file() else ""
+    except Exception:  # health: allow BLE001 -- an advisory field must not 500 the create
+        _log.debug("questionnaire path lookup failed", exc_info=True)
+        return ""
 
 
 @contextlib.contextmanager
@@ -1010,7 +1026,10 @@ async def create_profile_endpoint(body: ProfileCreate, request: Request):
 
     return {"ok": True, "name": body.name, "path": str(path), "model_set": model_set, "model_error": model_error,
             "mcp_written": mcp_written, "skills_disabled": skills_disabled,
-            "hub_installs": hub_installs, "soul_set": body.soul is not None}
+            "hub_installs": hub_installs, "soul_set": body.soul is not None,
+            # A personal root (``01-<login>``) was seeded with the personalization questionnaire
+            # next to its SOUL; the desktop client offers it on first entry at this path.
+            "questionnaire_path": _questionnaire_path(path)}
 
 
 @router.get("/api/profiles/active")
@@ -1212,6 +1231,80 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate, request: Reque
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+@router.post("/api/profiles/{name}/soul/apply-questionnaire")
+async def apply_soul_questionnaire(name: str, body: ProfileSoulQuestionnaire, request: Request):
+    """Apply a filled personalization questionnaire to a profile's SOUL and memory.
+
+    SOUL.md is the profile's instructions, so the same rule as the editor applies: only the
+    profile's own person (or the host owner) may rewrite it — ``require_writable`` also refuses
+    a shared profile with 403 and a foreign one with the 404 an absent name gets.
+
+    Empty answers leave their section untouched; the response carries the sections that actually
+    changed and the SOUL's new hash so a client can show the edit without re-reading the file.
+    Block 5–6 answers (terms, sources, free-form) are durable facts about the person, not
+    instructions: they go to the profile's memory through the same store the ``memory`` tool uses.
+    """
+    from hermes_acl_soul import apply_questionnaire, questionnaire_memory_entries
+
+    acl_profiles.require_writable(request, name)
+    profile_dir = _resolve_profile_dir(name)
+    soul_path = profile_dir / "SOUL.md"
+    answers = body.model_dump()
+
+    def _run() -> dict[str, Any]:
+        import hashlib
+
+        from utils import atomic_write_text
+
+        before_text = soul_path.read_text(encoding="utf-8-sig") if soul_path.exists() else ""
+        if not before_text.strip():
+            # Nothing to personalize: a profile with no SOUL would get a document built from
+            # nothing, and «пустой ответ = по умолчанию» has no default to fall back to.
+            raise ValueError("profile has no SOUL.md to personalize")
+        new_text, report = apply_questionnaire(before_text, answers)
+        changed = new_text != before_text
+        if changed:
+            atomic_write_text(soul_path, new_text, preserve_mode=True, create_mode=0o644)
+        return {
+            "ok": True,
+            "changed": changed,
+            "changed_sections": report["changed_sections"] if changed else [],
+            "soul_sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+        }
+
+    def _write_memory() -> list[str]:
+        """Durable facts go to the profile's own memory store, under that profile's home."""
+        from tools.memory_tool import load_on_disk_store
+
+        store = load_on_disk_store()
+        written: list[str] = []
+        for entry in questionnaire_memory_entries(answers):
+            result = store.add("memory", entry)
+            if result.get("success"):
+                written.append(entry)
+            else:
+                _log.warning("questionnaire memory write refused: %s", result.get("error"))
+        return written
+
+    with _profile_errors("POST /api/profiles/%s/soul/apply-questionnaire failed", name,
+                         not_found=(FileNotFoundError,), bad_request=(ValueError,)):
+        result = await run_in_threadpool(_run)
+        # SOUL is already saved: a memory hiccup is reported, never 500s the personalization.
+        entries = questionnaire_memory_entries(answers)
+        if entries:
+            try:
+                written = await config_scoped_to_thread(name, _write_memory)
+            except Exception:  # health: allow BLE001 -- SOUL is already saved; report, never 500
+                _log.exception("questionnaire memory write failed for %s", name)
+                written = None
+            result["memory_entries"] = written or []
+            result["memory_error"] = "" if written is not None else "memory write failed"
+        else:
+            result["memory_entries"] = []
+            result["memory_error"] = ""
+    return result
 
 
 @router.put("/api/profiles/{name}/description")

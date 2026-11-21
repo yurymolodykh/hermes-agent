@@ -875,6 +875,16 @@ _STATUS_TO_FAILOVER_REASON = {
 }
 _USAGE_LIMIT_REASON_TOKENS = ("usage_limit_reached", "gousagelimit")
 _USAGE_LIMIT_MESSAGE_TOKENS = ("usage limit reached", "usage limit has been reached")
+# Failover reasons that are a verdict about the CREDENTIAL, and so the only ones allowed to
+# quarantine a card's reserved key: auth (dead token), billing (exhausted credit), rate_limit
+# (this account's window), upstream_rate_limit/model_entitlement (this account's allowance for the
+# model). Everything else — connection errors, timeouts, 5xx, policy refusals, format errors —
+# says nothing about the key, and quarantining on it removed a healthy account from the pool.
+_KEY_BLAMING_REASONS = frozenset({
+    FailoverReason.auth, FailoverReason.auth_permanent, FailoverReason.billing,
+    FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
+    FailoverReason.model_entitlement,
+})
 
 
 def _failed_credential_identity(agent, pool) -> tuple[Optional[str], Optional[str]]:
@@ -1000,15 +1010,29 @@ def recover_with_credential_pool(
     except Exception:  # pragma: no cover - pool module unavailable
         _kp_binding = None
     if _kp_binding is not None and getattr(_kp_binding, "role", "") == "card":
+        # Only a failure the CREDENTIAL can be blamed for may quarantine the card's key. A
+        # transport failure carries no verdict about the key at all: ``status=None`` here is a
+        # stream/connection error (logged as ``Streaming failed before delivery: Connection
+        # error``), and the classifier treats it as transient and retryable. Marking the key bad
+        # on it quarantined a healthy account and flipped this process's binding to ``bad``, so
+        # every later resolution in the same run raised — a network blip ended a card. 40 of the
+        # 47 quarantine records on this board were exactly that (``HTTP None``), against 7 real
+        # 429s. Rotation stays blocked either way: the card never hops accounts mid-run.
+        credential_failure = (
+            classified_reason in _KEY_BLAMING_REASONS
+            or (classified_reason is None and status_code in (401, 403, 429))
+        )
         logger.error(
             "Credential pool rotation blocked: task %s holds reserved key #%s (%s) "
-            "and must not switch keys mid-run (status=%s)",
+            "and must not switch keys mid-run (status=%s, reason=%s, key quarantined=%s)",
             getattr(_kp_binding, "task_id", "?"), getattr(_kp_binding, "key_id", "?"),
-            getattr(_kp_binding, "label", "?"), status_code)
-        try:
-            mark_current_key_failed(status_code, reason="credential_rotation_blocked")
-        except Exception:  # pragma: no cover - best effort
-            logger.debug("key-pool: marking the key bad failed", exc_info=True)
+            getattr(_kp_binding, "label", "?"), status_code,
+            getattr(classified_reason, "value", classified_reason), credential_failure)
+        if credential_failure:
+            try:
+                mark_current_key_failed(status_code, reason="credential_rotation_blocked")
+            except Exception:  # pragma: no cover - best effort
+                logger.debug("key-pool: marking the key bad failed", exc_info=True)
         return False, has_retried_429
 
     if pool is None:

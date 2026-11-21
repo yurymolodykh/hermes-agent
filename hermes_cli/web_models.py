@@ -485,6 +485,33 @@ class ProfileImport(BaseModel):
 class ProfileSoulUpdate(BaseModel):
     content: str
 
+class ProfileSoulQuestionnaire(BaseModel):
+    """Filled-in personalization questionnaire (``SOUL-QUESTIONNAIRE.md``).
+
+    Every field is optional: an omitted or empty answer means «оставить по умолчанию», which is
+    the questionnaire's own rule. The keys are the ones the questionnaire prints next to each
+    prompt, so a client can post its form straight through.
+    """
+    display_name: str = ""
+    address_form: str = ""       # «ты» / «вы»
+    area: str = ""
+    frequent_requests: str = ""
+    answer_length: str = ""
+    answer_format: str = ""
+    uncertainty: str = ""
+    address_style: str = ""
+    boundaries: list[str] = []   # keys of hermes_acl_soul.BOUNDARY_CHOICES
+    boundary_custom: str = ""
+    planning: str = ""
+    failure_mode: str = ""
+    reporting: str = ""
+    suggest_improvements: str = ""
+    precise_domain: str = ""
+    terms: str = ""
+    trusted_sources: str = ""
+    untrusted_sources: str = ""
+    extra: str = ""
+
 class ProfileActiveUpdate(BaseModel):
     name: str
 

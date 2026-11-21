@@ -172,6 +172,25 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
             explicit_api_key=key, explicit_base_url=launch_url,
             target_model=model, config=frozen)
         if runtime is not None:
+            # A named endpoint (``providers.letovo`` and friends) is resolved HERE, not by
+            # ``resolve_runtime_provider``, so the per-card key pool never ran: the early return
+            # shipped the launch credential — the background key — to every managed worker of a
+            # card, whatever its reservation said (t_3643a157 run 514: reserved #4, ran on #1).
+            # Apply the same chokepoint the general rung applies, keeping the named entry's
+            # extras (api_mode, endpoint, source) untouched.
+            from agent.kanban_key_pool import KeyPoolError, apply_card_key
+
+            try:
+                runtime = apply_card_key(runtime)
+            except KeyPoolError:
+                raise
+            except Exception:
+                # Same forgiving shape as ``resolve_runtime_provider``: plumbing failure on a
+                # background caller keeps the unpooled runtime; a card fails closed inside.
+                import logging
+                logging.getLogger(__name__).warning(
+                    'key-pool: applying the per-card key to a named endpoint failed; using '
+                    'the unpooled runtime for this resolution', exc_info=True)
             return runtime, None
         # Only a bound launch key is explicit: the frozen ``model.api_key`` is config, which the
         # resolver already reads from the frozen scope, so a URL-matched credential pool still
@@ -215,7 +234,14 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
-    return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
+    # The pool's verdict, when it made one, is the credential the request must carry: a card's
+    # reserved key (or the background key for a non-card caller) is the whole point of the pool,
+    # so the launch key bound to the route may not overwrite it. Without a pool audit
+    # (``key_pool`` absent: pool off, or a different endpoint) the launch key keeps winning, as
+    # before — it authenticates the frozen route it was bound with.
+    pooled = runtime.get('key_pool') is not None
+    wire_key = runtime.get('api_key') if pooled else (construct['api_key'] or runtime.get('api_key'))
+    return {'api_key': wire_key, 'base_url': runtime.get('base_url'),
             'api_mode': api_mode}
 
 

@@ -116,8 +116,9 @@ def _status(kb, kbc, task_id):
 def _run_tick(kbd, kbc, spawned: list):
     """One real tick whose spawner is faked at module level.
 
-    ``spawn_fn`` stays ``None`` on purpose: that is exactly the production path
-    the key-pool gate guards (a custom ``spawn_fn`` owns its own workers).
+    ``spawn_fn`` stays ``None`` on purpose: this is the production spawn path
+    (the embedded dispatcher never passes a ``spawn_fn``). The custom-spawner
+    path is covered separately below — it must obey the SAME key gate.
     """
     pids = itertools.count(4242)
 
@@ -191,6 +192,86 @@ def test_slot_probe_reserves_headroom_for_workers_spawned_this_tick(
     assert kbd._keypool_has_free_slot() is True
     assert kbd._keypool_has_free_slot(reserve=1) is True
     assert kbd._keypool_has_free_slot(reserve=2) is False
+
+
+# ── custom spawner ─────────────────────────────────────────────────────────
+
+
+def _run_tick_with_spawn_fn(kbd, kbc, spawned: list, spawn_fn, **kwargs):
+    with kbc.connect_closing() as conn:
+        return kbd.dispatch_once(conn, spawn_fn=spawn_fn, **kwargs)
+
+
+def test_custom_spawner_obeys_the_same_key_gate(
+    kanban_home, monkeypatch, tmp_path, live_pid
+):
+    """An explicit ``spawn_fn`` must NOT bypass the key-pool gate.
+
+    A custom spawner still starts a real worker that resolves its key through
+    ``resolve_runtime_provider`` — the same chokepoint the gate protects — so
+    spawning with a full pool produces exactly the worker the gate exists to
+    keep off the board (KeyPoolError at startup, burned retry budget, card
+    auto-blocked on a transient condition).
+    """
+    kb, kbc, kbd = kanban_home
+    kp = _pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = _ready_card(kb, kbc)
+    kp.reserve_for_card("t_occupant", 1, pid=live_pid())
+    kp.reset_process_cache()
+
+    spawned: list = []
+
+    def spawn_fn(task, workspace, board=None):  # pragma: no cover - must not run
+        spawned.append(task.id)
+        return 4242
+
+    res = _run_tick_with_spawn_fn(kbd, kbc, spawned, spawn_fn)
+
+    assert res.skipped_keypool_capped == [task_id]
+    assert spawned == [], "a custom spawner may not start a worker without a key"
+    assert _status(kb, kbc, task_id) == "ready"
+
+
+def test_custom_spawner_still_spawns_when_a_key_is_free(
+    kanban_home, monkeypatch, tmp_path
+):
+    kb, kbc, kbd = kanban_home
+    _pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = _ready_card(kb, kbc)
+
+    spawned: list = []
+
+    def spawn_fn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 4242
+
+    res = _run_tick_with_spawn_fn(kbd, kbc, spawned, spawn_fn)
+
+    assert res.skipped_keypool_capped == []
+    assert [s[0] for s in res.spawned] == [task_id]
+    assert spawned == [task_id]
+
+
+def test_keypool_exempt_is_the_named_opt_out(
+    kanban_home, monkeypatch, tmp_path, live_pid
+):
+    """A spawner that truly keys its workers another way opts out by name."""
+    kb, kbc, kbd = kanban_home
+    kp = _pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = _ready_card(kb, kbc)
+    kp.reserve_for_card("t_occupant", 1, pid=live_pid())
+    kp.reset_process_cache()
+
+    spawned: list = []
+
+    def spawn_fn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 4242
+
+    res = _run_tick_with_spawn_fn(kbd, kbc, spawned, spawn_fn, keypool_exempt=True)
+
+    assert res.skipped_keypool_capped == []
+    assert spawned == [task_id], "the named opt-out must actually spawn"
 
 
 # ── startup exit contract ──────────────────────────────────────────────────
