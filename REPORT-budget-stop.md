@@ -81,6 +81,25 @@ docstring: **это не решение проблемы останова**, 25 
 раздел Р12 + таблица «бюджет → пунктов приёмки влезает» + раздел «Что делает воркер на пределе
 бюджета».
 
+Живой вызов того же пути, что `kanban_create` (реальный профильный конфиг, реальный
+`assignee_iteration_budget`):
+
+```
+big on 03 (300):  card volume may exceed the assignee's iteration budget: 9 acceptance items
+                  ≈ 310 iterations vs 300 for '03-software-engineer'. Split the card, or raise
+                  `agent.max_turns` for that profile, or accept that it may stop mid-work
+                  (the WIP checkpoint keeps the tree).
+small on 03:      None      (по формуле влезает — молчание)
+big on 08 (200):  310 vs 200 for '08-visual-media-designer'
+```
+
+**Расхождение с телом карточки:** там `08-visual-media-designer` = **120**, а в живом
+`~/.hermes/profiles/08-visual-media-designer/config.yaml` стоит `agent.max_turns: 200`
+(проверено инструментом; на доске бюджеты: 03=300, 02=300, 05=400, 15/10/09/12/07/06/01/08=200,
+default=300). Правило читает фактический конфиг, поэтому цифра из тела карточки на вывод не
+влияет — но если 120 было намерением, это отдельная правка конфига, которую карточка делать
+запрещает («сначала правило, потом значения»).
+
 ## Проверки
 
 | что | результат |
