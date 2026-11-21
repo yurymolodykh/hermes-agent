@@ -182,15 +182,18 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    record.assert_called_once_with(
-        conn,
-        "task-123",
-        error=ANY,
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
-    )
+    # The payload names the work and what is still open, not just the counters: the
+    # board must read "stopped by budget, work in commit X, Y still open" (t_f3d28e37).
+    record.assert_called_once()
+    kwargs = record.call_args.kwargs
+    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["release_claim"] is True and kwargs["end_run"] is True
+    assert kwargs["event_payload_extra"]["budget_used"] == 60
+    assert kwargs["event_payload_extra"]["budget_max"] == 60
+    stop_note = kwargs["event_payload_extra"]["stop_note"]
+    assert "остановлено по бюджету 60/60" in stop_note
+    assert "осталось:" in stop_note
+    assert "could not complete" not in kwargs["error"]
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

@@ -1091,6 +1091,24 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _card_sizing_warning(assignee: str, body: Any) -> Optional[str]:
+    """Advisory when a card's declared volume cannot fit the assignee's budget.
+
+    Never raises and never blocks: a sizing heuristic must not be able to fail a
+    create. Returns None whenever the rule has nothing to say.
+    """
+    try:
+        from agent.kanban_card_sizing import (
+            assignee_iteration_budget, estimate_card, sizing_warning,
+        )
+        budget = assignee_iteration_budget(assignee)
+        estimate = estimate_card(body if isinstance(body, str) else None, budget)
+        return sizing_warning(estimate, assignee=assignee)
+    except Exception:
+        logger.debug("card sizing estimate failed for assignee %s", assignee, exc_info=True)
+        return None
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1113,6 +1131,7 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    sizing_note = _card_sizing_warning(str(assignee), args.get("body"))
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1151,6 +1170,7 @@ def _handle_create(args: dict, **kw) -> str:
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
+                   **({"sizing_warning": sizing_note} if sizing_note else {}),
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
