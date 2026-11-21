@@ -752,21 +752,41 @@ def _pid_alive(pid: int) -> bool:
     On Windows ``os.kill(pid, 0)`` raises for a live process too, so psutil is
     the reliable probe (already a hard dependency). It is imported lazily so
     the pure-stdlib test paths and the fast no-pool path never pay for it.
+
+    An exited-but-unreaped process (a zombie) is DEAD for this purpose: it holds
+    no socket and sends no request, so its reservation must not keep a slot from
+    the next card. ``psutil.pid_exists`` reports a zombie as existing until its
+    parent reaps it, which on the dispatcher's kill path is a whole tick later —
+    exactly the lag that starved the ready queue. Same rule as
+    ``hermes_cli.kanban_db_dispatch._pid_alive``.
     """
     if pid <= 0:
         return False
+    alive: Optional[bool] = None
     try:
         import psutil  # type: ignore
 
-        return psutil.pid_exists(pid)
+        alive = psutil.pid_exists(pid)
     except Exception:  # pragma: no cover - psutil unavailable
-        pass
-    if os.name == "nt":  # pragma: no cover - Windows without psutil
-        return True  # cannot prove it is dead → keep the reservation
-    try:
-        os.kill(pid, 0)
-    except OSError as exc:
-        return exc.errno == errno.EPERM
+        alive = None
+    if alive is False:
+        return False
+    if alive is None:  # pragma: no cover - psutil unavailable
+        if os.name == "nt":
+            return True  # cannot prove it is dead → keep the reservation
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            return exc.errno == errno.EPERM
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("State:"):
+                        return "Z" not in line.split(":", 1)[1]
+        except (FileNotFoundError, PermissionError, OSError):
+            return False  # the proc entry is gone: already reaped
     return True
 
 
@@ -1436,6 +1456,39 @@ def release_for_task(
                 caller_pid,
             )
             return []
+    released = _drop_task_slots(task_id, caller_pid=caller_pid, only_stale=False)
+    for record in released:
+        logger.info(
+            "key-pool: released key %s from task %s (pid %s)",
+            record.get("key_id"),
+            task_id,
+            caller_pid,
+        )
+    return released
+
+
+def _drop_task_slots(
+    task_id: str,
+    *,
+    caller_pid: Optional[int] = None,
+    only_stale: bool,
+) -> List[Dict[str, Any]]:
+    """Remove ``task_id``'s slots under the state lock; return what went.
+
+    One implementation for both callers, because the scan is the same and only
+    the admission rule differs:
+
+    * ``only_stale=False`` — a terminal transition named this card, so every
+      slot it holds goes back. Used by :func:`release_for_task`.
+    * ``only_stale=True`` — the dispatcher is closing a run whose worker it may
+      not have proven dead, so only slots :func:`_reservation_is_stale` calls
+      stale go. **A live card must never share its account**; that is the one
+      guarantee the pool exists to provide, and freeing on the wrong evidence
+      would break it. Used by :func:`release_dead_task_slots`.
+    """
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return []
     path = state_path()
     if path is None or not path.exists():
         return []
@@ -1454,33 +1507,57 @@ def release_for_task(
             key_id = entry.get("key_id")
             kept: List[Dict[str, Any]] = []
             for slot in _key_slots(entry):
-                if slot.get("task_id") == task_id:
-                    # Requirement 4: release EXACTLY the slots of this card.
-                    # The other card's slot on the SAME key stays untouched —
-                    # dropping the whole key record here would cancel a live
-                    # card's reservation.
-                    record = dict(slot)
-                    record["key_id"] = key_id
-                    record["key_label"] = entry.get("key_label")
-                    record["released_reason"] = "released"
-                    record["released_at"] = int(now)
-                    record["released_by_pid"] = caller_pid
-                    released.append(record)
-                    changed = True
+                if slot.get("task_id") != task_id:
+                    kept.append(slot)
                     continue
-                kept.append(slot)
+                reason = _reservation_is_stale(slot, now) if only_stale else "released"
+                if reason is None:
+                    kept.append(slot)  # owner still alive: it keeps its key
+                    continue
+                # Requirement 4: release EXACTLY the slots of this card. The
+                # other card's slot on the SAME key stays untouched — dropping
+                # the whole key record would cancel a live card's reservation.
+                record = dict(slot)
+                record["key_id"] = key_id
+                record["key_label"] = entry.get("key_label")
+                record["released_reason"] = reason
+                record["released_at"] = int(now)
+                if caller_pid is not None:
+                    record["released_by_pid"] = caller_pid
+                released.append(record)
+                changed = True
             if kept:
                 entry["slots"] = kept
             else:
                 reservations.pop(key, None)
         if changed:
             _write_state(path, state)
+    return released
+
+
+def release_dead_task_slots(task_id: str) -> List[Dict[str, Any]]:
+    """Drop the slots of ``task_id`` whose owner process is already gone.
+
+    The dispatcher-side death paths close a run (``timed_out`` / ``crashed`` /
+    ``stale`` / ``gave_up``) from a process that is not the card's worker, so
+    the release cannot come from that worker's own ``atexit`` hook. It also
+    cannot call :func:`release_for_task` unconditionally: that drops EVERY slot
+    of the card, and the dispatcher may not be able to prove the worker died (a
+    ``SIGKILL`` that did not land, an unverified spawn fingerprint). Freeing a
+    key a live worker is still sending requests on would hand the same account
+    to another card — the one guarantee the pool exists to provide.
+
+    So this drops only provably-dead slots (dead owner and dead siblings, per
+    :func:`_reservation_is_stale`). Whatever survives is left to the worker's
+    own exit release and to :func:`sweep`, which the dispatcher runs every tick
+    — so a corpse holds a slot for at most one tick.
+    """
+    released = _drop_task_slots(task_id, only_stale=True)
     for record in released:
         logger.info(
-            "key-pool: released key %s from task %s (pid %s)",
-            record.get("key_id"),
-            task_id,
-            caller_pid,
+            "key-pool: released key %s from finished task %s (pid %s, %s)",
+            record.get("key_id"), record.get("task_id"),
+            record.get("pid"), record.get("released_reason"),
         )
     return released
 
@@ -1543,168 +1620,22 @@ def mark_key_failed(
     pid: Optional[int] = None,
     key_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Record that the provider rejected this card's own key, then quarantine it.
+    """Record a rejected key and quarantine it — see the sibling module.
 
-    The card does **not** get a different key from here — that would be the
-    silent mid-run hop the owner forbade. What happens instead:
-
-    * the failure is written to the state file's ``failed_keys`` map, which is
-      the audit trail (§4 of the report) and survives restarts;
-    * the card's OWN slot is kept, flipped to ``bad`` (defect D1: deleting it
-      freed the key for a second card while the first was still running on it,
-      which at the production limit of one card per key inverted the
-      "one card = one key" invariant). A ``bad`` slot still counts against the
-      key's capacity, so the key stays unavailable until the card releases it
-      (``release_for_task`` / ``release_for_pid``) or the PID/TTL backstop
-      reaps it — and a *quarantine* keeps it out of the next reservation for
-      new cards until it expires (or forever, for a dead 401/403 key);
-    * this process's binding flips to ``bad``, so every further resolution in
-      it raises instead of quietly working off some other key.
-
-    **Who is allowed to report.** Any process that actually holds the key: the
-    reserving owner (``pid == entry.pid``) or a sibling of the same card
-    (``pid in entry.attached_pids``). The check is on the *pair* ``(task_id,
-    pid)``, not on the pid alone, so a stale worker of a different card cannot
-    poison someone else's key. Restricting it to the owner pid (the original
-    implementation) meant an adopted helper — the process that may well be the
-    one that saw the 401 — could not quarantine a key it was using, and the
-    key came back for the next card. ``key_id`` is accepted so a caller that
-    already knows which key failed does not depend on the scan order.
-
-    Quarantine policy, chosen so neither extreme is silent:
-
-    * ``401`` / ``403`` — the key is dead or revoked. Quarantined with no
-      expiry (``quarantine_until: 0``): it stays out until the owner fixes the
-      key file or runs ``hermes kanban keypool clear``.
-    * ``429`` — rate limited, not dead. Quarantined for
-      ``HERMES_KANBAN_KEYPOOL_QUARANTINE_SECONDS`` (default 900s = the
-      documented limit window), then it becomes eligible again automatically.
-    * anything else — treated like 401 but with the 429 default window, since a
-      non-auth failure was not attributed to the credential by the classifier.
+    The implementation lives in :mod:`agent.kanban_key_pool_quarantine` (this
+    facade is over the ``FILE_LINES`` target); the public name, signature and
+    docstring contract stay here so every caller and test is unaffected.
     """
-    task_id = (task_id or "").strip()
-    if not task_id:
-        return None
-    caller_pid = int(pid if pid is not None else os.getpid())
-    path = state_path()
-    if path is None or not path.exists():
-        return None
-    now = time.time()
-    marked: Optional[Dict[str, Any]] = None
-    with _state_lock(path):
-        state = _read_state(path)
-        reservations: Dict[str, Any] = state["reservations"]
-        for key_entry, entry in list(reservations.items()):
-            if not isinstance(entry, dict):
-                continue
-            kid = int(entry.get("key_id") or key_entry)
-            if key_id is not None and kid != int(key_id):
-                continue
-            victim: Optional[Dict[str, Any]] = None
-            for slot in _key_slots(entry):
-                if slot.get("task_id") != task_id:
-                    continue
-                owner_pid = int(slot.get("pid") or 0)
-                attached = slot.get("attached_pids") or []
-                is_holder = caller_pid == owner_pid or (
-                    isinstance(attached, list) and caller_pid in attached
-                )
-                if not is_holder:
-                    continue
-                victim = slot
-                break
-            if victim is None:
-                continue
-            owner_pid = int(victim.get("pid") or 0)
-            failure = {
-                "status_code": status_code,
-                "reason": reason or f"http_{status_code}",
-                "at": int(now),
-                "task_id": task_id,
-                "run_id": victim.get("run_id"),
-                "pid": caller_pid,
-                "owner_pid": owner_pid,
-                "reported_by": "sibling" if caller_pid != owner_pid else "owner",
-                "degradation": "card_kept_its_key_then_failed",
-            }
-            marked = {
-                "key_id": kid,
-                "key_label": entry.get("key_label"),
-                **{k: v for k, v in victim.items()},
-            }
-            marked["status"] = _STATUS_BAD
-            marked["failure"] = failure
+    from agent.kanban_key_pool_quarantine import mark_key_failed as _mark
 
-            quarantine_until = 0
-            if status_code == 429:
-                quarantine_until = int(now + _quarantine_seconds())
-            elif status_code in (401, 403):
-                quarantine_until = 0  # dead key: no automatic return
-            else:
-                quarantine_until = int(now + _quarantine_seconds())
-            # Quarantine the KEY, not the slot (requirement 7): a rejected
-            # credential is not safe for the second card on the same key, so
-            # the whole key leaves circulation while the window lasts.
-            state.setdefault("failed_keys", {})[str(kid)] = {
-                **failure,
-                "key_id": kid,
-                "key_label": entry.get("key_label") or f"key-{kid}",
-                "quarantine_until": quarantine_until,
-            }
-            # The failing card keeps its slot while its own process is alive.
-            # Deleting it was defect D1: at the production limit of one card
-            # per key the key has exactly one slot, so ``kept`` came out empty,
-            # the whole reservation record vanished, and the moment
-            # ``quarantine_until`` elapsed the key went back into circulation
-            # and was handed to a second card while the first was still
-            # running on it. Marking the slot ``bad`` keeps it counted as
-            # occupied, so the key is not free for anyone else. The slot is
-            # removed by the card's own release (``release_for_task`` from
-            # ``_release_card_key`` / ``release_for_pid`` on exit) or, if the
-            # process dies without releasing, by the PID/TTL backstop in
-            # ``_sweep_locked``. The OTHER card on a shared key keeps its own
-            # slot untouched.
-            victim["status"] = _STATUS_BAD
-            victim["quarantined_at"] = int(now)
-            break
-        if marked is not None:
-            _write_state(path, state)
-    if marked is not None:
-        logger.error(
-            "key-pool: key %s for task %s rejected by the provider (HTTP %s) — "
-            "marked bad and quarantined; this run kept its key and was not "
-            "re-keyed (release_reason=key_failed)",
-            marked.get("key_id"),
-            task_id,
-            status_code,
-        )
-    return marked
+    return _mark(task_id, status_code, reason=reason, pid=pid, key_id=key_id)
 
 
 def clear_quarantine(key_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Drop quarantine records (owner action: trusted a key again).
+    """Drop quarantine records — see the sibling module for the full rules."""
+    from agent.kanban_key_pool_quarantine import clear_quarantine as _clear
 
-    ``key_id=None`` clears every record — the recovery step after re-issuing a
-    previously dead key.
-    """
-    path = state_path()
-    if path is None or not path.exists():
-        return []
-    cleared: List[Dict[str, Any]] = []
-    with _state_lock(path):
-        state = _read_state(path)
-        failed: Dict[str, Any] = state.get("failed_keys") or {}
-        if key_id is None:
-            cleared = list(failed.values())
-            state["failed_keys"] = {}
-        else:
-            record = failed.pop(str(int(key_id)), None)
-            if record is not None:
-                cleared = [record]
-            state["failed_keys"] = failed
-        if cleared:
-            _write_state(path, state)
-    return cleared
+    return _clear(key_id)
 
 
 # ── background / card resolution ───────────────────────────────────────────

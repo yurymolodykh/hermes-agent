@@ -148,6 +148,8 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    keypool_reaped: list[dict] = field(default_factory=list)
+    """Reservations this tick's sweep dropped: their owner process was gone."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -176,6 +178,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
+            counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -747,6 +751,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
+            _release_dead_card_key(tid)  # killed worker: no atexit release
     return timed_out
 
 
@@ -854,6 +859,9 @@ def detect_stale_running(
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
             reclaimed.append(tid)
+        # Outside the write_txn: the release touches the pool's own state file.
+        if cur.rowcount == 1:
+            _release_dead_card_key(tid)  # terminated worker: no atexit release
 
     return reclaimed
 
@@ -1406,6 +1414,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
+    for tid in (*sweep.crashed, *sweep.rate_limited):  # dead: no exit release
+        _release_dead_card_key(tid)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
@@ -2137,39 +2147,13 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+# Key-pool seams; the mechanism lives in ``hermes_cli/kanban_db_keypool.py``.
 def _keypool_has_free_slot(reserve: int = 0) -> bool:
-    """True when at least ``reserve + 1`` card key slots are free right now.
+    return _kbkp.keypool_has_free_slot(reserve)
 
-    A kanban card reserves ONE API key for its whole run and may never fall
-    back to the shared env key. When every card key is occupied, a worker
-    spawned now dies at key resolution (``KeyPoolError``) and burns the retry
-    budget until the card auto-blocks on a transient condition. The dispatcher
-    therefore defers such a card instead of spawning it.
-    Fail-open: any probe error returns True so a broken pool cannot stop
-    dispatch entirely, and no pool config at all returns True (no-op).
-    """
-    try:
-        from agent.kanban_key_pool import load_config, pool_status
-        cfg = load_config()
-        if cfg is None or not cfg.usable:
-            return True
-        status = pool_status() or {}
-        limit = int(status.get("max_cards_per_key") or 1) or 1
-        free = 0
-        for row in (status.get("keys") or []):
-            _lim = int(row.get("limit") or limit)
-            _used = int(row.get("used") or 0)
-            if _used < _lim:
-                free += (_lim - _used)
-        # ``reserve`` counts workers already spawned earlier in THIS tick whose
-        # child process has not written its reservation yet. Without it two
-        # cards spawned back-to-back both see the same free slot, the second
-        # child then dies at key resolution and the card burns a failure.
-        # Checking headroom against the in-tick tally closes that race without
-        # holding the pool lock across spawn().
-        return free > int(reserve or 0)
-    except Exception:
-        return True
+
+def _release_dead_card_key(task_id: str) -> None:
+    _kbkp.release_dead_card_key(task_id)
 
 
 def _dispatch_lane_task(
@@ -2366,6 +2350,7 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    result.keypool_reaped = _kbkp.keypool_sweep()  # backstop: host-restart orphans
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -3100,4 +3085,5 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_keypool as _kbkp
 from hermes_cli import kanban_db_workspace as _kbw

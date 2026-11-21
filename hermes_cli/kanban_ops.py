@@ -112,6 +112,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_keypool_capped": res.skipped_keypool_capped,
+            "keypool_reaped": res.keypool_reaped,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
