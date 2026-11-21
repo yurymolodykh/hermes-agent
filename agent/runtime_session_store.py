@@ -169,6 +169,22 @@ class WorkerRPC:
         with self.lock:
             self._drop()
 
+    @staticmethod
+    def receipt_budget_s() -> float:
+        """How long one receipt may take before the call gives up: ``HERMES_WORKER_RECEIPT_TIMEOUT_S``.
+
+        The value has to be a project of measurement, not a feeling: the owner's loop can be stalled
+        by work that is not this worker's (a plugin load deadline, a GIL-heavy turn), and a fixed 20 s
+        turned such a stall into a failed persist of a turn whose data was already written. Defaults
+        to 20 s; clamped to [5, 300] so a typo cannot turn a stall into a hang.
+        """
+        raw = os.environ.get('HERMES_WORKER_RECEIPT_TIMEOUT_S', '').strip()
+        try:
+            value = float(raw) if raw else 20.0
+        except ValueError:
+            return 20.0
+        return min(300.0, max(5.0, value))
+
     def __call__(self, method, **params):
         try:
             asyncio.get_running_loop()
@@ -183,28 +199,49 @@ class WorkerRPC:
             self.request_id += 1
             request_id = self.request_id
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
-            try:
-                link = self._connection()
+            budget = self.receipt_budget_s()
+            replayed = False
+            while True:
                 try:
-                    link.send(request_id, message)
-                except ConnectionClosed:
-                    # websockets raises this from send only before a complete frame is written (closed
-                    # on entry, or the socket write failed): the owner closed the link after the idle
-                    # check and never saw this request, so redial and send it once more.
-                    self._drop()
                     link = self._connection()
-                    link.send(request_id, message)
-                response = link.receive(20)
-            except BaseException:
-                # Outcome unknown once sent: surface the error and never resend; the next call redials.
-                self._drop()
-                raise
-            if 'error' in response:
-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
-            if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
-                global _worker_process
-                _worker_process = True
-            return response['result']
+                    try:
+                        link.send(request_id, message)
+                    except ConnectionClosed:
+                        # websockets raises this from send only before a complete frame is written (closed
+                        # on entry, or the socket write failed): the owner closed the link after the idle
+                        # check and never saw this request, so redial and send it once more.
+                        self._drop()
+                        link = self._connection()
+                        link.send(request_id, message)
+                    response = link.receive(budget)
+                except TimeoutError as exc:
+                    # Only the receipt budget is replayable. A connect/handshake timeout means the
+                    # request was never sent, and that path already redials on its own.
+                    if str(exc) != 'worker_receipt_timeout':
+                        self._drop()
+                        raise
+                    # Not "the write failed": the owner's loop was stalled and the receipt never came
+                    # back, so the outcome is unknown. ``worker.persist`` is replay-safe by contract —
+                    # an exact (execution, sequence, digest) retry returns the stored result — so the
+                    # turn that WAS written is not reported as failed, and one that never landed is
+                    # applied now. Every other method has no replay contract: surface it.
+                    self._drop()
+                    if method != 'worker.persist' or replayed:
+                        raise
+                    replayed = True
+                    logger.warning('%s: worker_receipt_timeout after %ss; replaying once (outcome unknown '
+                                   'once sent, the receipt decides)', method, budget)
+                    continue
+                except BaseException:
+                    # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                    self._drop()
+                    raise
+                if 'error' in response:
+                    raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
+                if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+                    global _worker_process
+                    _worker_process = True
+                return response['result']
 
 
 from agent.runtime_session_compression import RuntimeSessionCompressionMixin
