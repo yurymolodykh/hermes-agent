@@ -1,5 +1,23 @@
-Traceback (most recent call last):
-  File "/home/hermes/.hermes/kanban/workspaces/t_af262aaf/probe-create-sizing-warning.py", line 2, in <module>
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-                           ^^^^
-NameError: name 'Path' is not defined
+Assignee budgets as the rule reads them (real profile configs):
+  03-software-engineer       agent.max_turns = 300
+  05-rag-knowledge-engineer  agent.max_turns = 400
+  08-visual-media-designer   agent.max_turns = 200
+  10-skill-librarian         agent.max_turns = 200
+  15-sre-qa                  agent.max_turns = 200
+  01-orchestrator            agent.max_turns = 200
+
+kanban_create sizing path (9 acceptance items = 'big' card):
+  03-software-engineer:
+    card volume may exceed the assignee's iteration budget: 9 acceptance items ≈ 310 iterations vs 300 for '03-software-engineer'. Split the card, or raise `agent.max_turns` for that profile, or accept that it may stop mid-work (the WIP checkpoint keeps the tree).
+  08-visual-media-designer:
+    card volume may exceed the assignee's iteration budget: 9 acceptance items ≈ 310 iterations vs 200 for '08-visual-media-designer'. Split the card, or raise `agent.max_turns` for that profile, or accept that it may stop mid-work (the WIP checkpoint keeps the tree).
+
+Same call for a card that fits (2 acceptance items):
+  03-software-engineer: None
+  08-visual-media-designer: None
+
+A card with no acceptance heading cannot be sized — the rule stays silent:
+  None
+
+A card whose body is not a string (defensive path in _handle_create):
+  None
