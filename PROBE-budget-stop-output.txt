@@ -1,0 +1,45 @@
+  OK   card is running and owns an open run
+
+== 1. 85% notice parks the tree WITHOUT a branch commit ==
+  OK   85% notice was injected
+  OK   notice names the parked ref
+  OK   the ref really exists
+  OK   85% did NOT create a branch commit
+  OK   working tree still dirty (model keeps working)
+  OK   parked ref carries the file bytes
+
+== 2. budget stop (60/60) commits the work and records it ==
+  OK   turn exit reason is the budget stop
+  OK   a WIP commit landed on the card's branch
+  OK   the commit carries the work files
+  OK   working tree is clean after the stop
+  OK   committed bytes are the real content
+
+  board status='ready'  run='timed_out'
+  last_failure_error: Iteration budget exhausted (60/60) — остановлено по бюджету 60/60 · работа в коммит af0518a (ветка wt/t_probe_budget) · сохранено файлов: 3 (PROGRESS.md, results.py, test_results.py) · осталось: wire the loader; rerun the probe
+  OK   card did not stay 'running'
+  OK   run closed as timed_out
+  OK   (c) text names the budget counters
+  OK   (c) text names the commit
+  OK   (c) text names what is left
+  OK   (c) text is not the bare give-up phrasing
+  OK   event payload carries the stop_note
+  OK   event payload keeps the counters
+
+== 3. the next attempt resumes from the saved place ==
+  OK   (b) worker context names the stop and the commit
+  OK   (b) worker context keeps the open items
+  OK   (b) worker context names the previous attempt as timed_out
+  OK   (b) a successor checkout carries the work, not an empty tree
+  OK   (b) the successor's PROGRESS.md is the saved one
+  OK   (b) the card is retryable (claimed again from ready)
+
+== 4. regression: a card that fits gets no WIP commit ==
+  OK   clean tree -> no checkpoint
+  OK   clean tree -> no parked ref
+  OK   no WIP subject anywhere in history
+  OK   history still has exactly the one base commit
+  OK   card that committed its own work gets no extra commit
+  OK   its history carries only its own commits
+
+=== ИТОГ 32/32 OK, 0 LEAK ===

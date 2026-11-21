@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import random
+import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
@@ -61,7 +62,10 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         and "kanban_complete" in getattr(agent, "valid_tool_names", ())
     )
     if ratio is None and kanban_worker:
-        ratio = 0.9
+        # 0.85, not 0.9: the last ~15% of a 300-iteration card is ~45 iterations —
+        # enough for the model to see this notice, commit, and still hand off
+        # (300/300 stops before the earlier 0.9 notice could be acted on).
+        ratio = 0.85
     budget = getattr(agent, "iteration_budget", None)
     if (
         ratio is None
@@ -82,6 +86,20 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
             "review; otherwise persist a kanban_comment handoff and "
             "continue. A diff or commit alone is not completion evidence."
         )
+        # Park the tree under a ref as well: the model may still be mid-edit when the
+        # budget stops it, and a reachable ref survives the stop without a branch commit.
+        try:
+            from agent.kanban_budget_checkpoint import preserve_wip_ref
+            _wip_ref = preserve_wip_ref()
+        except (ImportError, OSError, subprocess.SubprocessError):
+            # The notice must still reach the model: parking the ref is a bonus on
+            # top of the instruction to checkpoint, not a precondition for it.
+            _wip_ref = None
+        if _wip_ref:
+            notice += (
+                f" Your working tree is parked at {_wip_ref} (reachable with "
+                "`git stash apply` / `git diff`), so a budget stop no longer loses it."
+            )
     # Only the current tool-result tail is mutable; an older turn may already be cached.
     from agent.context_compressor import _DB_PERSISTED_MARKER
     if (not messages or messages[-1].get("role") != "tool"

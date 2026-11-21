@@ -44,8 +44,40 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _checkpoint_work_before_stop(
+    agent, kanban_task: str, api_call_count: int, logger: logging.Logger,
+) -> str:
+    """Save the card's working tree and phrase the stop, before the budget closes the run.
+
+    The iteration budget is a hard ``break``: without this the verified work of the
+    whole run is still only an uncommitted working tree when the card is recorded as
+    a failure (#29747 class). Returns the one-line stop description for the event.
+    """
+    from agent.kanban_budget_checkpoint import card_workspace, checkpoint_wip, describe_stop
+
+    # ``card_workspace`` is the single gate on the full dispatcher envelope, so a
+    # long-lived process that merely inherited HERMES_KANBAN_WORKSPACE never commits
+    # into a repository it does not own.
+    workspace = card_workspace()
+    checkpoint = None
+    try:
+        checkpoint = checkpoint_wip(
+            reason="предел",
+            used=api_call_count,
+            max_total=agent.max_iterations,
+            workspace=workspace,
+            task_id=kanban_task,
+        )
+    except Exception:
+        logger.warning("kanban WIP checkpoint failed for %s", kanban_task, exc_info=True)
+    return describe_stop(
+        checkpoint, used=api_call_count, max_total=agent.max_iterations, workspace=workspace,
+    )
+
+
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    *, stop_note: Optional[str] = None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
 
@@ -81,12 +113,16 @@ def _record_kanban_budget_exhausted(
                 kanban_task,
                 error=(
                     f"Iteration budget exhausted ({api_call_count}/{max_iterations}) — "
-                    "task could not complete within the allowed iterations"
+                    f"{stop_note or 'task could not complete within the allowed iterations'}"
                 ),
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                    "stop_note": stop_note,
+                },
             )
         finally:
             with suppress(Exception):
@@ -204,7 +240,14 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        # Save first, record second: the run must not be closed as a failure while the
+        # work it produced is still only an uncommitted working tree.
+        _stop_note = _checkpoint_work_before_stop(
+            agent, _kanban_task, api_call_count, logger
+        )
+        _record_kanban_budget_exhausted(
+            _kanban_task, api_call_count, agent.max_iterations, logger, stop_note=_stop_note,
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback, interrupted
 
 

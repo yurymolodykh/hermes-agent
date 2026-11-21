@@ -101,6 +101,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_anonymous": res.skipped_anonymous,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -147,6 +148,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_anonymous:
+        print(
+            f"Skipped (authorless placeholder card on the live board — archive it or "
+            f"give it a real author/assignee): {', '.join(res.skipped_anonymous)}"
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")

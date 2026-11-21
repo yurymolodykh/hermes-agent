@@ -115,6 +115,13 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids with no assignee at all — operator-actionable (usually a
     misfiled task waiting for routing)."""
+    skipped_anonymous: list[str] = field(default_factory=list)
+    """Ready/review task ids refused on the LIVE board because they carry no
+    author and only a placeholder assignee (``default``). The creation fuse
+    (``create_task``) stops new ones; this bucket covers rows that predate it —
+    probe leftovers that would otherwise crash-loop the queue and page a human.
+    Never operator-actionable as work: the card must be archived or given a
+    real author/assignee. Empty on throwaway boards."""
     auto_assigned_default: list[str] = field(default_factory=list)
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
@@ -175,40 +182,14 @@ class DispatchResult:
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
+    """Repr of the tick's holds; the body lives in ``kanban_db_suppression``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    Kept here as the name every caller (``kanban_ops``, the gateway watchers,
+    the tests) imports: the module may only shrink, so new logic goes to the
+    sibling and this stays a one-line hop.
     """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
-            counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
-        if res.skipped_per_profile_capped:  # same for an assignee at its own cap
-            counts["per_profile_capped"] = counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
-        if res.skipped_env_unready:  # a host condition, named so it is not read as a stall
-            counts["env_unready"] = counts.get("env_unready", 0) + len(res.skipped_env_unready)
-        if res.budget_hold:  # a full host/per-board cap: saturation, not a stall
-            counts[f"budget_hold:{res.budget_hold}"] = counts.get(f"budget_hold:{res.budget_hold}", 0) + 1
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
+    from hermes_cli.kanban_db_suppression import describe_suppression as _impl
+    return _impl(results)
 
 
 def capacity_bound(results: Iterable[Optional[DispatchResult]]) -> bool:
@@ -1595,6 +1576,12 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                # The caller's own facts (a budget stop's counters and the "work is in
+                # commit X, Y still open" note) belong on the event the board reads,
+                # not only on the trip path — a card that stops once and retries never
+                # reaches that branch, and its stop would read as a bare counter bump.
+                if event_payload_extra:
+                    detail.update(event_payload_extra)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -2238,6 +2225,8 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    if _refuse_anonymous_card(conn, row, result, dry_run=dry_run):
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2470,10 +2459,39 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_by FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _refuse_anonymous_card(
+    conn: sqlite3.Connection, row: sqlite3.Row, result: DispatchResult, *, dry_run: bool,
+) -> bool:
+    """True when the row is an authorless placeholder card on the LIVE board.
+
+    The creation fuse in ``_kb.create_task`` stops new ones; this covers rows
+    that predate it (probe leftovers). Such a card must never consume a worker
+    slot: it would crash-loop and page a human. Records one ``skipped_anonymous``
+    event per distinct card state, like ``_record_nonspawnable_assignee``, so
+    ``show``/``tail`` explain the idle card instead of leaving it silent.
+    """
+    if not _kb.is_anonymous_placeholder_card(row["assignee"], row["created_by"]):
+        return False
+    if not _kb.path_is_live_board(_kb._conn_db_path(conn)):
+        return False
+    result.skipped_anonymous.append(row["id"])
+    if dry_run:
+        return True
+    with _kb.write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (row["id"],)).fetchone()
+        payload = {"assignee": row["assignee"], "reason": "anonymous_placeholder"}
+        if (last is None or last["kind"] != "skipped_anonymous"
+                or last["payload"] != _kb._json_or_null(payload)):
+            _kb._append_event(conn, row["id"], "skipped_anonymous", payload)
+    return True
 
 
 def _any_spawnable_review(
@@ -2495,9 +2513,14 @@ def _any_spawnable_review(
         return False
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
+    live_board = _kb.path_is_live_board(_kb._conn_db_path(conn))
     for row in review_rows:
         assignee = row["assignee"]
         if not assignee:
+            continue
+        # An authorless placeholder card will be refused by
+        # ``_refuse_anonymous_card``; it must not hold a slot back from real work.
+        if live_board and _kb.is_anonymous_placeholder_card(assignee, row["created_by"]):
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue

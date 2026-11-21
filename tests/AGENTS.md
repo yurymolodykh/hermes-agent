@@ -61,6 +61,26 @@ just test tests/agent/test_foo.py -k test_x             # same runner; refuses t
   ```
   Tests that `patch.object(Path, "home", ...)` must ALSO set `HERMES_HOME` — code reads the
   env var, not `Path.home()/.hermes`.
+- **The kanban board does NOT follow `HERMES_HOME` — pin `HERMES_KANBAN_HOME`.** Boards are
+  shared across profiles by design, so `kanban_home()` anchors on the *root*, and any
+  `HERMES_HOME` under `~/.hermes` (including the profile scratch dir Hermes exports as
+  `TMPDIR`) folds back onto the operator's live root. A test that only moved `HERMES_HOME`
+  used to write `"scratch card"` / `"worktree card"` rows to the live board and page the
+  owner; the fixture now isolates the board per test, and the session sandbox pins a temp
+  root and drops an inherited `HERMES_KANBAN_DB` / `HERMES_KANBAN_BOARD`. A test that needs a
+  specific board still sets `HERMES_KANBAN_HOME` itself (fixtures run after the sandbox):
+  ```python
+  @pytest.fixture
+  def kanban_home(tmp_path, monkeypatch):
+      home = tmp_path / ".hermes"; home.mkdir()
+      monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+      monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+      monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+      return home
+  ```
+  Standalone probe scripts are subject to the same rule: set `HERMES_KANBAN_HOME` to a
+  temporary directory (or `HERMES_KANBAN_DB` to a temp file) *before* importing
+  `hermes_cli.kanban_db`. `HERMES_HOME` alone is not enough.
 - **Tests never reach the network.** `tests/conftest.py` refuses every lookup of a host off this
   machine for the whole pytest process (address literals and loopback pass). Serve what a test
   needs from a fixture: a server on `127.0.0.1`, a stubbed transport, a seeded cache (models.dev,
