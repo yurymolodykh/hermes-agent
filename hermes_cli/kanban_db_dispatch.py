@@ -169,36 +169,14 @@ class DispatchResult:
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
+    """Repr of the tick's holds; the body lives in ``kanban_db_suppression``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    Kept here as the name every caller (``kanban_ops``, the gateway watchers,
+    the tests) imports: the module may only shrink, so new logic goes to the
+    sibling and this stays a one-line hop.
     """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
-            counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
-        if res.skipped_env_unready:  # a host condition, named so it is not read as a stall
-            counts["env_unready"] = counts.get("env_unready", 0) + len(res.skipped_env_unready)
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
+    from hermes_cli.kanban_db_suppression import describe_suppression as _impl
+    return _impl(results)
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1553,6 +1531,12 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                # The caller's own facts (a budget stop's counters and the "work is in
+                # commit X, Y still open" note) belong on the event the board reads,
+                # not only on the trip path — a card that stops once and retries never
+                # reaches that branch, and its stop would read as a bare counter bump.
+                if event_payload_extra:
+                    detail.update(event_payload_extra)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
