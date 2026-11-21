@@ -419,22 +419,47 @@ def kanban_home() -> Path:
 def _real_platform_kanban_roots() -> tuple[Path, ...]:
     """The OPERATOR's live board files: ``<root>/kanban.db`` and ``<root>/kanban/boards``.
 
-    Resolved from the real platform home (``os.path.expanduser("~")``) — never
-    ``Path.home()``, which tests repatch, and never ``kanban_home()``, which
-    follows whatever pin the caller set. This predicate must keep naming the
-    operator's board even while a test or a probe runs, so the anonymous-card
-    fuse below can tell "a throwaway board" from "the board the dispatcher pages
-    a human about"."""
-    try:
-        home = Path(os.path.expanduser("~"))
-        if sys.platform == "win32":
-            base = os.environ.get("LOCALAPPDATA", "").strip()
-            root = Path(base) / "hermes" if base else home / "AppData" / "Local" / "hermes"
-        else:
-            root = home / ".hermes"
-    except Exception:  # pragma: no cover - defensive
+    Resolved from the real platform home — never ``Path.home()``, which tests
+    repatch, and never ``kanban_home()``, which follows whatever pin the caller
+    set. This predicate must keep naming the operator's board even while a test
+    or a probe runs, so the anonymous-card fuse below can tell "a throwaway
+    board" from "the board the dispatcher pages a human about".
+
+    Deliberately does NOT read ``$HOME``: a probe that exports
+    ``HERMES_HOME=<tempdir>`` on the *shell* line rewrites HOME for its children
+    too (``~`` -> the tempdir), which would make the operator's real board look
+    like a throwaway and silently disarm the fuse (t_e0c9e1ce). ``pwd``'s home
+    for this uid is fixed and unrepatchable.
+    """
+    home = _real_user_home()
+    if home is None:  # pragma: no cover - defensive
         return ()
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(base) / "hermes" if base else home / "AppData" / "Local" / "hermes"
+    else:
+        root = home / ".hermes"
     return (root / "kanban.db", root / "kanban" / "boards")
+
+
+def _real_user_home() -> Optional[Path]:
+    """The account's own home from the user database, never from ``$HOME``.
+
+    A hard failsafe for the live-board test: environment variables are what a
+    probe rewrites, the passwd entry is not. Falls back to ``$HOME`` only when
+    the platform has no user database (Windows) or the lookup fails.
+    """
+    if sys.platform != "win32":
+        try:
+            import pwd
+
+            return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        except Exception:  # pragma: no cover - no passwd entry (containers)
+            pass
+    try:
+        return Path(os.path.expanduser("~")).resolve()
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def path_is_live_board(path: Any) -> bool:

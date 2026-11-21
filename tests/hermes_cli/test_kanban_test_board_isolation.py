@@ -94,6 +94,27 @@ def test_kanban_pins_are_listed_among_blanked_behavioral_vars():
         assert name in _HERMES_BEHAVIORAL_VARS
 
 
+@pytest.mark.allow_real_home_io  # names the live board's path; no read or write happens
+def test_live_board_is_still_named_when_a_probe_repoints_home(tmp_path, monkeypatch):
+    """A probe that rewrites ``$HOME`` must not be able to hide the live board.
+
+    The anonymous-card fuse asks ``path_is_live_board`` whether a board is the
+    operator's. The naive answer resolves ``~`` through ``$HOME``, which is
+    exactly the variable a probe rewrites — so the real board looked like a
+    throwaway and the fuse silently disarmed itself while the card still landed
+    on the live board. The predicate reads the account's home from ``pwd``.
+    """
+    real_root = _conftest._REAL_KANBAN_ROOT
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    assert kb.path_is_live_board(real_root / "kanban.db"), (
+        "repointing $HOME hid the operator's live board from the fuse"
+    )
+    assert kb.path_is_live_board(real_root / "kanban" / "boards" / "other.db")
+    # And the disguised tempdir itself is not mistaken for the live board.
+    assert not kb.path_is_live_board(tmp_path / ".hermes" / "kanban.db")
+
+
 def test_the_isolation_rule_is_documented_where_the_tests_live():
     """The rule lives next to the tests, not only in a report."""
     agents_md = os.path.join(os.path.dirname(os.path.abspath(_conftest.__file__)), "AGENTS.md")
