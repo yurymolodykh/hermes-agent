@@ -167,6 +167,45 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     os.environ["HERMES_TEST_SANDBOX_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
+# ── Kanban board sandbox (t_e0c9e1ce) ───────────────────────────────────────
+# Redirecting HERMES_HOME does NOT move the board: ``kanban_db.kanban_home()``
+# anchors on ``get_default_hermes_root()`` on purpose (boards are shared across
+# profiles), and ``_hermes_root_of`` folds any HERMES_HOME that lives under the
+# native ``~/.hermes`` back onto the live root — which includes every tempdir
+# created under the profile scratch dir that Hermes exports as TMPDIR. A test
+# (or an ad-hoc probe) that only moved HERMES_HOME therefore wrote cards to the
+# operator's live ``kanban.db``; two "scratch card"/"worktree card" rows then sat
+# in the dispatcher queue and paged the owner. Pin the board root explicitly.
+#
+# A pre-set HERMES_KANBAN_HOME is honored only when it is genuinely custom (not
+# under the real root) — a shell that inherited a production value gets the
+# sandbox instead, exactly like the HERMES_HOME rule above.
+def _kanban_home_points_at_production(value: str) -> bool:
+    if not value:
+        return True
+    try:
+        resolved = Path(value).expanduser().resolve()
+    except Exception:
+        return True
+    return resolved == _real_test_root or resolved.is_relative_to(_real_test_root)
+
+
+if _kanban_home_points_at_production(_PRE_SANDBOX_KANBAN_OVERRIDE):
+    _SESSION_KANBAN_HOME = Path(tempfile.mkdtemp(prefix="hermes-test-kanban-"))
+    os.environ["HERMES_KANBAN_HOME"] = str(_SESSION_KANBAN_HOME)
+    atexit.register(shutil.rmtree, str(_SESSION_KANBAN_HOME), True)
+
+# A dispatcher-injected HERMES_KANBAN_DB (or HERMES_KANBAN_BOARD) names the
+# caller's OWN live board and outranks the root pin. A pytest run inside a
+# worker shell must not fall back onto it.
+for _pin_var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+    _pin_value = os.environ.get(_pin_var, "").strip()
+    if not _pin_value:
+        continue
+    _pin_path = Path(_pin_value).expanduser()
+    if not _pin_path.is_absolute() or _kanban_home_points_at_production(str(_pin_path)):
+        del os.environ[_pin_var]
+
 # PYTHONPYCACHEPREFIX is a bytecode-mirror escape hatch: when set (the
 # bundled desktop app exports it as %LOCALAPPDATA%\hermes\pycache),
 # importlib/pytest write .pyc files to <prefix>/<absolute source path>
@@ -318,6 +357,24 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # 3a-kanban. The board root does NOT follow HERMES_HOME: ``kanban_home()``
+    #    anchors on ``get_default_hermes_root()`` by design (one board shared by
+    #    every profile). When that root is still the REAL one — a custom
+    #    HERMES_HOME under ~/.hermes folds back onto it — pin the board to this
+    #    test's tmp dir so a card created here cannot land on the operator's live
+    #    board (t_e0c9e1ce: probe "scratch card"/"worktree card" rows paged the
+    #    owner). A test that moves the root off the real one is left alone, and a
+    #    test may still set HERMES_KANBAN_HOME itself (fixtures run after this).
+    try:
+        from hermes_cli import kanban_db as _kdb
+
+        _resolved_root = _kdb.kanban_home().resolve()
+        if _resolved_root == _real_test_root or _resolved_root.is_relative_to(_real_test_root):
+            _test_kanban_home = tmp_path / "kanban_home"
+            _test_kanban_home.mkdir()
+            monkeypatch.setenv("HERMES_KANBAN_HOME", str(_test_kanban_home))
+    except Exception:  # pragma: no cover - defensive
+        pass
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:

@@ -237,7 +237,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable", "skipped_keypool_capped",
+    "skipped_nonspawnable", "skipped_keypool_capped", "skipped_anonymous",
 )
 
 
@@ -414,6 +414,99 @@ def kanban_home() -> Path:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
+
+
+def _real_platform_kanban_roots() -> tuple[Path, ...]:
+    """The OPERATOR's live board files: ``<root>/kanban.db`` and ``<root>/kanban/boards``.
+
+    Resolved from the real platform home — never ``Path.home()``, which tests
+    repatch, and never ``kanban_home()``, which follows whatever pin the caller
+    set. This predicate must keep naming the operator's board even while a test
+    or a probe runs, so the anonymous-card fuse below can tell "a throwaway
+    board" from "the board the dispatcher pages a human about".
+
+    Deliberately does NOT read ``$HOME``: a probe that exports
+    ``HERMES_HOME=<tempdir>`` on the *shell* line rewrites HOME for its children
+    too (``~`` -> the tempdir), which would make the operator's real board look
+    like a throwaway and silently disarm the fuse (t_e0c9e1ce). ``pwd``'s home
+    for this uid is fixed and unrepatchable.
+    """
+    home = _real_user_home()
+    if home is None:  # pragma: no cover - defensive
+        return ()
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(base) / "hermes" if base else home / "AppData" / "Local" / "hermes"
+    else:
+        root = home / ".hermes"
+    return (root / "kanban.db", root / "kanban" / "boards")
+
+
+def _real_user_home() -> Optional[Path]:
+    """The account's own home from the user database, never from ``$HOME``.
+
+    A hard failsafe for the live-board test: environment variables are what a
+    probe rewrites, the passwd entry is not. Falls back to ``$HOME`` only when
+    the platform has no user database (Windows) or the lookup fails.
+    """
+    if sys.platform != "win32":
+        try:
+            import pwd
+
+            return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        except Exception:  # pragma: no cover - no passwd entry (containers)
+            pass
+    try:
+        return Path(os.path.expanduser("~")).resolve()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def path_is_live_board(path: Any) -> bool:
+    """True when *path* is (or sits inside) one of the operator's live boards."""
+    if not path:
+        return False
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    for live in _real_platform_kanban_roots():
+        try:
+            if resolved == live or resolved.is_relative_to(live):
+                return True
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            continue
+    return False
+
+
+def _conn_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """The file behind *conn*'s ``main`` database, or None for an in-memory board."""
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if (row[1] or "") == "main" and row[2]:
+                return Path(row[2])
+    except sqlite3.Error:  # pragma: no cover - defensive
+        return None
+    return None
+
+
+#: Assignee values that name no specific owner: ``None``/empty (dispatcher falls
+#: back to ``kanban.default_assignee``) and the ``default`` single-profile profile.
+_ANONYMOUS_PLACEHOLDER_ASSIGNEES = frozenset({"", "default"})
+
+
+def is_anonymous_placeholder_card(assignee: Optional[str], created_by: Optional[str]) -> bool:
+    """A card with no author AND no named owner — the shape every probe leaves behind.
+
+    Field incident (t_e0c9e1ce): scratch scripts created ``assignee="default"``
+    cards with no ``created_by``; they entered the operator's live queue and
+    crash-looped until a human archived them. A real card always carries an
+    author (the CLI/tool/dashboard/swarm paths all set one) and, on a multi-profile
+    install, a specific assignee.
+    """
+    if (created_by or "").strip():
+        return False
+    return (assignee or "").strip().lower() in _ANONYMOUS_PLACEHOLDER_ASSIGNEES
 
 
 def boards_root() -> Path:
@@ -1200,6 +1293,17 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Fuse (t_e0c9e1ce): a card with NO author and no named owner is the exact
+    # shape every ad-hoc probe leaves behind, and on the operator's live board it
+    # enters the dispatcher queue, crash-loops and pages a human. Refuse it there
+    # — a throwaway board (tests, probes that pinned HERMES_KANBAN_HOME) still
+    # accepts one so fixtures keep working.
+    if is_anonymous_placeholder_card(assignee, created_by) and path_is_live_board(_conn_db_path(conn)):
+        raise ValueError(
+            "refusing a card with no author and no named assignee on the live board: "
+            "pass created_by= (who filed it) and a concrete assignee profile; "
+            "probes and tests must pin HERMES_KANBAN_HOME to a temporary directory"
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
