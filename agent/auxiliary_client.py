@@ -4432,8 +4432,12 @@ def _try_main_provider_route(
             _has_named_entry = _get_named_custom_provider(main_provider) is not None
         if _has_named_entry:
             # KEEP the full ``custom:<name>`` so the named arm honours the entry's api_mode
-            # (collapsing to "custom" strips /anthropic → 404s). base_url/api_key come from the entry.
+            # (collapsing to "custom" strips /anthropic → 404s). The entry supplies base_url, but a
+            # live session key (kanban key pool, credential rotation) must win over the entry's static
+            # key: auxiliary traffic — compression above all — then rides the same account as the
+            # session instead of pinning every process to one shared env key.
             explicit_base_url = None
+            explicit_api_key = runtime_api_key or None
         elif runtime_base_url:
             # Config-less named custom provider (live runtime only): anonymous custom arm + runtime key.
             # See #34777.
