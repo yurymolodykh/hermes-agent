@@ -113,6 +113,75 @@ def _telegram_fallback_ips(extra):
     return parse_fallback_ip_env(configured) or list(SEED_FALLBACK_IPS)
 
 
+def _warm_attempt_seconds(extra) -> float:
+    """Bound on ONE warm-up probe: ``extra.warm_attempt_seconds`` (default 8)."""
+    try:
+        value = float((extra or {}).get("warm_attempt_seconds") or 8.0)
+    except (TypeError, ValueError):
+        return 8.0
+    return value if value > 0 else 8.0
+
+
+def _warm_attempts(extra) -> int:
+    """Warm-up clients allowed: ``extra.warm_attempts`` (default 3; 0 disables the warm-up)."""
+    try:
+        return max(0, int((extra or {}).get("warm_attempts", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+async def _close_quietly(bot) -> None:
+    """Release a discarded bot's pool; a close failure must never fail the send."""
+    try:
+        await bot.shutdown()
+    except Exception:  # health: allow BLE001 -- closing a client being thrown away is best effort
+        logger.debug("send_message: closing a discarded Telegram client failed", exc_info=True)
+
+
+async def _warm_telegram_bot(build, extra=None):
+    """Return a Bot whose Bot API tunnel is established, warming fresh clients as needed.
+
+    The FIRST request on a new client pays the tunnel setup (proxy CONNECT, TLS, DNS), and on a
+    flaky link that setup sometimes hangs until the read timeout instead of failing fast:
+    measured against the production proxy path with the real PTB client, 5 of 40 cold clients
+    stalled the full 20 s read timeout while the second request on that same *warm* client
+    never took more than 0.21 s (n=36). A live gateway never notices — its long-poll already
+    holds a warm connection — so only the one-shot (cron/``hermes send``) path needs this.
+
+    Each attempt uses a BRAND-NEW client: a probe cancelled mid-connect leaves the abandoned
+    connection in that pool, so retrying on the same client can hang again (observed: two
+    same-client attempts each burned the full bound, then the real send timed out too).
+    ``getMe`` changes nothing, so a stalled attempt is free to repeat; the state-changing send
+    is never retried because it may already be in the chat.
+
+    ``build`` makes a client; the last attempt's client is returned even when warming failed —
+    the caller sends anyway and reports whatever the real request returns.
+    """
+    attempts = _warm_attempts(extra)
+    bot = build()
+    if not attempts:
+        return bot
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            await _close_quietly(bot)
+            bot = build()
+        try:
+            await asyncio.wait_for(bot.get_me(), timeout=_warm_attempt_seconds(extra))
+            if attempt > 1:
+                logger.info("send_message: Telegram tunnel established on warm-up attempt %d/%d",
+                            attempt, attempts)
+            return bot
+        except asyncio.CancelledError:
+            await _close_quietly(bot)
+            raise
+        except Exception as exc:  # health: allow BLE001 -- a probe is diagnostic: PTB raises
+            # TimedOut/NetworkError/ConnectError/any transport fault and a failed warm-up must
+            # never fail the send it was meant to protect. The real send reports the true error.
+            logger.warning("send_message: Telegram warm-up attempt %d/%d failed: %s",
+                           attempt, attempts, _sanitize_error_text(exc))
+    return bot
+
+
 def _telegram_bot(token, extra=None):
     """Bot built by the gateway adapter's request builder (``telegram_network.build_ptb_requests``:
     pool size, keepalive limits, timeouts, TLS verify): ``extra.base_url``/``base_file_url``
@@ -343,7 +412,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if is_visually_empty(message):
             message = ""  # invisible-only text would land as an empty bubble
         formatted, send_parse_mode, _has_html = _telegram_format(message)
-        bot = _telegram_bot(token, extra)
+        bot = await _warm_telegram_bot(lambda: _telegram_bot(token, extra), extra)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
         from gateway.platforms.base import BasePlatformAdapter, utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.

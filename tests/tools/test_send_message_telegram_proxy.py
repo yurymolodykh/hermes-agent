@@ -53,6 +53,10 @@ def _install_telegram_mock_with_request(
 def _make_bot() -> MagicMock:
     bot = MagicMock()
     bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    # The one-shot send warms the client with a bounded getMe before the real request, so a
+    # stub Bot needs an awaitable get_me (and a shutdown for a discarded client).
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(username="probe_bot"))
+    bot.shutdown = AsyncMock(return_value=None)
     return bot
 
 
