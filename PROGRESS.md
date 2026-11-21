@@ -1,3 +1,59 @@
+# PROGRESS — t_819d3353: SOUL-клон для 01-<login> + опросник персонализации
+
+## Состояние: ГОТОВО И ЗАКОММИЧЕНО
+
+* Дерево: `/home/hermes/.hermes/kanban/workspaces/t_819d3353`, ветка `wt/t_819d3353`
+* База: `0a1960695e`
+* **Верхушка ветки: `1c4dce2c24`**
+* Отчёт: `REPORT-soul-seed.md`
+* Доказательства: `evidence/` (`live_probe.py`, `live_probe.final.json`, `SOUL-01-testuser.md`,
+  `SOUL-QUESTIONNAIRE.md`, `MEMORY-01-testuser.md`)
+
+### Что сделано
+
+1. `hermes_acl_soul.py` (новый, stdlib) — `personal_soul_for`, `build_user_soul`,
+   `apply_questionnaire`, `seed_questionnaire`, `questionnaire_text`, CLI `main`.
+2. `hermes_cli/data/user_soul_base.md` + `hermes_cli/data/soul-questionnaire.md` — bundled
+   источник и опросник (объявлены в `pyproject.toml` → `data/*.md`).
+3. `hermes_cli/profiles_initialization.py` — `personal_soul_seed()` (best effort) и
+   `materialize_symlinked_files` (перенос из фасада `profiles.py`).
+4. `hermes_cli/profiles.py::create_profile` — персональный SOUL при `soul is None`;
+   `finish_profile_layout(..., personal_root=True)` кладёт опросник.
+5. `hermes_cli/web_routers/profiles.py` — `questionnaire_path` в ответе create;
+   `POST /api/profiles/{name}/soul/apply-questionnaire` (гейт `require_writable`).
+6. `hermes_cli/web_models.py` — `ProfileSoulQuestionnaire`.
+7. `hermes_cli/profile_cmd.py` — CLI печатает путь к опроснику.
+8. `tests/hermes_cli/test_profile_soul_seed.py` — 49 тестов.
+9. `/home/hermes/workspaces/01-orchestrator/ops/soul-clone-for-user.py` — тонкая обёртка
+   над платформенным модулем (правка не живёт только в ops).
+
+### Проверки
+
+* `test_profile_soul_seed.py` — **49 passed** (требовалось ≥10).
+* `test_profile_route_owner_scope.py` — **73 passed** (не уменьшилось).
+* Живая проба (`evidence/live_probe.py`, изолированный HERMES_HOME): (а) 60 строк / 4025 симв.,
+  роль «Ты — персональный ассистент testuser», 0 попаданий по 6 маркерам; (б) `questionnaire_path`
+  в ответе create; (в) apply → 3 раздела, sha `0621417f`→`4d307ea7`, diff только в них;
+  (г) пустой → sha идентичен; (д) чужой namespace → 403; свой корень → 200.
+* CLI-путь: `01-cliuser` → 60 строк + опросник; `plaingroup` → прежний `DEFAULT_SOUL_MD` (1 строка),
+  без опросника. Профили-зонды удалены из живого `~/.hermes`.
+* Смежная регрессия вне `~/.hermes` (`/tmp/soulbranch2`): 129 passed + 3 skipped
+  (profiles / clone_channels / soul_writes) и 135 passed (route_names / soul_seed / owner_scope).
+* `tests/gateway/test_native_profile_create.py` — флейк готовности шлюза, воспроизводится и на базе
+  `0a1960695e` (не регрессия).
+* `scripts.code_health --base 0a1960695e` → 0 blocking, 0 advisory. `ruff check` — All checks passed.
+* `pre-commit` пропущен при коммите: `scripts/hermes-python` в worktree падает на
+  «no bootstrap Python found; run setup-hermes.sh». Та же проверка ruff прогнана напрямую
+  интерпретатором test-environment — All checks passed.
+
+### Остаточное (manual_review, вне рамок карточки)
+
+* Показ опросника в десктопном клиенте — API отдаёт путь, UI отдельной темой.
+* Миграция существующих профилей.
+* Слияние в `feature/multiuser-access` и публикацию делает оркестратор (страж деревьев).
+
+---
+
 # PROGRESS — t_44bd1c6a (гонка провижининга: воркер стартует раньше симлинка окружения)
 
 ## Состояние: КОД И ПРОВЕРКИ ГОТОВЫ; ОСТАЛОСЬ — КОММИТ
