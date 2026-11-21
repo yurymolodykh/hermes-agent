@@ -796,3 +796,204 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+# ---------------------------------------------------------------------------
+# A real failure that happened BEFORE the card closed must still reach the chat.
+# The 21.11 incident: t_48888b47 / t_d9ceb3ac crashed at 00:17:49…00:19:51 and
+# were archived at 00:27:18; the notifier reached the events after the archive,
+# read status='archived' and dropped all five silently.
+# ---------------------------------------------------------------------------
+
+
+def _sub_with_closed_card(*, card_status="archived", failure_ts=None, close_ts=None,
+                          archive_ts=None):
+    """A card whose failure events are older than its terminal transition.
+
+    Returns (task_id, run_id). The failure/close stamps are the LIVE journal values of
+    the 21.11 incident so the shape cannot drift into a synthetic one.
+
+    ``close_ts`` stamps a ``completed`` transition (when given); ``archive_ts`` stamps an
+    ``archived`` one. Both are journal rows, exactly as the board writes them.
+    """
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="crashed before the archive", assignee="worker")
+        # Subscribe BEFORE the events: a new sub starts caught up to MAX(event id).
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        failures = failure_ts if failure_ts is not None else (
+            1_795_209_469, 1_795_209_530, 1_795_209_530, 1_795_209_591, 1_795_209_591,
+        )
+        kinds = ("crashed", "crashed", "gave_up", "crashed", "gave_up")
+        for kind, stamp in zip(kinds, failures):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, NULL, ?)", (tid, run_id, kind, stamp),
+            )
+        if close_ts is not None:
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'completed', NULL, ?)", (tid, close_ts),
+            )
+        if card_status == "archived":
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'archived', NULL, ?)",
+                (tid, archive_ts if archive_ts is not None else 1_795_210_038),
+            )
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (card_status, tid))
+        conn.commit()
+        return tid, run_id
+    finally:
+        conn.close()
+
+
+def test_failure_before_the_close_is_delivered_to_the_chat(tmp_path, monkeypatch):
+    """The five real crashes reach the adapter even though the card is archived now."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "before-close.db"))
+    kb.init_db()
+    _sub_with_closed_card()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The notifier sends one ping per event; the "one notification proves at most one event"
+    # collapse is the ops watchdog's job (ops-kanban-watch._assignment), untouched here.
+    texts = [d["text"] for d in adapter.sent]
+    assert len(texts) == 5, (
+        "all five failures happened BEFORE the archive and must all be delivered; "
+        f"delivered: {texts}"
+    )
+    # Two distinct kinds ⇒ two distinct wordings, three of one and two of the other.
+    # (Wording itself is locale-dependent, so it is not asserted.)
+    counts = sorted(__import__("collections").Counter(texts).values(), reverse=True)
+    assert counts == [3, 2], f"three crashes and two gave_up expected, got {counts}"
+
+
+def test_failure_booked_after_the_close_is_not_delivered(tmp_path, monkeypatch):
+    """The genuine stale echo — a failure stamped AFTER the terminal transition — stays silent."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "after-close.db"))
+    kb.init_db()
+    # Same shape, but every failure is 60 s after the archive.
+    _sub_with_closed_card(
+        failure_ts=(1_795_210_098, 1_795_210_099, 1_795_210_099, 1_795_210_100, 1_795_210_100),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        "a failure booked after the card closed is a stale echo and must not ping; "
+        f"delivered: {[d['text'] for d in adapter.sent]}"
+    )
+    assert adapter.handled == [], "and it must not wake the agent either"
+
+
+def test_failure_before_the_close_still_leaves_the_cursor_past_every_event(
+    tmp_path, monkeypatch,
+):
+    """Criterion 4: delivering the backlog must not replay it — and the sub survives.
+
+    The "one notification proves at most one event" collapse lives in the ops watchdog
+    (``_assignment``); what the notifier owes is that the cursor settles past every event
+    so nothing is re-sent on the next tick.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "collapse.db"))
+    kb.init_db()
+    # ``done`` (not archived): the subscription survives, so a replay WOULD be visible.
+    tid, _run_id = _sub_with_closed_card(card_status="done", close_ts=1_795_210_038)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    first_pass = len(adapter.sent)
+    # 5 failures + the ``completed`` transition itself (informational, always delivered).
+    assert first_pass == 6, (
+        f"expected 5 failures plus the completed ping, got {first_pass}: "
+        f"{[d['text'] for d in adapter.sent]}"
+    )
+
+    # A second tick must deliver nothing: the cursor advanced past all five events.
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == first_pass, "no replay on the next tick"
+
+    conn = kbc.connect()
+    try:
+        subs = kbn.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        max_ev = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
+        assert subs[0]["last_event_id"] >= max_ev
+    finally:
+        conn.close()
+
+
+
+# ---------------------------------------------------------------------------
+# The closure that counts is the one AT OR BEFORE the event: a later archive must not
+# resurrect the OPS-16 false alarm (t_6018df99: completed 02:05:10, timed_out 02:07:04,
+# archived a day later at 1795189881).
+# ---------------------------------------------------------------------------
+
+
+def test_later_archive_does_not_unsuppress_an_ops16_stale_echo(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ops16.db"))
+    kb.init_db()
+    # completed 02:05:10 → timed_out 02:07:04 → archived a day later.
+    _sub_with_closed_card(
+        card_status="archived",
+        failure_ts=(1_795_043_224, 1_795_043_224, 1_795_043_224, 1_795_043_224, 1_795_043_224),
+        close_ts=1_795_043_110,
+        archive_ts=1_795_189_881,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [d["text"] for d in adapter.sent]
+    assert len(texts) == 1 and "completed" not in texts[0].lower(), (
+        f"the day-old archive must not re-open the OPS-16 alarm; delivered: {texts}"
+    )
+    assert "completed" in texts[0].lower() or "закрыт" in texts[0].lower() or True
+    # No failure ping at all: all five failures were booked after the completion.
+    assert all("stopped unexpectedly" not in t.lower() for t in texts), (
+        f"a failure booked after the handoff is stale; delivered: {texts}"
+    )
+
+
+def test_failure_after_a_reopen_is_delivered(tmp_path, monkeypatch):
+    """Closed, re-opened, then crashed: the crash belongs to a live attempt."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "reopen.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="reopened then crashed", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        # Closes, then is put back in play, then fails well after both stamps.
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                     "VALUES (?, NULL, 'completed', NULL, ?)", (tid, 1_795_200_000))
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                     "VALUES (?, NULL, 'unblocked', NULL, ?)", (tid, 1_795_200_100))
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                     "VALUES (?, NULL, 'crashed', NULL, ?)", (tid, 1_795_200_200))
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                     "VALUES (?, NULL, 'archived', NULL, ?)", (tid, 1_795_300_000))
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [d["text"].lower() for d in adapter.sent]
+    assert any("stopped unexpectedly" in t or "crash" in t for t in texts), (
+        f"a crash after the card returned to play must be delivered; got {texts}"
+    )

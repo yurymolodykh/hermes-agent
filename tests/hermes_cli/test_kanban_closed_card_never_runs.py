@@ -134,24 +134,102 @@ def test_record_task_failure_ignores_a_done_card(conn):
 def test_stale_failure_event_is_not_delivered_for_a_done_card():
     from gateway.kanban_watchers_notifier import event_is_stale_for_closed_card
 
+    CLOSED_AT = 1_000
+
     class _Ev:
-        def __init__(self, kind):
+        def __init__(self, kind, created_at=None):
             self.kind = kind
+            self.created_at = created_at
 
     class _Task:
-        def __init__(self, status):
+        def __init__(self, status, completed_at=None):
             self.status = status
+            self.completed_at = completed_at
 
-    # A failure echo on a closed card: dropped.
+    # A failure echo booked AFTER the close: dropped.
     for kind in ("timed_out", "crashed", "gave_up"):
-        assert event_is_stale_for_closed_card(_Ev(kind), _Task("done")) is True
-        assert event_is_stale_for_closed_card(_Ev(kind), _Task("archived")) is True
+        for status in ("done", "archived"):
+            late = _Ev(kind, CLOSED_AT + 60)
+            assert event_is_stale_for_closed_card(late, _Task(status), CLOSED_AT) is True
     # Same failure while the card still needs someone: always delivered.
     for status in ("running", "ready", "review", "blocked"):
-        assert event_is_stale_for_closed_card(_Ev("timed_out"), _Task(status)) is False
+        late = _Ev("timed_out", CLOSED_AT + 60)
+        assert event_is_stale_for_closed_card(late, _Task(status), CLOSED_AT) is False
     # Terminal kinds that carry information (not failures) are never suppressed.
     for kind in ("completed", "commented", "review_requested", "blocked"):
-        assert event_is_stale_for_closed_card(_Ev(kind), _Task("done")) is False
+        late = _Ev(kind, CLOSED_AT + 60)
+        assert event_is_stale_for_closed_card(late, _Task("done"), CLOSED_AT) is False
+
+
+# --- a real failure that happened BEFORE the close is never suppressed ---------------------
+
+def test_failure_before_the_close_is_delivered_even_when_processed_late():
+    """The 21.11 defect: status-at-delivery swallowed 5 real crashes.
+
+    ``t_48888b47``/``t_d9ceb3ac`` crashed/failed at 00:17:49…00:19:51 and were archived at
+    00:27:18 — 569 s later. The notifier only reached those events after the archive, read
+    ``status='archived'`` and dropped all five. The event's own timestamp is what decides.
+    """
+    from gateway.kanban_watchers_notifier import event_is_stale_for_closed_card
+
+    CLOSED_AT = 1_795_210_038  # 21.11 00:27:18 — the ``archived`` event's own stamp
+
+    class _Ev:
+        def __init__(self, kind, created_at):
+            self.kind = kind
+            self.created_at = created_at
+
+    class _Task:
+        status = "archived"
+        completed_at = None  # archived without completing — the live shape
+
+    # Exactly the five event stamps from the incident journal, all before the close.
+    # (Stamps below are the live ``task_events.created_at`` values.)
+    incident = [
+        ("crashed", 1_795_209_469),   # 21.11 00:17:49  t_48888b47 / t_d9ceb3ac
+        ("crashed", 1_795_209_530),   # 21.11 00:18:50  both cards
+        ("gave_up", 1_795_209_530),   # 21.11 00:18:50  both cards
+        ("crashed", 1_795_209_591),   # 21.11 00:19:51  both cards
+        ("gave_up", 1_795_209_591),   # 21.11 00:19:51  both cards
+    ]
+    for kind, stamp in incident:
+        assert stamp < CLOSED_AT
+        assert event_is_stale_for_closed_card(_Ev(kind, stamp), _Task(), CLOSED_AT) is False
+    # The +569 s gap quoted in the incident: the archive came LONG after the failures.
+    assert CLOSED_AT - incident[0][1] == 569 and CLOSED_AT - incident[1][1] == 508
+    # The ``archived`` event itself is not a failure kind: never suppressed.
+    assert event_is_stale_for_closed_card(_Ev("archived", CLOSED_AT), _Task(), CLOSED_AT) is False
+
+
+def test_failure_without_a_known_closure_time_is_delivered():
+    """No closure evidence ⇒ no suppression: an unknown moment cannot justify silence."""
+    from gateway.kanban_watchers_notifier import event_is_stale_for_closed_card
+
+    class _Ev:
+        kind = "crashed"
+        created_at = 1_000
+
+    class _Task:
+        status = "archived"
+        completed_at = None
+
+    assert event_is_stale_for_closed_card(_Ev(), _Task(), None) is False
+
+
+def test_failure_at_the_closure_second_is_delivered():
+    """Boundary: an event stamped at the same second as the close is not "after" it."""
+    from gateway.kanban_watchers_notifier import event_is_stale_for_closed_card
+
+    class _Ev:
+        kind = "timed_out"
+        created_at = 1_000
+
+    class _Task:
+        status = "done"
+        completed_at = 1_000
+
+    assert event_is_stale_for_closed_card(_Ev(), _Task(), 1_000) is False
+    assert event_is_stale_for_closed_card(_Ev(), _Task(), 999) is True
 
 
 # --- the worker's own turn ends at handoff ------------------------------------------------

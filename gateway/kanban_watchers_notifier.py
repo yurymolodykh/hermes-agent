@@ -67,21 +67,118 @@ def diagnostic_event(ev) -> bool:
 # handoff — paging the owner about them is a false alarm on closed work.
 _STALE_ON_CLOSED_CARD_KINDS = frozenset({"crashed", "timed_out", "gave_up"})
 _CLOSED_CARD_STATUSES = frozenset({"done", "archived"})
+# Journal kinds that record the card BECOMING terminal. ``tasks.completed_at`` is not enough:
+# a card can be archived without ever completing, and that column then stays NULL.
+_CLOSURE_EVENT_KINDS = ("completed", "archived")
+# Journal kinds that put the card BACK IN PLAY after a terminal transition. A failure that
+# follows one of these belongs to a live attempt, not to the finished handoff.
+_REOPEN_EVENT_KINDS = (
+    "created", "promoted", "unblocked", "claimed", "spawned", "worker_bound",
+    "scheduled", "review_requested", "changes_requested", "respawn_guarded",
+)
 
 
-def event_is_stale_for_closed_card(ev, task) -> bool:
-    """True when ``ev`` reports a failure for a card that is already terminal.
+def _epochs_for(conn: Any, task_id: str, kinds: tuple) -> list[int]:
+    """Every journal stamp of ``kinds`` for ``task_id``, ascending. Never raises."""
+    placeholders = ",".join("?" * len(kinds))
+    try:
+        rows = conn.execute(
+            f"SELECT created_at FROM task_events WHERE task_id = ? AND kind IN ({placeholders}) "
+            "ORDER BY created_at",
+            (task_id, *kinds),
+        ).fetchall()
+    except Exception:  # a journal read must never break delivery
+        return []
+    out: list[int] = []
+    for row in rows:
+        try:
+            stamp = row[0] if not hasattr(row, "keys") else row["created_at"]
+            out.append(int(stamp))
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def card_closures(conn: Any, task_id: str, task: Any = None) -> list[int]:
+    """Every known moment ``task_id`` became terminal, ascending — [] when unknown.
+
+    The board journal is the primary source (``completed``/``archived`` events), because
+    ``tasks.completed_at`` is NULL on cards archived without completing — exactly the two
+    cards of the 21.11 incident, archived 00:27:18 with ``completed_at IS NULL``.
+    """
+    stamps = _epochs_for(conn, task_id, _CLOSURE_EVENT_KINDS)
+    if stamps:
+        return stamps
+    # Legacy rows (pre-journal or hand-migrated archives) may still carry completed_at.
+    completed_at = getattr(task, "completed_at", None) if task is not None else None
+    try:
+        return [int(completed_at)] if completed_at else []
+    except (TypeError, ValueError):
+        return []
+
+
+def event_is_stale_for_closed_card(ev, task, closure_ts: Optional[int] = None) -> bool:
+    """True when ``ev`` reports a failure booked AFTER the card had already gone terminal.
 
     The worker hands the card off, its conversation turn keeps running for a while, and
     the leftover attempt is then booked as ``timed_out``/``crashed``/``gave_up`` — after
     the card is ``done``. That event describes an attempt nobody can act on, so it must
-    not become a ping or a wake in the owner's chat. The card's own status at delivery
-    time is the evidence: a failure on a card still ``running``/``ready``/``review`` is
-    real and always delivered.
+    not become a ping or a wake in the owner's chat.
+
+    The evidence is the ORDER OF EVENTS, not the card's status at delivery time. A card
+    can be closed long before the notifier reaches its events (processing lag, a gateway
+    restart, the nightly archive sweep); suppressing on status alone silently swallowed
+    five real crashes on 21.11.2026 (``t_48888b47``/``t_d9ceb3ac``: events at 00:17:49…
+    00:19:51, card archived 00:27:18 — 569 s later). So:
+
+    * a failure on a card that is not terminal is real — always delivered;
+    * a failure WITHOUT a known closure time cannot be justified as stale — delivered;
+    * a failure that happened BEFORE the closure is real — always delivered;
+    * only a failure booked after the closure is the stale echo of a finished handoff.
+
+    ``closure_ts`` is the last terminal transition at or before this event (see
+    :func:`closure_before_event`); None means "no evidence", which never suppresses.
     """
     if ev.kind not in _STALE_ON_CLOSED_CARD_KINDS:
         return False
-    return str(getattr(task, "status", "") or "") in _CLOSED_CARD_STATUSES
+    if str(getattr(task, "status", "") or "") not in _CLOSED_CARD_STATUSES:
+        return False
+    if closure_ts is None:
+        return False
+    try:
+        event_ts = int(getattr(ev, "created_at", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return event_ts > int(closure_ts)
+
+
+def closure_before_event(
+    conn: Any, task_id: str, event_ts: int, closures: Optional[list[int]] = None,
+    task: Any = None,
+) -> Optional[int]:
+    """The card's last terminal transition at or before ``event_ts`` — None when there is none.
+
+    Only a closure the failure could actually have outlived counts. A *later* archive (the
+    nightly sweep, a day-old ``archived`` event) says nothing about an attempt that had
+    already finished, and treating it as the closure would resurrect exactly the false
+    alarms OPS-16 removed (``t_6018df99``: ``completed`` 02:05:10, ``timed_out`` 02:07:04,
+    armed a day later).
+
+    A failure that follows an event putting the card back in play belongs to a live attempt
+    and is delivered: the card was NOT closed at that moment, whatever an older stamp says.
+    """
+    stamps = closures if closures is not None else card_closures(conn, task_id, task)
+    eligible = [ts for ts in stamps if ts <= int(event_ts)]
+    if not eligible:
+        return None
+    closure = max(eligible)
+    reopened = [ts for ts in _epochs_for(conn, task_id, _REOPEN_EVENT_KINDS)
+                if closure < ts <= int(event_ts)]
+    if reopened:
+        return None
+    return closure
+
+
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -345,12 +442,27 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         # A failure booked on a card that is already terminal is a stale echo of an attempt
         # that outlived its own handoff — dropping it here keeps the cursor moving while
-        # neither pinging nor waking the owner about closed work.
-        kept = [ev for ev in events if not event_is_stale_for_closed_card(ev, task)]
+        # neither pinging nor waking the owner about closed work. Whether it IS stale is
+        # decided per event: the card's closure time against the event's OWN timestamp, never
+        # the status at delivery time (that status silently swallowed five real crashes when
+        # the notifier ran 569 s after the archive).
+        closures: Optional[list[int]] = None
+        if any(ev.kind in _STALE_ON_CLOSED_CARD_KINDS for ev in events):
+            closures = card_closures(conn, sub["task_id"], task)
+
+        def _is_stale(ev) -> bool:
+            closure_ts = closure_before_event(
+                conn, sub["task_id"], int(getattr(ev, "created_at", 0) or 0),
+                closures=closures, task=task,
+            )
+            return event_is_stale_for_closed_card(ev, task, closure_ts)
+
+        kept = [ev for ev in events if not _is_stale(ev)]
         if len(kept) != len(events):
             logger.info(
-                "kanban notifier: dropped %d stale failure event(s) for closed card %s",
-                len(events) - len(kept), sub["task_id"],
+                "kanban notifier: dropped %d stale failure event(s) for card %s — booked "
+                "after it closed (closures %s)",
+                len(events) - len(kept), sub["task_id"], closures,
             )
         if not kept:
             return None
