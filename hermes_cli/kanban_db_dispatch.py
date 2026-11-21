@@ -207,6 +207,14 @@ def capacity_bound(results: Iterable[Optional[DispatchResult]]) -> bool:
     Any other hold (``env_unready``, respawn guard, ``rate_limited``,
     ``skipped_locked``, memory pressure, unassigned/nonspawnable rows) makes
     this ``False``: those stay operator-actionable warnings.
+
+    ``budget_hold`` outranks everything else on its own tick. The reclaim
+    phase runs BEFORE the spawn-budget gate, so a tick stopped by a full host
+    cap can also carry ``crashed``/``stale``/``timed_out`` (a dead worker was
+    requeued a line earlier, freeing nothing this tick). Those are lifecycle
+    facts already written to ``task_events`` and must not turn a saturated
+    tick into a "check profile health" warning — measured live on 22.11: one
+    of 22 saturated ticks carried ``crashed`` and re-armed the false alarm.
     """
     saw_capacity = False
     for res in results:
@@ -216,10 +224,13 @@ def capacity_bound(results: Iterable[Optional[DispatchResult]]) -> bool:
             return False
         if res.skipped_locked or res.memory_pressure:
             return False
+        if res.budget_hold:  # the cap stopped the tick before the lane loops
+            saw_capacity = True
+            continue
         if res.skipped_unassigned or res.skipped_nonspawnable or res.auto_blocked \
                 or res.crashed or res.stale or res.timed_out:
             return False
-        if res.budget_hold or res.skipped_keypool_capped or res.skipped_per_profile_capped:
+        if res.skipped_keypool_capped or res.skipped_per_profile_capped:
             saw_capacity = True
     return saw_capacity
 

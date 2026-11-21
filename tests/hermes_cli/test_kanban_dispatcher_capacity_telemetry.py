@@ -83,6 +83,28 @@ def test_board_cap_hold_is_saturation_not_stall():
     assert capacity_bound([DispatchResult(budget_hold="max_spawn")]) is True
 
 
+def test_host_cap_hold_survives_a_reclaim_in_the_same_tick():
+    """The cap gate runs after the reclaim phase, so one tick can carry both.
+
+    Live 22.11: 1 of 22 saturated ticks also requeued a crashed worker
+    (``crashed=[...]``) and re-armed the "check profile health" warning even
+    though the cap — not a broken profile — was why nothing spawned. A
+    ``budget_hold`` means the lane loops never ran; the reclaim buckets are
+    lifecycle bookkeeping, not evidence about the host.
+    """
+    res = DispatchResult(budget_hold="max_in_progress", crashed=["t_dead"])
+    assert capacity_bound([res]) is True
+    assert "budget_hold:max_in_progress=1" in describe_suppression([res])
+
+
+def test_cap_hold_does_not_mask_an_operator_actionable_hold():
+    # A broken environment / quota wall still warns, cap or no cap.
+    assert capacity_bound([DispatchResult(budget_hold="max_in_progress",
+                                          skipped_env_unready=[("t_b", "no deps")])]) is False
+    assert capacity_bound([DispatchResult(budget_hold="max_in_progress",
+                                          rate_limited=["t_c"])]) is False
+
+
 def test_suppression_line_names_the_profile_cap():
     res = DispatchResult(skipped_per_profile_capped=[("t_a", "02-hermes-platform", 3)])
     assert "per_profile_capped=1" in describe_suppression([res])
