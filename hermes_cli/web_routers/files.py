@@ -1080,7 +1080,7 @@ async def fs_read_text(
 
 
 @router.post("/api/fs/write-text")
-async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
+async def fs_write_text(payload: FsWriteText, request: Request, profile: Optional[str] = None):
     """Overwrite (or create) a UTF-8 text file for the in-app spot editor.
 
     Mirrors the Electron ``hermes:fs:writeText`` hardening: path validated by
@@ -1110,6 +1110,11 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
     target = await _fs_download_path(
         payload.path, profile, payload.session_id, session=session, decode_fallback=False, own_sandbox_only=True,
     )
+    if not await asyncio.to_thread(_is_host_file, payload.path, profile):
+        # A write outside the caller's own root is refused before the bytes are staged (step 6).
+        from hermes_acl_results import require_path
+
+        require_path(request, target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
@@ -1381,7 +1386,7 @@ async def fs_download(
 
 
 @router.get("/api/fs/git-root")
-async def fs_git_root(path: str, profile: Optional[str] = None):
+async def fs_git_root(path: str, request: Request, profile: Optional[str] = None):
     backend = await asyncio.to_thread(_fs_backend, profile)
     if backend is not None:
         try:
@@ -1389,12 +1394,18 @@ async def fs_git_root(path: str, profile: Optional[str] = None):
         except Exception as exc:
             _raise_fs_backend_error(exc)
     target = _fs_path(path)
+    # The walk below climbs to the repository root, which may sit ABOVE the named folder: the
+    # start point is the caller's to name, so it carries the same boundary as every other read.
+    _hosted_fs_read_guard(target, request)
     try:
         st = target.stat()
         start = target if stat.S_ISDIR(st.st_mode) else target.parent
     except OSError:
         start = target
-    return {"root": _fs_find_git_root(start)}
+    root = _fs_find_git_root(start)
+    if root:
+        _hosted_fs_read_guard(Path(root), request)
+    return {"root": root}
 
 
 @router.get("/api/fs/default-cwd")

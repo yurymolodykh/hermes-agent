@@ -1,0 +1,34 @@
+== 1. файлы: свой и чужой ==
+  [OK ] GET /api/fs/read-text свой файл: 200 (ждали 200) {"binary":false,"byteSize":10,"language":"text","mimeType":"text/plain","path":"/tmp/mpd6probe.uncdj5ng/.hermes/profiles/01-alice/secret.txt","text":"alice only","truncated":false}
+  [OK ] GET /api/fs/read-text чужой файл: 403 (ждали 403) {"detail":"Path is outside the caller's allowed roots"}
+  [OK ] GET /api/fs/list чужой каталог: 403 (ждали 403) {"detail":"Path is outside the caller's allowed roots"}
+  [OK ] GET /api/fs/read-text обход ..: 403 (ждали 403) {"detail":"Path is outside the caller's allowed roots"}
+  [OK ] GET /api/files/read чужой файл: 403 (ждали 403) {"detail":"Path is outside the caller's allowed roots"}
+  [OK ] GET /api/files свой каталог: 200 (ждали 200) {"path":"/tmp/mpd6probe.uncdj5ng/.hermes/profiles/01-alice","parent":"/tmp/mpd6probe.uncdj5ng/.hermes/profiles","entries":[{"name":"memories","path":"/tmp/mpd6probe.uncdj5ng/.hermes/profiles/01-alice/
+  [OK ] POST /api/fs/write-text запись чужого: 403 (ждали 403) {"detail":"Path is outside the caller's allowed roots"}
+    planted.txt существует? False (ожидали False)
+== 2. скиллы ==
+  [OK ] GET /api/skills (свой набор): 200 (ждали 200) [{"name":"01-alice-skill","description":"01-alice","category":null,"locked":false,"enabled":true,"usage":0,"provenance":"agent"}]
+    навыки alice: ['01-alice-skill']
+  [OK ] свой 01-alice-skill виден, чужой 01-bob-skill — False (ждали False)
+  [OK ] GET /api/skills?profile=01-bob (чужой профиль): 404 (ждали 404) {"detail":"Profile '01-bob' does not exist."}
+  [OK ] GET /api/skills/content чужой навык: 404 (ждали 404) {"detail":"Skill '01-bob-skill' not found."}
+  [OK ] GET /api/skills?profile=02-hermes-platform (общий): 200 (ждали 200) [{"name":"shared-skill","description":"shared","category":null,"locked":false,"enabled":true,"usage":0,"provenance":"agent"}]
+== 3. память ==
+  [OK ] GET /api/memory: 200 (ждали 200) {"active":"","providers":[{"name":"byterover","description":"ByteRover — persistent knowledge tree with tiered retrieval via the brv CLI.","available":false,"configured":true,"status":"unavailable","s
+  [OK ] считает только свой бакет: 13 == 13
+  [OK ] GET /api/memory?profile=01-bob: 404 (ждали 404) {"detail":"Profile '01-bob' does not exist."}
+  [OK ] POST /api/memory/reset: 200 (ждали 200) {"ok":true,"deleted":["MEMORY.md"]}
+  [OK ] сброс только своего: alice=False, bob=True (ждали False/True)
+== 4. вложения карточек ==
+  [OK ] GET вложение своей карточки: 200 (ждали 200) person/alice's private notes
+  [OK ] GET вложение чужой карточки по id: 404 (ждали 404) {"detail":"attachment not found"}
+  [OK ] GET список вложений чужой карточки: 404 (ждали 404) {"detail":"Task not found"}
+  [OK ] DELETE вложение чужой карточки: 404 (ждали 404) {"detail":"attachment not found"}
+  [OK ] чужой файл уцелел: True
+== 5. владелец хоста (положительный контроль) ==
+  [OK ] owner: чужой файл: 200 (ждали 200) {"binary":false,"byteSize":8,"language":"text","mimeType":"text/plain","path":"/tmp/mpd6probe.uncdj5ng/.hermes/profiles/01-bob/secret.txt","text":"bob only","truncated":false}
+  [OK ] owner: /api/skills?profile=01-bob: 200 (ждали 200) [{"name":"01-bob-skill","description":"01-bob","category":null,"locked":false,"enabled":true,"usage":0,"provenance":"agent"}]
+  [OK ] owner: вложение чужой карточки: 200 (ждали 200) person/bob's private notes
+
+ИТОГ: 25/25 проверок

@@ -22,6 +22,28 @@ from hermes_cli.web_server_profiles import _profile_cli_args
 log = logging.getLogger("hermes_cli.web_server")
 
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
+
+def results_profile(request: Any, profile: Optional[str]) -> Optional[str]:
+    """The profile a RESULTS route (files/skills/memory) acts on for THIS caller (МПД Т6).
+
+    With no ``?profile=`` the dashboard used to answer from the LAUNCH profile — the owner's on a
+    shared host. :func:`hermes_acl_results.resolve_profile` turns that into the caller's own
+    orchestrator root and refuses a foreign name with the 404 an absent one gets. Unscoped
+    (``acl.multi_user`` off, or the host owner) this is the requested name, unchanged.
+    """
+    from hermes_acl_results import resolve_profile
+
+    return resolve_profile(request, profile)
+
+
+def require_results_write(request: Any, profile: Optional[str]) -> None:
+    """A shared profile is usable by everybody and reconfigurable by nobody but the host owner."""
+    if profile is None:
+        return
+    from hermes_acl_profiles import require_writable
+
+    require_writable(request, profile)
+
 _config_profile_scope = late("_config_profile_scope", "hermes_cli.web_server_profiles")
 _spawn_hermes_action = late("_spawn_hermes_action", "hermes_cli.web_server_gateway")
 # Config read-modify-write serialization for off-loop handlers (live lock —

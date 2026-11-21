@@ -17,7 +17,7 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from hermes_cli.config import redact_key
@@ -31,9 +31,10 @@ from hermes_cli.web_models import (
 )
 from hermes_cli.web_routers._common import (
     config_scoped_to_thread, config_write_scope, destructive_profile, http_failure,
-    spawn_profile_action,
+    require_results_write, results_profile, spawn_profile_action,
 )
 from hermes_cli.web_routers.files import stream_upload_to_path
+from hermes_acl_results import memory_dirs_for
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -496,7 +497,9 @@ _MEMORY_FILES = (("MEMORY.md", "memory"), ("USER.md", "user"))
 
 
 @router.get("/api/memory")
-async def get_memory_status(profile: Optional[str] = None):
+async def get_memory_status(request: Request, profile: Optional[str] = None):
+    profile = results_profile(request, profile)
+
     def _run():  # load_config(), stats and discovery are disk reads — off-loop
         cfg = load_config()
         mem = cfg.get("memory")
@@ -504,7 +507,8 @@ async def get_memory_status(profile: Optional[str] = None):
         from tools.memory_tool import memory_dirs_all
         # Memory is per subject (ACCESS-MODEL D13): sum the legacy base AND every u/<subject>/
         # bucket, or the panel reports 0 bytes while the real notes sit in a subject dir.
-        mem_dirs = memory_dirs_all()
+        # A person sees ONLY their own bucket (step 6): the panel must not count a neighbour's.
+        mem_dirs = memory_dirs_for(request, memory_dirs_all())
         files = {}  # sizes so the UI can show what a reset would erase
         for fname, key in _MEMORY_FILES:
             files[key] = sum(p.stat().st_size for d in mem_dirs if (p := d / fname).exists())
@@ -514,7 +518,9 @@ async def get_memory_status(profile: Optional[str] = None):
 
 
 @router.put("/api/memory/provider")
-async def set_memory_provider(body: MemoryProviderSelect, profile: Optional[str] = None):
+async def set_memory_provider(body: MemoryProviderSelect, request: Request, profile: Optional[str] = None):
+    profile = results_profile(request, profile)
+    require_results_write(request, profile)
     provider = _normalize_memory_provider_name(body.provider)
 
     def _run():
@@ -535,17 +541,21 @@ async def set_memory_provider(body: MemoryProviderSelect, profile: Optional[str]
 
 
 @router.post("/api/memory/reset")
-async def reset_memory(body: MemoryReset, profile: Optional[str] = None):
+async def reset_memory(body: MemoryReset, request: Request, profile: Optional[str] = None):
     target = (body.target or "all").strip().lower()
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
+    profile = results_profile(request, profile)
+    # A reset ERASES notes: a shared profile's operator may clear only their own bucket, and a
+    # profile they do not own is refused before anything is unlinked.
+    require_results_write(request, profile)
     profile = destructive_profile(profile, "POST /api/memory/reset")
 
     def _run():
         from tools.memory_tool import memory_dirs_all
-        # Every bucket: the base and each u/<subject>/ (ACCESS-MODEL D13). Deleting only the base
-        # would report success while every real note survived.
-        mem_dirs = memory_dirs_all()
+        # Every bucket the CALLER owns (step 6 narrows the owner's list to one person's):
+        # deleting only the base would report success while every real note survived.
+        mem_dirs = memory_dirs_for(request, memory_dirs_all())
         deleted = []
         for d in mem_dirs:
             for fname, key in _MEMORY_FILES:

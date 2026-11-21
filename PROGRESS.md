@@ -1,4 +1,83 @@
-# PROGRESS — t_a08e47a4 (МПД шаг 5: профили — свои и общие)
+# PROGRESS — t_f3d28e37 (МПД шаг 6: результаты — файлы, скиллы, память, вложения)
+
+## Состояние: РАБОТА ЗАВЕРШЕНА (код, 79 тестов, живая проба 25/25, база красная 16 LEAK, отчёт)
+
+* Ветка: `wt/t_f3d28e37`, worktree `.worktrees/t_f3d28e37`
+* База: `9b2e01a4f5` (merge шага 5 в ветку карточки)
+* Отчёт: `REPORT-step6.md`
+* Пробы: `verify-step6-live.py` + `PROBE-step6-output.txt` (25/25), `verify-step6-counts.py`
+  (owner 20/10 до и после; alice 10 своих / 0 чужих / 0 в корне)
+
+## Что сделано (шаг 6)
+
+* `hermes_acl_results.py` (новый, 400 стр.) — одна точка политики Т6: `scoped`, `file_roots`
+  (свои профили + `kanban/{workspaces,attachments}/<id>` СВОИХ карточек; пустой кортеж =
+  fail closed), `path_allowed`/`require_path` (содержательность по `resolve()`, поэтому `..` и
+  симлинк наружу = 403), `resolve_profile` (без `?profile=` → свой профиль, не профиль запуска;
+  чужое имя → 404 шага 5), `memory_dirs_for` (только свой бакет `u/<subject>`),
+  `task_visible`/`require_task` (владение по карточке, не по id файла; чужое → 404 как у
+  отсутствующего id).
+* Швы: `web_server_files._resolve_managed_path` + `_hosted_fs_read_guard` + `_caller_default`;
+  `web_routers/files.py` (`write-text` до записи байтов, `git-root` на точку и корень);
+  `web_routers/skills.py` и `ops.py` (`results_profile` + `require_results_write` +
+  `memory_dirs_for`); `plugins/kanban/dashboard/plugin_api.py` (`_require_owned_task` на всех
+  четырёх ручках вложений).
+* `hermes_cli/web_routers/_common.py` — `results_profile` / `require_results_write`.
+* `tests/hermes_cli/test_results_route_scope.py` (новый, **79 тестов**, 12 классов).
+
+## Найденный и исправленный собственный дефект
+
+Первая редакция `_multi_user()` читала флаг через `load_config()`, а тот СОЗДАЁТ скелет
+`~/.hermes` — т.е. листание каталога материализовало домашний каталог оператора. Ловилось
+падением `test_web_server_files.py::test_directory_listing_skips_vanished_regular_file`
+(лишний `.hermes` в листинге). Исправлено: флаг читается, только если домашний каталог уже
+есть; запинено тестом `test_reading_the_flag_never_creates_a_hermes_home`.
+
+## Проверенное
+
+* 79 passed (`tests/hermes_cli/test_results_route_scope.py`, 14 s).
+* Смежные 9 наборов: ветка **2 failed / 180 passed / 10 skipped**; база — ровно те же 2
+  (предсуществующие `test_download_resolves_paths_in_the_originating_profile_session`
+  [/api/fs/download] и [/api/fs/read-data-url], 503 «Session store is not initialized»).
+* Живая проба `verify-step6-live.py`: **ИТОГ 25/25**, exit 0 (`PROBE-step6-output.txt`).
+* База красная: та же проба, скопированная в дерево базы (`verify-step6-baseline-red.py` —
+  копия `verify-step6-live.py`), на `9b2e01a4f5` — **9/25, 16 LEAK**.
+* `python -m scripts.code_health --base 9b2e01a4f5` → **0 blocking, 0 advisory** (10 файлов).
+* `ruff check` по 8 файлам — All checks passed.
+* `scripts/boundary_lint.py --check` — падает так же, как база (те же 6 предсуществующих
+  кроссов `plugins/dashboard_auth/basic`); единственная дельта — запись baseline
+  `plugins/kanban/dashboard/plugin_api.py hermes_acl_results.require_task: 1` (осознанно).
+
+## Ограничения
+
+* `manual_review`: Windows-ограничение шима **не проверено** (прогон только на Linux) — так и
+  написано в отчёте, за проверенное не выдаётся.
+* `manual_review`: два живых браузера против запущенного шлюза с `acl.multi_user: true`
+  (проверено на уровне роутеров/политики и живых HTTP-кодов через TestClient, не по TCP).
+* Включение `acl.multi_user: true` — решение владельца, поставка ничего не включает.
+* Тесты/пробы гонять на копии дерева вне `~/.hermes` (`/tmp/mpd6/branch3`):
+  `tests/home_io_guard.py` рубит инициализацию БД внутри реального дома. Проба берёт
+  `HERMES_HOME` в `/tmp`, иначе `get_default_hermes_root` вернёт реальный `~/.hermes`.
+* `pre-commit` пропущен: `scripts/hermes-python` в worktree падает («no bootstrap Python found»).
+* Шаги 3–5 не менялись, данные не переносились, общий каталог платформы не тронут.
+
+## Команды для повтора
+
+```bash
+PY=/home/hermes/.hermes/installs/1a23eac39a17788f/test-environment/gen-5ac62ab36b984c04812d85ab1fc76459/venv/bin/python3
+mkdir -p /tmp/mpd6/branch3 && cd <worktree> && \
+  tar -c --exclude=.git --exclude=.venv --exclude=__pycache__ -f - . | tar -x -f - -C /tmp/mpd6/branch3
+cd /tmp/mpd6/branch3 && HERMES_HOME=$(mktemp -d /tmp/mpd6t.XXXX) \
+  $PY -m pytest -q tests/hermes_cli/test_results_route_scope.py      # 79 passed
+cd /tmp/mpd6/branch3 && HERMES_DASHBOARD_SESSION_TOKEN=x $PY verify-step6-live.py       # 25/25
+cd /tmp/mpd6/branch3 && $PY verify-step6-counts.py                                     # owner 20/10
+cd /tmp/mpd6/base && HERMES_DASHBOARD_SESSION_TOKEN=x $PY verify-step6-baseline-red.py # 9/25
+cd <worktree> && $PY -m scripts.code_health --base 9b2e01a4f5                          # 0 blocking
+```
+
+---
+
+# История: шаг 5 (t_a08e47a4) — профили
 
 ## Состояние: РАБОТА ЗАВЕРШЕНА (код, 73 теста, живая проба 24/24, база красная, отчёт, коммит)
 

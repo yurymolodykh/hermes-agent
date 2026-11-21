@@ -180,6 +180,7 @@
     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.get_affinity_scope": 1,
     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.reset_affinity_scope": 1,
     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.set_affinity_scope": 1,
+    "plugins/kanban/dashboard/plugin_api.py hermes_acl_results.require_task": 1,
     "plugins/kanban/dashboard/plugin_api.py hermes_cli.inventory.build_models_payload": 1,
     "plugins/kanban/dashboard/plugin_api.py hermes_cli.inventory.load_picker_context": 1,
     "plugins/kanban/dashboard/plugin_api.py hermes_cli.kanban._check_dispatcher_presence": 1,

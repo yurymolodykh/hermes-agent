@@ -415,17 +415,34 @@ def _managed_files_policy(request: Optional[Request], *, create_root: bool = Tru
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
-        return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
+        return _caller_default(request, ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False))
 
     # Remote/OAuth access does not imply a hosted container (a gated macOS launchd
     # install still browses its home). Lock to /opt/data only when the Hermes
     # root actually IS /opt/data or HERMES_DASHBOARD_FILES_ROOT is set.
     if _default_hermes_root_is_opt_data():
         root = _ensure_managed_root(_HOSTED_MANAGED_FILES_ROOT) if create_root else _HOSTED_MANAGED_FILES_ROOT
-        return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
+        return _caller_default(request, ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False))
 
     home = _canonical_path(Path.home())
-    return ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True)
+    return _caller_default(request, ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True))
+
+
+def _caller_default(request: Optional[Request], policy: ManagedFilesPolicy) -> ManagedFilesPolicy:
+    """Open the browser at the CALLER's own root instead of ``$HOME`` (multi-user, step 6).
+
+    ``Path.home()`` is the process's home — on a shared host the owner's — so an unscoped person
+    would land in somebody else's tree. Their own orchestrator home is the honest default, and
+    ``locked_root`` stays unset: containment is decided per path by
+    :func:`hermes_acl_results.require_path`, which knows every root the person holds (their
+    profiles and the cards they own), while a single locked root would refuse the second one.
+    """
+    from hermes_acl_results import file_roots
+
+    roots = file_roots(request)
+    if roots is None or not roots:
+        return policy
+    return ManagedFilesPolicy(default_path=roots[0], locked_root=None, can_change_path=False)
 
 
 def _resolve_managed_path(
@@ -470,6 +487,13 @@ def _resolve_managed_path(
     if root is not None and not _path_is_under(root, resolved):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
 
+    # The caller's own root (multi-user, step 6): every /api/files* route resolves here first, so
+    # list/read/upload/mkdir/delete inherit the SAME boundary without a per-route check. With
+    # ``acl.multi_user`` off this is a no-op. A request-less call (internal, tests) is unscoped.
+    from hermes_acl_results import require_path
+
+    require_path(request, resolved)
+
     return policy, resolved, str(resolved)
 
 
@@ -489,9 +513,15 @@ def _hosted_fs_path_allowed(root: Path, target: Path) -> bool:
 def _hosted_fs_read_guard(target: Path, request: Optional[Request] = None) -> Path | None:
     """Preview and Git reads share managed-file restrictions on locked deployments.
 
-    ``request`` is unused (the policy is env/home driven) and optional so the
-    route functions stay callable directly, e.g. from agent-side tests.
+    ``request`` carries the CALLER, so the multi-user boundary lands here too: every ``/api/fs``
+    read (list, preview, data URL, download, git root) passes through this one function, and a
+    path outside the caller's root is refused exactly as a locked root refuses one outside the
+    tree. ``None`` (an internal caller, a direct unit call) means "no identity", which is the
+    unscoped answer while ``acl.multi_user`` is off — the shipped default.
     """
+    from hermes_acl_results import require_path
+
+    require_path(request, target)
     root = _managed_files_policy(request, create_root=False).locked_root
     if root is not None and not _hosted_fs_path_allowed(root, target):
         raise HTTPException(status_code=403, detail="Path is outside the managed read boundary")
