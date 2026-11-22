@@ -704,13 +704,19 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(
+    conn: sqlite3.Connection, *, signal_fn=None, failure_limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    ``failure_limit`` is the dispatcher's resolved threshold (``kanban.failure_limit``
+    from ``_run_reclaim_phase``): without it the timeout path booked every trip at
+    ``DEFAULT_FAILURE_LIMIT`` and an operator's configured 3 silently ran as 2.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -799,6 +805,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 conn, tid,
                 error=error,
                 outcome="timed_out",
+                failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
@@ -1363,7 +1370,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, failure_limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
@@ -1371,6 +1380,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
     heal them) trip immediately.
+
+    ``failure_limit`` is the dispatcher's resolved threshold; passing it here is
+    what makes ``kanban.failure_limit`` reach the crash path at all (it used to
+    fall through to ``DEFAULT_FAILURE_LIMIT`` whatever the config said).
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -1430,6 +1443,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
+                failure_limit=failure_limit,
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
