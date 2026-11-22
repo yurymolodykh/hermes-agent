@@ -58,6 +58,10 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="scratch-guard-probe."))
     env = dict(os.environ)
     env["HERMES_HOME"] = str(root / "hermes")
+    # kanban_home() prefers HERMES_KANBAN_HOME and falls back to the OPERATOR's real
+    # root on purpose (boards are shared across profiles), so a probe that only set
+    # HERMES_HOME would write cards into the live board.
+    env["HERMES_KANBAN_HOME"] = str(root / "kanban-home")
     for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
                 "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
                 "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_DB"):
@@ -104,7 +108,7 @@ def main() -> int:
         "workspace_exists": ws_a.is_dir(),
         "unpushed_file_present": (repo_a / "unpushed.txt").exists(),
         "preserved_event": [e for e in events_a if e.get("kind") == PRESERVED],
-        "status": show(task_a).get("status"),
+        "status": show(task_a).get("task", {}).get("status"),
     }
 
     # Case B: a clean clone whose history is fully pushed -> directory must go.
@@ -117,7 +121,7 @@ def main() -> int:
         "workspace": str(ws_b),
         "workspace_exists": ws_b.exists(),
         "preserved_event": [e for e in events_b if e.get("kind") == PRESERVED],
-        "status": show(task_b).get("status"),
+        "status": show(task_b).get("task", {}).get("status"),
     }
 
     a = report["cases"]["unsaved_local_commit"]
@@ -130,7 +134,10 @@ def main() -> int:
         and b["preserved_event"] == []
     )
     report["verdict"] = "pass" if ok else "FAIL"
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    text = json.dumps(report, indent=2, ensure_ascii=False)
+    if len(sys.argv) > 1:
+        Path(sys.argv[1]).write_text(text + "\n", encoding="utf-8")
+    print(text)
     if not ok:
         print(f"\nartifacts kept at {root}", file=sys.stderr)
         return 1
