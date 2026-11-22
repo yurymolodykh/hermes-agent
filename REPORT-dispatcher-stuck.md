@@ -1,6 +1,6 @@
 # t_30b89c61 — `kanban dispatcher stuck`: механизм, правка, доказательства
 
-Дата: 22.11.2026, 02:35–04:10 МСК. Ветка карточки `wt/t_30b89c61`, верхушка **`eda4feff3f`**.
+Дата: 22.11.2026, 02:35–04:10 МСК. Ветка карточки `wt/t_30b89c61`, верхушка **`1f3dd09424`**.
 Рабочий каталог доказательств: `/home/hermes/.hermes/kanban/workspaces/t_30b89c61/evidence/`.
 
 ---
@@ -73,6 +73,7 @@ AFTER  repo      18ee183313  capacity_bound_present=True
 | `6f8c6bb758` | `capacity_bound(results)` в `hermes_cli/kanban_db_dispatch.py:195-232`; поле `DispatchResult.budget_hold`; `describe_suppression` называет `budget_hold:*` и `per_profile_capped` (`hermes_cli/kanban_db_suppression.py`); обе поверхности тревоги — gateway watcher (`gateway/kanban_watchers.py:309-333`) и CLI daemon (`hermes_cli/kanban_ops.py:227-247`) — при насыщении **не инкрементируют `bad_ticks`**, а пишут `INFO dispatcher saturated: … not a stall` не чаще раза в 5 мин |
 | `81bc8010b3` | `budget_hold` проверяется **до** reclaim-бакетов: тик, остановленный лимитом, не может быть объявлен тревогой из-за `crashed` |
 | `18ee183313`, `eda4feff3f` | merge `ours/feature/multiuser-access` (6308ff67cc → f60b97e0d5) в ветку карточки: правка наложена на актуальный прод-код |
+| `1f3dd09424` | этот отчёт в дереве (ветка карточки) |
 
 Что **не** тронуто (по требованию карточки): `_hold_if_workspace_unready`, `kanban.max_in_progress: 7`,
 `max_in_progress_per_profile: 3`, `agent.max_turns`. Тревога по-прежнему срабатывает на
@@ -88,11 +89,11 @@ AFTER  repo      18ee183313  capacity_bound_present=True
 (прод), запрос к базе с выводом — `evidence/mechanism-db-query.txt`.
 
 ### (б) Коммит и публикация — частично, нужен оркестратор
-Верхушка ветки карточки: **`eda4feff3fc84c331a7c2abbb631f0df993cd55e`**.
+Верхушка ветки карточки: **`1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4`**.
 Локальная = удалённая (`refs/heads/wt/t_30b89c61` в `ours`):
 ```
-LOCAL =eda4feff3fc84c331a7c2abbb631f0df993cd55e
-REMOTE=eda4feff3fc84c331a7c2abbb631f0df993cd55e
+LOCAL =1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4
+REMOTE=1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4
 ```
 Слияние в `ours/feature/multiuser-access` **не делалось**: страж деревьев
 (`bin/card-tree-guard.py`) блокирует это карточке, по постановке слияние делает оркестратор.
@@ -137,7 +138,7 @@ real_stall (слот свободен, спавна нет)    = 0
 
 ```
 BEFORE 6308ff67cc (прод) : passed=484 failed=51  absent_files=2
-AFTER  eda4feff3f (правка): passed=501 failed=52 absent_files=0
+AFTER  1f3dd09424 (правка): passed=501 failed=52 absent_files=0
 DELTA: passed +17
 ```
 
@@ -157,7 +158,7 @@ DELTA: passed +17
 
 ## 4. Что осталось человеку/оркестратору
 
-1. **Слияние** `wt/t_30b89c61` (`eda4feff3f`) в `ours/feature/multiuser-access` — страж деревьев
+1. **Слияние** `wt/t_30b89c61` (`1f3dd09424`) в `ours/feature/multiuser-access` — страж деревьев
    запрещает это карточке. Конфликтов не ожидается: 5 коммитов, из них правка — 2 файла кода
    + 2 файла тестов, остальное — merge актуального `ours`.
 2. **Рестарт шлюза** после слияния (карточке запрещён). Без рестарта прод продолжает слать
