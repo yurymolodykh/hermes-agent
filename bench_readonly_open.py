@@ -26,6 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hermes_state import SessionDB  # noqa: E402
 
 
+def _write_config(home: Path) -> None:
+    """A realistic install has a config.yaml; without one every load re-deepcopies DEFAULT_CONFIG."""
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n  default: letovo/deepseek-v4-flash\ndatabase:\n  cache_size: -8000\n"
+        "  synchronous: FULL\nsessions:\n  auto_archive: false\n", encoding="utf-8")
+
+
 def _seed(path: Path, sessions: int = 200) -> None:
     db = SessionDB(db_path=path)
     for i in range(sessions):
@@ -56,6 +64,7 @@ def main() -> int:
 
     home = _TMP / "home"
     home.mkdir(parents=True, exist_ok=True)
+    _write_config(home)
     db_path = home / "state.db"
     _seed(db_path)
 
