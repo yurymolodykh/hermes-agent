@@ -42,8 +42,10 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / ".hermes"
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path(board="default").resolve()))
     kb.init_db()
     return root
 
@@ -55,6 +57,12 @@ def conn(home: Path):
         yield connection
     finally:
         connection.close()
+
+
+@pytest.fixture(autouse=True)
+def any_assignee_is_spawnable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the LOCK, not profile routing: accept any assignee."""
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: True))
 
 
 def _board_card(conn) -> str:
