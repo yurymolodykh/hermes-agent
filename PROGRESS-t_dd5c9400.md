@@ -1,51 +1,34 @@
 # PROGRESS — t_dd5c9400: разредить фоновый опрос веб-панели (116 → ≤25 запросов/мин)
 
 Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_dd5c9400`, ветка `wt/t_dd5c9400`,
-база — `feature/multiuser-access`.
+база — `feature/multiuser-access` = `beeb9623539`.
 
-## Замер (nginx, 22.11.2026)
+## Состояние: КРУГ 2 ЗАВЕРШЁН И ОПУБЛИКОВАН
 
-Окно 13:14–13:19 (6 мин):
+* Верхушка ветки: `7c9fc07399307e3b8b323ebeb31a917af07c5e85`
+* Влито в `feature/multiuser-access` = `b55cbeb3c64ad75328b29e3d812d1d34daefbf34`,
+  отправлено в `ours`, readback совпал; расписка
+  `/home/hermes/workspaces/01-orchestrator/ops/state/card-publish/t_dd5c9400.json`
+  (`verified/merged/published: true`), `--dry-run` → `already_ancestor: true`.
+* Отчёт: `REPORT-t_dd5c9400.md` (обновлён кругом 2).
 
-```
-GET /api/desktop-plugins/root             11.8/m  gaps=5s
-GET /api/desktop-plugins/list             11.8/m  gaps=5s
-GET /api/ui-preferences                    6.0/m  gaps=10s
-GET /api/profiles                          5.0/m
-GET /api/profiles/sessions/sidebar         4.7/m  gaps=10s
-GET /api/cron/jobs                         4.5/m  gaps=10s
-GET /api/config                            4.2/m  пачки gap=0
-GET /api/profiles/sessions                 4.2/m  gaps=10s
-GET /api/gateway-connections               3.7/m  gaps=30s
-GET /api/config/defaults                   3.0/m  пачки gap=0
-GET /api/audio/voice-live/status           1.7/m
-GET /api/status                            1.5/m  gaps=60s
-GET /api/model/info                        1.5/m
-итого                                     66.8/m
-```
+## Круг 2 — что было дефектом и что исправлено
 
-Полное окно 10 мин (карточка): 116.4/мин — разница из-за окон с активной вкладкой.
+Ревью (оркестратор) нашло реальную регрессию: `SESSIONS_LIST_TICK_GAP_MS` 10 000 → 30 000
+стал не только ограничителем частоты, но и задержкой ответа на событие «ход закончился».
+Тик внутри окна вооружал trailing-таймер на остаток окна → до 30 с ожидания.
 
-## Найденные драйверы и что сделано
+Исправление в `apps/desktop/src/app/contrib/hooks/use-background-sync.ts`:
+подписка на `$busy`; при `busy → false`, если trailing-таймер вооружён, он снимается и
+проход выполняется немедленно. Простаивающая вкладка (`$busy` не двигается) не получает
+дополнительных чтений. Интервал остался 30 000. Тест не менялся.
 
-1. `src/contrib/runtime-loader.ts` — `DISK_POLL_MS 5_000 → 60_000`
-   (устаревший Electron без `watchDirectory`; 2 запроса/тик: root+list).
-2. `src/lib/browser-ui-preferences.ts` — `POLL_MS 10_000 → 60_000`.
-3. `src/app/hooks/use-config-record.ts` — `staleTime 0 → HERMES_CONFIG_STALE_MS 30_000`
-   (убирает пачки 5–7 `/api/config` в одну секунду при перемонтировании).
-4. `src/app/contrib/hooks/use-background-sync.ts` —
-   `SESSIONS_LIST_TICK_GAP_MS 10_000 → 30_000` (тянет `refreshSessions` → `refreshCronJobs`).
-5. `src/app/settings/webapp-gateway-settings.tsx` — `SAVED_CONNECTIONS_POLL_MS 5_000 → 30_000`.
-6. `src/plugins/hermes-bots/relay.ts` — `RELAY_DRAIN_INTERVAL_MS 30_000 → 60_000`
-   (тик = routes + registry + served-set).
-7. `src/store/profile.ts` — сигнатурный гейт публикации `$profiles`.
-   Устраняет цикл: новый массив → `useUnservedProfiles` (`[profiles]`) → roster
-   (`/api/profiles` + `/api/gateway-connections` + `/api/status`).
+Проверено: `use-background-sync.test.ts` 67 passed; шесть изменённых модулей 152 passed /
+0 failed; `typecheck` exit 0; `build:webapp` ✓ built in 17.45s, `dist-webapp/index.html`
+перезаписан (19:28), `.hermes-stale` нет.
 
-## Остаётся
+## Остаточное (вне этой карточки)
 
-- `pnpm run build:webapp` (фон, session `proc_a7d60e9cfeed`).
-- Типы/линт затронутых файлов.
-- Тесты затронутых модулей.
-- Коммит + `git show --stat`.
-- `kanban_request_review` → `09-independent-reviewer`.
+* Живой замер опроса на новой сборке — карточка выката t_8af52d4a
+  (`ops/measure/poll-rate.py`); при недостижении ≤25/мин откатывается эта правка.
+* Независимое ревью — `09-independent-reviewer`.
