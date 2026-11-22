@@ -75,16 +75,15 @@ def main() -> int:
     serial = sorted(one() for _ in range(15))
     print(f"serial /api/status median : {serial[len(serial) // 2] * 1000:.1f} ms")
 
+    import faulthandler
+    faulthandler.dump_traceback_later(float(os.environ.get("DUMP_AFTER","20")), repeat=False)
     bursts = []
-    for _ in range(int(os.environ.get("BURSTS","5"))):
-        cond = threading.Condition()
-        ready = [False] * 8
+    for _ in range(int(os.environ.get("BURSTS", "5"))):
+        barrier = threading.Barrier(8)
         out = [0.0] * 8
 
         def run(i: int) -> None:
-            with cond:
-                ready[i] = True
-                cond.wait_for(lambda: all(ready))
+            barrier.wait()
             out[i] = one()
 
         ts = [threading.Thread(target=run, args=(i,)) for i in range(8)]
