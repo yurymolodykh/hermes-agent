@@ -363,83 +363,95 @@ _SCRATCH_REPO_SCAN_SKIP = frozenset({
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
     ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
 })
-_SCRATCH_REPO_SCAN_MAX_DEPTH = 4
+_SCRATCH_REPO_SCAN_MAX_DEPTH = 8
 
 
-def _iter_scratch_repos(root: Path) -> list[Path]:
-    """Git working-tree roots at or below ``root`` (bounded scan), outermost first.
+def _child_dirs(path: Path) -> list[Path]:
+    """Immediate subdirectories of *path* that cannot hold vendored tool state."""
+    try:
+        with os.scandir(path) as entries:
+            return [
+                Path(entry.path) for entry in entries
+                if entry.name not in _SCRATCH_REPO_SCAN_SKIP
+                and entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
+        return []
+
+
+def _iter_scratch_repos(root: Path) -> tuple[list[Path], bool]:
+    """Git working-tree roots at or below ``root`` (bounded scan), plus a truncation flag.
 
     A scratch workspace is arbitrary user space: a worker may clone a repo into it
-    (or into a subdirectory of it). Nesting under a found repo is not descended —
-    a submodule's own work is already visible as a dirty entry in its parent.
+    or into a subdirectory of it. A found repo is not descended — a submodule's
+    own work already shows up as a changed entry in its parent. The depth cap keeps
+    the scan cheap; when it stops the walk early the flag says the tree was not
+    fully searched, so the caller can treat "not found" as "cannot tell".
     """
     found: list[Path] = []
-    try:
-        stack: list[tuple[Path, int]] = [(root, 0)]
-        while stack:
-            current, depth = stack.pop()
-            if (current / ".git").exists():
-                found.append(current)
-                continue
-            if depth >= _SCRATCH_REPO_SCAN_MAX_DEPTH:
-                continue
-            try:
-                with os.scandir(current) as entries:
-                    for entry in entries:
-                        if entry.name in _SCRATCH_REPO_SCAN_SKIP:
-                            continue
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                stack.append((Path(entry.path), depth + 1))
-                        except OSError:
-                            continue
-            except OSError:
-                continue
-    except Exception:
-        return found
-    return found
+    truncated = False
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if (current / ".git").exists():
+            found.append(current)
+            continue
+        children = _child_dirs(current)
+        if depth >= _SCRATCH_REPO_SCAN_MAX_DEPTH:
+            truncated = truncated or bool(children)
+            continue
+        pending.extend((child, depth + 1) for child in children)
+    return found, truncated
 
 
 def _scratch_repo_unsaved_reason(repo: Path) -> Optional[str]:
     """Why *repo*'s work exists nowhere else, or ``None`` when it is clean and fully pushed.
 
-    Everything uncertain resolves toward "unsaved": the caller only skips a delete.
+    Every uncertain answer ("cannot read", a timed-out git) resolves toward
+    "unsaved": the caller's only response to a reason is to keep the directory.
     """
-    def _git_out(*args: str, timeout: int = 10) -> Optional[str]:
+    def _git_stdout(*args: str) -> Optional[str]:
         try:
-            result = _git(repo, *args, timeout=timeout)
-        except Exception:
+            result = _git(repo, *args, timeout=10)
+        except (OSError, subprocess.SubprocessError):
             return None
         return result.stdout if result.returncode == 0 else None
 
-    status = _git_out("status", "--porcelain", "-z", "--untracked-files=normal")
+    status = _git_stdout("status", "--porcelain", "-z", "--untracked-files=normal")
     if status is None:
         return "cannot read git status"
     if status.replace("\0", "").strip():
         return "uncommitted changes"
-    remote_refs = _git_out("for-each-ref", "--format=%(refname)", "refs/remotes")
+    remote_refs = _git_stdout("for-each-ref", "--format=%(refname)", "refs/remotes")
     if remote_refs is None:
         return "cannot list remote-tracking refs"
     if not remote_refs.strip():
         # Nothing was ever pushed: this history exists only in the scratch dir.
         return "no remote-tracking refs (nothing pushed)"
-    unpushed = _git_out("log", "--oneline", "HEAD", "--branches", "--not", "--remotes")
+    unpushed = _git_stdout("log", "--oneline", "HEAD", "--branches", "--not", "--remotes")
     if unpushed is None:
         return "cannot compare refs against the remote"
     if unpushed.strip():
         return "commits unreachable from any remote branch"
-    stash = _git_out("stash", "list")
+    stash = _git_stdout("stash", "list")
     if stash is None or stash.strip():
         return "stash entries"
     return None
 
 
 def _scratch_workspace_unsaved_reason(wp: Path) -> Optional[tuple[Path, str]]:
-    """First (repo, reason) inside *wp* whose work must not be destroyed, or ``None``."""
-    for repo in _iter_scratch_repos(wp):
+    """First (repo, reason) inside *wp* whose work must not be destroyed, or ``None``.
+
+    A scan that stopped before covering the whole tree reports "cannot tell"
+    instead of ``None``: a repository too deep to see may still be there.
+    """
+    repos, truncated = _iter_scratch_repos(wp)
+    for repo in repos:
         reason = _scratch_repo_unsaved_reason(repo)
         if reason is not None:
             return repo, reason
+    if truncated:
+        return wp, "workspace tree too deep to verify"
     return None
 
 
@@ -448,8 +460,8 @@ def _preserve_scratch_workspace(
 ) -> bool:
     """Keep *wp* and record why when it holds git work that exists nowhere else.
 
-    ``True`` means the caller must NOT delete it. Skips the scan (and returns
-    ``False``) for a workspace with no repository at all, which is the common case.
+    ``True`` means the caller must NOT delete it. A workspace without any
+    repository — the common case — costs one directory listing and returns ``False``.
     """
     try:
         if not wp.is_dir():
@@ -458,27 +470,27 @@ def _preserve_scratch_workspace(
         if unsaved is None:
             return False
         repo, reason = unsaved
-        _kb._log.warning(
-            "Preserving scratch workspace for task %s: unsaved work (%s) in %s — %s "
-            "is left on disk; declare it as an artifact or use worktree:/dir: to keep it",
-            task_id, reason, repo, wp,
-        )
-        try:
-            _kb._append_event(
-                conn, task_id, "workspace_cleanup_preserved_unsaved_work",
-                {"path": str(wp), "repo": str(repo), "reason": reason},
-            )
-        except sqlite3.Error:
-            pass
-        return True
-    except Exception:
-        # Never let the check itself delete or block: an exception here means
-        # "cannot tell", and the only safe verdict for that is "preserve".
-        _kb._log.warning(
+    except OSError:
+        # A check that cannot run must read as "cannot tell", and the only safe
+        # verdict for that is to keep the directory.
+        _kb._log.exception(
             "Preserving scratch workspace for task %s: unsaved-work check failed at %s",
             task_id, wp,
         )
         return True
+    _kb._log.warning(
+        "Preserving scratch workspace for task %s: unsaved work (%s) in %s — %s is left "
+        "on disk; declare it as an artifact or use worktree:/dir: to keep it",
+        task_id, reason, repo, wp,
+    )
+    try:
+        _kb._append_event(
+            conn, task_id, "workspace_cleanup_preserved_unsaved_work",
+            {"path": str(wp), "repo": str(repo), "reason": reason},
+        )
+    except sqlite3.Error:
+        pass
+    return True
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
