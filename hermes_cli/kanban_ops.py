@@ -374,6 +374,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    preserved_ws = 0
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
@@ -402,6 +403,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                 continue
             if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
                 continue
+            # A directory holding unsaved git work (local commits, uncommitted
+            # changes) is exactly what completion refused to delete; `gc` must not
+            # be the back door that destroys it.
+            if kbw._preserve_scratch_workspace(conn, row["id"], path):
+                preserved_ws += 1
+                continue
             shutil.rmtree(path, ignore_errors=True)
             if not path.exists():
                 removed_ws += 1
@@ -412,7 +419,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
     removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed"
+          + (f"; {preserved_ws} preserved for unsaved git work" if preserved_ws else ""))
     return 0
 
 
