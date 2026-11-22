@@ -596,6 +596,68 @@ def _write_state(path: Path, state: Dict[str, Any]) -> None:
     _state.write_state(path, state)
 
 
+def _account_usage(state: Dict[str, Any], key_id: Any, slot: Dict[str, Any], *, now: float) -> None:
+    """Charge one dropped slot's busy time to its key (delegates to the sibling).
+
+    Every place that removes a slot calls exactly this, in the same branch that
+    removes it, so a slot cannot be charged twice. The clamp to the TTL lives in
+    :func:`agent.kanban_key_pool_usage.account_slot`.
+    """
+    _usage.account_slot(state, key_id, slot, now=now, ttl_seconds=_ttl_seconds())
+
+
+def _pick_key(
+    free: List[int],
+    occupied: Dict[int, List[Dict[str, Any]]],
+    last_key_id: Optional[int],
+    usage: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Choose the next card key: least loaded, then least busy, then round-robin.
+
+    Three rules, in this order — the owner asked for both the rotation (card
+    K4-Р, 2026-11-08: «чтобы ключи постоянно ротировались, а не всегда
+    использовались первые 4») and the *even load* (this card: «нагрузка по 7
+    ключам — равномерная»):
+
+    1. **Least loaded.** The key with the fewest occupied slots wins. That is
+       what spreads two cards of a two-slot key onto two *different* keys
+       while there are free keys, instead of filling #2's second slot first.
+    2. **Least busy today.** Among the equally loaded candidates, prefer the
+       key with the smallest accumulated ``busy_seconds`` (the time its slots
+       were actually held today), inside a ``_USAGE_TOLERANCE_SECONDS``
+       tolerance. Load alone cannot see that one key has already served a
+       three-hour card while another served none — counting hand-outs would
+       not see it either. The tolerance is what keeps the metric from
+       over-fitting: two keys within a minute of each other are *equally*
+       busy, and the ring should keep turning instead of alternating on noise.
+    3. **Round-robin.** Among the survivors, prefer the first key *after*
+       ``last_key_id`` in ascending id order, wrapping at the end — the same
+       cursor as before, so a pool with no history still rotates exactly as it
+       did.
+
+    Leaving this as ``free[0]`` would reintroduce the reported defect: with
+    2 slots and 9 keys every card piles onto #2 before #3 is ever touched.
+
+    The usage read is read-only (``_usage.lookup``): the picker must not mutate
+    state while it is only choosing — the caller writes under the state lock.
+    """
+    least = min(len(occupied.get(kid) or []) for kid in free)
+    candidates = [kid for kid in free if len(occupied.get(kid) or []) == least]
+    if usage:
+        today = _usage.usage_today(None)
+        busy = {kid: _usage.lookup(usage, kid, today) for kid in candidates}
+        cheapest = min(busy.values())
+        candidates = [
+            kid for kid in candidates
+            if busy[kid] - cheapest <= _USAGE_TOLERANCE_SECONDS
+        ]
+    if last_key_id is None:
+        return candidates[0]
+    # First candidate strictly after the cursor, wrapping around the ring.
+    after = [kid for kid in candidates if kid > last_key_id]
+    return after[0] if after else candidates[0]
+
+
 # ── PID liveness ───────────────────────────────────────────────────────────
 
 
@@ -1822,7 +1884,7 @@ def pool_status() -> Dict[str, Any]:
         "usage": {},
     }
     now = time.time()
-    usage_today = _usage_bucket(state, now)
+    usage_today = _usage.usage_bucket(state, now)
     limit = int(getattr(cfg, "max_cards_per_key", _DEFAULT_MAX_CARDS_PER_KEY) or 1) \
         if cfg is not None else _DEFAULT_MAX_CARDS_PER_KEY
     reservations = []
