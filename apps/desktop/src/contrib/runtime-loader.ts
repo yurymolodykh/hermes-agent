@@ -577,7 +577,11 @@ export async function loadRuntimePlugin(
 // collapse -> appear, never a placeholder flash.
 // ---------------------------------------------------------------------------
 
-const DISK_POLL_MS = 5_000
+// Fallback cadence for shells without the `watchDirectory` IPC (the Webapp always
+// is one): two REST reads per tick. A plugin appearing a minute late is fine —
+// every in-app install/uninstall publishes its own reload — so keep it a cheap
+// backstop instead of a 5s scan that dominates an idle tab's request budget.
+const DISK_POLL_MS = 60_000
 
 interface DiskRoot {
   dir: string
