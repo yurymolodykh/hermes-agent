@@ -30,6 +30,7 @@ from hermes_cli.version_info import get_version_info
 from hermes_constants import get_process_hermes_home, profile_name_for_home
 from hermes_cli.web_models import CuratorPause, LearningNodeRef, LearningNodeEdit, DebugShareRequest
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile, scoped_to_thread
+from hermes_cli.web_status_cache import TtlSingleFlightCache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -541,112 +542,160 @@ async def _webapp_caller_signed_out(request: Request) -> bool:
     return False
 
 
+#: ``/api/status`` snapshot cache: TTL + single flight (see ``hermes_cli.web_status_cache``).
+#: Keyed on the call shape — the requested profile plus whether the Webapp caller is signed out —
+#: exactly like the older per-seam caches it replaces for this endpoint.
+_STATUS_CACHE = TtlSingleFlightCache()
+
+#: Identity of every injected seam plus the gateway identity/runtime file stamps. A snapshot is only
+#: reused while this tuple is unchanged, so a gateway restart (new PID file), a runtime-state
+#: transition (gateway_state.json rewritten) or a test's monkeypatch drops the entry immediately
+#: instead of waiting out the TTL.
+def _status_cache_signature(profile_dir: Optional[Path]) -> tuple:
+    from gateway import status as gateway_status
+
+    home = profile_dir if profile_dir is not None else get_process_hermes_home()
+    stamps = []
+    for name in ("gateway.pid", "gateway.lock", "gateway_state.json"):
+        path = home / name
+        try:
+            stat = path.stat()
+            stamps.append((name, stat.st_mtime_ns, stat.st_size, stat.st_ino))
+        except OSError:
+            stamps.append((name, None))
+    seams = (
+        id(gateway_status.get_running_pid_cached), id(gateway_status.read_runtime_status),
+        id(_collect_profile_gateway_topology_cached), id(_load_configured_gateway_platforms),
+        id(_resolve_restart_drain_timeout),
+        bool(getattr(app.state, "auth_required", False)),
+        bool(getattr(app.state, "bound_host", None) not in (None, "127.0.0.1", "localhost", "::1")),
+    )
+    return (tuple(stamps), seams)
+
+
+async def _collect_status(profile_dir: Optional[Path], requested_profile: str,
+                          signed_out: bool) -> dict[str, Any]:
+    """One full (expensive) ``/api/status`` pass; the cache calls this at most once per window."""
+    from hermes_cli.web_server import _GATEWAY_HEALTH_URL
+    local = await run_in_threadpool(_status_local_reads)
+    gateway = await _resolve_gateway_status(profile_dir, _GATEWAY_HEALTH_URL)
+    gateway_running, gateway_state = gateway["gateway_running"], gateway["gateway_state"]
+
+    # Topology (cached, TTL 10s) is fetched before the platform rollup so per-profile
+    # gateway failures fold into the machine-level view (see
+    # _merge_profile_gateway_platforms); a ``?profile=`` request is left unmerged.
+    topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+    if not requested_profile:
+        gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
+            gateway["gateway_platforms"], topology.get("profile_platforms") or {})
+
+    active_sessions = await _status_active_sessions()
+
+    # Busy/drainable (NAS lifecycle-safety gate) derive from the persisted in-flight turn
+    # count + liveness via gateway.status. Liveness keys off gateway_running, NEVER
+    # gateway_updated_at — a stale heartbeat is reported separately, not treated as death.
+    active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
+    # Off-loop: on a cold Windows install the first import of hermes_cli.gateway blocks
+    # 15-30s (.pyc compilation + Defender), exceeding the desktop handshake's 15s timeout.
+    restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout)
+    auth = _auth_gate_status()
+
+    status = {
+        "version": local["version"], "release_date": __release_date__,
+        "config_version": local["config_version"], "latest_config_version": local["latest_config_version"],
+        "can_update_hermes": local["can_update_hermes"],
+        "gateway_running": gateway_running, "gateway_state": gateway_state,
+        "gateway_platforms": gateway["gateway_platforms"],
+        "gateway_exit_reason": gateway["gateway_exit_reason"],
+        "gateway_updated_at": gateway["gateway_updated_at"],
+        # Seconds since housekeeping last stamped the heartbeat, only when the PID is alive but the
+        # stamp is past the freshness TTL (loop/housekeeping wedged, #113372); else null.
+        "gateway_heartbeat_stale_s": gateway["gateway_heartbeat_stale_s"],
+        # Non-null only for a profile served by the shared multiplexer: every profile that process carries.
+        "gateway_shared_with": gateway["gateway_shared_with"],
+        "active_agents": active_agents,
+        "gateway_busy": derive_gateway_busy(
+            gateway_running=gateway_running, gateway_state=gateway_state,
+            active_agents=active_agents),
+        "gateway_drainable": derive_gateway_drainable(
+            gateway_running=gateway_running, gateway_state=gateway_state),
+        "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
+        **auth, "nous_session_valid": local["nous_session_valid"]}
+
+    # Stable per-install identity (first call may touch disk). Omitted (not null) when
+    # unpersistable so older-client behavior and the no-identity fallback stay identical.
+    install_id = await run_in_threadpool(get_install_id)
+    if install_id:
+        status["install_id"] = install_id
+
+    # Advisory only. Expose no paths or process identities on this public probe.
+    from hermes_cli.shared_profile_warning import shared_profile_warning
+    status["shared_profile_warning"] = bool(await run_in_threadpool(shared_profile_warning))
+
+    components = await _component_health(gateway)
+    status["components"] = components
+    status["overall"] = ("ok" if all(item.get("status") == "ok" for item in components.values())
+                         else "degraded")
+    await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
+
+    # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud
+    # renders the profile list over a gated bind) so they survive the auth gate; the
+    # per-gateway ``gateways[]`` carries host ports and stays gated below.
+    status["profiles"] = topology["profiles"]
+    status["parked_profiles"] = topology.get("parked_profiles", [])
+    status["gateway_mode"] = topology["gateway_mode"]
+    status["multiplex_standalone_reason"] = topology.get("multiplex_standalone_reason")
+
+    # Host paths, gateway PID, internal health URL and per-gateway ports are deployment
+    # recon a liveness probe never needs, and on a gated bind *any* unauthenticated caller
+    # reaches this endpoint — surface them only on a loopback / ``--insecure`` bind.
+    if not auth["auth_required"]:
+        status.update({
+            "hermes_home": str(get_hermes_home()), "config_path": str(get_config_path()),
+            "env_path": str(get_env_path()), "gateway_pid": gateway["gateway_pid"],
+            "gateway_health_url": _GATEWAY_HEALTH_URL, "gateways": topology["gateways"]})
+    return status
+
+
 @router.get("/api/status")
 async def get_status(profile: Optional[str] = None,
                      request: Request = None):  # type: ignore[assignment]  # None when awaited in-process
     """Public machine-level liveness probe (``PUBLIC_API_PATHS``): version, gateway state,
     active session count and the auth-gate shape — no bodies, no session content, no secrets.
 
+    Served from a 1.5 s TTL snapshot with single-flight collapse (``_STATUS_CACHE``): the probe is
+    polled ~1/s and one pass runs several blocking reads, so before the cache eight simultaneous
+    polls serialized into ~2 s each. Anything that changes the answer — a gateway restart, a
+    runtime-state transition, a swapped seam — changes the cache signature and drops the snapshot.
+
     ``?profile=`` (dashboard management switcher) uses the config-only contextvar scope, NOT
     _profile_scope: this handler awaits the remote health probe, and _profile_scope swaps
     process-global skills-module attributes a concurrent request would cross-restore.
     """
-    from hermes_cli.web_server import _GATEWAY_HEALTH_URL
     signed_out = await _webapp_caller_signed_out(request)
-    status_scope = None
     # A signed-out caller's ``?profile=`` is ignored: an unknown name's 404 would tell it which exist.
     requested_profile = "" if signed_out else (profile or "").strip()
     profile_dir: Optional[Path] = None
     if requested_profile and requested_profile.lower() != "current":
         profile_dir = _resolve_profile_dir(requested_profile)
-        status_scope = _config_profile_scope(requested_profile)
-        status_scope.__enter__()
 
-    try:
-        local = await run_in_threadpool(_status_local_reads)
-        gateway = await _resolve_gateway_status(profile_dir, _GATEWAY_HEALTH_URL)
-        gateway_running, gateway_state = gateway["gateway_running"], gateway["gateway_state"]
-
-        # Topology (cached, TTL 10s) is fetched before the platform rollup so per-profile
-        # gateway failures fold into the machine-level view (see
-        # _merge_profile_gateway_platforms); a ``?profile=`` request is left unmerged.
-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
-        if not requested_profile:
-            gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
-                gateway["gateway_platforms"], topology.get("profile_platforms") or {})
-
-        active_sessions = await _status_active_sessions()
-
-        # Busy/drainable (NAS lifecycle-safety gate) derive from the persisted in-flight turn
-        # count + liveness via gateway.status. Liveness keys off gateway_running, NEVER
-        # gateway_updated_at — a stale heartbeat is reported separately, not treated as death.
-        active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
-        # Off-loop: on a cold Windows install the first import of hermes_cli.gateway blocks
-        # 15-30s (.pyc compilation + Defender), exceeding the desktop handshake's 15s timeout.
-        restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout)
-        auth = _auth_gate_status()
-
-        status = {
-            "version": local["version"], "release_date": __release_date__,
-            "config_version": local["config_version"], "latest_config_version": local["latest_config_version"],
-            "can_update_hermes": local["can_update_hermes"],
-            "gateway_running": gateway_running, "gateway_state": gateway_state,
-            "gateway_platforms": gateway["gateway_platforms"],
-            "gateway_exit_reason": gateway["gateway_exit_reason"],
-            "gateway_updated_at": gateway["gateway_updated_at"],
-            # Seconds since housekeeping last stamped the heartbeat, only when the PID is alive but the
-            # stamp is past the freshness TTL (loop/housekeeping wedged, #113372); else null.
-            "gateway_heartbeat_stale_s": gateway["gateway_heartbeat_stale_s"],
-            # Non-null only for a profile served by the shared multiplexer: every profile that process carries.
-            "gateway_shared_with": gateway["gateway_shared_with"],
-            "active_agents": active_agents,
-            "gateway_busy": derive_gateway_busy(
-                gateway_running=gateway_running, gateway_state=gateway_state,
-                active_agents=active_agents),
-            "gateway_drainable": derive_gateway_drainable(
-                gateway_running=gateway_running, gateway_state=gateway_state),
-            "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
-            **auth, "nous_session_valid": local["nous_session_valid"]}
-
-        # Stable per-install identity (first call may touch disk). Omitted (not null) when
-        # unpersistable so older-client behavior and the no-identity fallback stay identical.
-        install_id = await run_in_threadpool(get_install_id)
-        if install_id:
-            status["install_id"] = install_id
-
-        # Advisory only. Expose no paths or process identities on this public probe.
-        from hermes_cli.shared_profile_warning import shared_profile_warning
-        status["shared_profile_warning"] = bool(await run_in_threadpool(shared_profile_warning))
-
-        components = await _component_health(gateway)
-        status["components"] = components
-        status["overall"] = ("ok" if all(item.get("status") == "ok" for item in components.values())
-                             else "degraded")
-        await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
-
-        # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud
-        # renders the profile list over a gated bind) so they survive the auth gate; the
-        # per-gateway ``gateways[]`` carries host ports and stays gated below.
-        status["profiles"] = topology["profiles"]
-        status["parked_profiles"] = topology.get("parked_profiles", [])
-        status["gateway_mode"] = topology["gateway_mode"]
-        status["multiplex_standalone_reason"] = topology.get("multiplex_standalone_reason")
-
-        # Host paths, gateway PID, internal health URL and per-gateway ports are deployment
-        # recon a liveness probe never needs, and on a gated bind *any* unauthenticated caller
-        # reaches this endpoint — surface them only on a loopback / ``--insecure`` bind.
-        if not auth["auth_required"]:
-            status.update({
-                "hermes_home": str(get_hermes_home()), "config_path": str(get_config_path()),
-                "env_path": str(get_env_path()), "gateway_pid": gateway["gateway_pid"],
-                "gateway_health_url": _GATEWAY_HEALTH_URL, "gateways": topology["gateways"]})
-
-        if signed_out:
-            return {key: value for key, value in status.items() if key in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
-        return status
-    finally:
+    async def _collect() -> dict[str, Any]:
+        status_scope = _config_profile_scope(requested_profile) if profile_dir is not None else None
         if status_scope is not None:
-            status_scope.__exit__(*sys.exc_info())
+            status_scope.__enter__()
+        try:
+            return await _collect_status(profile_dir, requested_profile, signed_out)
+        finally:
+            if status_scope is not None:
+                status_scope.__exit__(*sys.exc_info())
+
+    key = (requested_profile, signed_out, str(profile_dir) if profile_dir is not None else "")
+    full = await _STATUS_CACHE.get_or_compute(
+        key, _collect, signature=lambda: _status_cache_signature(profile_dir))
+
+    if signed_out:
+        return {key_: value for key_, value in full.items() if key_ in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
+    return full
 
 
 @router.get("/api/system/stats")
