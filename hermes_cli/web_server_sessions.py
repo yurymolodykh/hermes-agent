@@ -399,7 +399,13 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     from hermes_state_common import stat_db_file_identity
 
     pool = get_pool()
-    pool_key = str(db_path)
+    # Resolved, like sqlite_safe_read._key: offline_file_access drains by the same spelling.
+    from pathlib import Path as _Path
+
+    try:
+        pool_key = str(_Path(db_path).resolve())
+    except OSError:
+        pool_key = str(db_path)
     identity = stat_db_file_identity(db_path)
     pooled = pool.acquire(pool_key, identity)
     if pooled is not None:

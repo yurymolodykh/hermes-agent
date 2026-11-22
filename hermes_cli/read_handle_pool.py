@@ -145,6 +145,13 @@ class _ReadOnlyHandlePool:
         for entry in entries:
             self._close_entry(entry)
 
+    def drop_path(self, key: str) -> None:
+        """Close every idle handle for one path: raw file access about to claim exclusive use."""
+        with self._lock:
+            entries = self._idle.pop(key, [])
+        for entry in entries:
+            self._close_entry(entry)
+
 
 _pool = _ReadOnlyHandlePool()
 
