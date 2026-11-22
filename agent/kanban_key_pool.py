@@ -54,6 +54,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -122,6 +123,10 @@ _ROLE_CARD = "card"
 _VALID_ROLES = frozenset({_ROLE_BACKGROUND, _ROLE_CARD})
 _STATUS_ACTIVE = "active"
 _STATUS_BAD = "bad"
+#: Two keys whose busy time differs by no more than this are treated as equally
+#: loaded, so the round-robin keeps turning instead of alternating on rounding
+#: noise between reservations that were seconds apart.
+_USAGE_TOLERANCE_SECONDS = 60.0
 
 #: Per-process memo of this worker's binding so repeated resolutions inside
 #: one process (main + aux + delegated children in-process) are O(1) and can
@@ -578,7 +583,8 @@ def _read_state(path: Path) -> Dict[str, Any]:
     reading the file, and a rollback to the exclusive scheme finds the state
     intact instead of every card losing its key at once.
     """
-    empty = {"version": 2, "reservations": {}, "failed_keys": {}, "rr_cursor": None}
+    empty = {"version": 2, "reservations": {}, "failed_keys": {}, "rr_cursor": None,
+             "usage": {}}
     if not path.exists():
         return empty
     try:
@@ -611,11 +617,24 @@ def _read_state(path: Path) -> Dict[str, Any]:
         rr_cursor: Optional[int] = None if cursor_raw is None else int(cursor_raw)
     except (TypeError, ValueError):
         rr_cursor = None
+    # ``usage`` (per-key busy time for the current Moscow day) is optional: a
+    # state file written before the fairness change has none, and it must read
+    # exactly as before — no reservations lost, no bucket invented. Buckets
+    # from an earlier day are dropped here rather than at pick time, so every
+    # reader (status CLI included) sees one consistent window.
+    usage_raw = raw.get("usage")
+    today = _usage_today()
+    usage: Dict[str, Any] = {}
+    if isinstance(usage_raw, dict):
+        for key, record in usage_raw.items():
+            if isinstance(record, dict) and record.get("window") == today:
+                usage[str(key)] = dict(record)
     return {
         "version": 2,
         "reservations": reservations,
         "failed_keys": failed_keys,
         "rr_cursor": rr_cursor,
+        "usage": usage,
     }
 
 
@@ -650,6 +669,117 @@ def _key_slots(entry: Any) -> List[Dict[str, Any]]:
     return [s for s in slots if isinstance(s, dict)]
 
 
+# ── usage accounting (fairness between keys) ───────────────────────────────
+#
+# Fairness is measured in **occupied time**, not in hand-outs. A key that served
+# three one-minute cards is not "more used" than a key that served one
+# three-hour card, and picking by hand-out count would keep punishing the key
+# that keeps getting the long jobs. ``usage[key] = {busy_seconds, cards,
+# window}`` accumulates the busy time of every slot as it is dropped, for the
+# current Moscow calendar day; the ``window`` stamp resets the bucket when the
+# day rolls over.
+
+#: Moscow is UTC+3 with no DST, so a fixed offset is exact rather than a
+#: shortcut. A local-time date would make the bucket boundary depend on where
+#: the dispatcher runs, which the owner asked not to happen.
+_USAGE_TZ = timezone(timedelta(hours=3))
+
+
+def _usage_today(now: Optional[float] = None) -> str:
+    """The Moscow calendar date (``YYYY-MM-DD``) a usage bucket belongs to."""
+    stamp = time.time() if now is None else float(now)
+    return datetime.fromtimestamp(stamp, _USAGE_TZ).strftime("%Y-%m-%d")
+
+
+def _usage_bucket(state: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    """Today's ``{key_id: {busy_seconds, cards, window}}``, rolling over in place.
+
+    Rollover is *reset*, not "carry yesterday forward": the owner's metric is
+    "how busy was each key today", so yesterday's imbalance must not keep
+    steering today's rotation.
+    """
+    today = _usage_today(now)
+    usage = state.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        state["usage"] = usage
+    for key in list(usage.keys()):
+        record = usage.get(key)
+        if not isinstance(record, dict) or record.get("window") != today:
+            usage.pop(key, None)
+    return usage
+
+
+def _account_usage(
+    state: Dict[str, Any],
+    key_id: Any,
+    slot: Dict[str, Any],
+    *,
+    now: float,
+) -> None:
+    """Charge one DROPPED slot's busy time to its key (idempotent by construction).
+
+    Called from every place that removes a slot — sweep, task release, pid
+    release — and only there, which is what makes double charging impossible: a
+    slot exists in exactly one list, and the caller removes it before/while
+    accounting. ``seconds`` is ``now - reserved_at`` clamped to
+    ``[0, _ttl_seconds()]`` so a clock jump or a corrupt ``reserved_at`` cannot
+    invent hours of usage.
+    """
+    try:
+        kid = int(key_id)
+    except (TypeError, ValueError):
+        return
+    try:
+        reserved_at = float(slot.get("reserved_at") or 0)
+    except (TypeError, ValueError):
+        reserved_at = 0.0
+    seconds = 0.0
+    if reserved_at > 0:
+        seconds = min(max(float(now) - reserved_at, 0.0), _ttl_seconds())
+    bucket = _usage_bucket(state, now)
+    record = bucket.get(str(kid))
+    if not isinstance(record, dict):
+        record = {"busy_seconds": 0.0, "cards": 0, "window": _usage_today(now)}
+        bucket[str(kid)] = record
+    try:
+        record["busy_seconds"] = float(record.get("busy_seconds") or 0.0) + seconds
+    except (TypeError, ValueError):
+        record["busy_seconds"] = seconds
+    try:
+        record["cards"] = int(record.get("cards") or 0) + 1
+    except (TypeError, ValueError):
+        record["cards"] = 1
+
+
+def _usage_seconds(state: Dict[str, Any], key_id: int, now: Optional[float] = None) -> float:
+    """Today's accumulated busy seconds for ``key_id`` (``0.0`` when it has none)."""
+    bucket = _usage_bucket(state, now)
+    record = bucket.get(str(int(key_id)))
+    if not isinstance(record, dict):
+        return 0.0
+    try:
+        return float(record.get("busy_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _usage_lookup(usage: Dict[str, Any], key_id: int, today: str) -> float:
+    """Read-only busy seconds for ``key_id`` in an already-rolled-over bucket.
+
+    The read-only twin of :func:`_usage_seconds`: :func:`_pick_key` must not
+    mutate state while it is only *choosing* a key (the write happens under the
+    lock right after, with the reservation it picked).
+    """
+    record = usage.get(str(int(key_id)))
+    if not isinstance(record, dict) or record.get("window") != today:
+        return 0.0
+    try:
+        return float(record.get("busy_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     """Render the in-memory slot state for disk, keeping v1 readable.
 
@@ -678,39 +808,64 @@ def _serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
                 "key_label": label,
                 "slots": [dict(s) for s in slots],
             }
-    return {
+    out: Dict[str, Any] = {
         "version": 2,
         "reservations": out_reservations,
         "failed_keys": dict(state.get("failed_keys") or {}),
         "rr_cursor": state.get("rr_cursor"),
     }
+    # Only written when there is something to say: an install that never
+    # accumulated a bucket keeps the exact state file it had before this change.
+    usage = state.get("usage")
+    if isinstance(usage, dict) and usage:
+        out["usage"] = {
+            str(k): dict(v) for k, v in usage.items() if isinstance(v, dict)
+        }
+    return out
 
 
 def _pick_key(
     free: List[int],
     occupied: Dict[int, List[Dict[str, Any]]],
     last_key_id: Optional[int],
+    usage: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Choose the next card key: least loaded first, round-robin to break ties.
+    """Choose the next card key: least loaded, then least busy, then round-robin.
 
-    Two rules, in this order — the owner asked for both at once (card K4-Р,
-    2026-11-08: «чтобы ключи постоянно ротировались, а не всегда
-    использовались первые 4»):
+    Three rules, in this order — the owner asked for both the rotation (card
+    K4-Р, 2026-11-08: «чтобы ключи постоянно ротировались, а не всегда
+    использовались первые 4») and the *even load* (this card: «нагрузка по 7
+    ключам — равномерная»):
 
     1. **Least loaded.** The key with the fewest occupied slots wins. That is
        what spreads two cards of a two-slot key onto two *different* keys
        while there are free keys, instead of filling #2's second slot first.
-    2. **Round-robin.** Among keys with the same load, prefer the first one
-       *after* ``last_key_id`` in ascending id order, wrapping at the end.
-       That is what keeps successive cards moving (#2 → #3 → #4 …) instead of
-       hammering the lowest id, and it brings the ring back to a key that has
-       emptied out again.
+    2. **Least busy today.** Among the equally loaded candidates, prefer the
+       key with the smallest accumulated ``busy_seconds`` (the time its slots
+       were actually held today), inside a ``_USAGE_TOLERANCE_SECONDS``
+       tolerance. Load alone cannot see that one key has already served a
+       three-hour card while another served none — counting hand-outs would
+       not see it either. The tolerance is what keeps the metric from
+       over-fitting: two keys within a minute of each other are *equally*
+       busy, and the ring should keep turning instead of alternating on noise.
+    3. **Round-robin.** Among the survivors, prefer the first key *after*
+       ``last_key_id`` in ascending id order, wrapping at the end — the same
+       cursor as before, so a pool with no history still rotates exactly as it
+       did.
 
     Leaving this as ``free[0]`` would reintroduce the reported defect: with
     2 slots and 9 keys every card piles onto #2 before #3 is ever touched.
     """
     least = min(len(occupied.get(kid) or []) for kid in free)
     candidates = [kid for kid in free if len(occupied.get(kid) or []) == least]
+    if usage:
+        today = _usage_today(None)
+        busy = {kid: _usage_lookup(usage, kid, today) for kid in candidates}
+        cheapest = min(busy.values())
+        candidates = [
+            kid for kid in candidates
+            if busy[kid] - cheapest <= _USAGE_TOLERANCE_SECONDS
+        ]
     if last_key_id is None:
         return candidates[0]
     # First candidate strictly after the cursor, wrapping around the ring.
@@ -876,6 +1031,10 @@ def _sweep_locked(state: Dict[str, Any], now: float) -> List[Dict[str, Any]]:
                 record["released_reason"] = reason
                 record["released_at"] = int(now)
                 dropped.append(record)
+                # Charge the busy time of the slot we are dropping, here and
+                # only here: the slot leaves the key in this same branch, so a
+                # slot can never be accounted twice.
+                _account_usage(state, key_id, slot, now=now)
                 continue
             survivors.append(slot)
         if survivors:
@@ -1307,7 +1466,7 @@ def reserve_for_card(
         # ties (see :func:`_pick_key`). The cursor is the last key actually
         # handed out and it is persisted in this same state file, so a
         # restarted process keeps turning the same ring.
-        key_id = _pick_key(free, occupied, state.get("rr_cursor"))
+        key_id = _pick_key(free, occupied, state.get("rr_cursor"), state.get("usage"))
         expires_at = int(now + ttl)
         entry = reservations.get(str(key_id))
         if not isinstance(entry, dict):
@@ -1525,6 +1684,7 @@ def _drop_task_slots(
                 if caller_pid is not None:
                     record["released_by_pid"] = caller_pid
                 released.append(record)
+                _account_usage(state, key_id, slot, now=now)
                 changed = True
             if kept:
                 entry["slots"] = kept
@@ -1591,6 +1751,7 @@ def release_for_pid(pid: Optional[int] = None) -> List[Dict[str, Any]]:
                     record["released_reason"] = "process_exit"
                     record["released_at"] = int(now)
                     released.append(record)
+                    _account_usage(state, key_id, slot, now=now)
                     changed = True
                     continue
                 # A sibling process of the same card holds no slot of its own —
@@ -1960,8 +2121,10 @@ def pool_status() -> Dict[str, Any]:
         "version": 2,
         "reservations": {},
         "failed_keys": {},
+        "usage": {},
     }
     now = time.time()
+    usage_today = _usage_bucket(state, now)
     limit = int(getattr(cfg, "max_cards_per_key", _DEFAULT_MAX_CARDS_PER_KEY) or 1) \
         if cfg is not None else _DEFAULT_MAX_CARDS_PER_KEY
     reservations = []
