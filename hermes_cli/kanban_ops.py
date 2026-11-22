@@ -60,12 +60,26 @@ def _resolve_failure_limit(cli_value, config_value) -> int:
 def _kanban_failure_limit_setting():
     """``kanban.failure_limit`` from config, or None when unreadable/unset.
 
+<<<<<<< Updated upstream
     Reads through :func:`_kanban_config`, the same loader the gateway uses, so
     the CLI dispatch path and the gateway see the SAME threshold; a local
     default here is what made ``hermes kanban dispatch`` run at 2 while
     ``config.yaml`` said 3.
     """
     return _kanban_config().get("failure_limit")
+=======
+    Read through the public config loader so the CLI dispatch path and the
+    gateway see the SAME threshold; a local default here is what made
+    ``hermes kanban dispatch`` run at 2 while ``config.yaml`` said 3.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return None
+    kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+    return (kanban_cfg or {}).get("failure_limit")
+>>>>>>> Stashed changes
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

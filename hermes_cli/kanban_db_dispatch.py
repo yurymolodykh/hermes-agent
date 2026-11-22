@@ -174,12 +174,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+<<<<<<< Updated upstream
     budget_hold: Optional[str] = None
     """Which concurrency cap stopped this tick before the lane loops ran:
     ``"max_in_progress"`` (host-level, every slot in use) or ``"max_spawn"``
     (per-board cap). The tick returns with an otherwise EMPTY result in that
     case — no skipped bucket is filled — which is why :func:`capacity_bound`
     needs this marker: a full host cap is saturation, not a stall."""
+=======
+>>>>>>> Stashed changes
     auto_split: list[str] = field(default_factory=list)
     """Cards this tick split into child cards after burning their retry counter
     twice in one generation (``kanban.auto_continue``)."""
