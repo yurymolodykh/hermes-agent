@@ -44,6 +44,7 @@ def _isolate() -> Path:
     )
     os.environ["HERMES_HOME"] = str(root / ".hermes")
     os.environ["HERMES_KANBAN_HOME"] = str(root / ".hermes")
+    os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] = str(root / "workspaces")
     os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.pop("HERMES_KANBAN_BOARD", None)
     # A Kanban worker inherits a write fence over ~/.hermes; this probe owns its board.
