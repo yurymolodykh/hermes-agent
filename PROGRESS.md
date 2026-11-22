@@ -1,70 +1,110 @@
-# PROGRESS — t_b7850007: дневное окно 08–18 МСК ≤4 карточки + равномерная нагрузка по 7 ключам пула letovo
+# PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
 
-## Состояние: ГОТОВО (все критерии приёмки закрыты), работа в коммите с номером карточки.
+## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_b7850007`, ветка `wt/t_b7850007`
-* База сравнения: `8cbd0cde6eb`
-* Интерпретатор проверок: `/home/hermes/.hermes/hermes-agent/.venv/bin/python`
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
+* База для сравнения: `beeb9623539`
+* Содержимое правки = `git diff beeb9623539`
+* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
 
-## Что доделано в этой попытке (остаток из карточки)
+## Сделано
 
-1. `agent/kanban_key_pool.py:614-660` — восстановлена `_pick_key(free, occupied, last_key_id, usage=None)`
-   с новой логикой: (1) минимум активных слотов среди свободных (`min(len(occupied[kid]))`),
-   (2) среди них минимум `_usage.busy_seconds` с допуском `_USAGE_TOLERANCE_SECONDS = 60.0`
-   (`agent/kanban_key_pool.py:136`), (3) внутри допуска — прежний round-robin по курсору
-   `last_key_id` (первый строго больший, с переходом через край). Вызов на
-   `agent/kanban_key_pool.py:1234` соответствует сигнатуре; курсор обновляется вызывающим на
-   выданный ключ.
-2. `_account_usage` (`agent/kanban_key_pool.py:604-612`) делегирует в
-   `_usage.account_slot(state, key_id, slot, now=now, ttl_seconds=_ttl_seconds())`;
-   вызовы: `:802`, `:1452`, `:1519`.
-3. `agent/kanban_key_pool.py:1892` — `_usage_bucket(state, now)` → `_usage.usage_bucket(state, now)`.
-4. Фасадный шов: `agent/kanban_key_pool.py:66` — `_usage_today = _usage.usage_today`
-   (тест `test_day_boundary_is_moscow_not_utc` читает день через фасад).
-5. Импорты сиблингов: `agent/kanban_key_pool.py:60-61` — `_state`, `_usage`.
+### Патч 1 — класс `owner_unavailable` (PR #152921, перенос по смыслу, не `git apply`)
 
-## Критерий 1 — тесты
+* `hermes_state_errors.py:99-103` — `PERSISTENCE_ERROR_CAUSES` += `"owner_unavailable"` (перед `"unknown"`).
+* `hermes_state_errors.py` — `_PERSISTENCE_CAUSE_BY_PHRASE` += `(("owner_unavailable",), …)` и
+  `(("worker_receipt_timeout",), "owner_unavailable")`, **после** `foreign key constraint failed` и
+  **перед** `_PERMISSION_MARKERS`; комментарий PR сохранён (фраза, не тип; RPC теряет тип; импорт
+  фасада воркера инвертировал бы зависимость листового модуля).
+* Докстринг `classify_persistence_error` дополнен.
+* `agent/turn_explainers.py:53-56` — `_PERSISTENCE_CAUSES` += `"owner_unavailable"` + комментарий.
+* `locales/*.yaml` — 17 файлов, ключ `explainer.persistence.owner_unavailable` после `turn_lease`.
+* `tests/agent/test_turn_completion_explainer.py` — 3 новых теста (+параметризация).
 
-`/home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest` по набору:
-`tests/hermes_cli/test_kanban_day_window.py`, `tests/agent/test_kanban_key_pool_fairness.py`,
-`tests/agent/test_kanban_key_pool.py`, `tests/hermes_cli/test_kanban_keypool_release.py`,
-`tests/hermes_cli/test_kanban_keypool_integration.py`, `tests/hermes_cli/test_kanban_keypool_red_proof.py`,
-`tests/hermes_cli/test_kanban_memory_guard.py`, `tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py`,
-`tests/hermes_cli/test_kanban_per_profile_cap.py`
+### Патч 2 — уборщик не убивает живых воркеров (issue #157057, диффа нет)
 
-→ **213 passed, 0 failed** (37.59s).
+* `hermes_cli/kanban_db_dispatch.py::_reap_terminal_worker_row` — перед сигналом проба
+  `_worker_alive(pid, fingerprint)`; живой → `_log.debug` + `return` (строка остаётся в выборке);
+  мёртвый → снятие улик. Ветка сигнала удалена.
+* Докстринги `reap_terminal_workers` и `DispatchResult.reaped_terminal_workers` приведены к факту.
+* `tests/hermes_cli/test_kanban_terminal_worker_reaper.py` — 5 тестов переписаны под контракт.
+* `website/docs/user-guide/features/kanban.md:138` — описание диспетчера обновлено.
 
-## Критерий 2 — боевая проверка окна и равномерности
+Не тронуто: `TERMINAL_WORKER_REAP_GRACE_SECONDS`, `reclaim`-логика, `_terminate_reclaimed_worker`,
+`enforce_max_runtime`, `kanban_auto_continue.py`, `kanban_profile_scope.py`, пороги ретраев.
 
-`/home/hermes/.hermes/hermes-agent/.venv/bin/python evidence-t_b7850007/criterion2_probe.py`
-(вывод — `evidence-t_b7850007/criterion2_output.txt`):
+## Проверки (все сняты)
 
-```
-base_cap=7  day_cap=4  window=08:00-18:00  tz=Europe/Moscow
-  OK  07:59 Europe/Moscow -> 7 (expected 7)
-  OK  08:00 Europe/Moscow -> 4 (expected 4)
-  OK  17:59 Europe/Moscow -> 4 (expected 4)
-  OK  18:00 Europe/Moscow -> 7 (expected 7)
-40 hand-outs over 4 of 7 keys (5 min each; quarantined: [6, 7, 8]):
-  key #2: cards=10; #3: 10; #4: 10; #5: 10
-  cards spread = 0 (limit 1)  total cards = 40 / 40
-RESULT: window_failures=0 fairness_failures=0
-```
+* reaper-тесты: 5 passed; на базе — 2 failed (красная база доказана).
+* explainer-тесты: 34 passed; на базе 4 новых падают (`-k owner`).
+* reaper + explainer + outbox: 61 passed.
+* Смежные наборы состояния: 109 passed, 7 skipped.
+* `ruff check` — All checks passed. `code_health --base beeb9623539` — 0 blocking, 0 advisory.
+* По-файлово `tests/hermes_cli/*kanban*` (99 файлов): база 17 FAIL / 82 PASS, патч 16 FAIL / 83 PASS;
+  `diff` наборов = единственная строка `test_kanban_terminal_worker_reaper.py`.
+* `tests/hermes_state` по-файлово: 134 падающих файла, все предсуществующие (страж
+  `home_io_guard.py:160` ругается на путь worktree; выборка 12 файлов даёт одинаковые числа на
+  базе и с правкой).
 
-Живой `_load_settings()` в профиле возвращает невыставленные значения (`None`) — дневной слой
-включается только когда владелец задаст `kanban.day_*`; гейт проверен на явно заданных
-значениях (base_cap=7, day_cap=4).
+## Следующий шаг для будущей попытки
 
-## Критерий 3 — коммит и дифф
+1. `git add -A && git commit` сообщением с номером карточки (t_4cb8f83b), затем
+   `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
+   `REPORT-patches.md`, `evidence-t4cb8f83b/`.
+2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.
 
-Коммит с номером карточки — `git log -1`. `git diff --stat 8cbd0cde6eb` — 11 файлов,
-1494 вставки / 147 удалений.
 
-## Остаточные ограничения
+---
 
-* `ruff` в `.venv` воркtree отсутствует (`No module named ruff`); линт-проверка не снималась,
-  критерии приёмки карточки её не требуют. Python-синтаксис подтверждён импортом модулей в пробах
-  и прогоном тестов.
-* Живой `~/.hermes/config.yaml` и `~/.hermes/kanban-keypool.state.json` не менялись; боевые
-  значения `kanban.day_*` не выставлялись (решение владельца, отдельный шаг выката).
-* Вливание в общую ветку и рестарт шлюза — за оркестратором, не этой карточкой.
+# PROGRESS — t_54c6b6f2: `hermes user add` (одна команда — целый пользователь)
+
+## Состояние: ГОТОВО. Тесты зелёные, живая проба снята, боевой ~/.hermes чист.
+
+* Дерево: `/home/hermes/.hermes/kanban/workspaces/t_54c6b6f2`, ветка `wt/t_54c6b6f2`
+* База: `feature/multiuser-access` = `65db1ee540b` (ветка ребейзнута на неё)
+* Ревизия: `859fe4502ba` (верхушка; автокоммит поверх `412ef36c6f4`)
+
+## Сделано
+
+* `hermes_cli/user_admin.py` (новый, 676 строк): `add_user`, `remove_user`, `list_users`,
+  `build_user_parser`, `cmd_user_add/list/remove`, `Refused` (код 2) / `Failed` (код 1).
+  Порядок шагов и собственный undo на каждый: профиль → SOUL+опросник → привязка →
+  users-file+пароль → маршрут. Любой сбой раскручивает undo в обратном порядке.
+* Регистрация: `hermes_cli/main.py` — `build_user_parser(subparsers)` + `"user"` в
+  `_BUILTIN_SUBCOMMANDS` (одна строка + локальный импорт, файл остаётся в своём капе).
+* `tests/hermes_cli/test_user_admin.py` (новый, 14 тестов).
+* Форматы взяты из кода, не выдуманы:
+  * профиль — `profiles.create_profile(name, clone_from=..., clone_config=True, no_alias=True)`;
+  * SOUL — `hermes_acl_soul.seed_personal_soul` через `personal_soul_seed` в `create_profile`,
+    опросник `SOUL-QUESTIONNAIRE.md` — `seed_questionnaire(only_personal=True)`;
+  * привязка — `hermes_acl_bindings.store().bind(slug="person/<login>", profiles=[...],
+    subjects=["tg:<id>"])`; реестр `<root>/acl/profile-bindings.json`;
+  * users-file — `dashboard_users.UserStore.upsert_record(UserRecord(...))`, `hash_password`;
+  * маршрут — `gateway.profile_routes`: `{name, platform: telegram, profile, user_id,
+    bot_profile: null, enabled}` (null = бот главного профиля).
+
+## Проверено (команда + число)
+
+* `scripts/run_tests.sh tests/hermes_cli/test_user_admin.py -q` → **14 passed**.
+* `+ test_acl_bindings.py + test_dashboard_users.py` → **184 passed, 0 failed, 8 skipped**.
+* `ruff check --config ruff.pre-commit.toml` на оба файла → All checks passed.
+* `python -m scripts.code_health --base feature/multiuser-access` → **0 blocking, 0 advisory**.
+* Живая проба `HERMES_HOME=$(mktemp -d)`:
+  * `user add demo1 --telegram-id 555000111` → **exit 0**; SOUL 7252 Б, опросник 5530 Б,
+    привязка `tg:555000111`, маршрут `bot_profile: null`, токенов Telegram в config.yaml **0**,
+    `users.jsonl` и `credentials/demo1.password` — режим **600**;
+  * повторный `user add demo1` → **exit 2** («profile 01-demo1 already exists»);
+  * `user list` → строка `demo1 / 01-demo1 / bound yes / password yes / route yes`;
+  * `user remove demo1 --yes` → удалены маршрут, привязка, запись users-file, файл пароля, профиль.
+
+## Замечания для следующего прогона
+
+1. Профили и ACL-реестр привязаны к `get_default_hermes_root()`, а НЕ к `HERMES_HOME`.
+   Проба с `HERMES_HOME` вне `~/.hermes` (например `/var/tmp/ua-probe-XXXX`) изолирована
+   полностью; `HERMES_HOME` внутри `~/.hermes` пишет профиль в боевой `profiles/`.
+   Первая проба так и сделала — созданное удалено (профиль, `acl/`, запись маршрута), боевой
+   `config.yaml` и `profile_routes: []` не изменились.
+2. `tests/hermes_cli/test_profiles.py::...lazy_skill_count...` и
+   `test_left_core_migration.py::test_old_mcp_serve...` падают и на базе (страж
+   `home_io_guard` на путь worktree) — предсуществующие, не связаны с правкой.
+3. Пароли владельцу не передавались (по указанию оркестратора — после закрытия карточки).
