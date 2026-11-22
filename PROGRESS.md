@@ -52,3 +52,59 @@
    `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
    `REPORT-patches.md`, `evidence-t4cb8f83b/`.
 2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.
+
+
+---
+
+# PROGRESS — t_54c6b6f2: `hermes user add` (одна команда — целый пользователь)
+
+## Состояние: ГОТОВО. Тесты зелёные, живая проба снята, боевой ~/.hermes чист.
+
+* Дерево: `/home/hermes/.hermes/kanban/workspaces/t_54c6b6f2`, ветка `wt/t_54c6b6f2`
+* База: `feature/multiuser-access` = `65db1ee540b` (ветка ребейзнута на неё)
+* Ревизия: `859fe4502ba` (верхушка; автокоммит поверх `412ef36c6f4`)
+
+## Сделано
+
+* `hermes_cli/user_admin.py` (новый, 676 строк): `add_user`, `remove_user`, `list_users`,
+  `build_user_parser`, `cmd_user_add/list/remove`, `Refused` (код 2) / `Failed` (код 1).
+  Порядок шагов и собственный undo на каждый: профиль → SOUL+опросник → привязка →
+  users-file+пароль → маршрут. Любой сбой раскручивает undo в обратном порядке.
+* Регистрация: `hermes_cli/main.py` — `build_user_parser(subparsers)` + `"user"` в
+  `_BUILTIN_SUBCOMMANDS` (одна строка + локальный импорт, файл остаётся в своём капе).
+* `tests/hermes_cli/test_user_admin.py` (новый, 14 тестов).
+* Форматы взяты из кода, не выдуманы:
+  * профиль — `profiles.create_profile(name, clone_from=..., clone_config=True, no_alias=True)`;
+  * SOUL — `hermes_acl_soul.seed_personal_soul` через `personal_soul_seed` в `create_profile`,
+    опросник `SOUL-QUESTIONNAIRE.md` — `seed_questionnaire(only_personal=True)`;
+  * привязка — `hermes_acl_bindings.store().bind(slug="person/<login>", profiles=[...],
+    subjects=["tg:<id>"])`; реестр `<root>/acl/profile-bindings.json`;
+  * users-file — `dashboard_users.UserStore.upsert_record(UserRecord(...))`, `hash_password`;
+  * маршрут — `gateway.profile_routes`: `{name, platform: telegram, profile, user_id,
+    bot_profile: null, enabled}` (null = бот главного профиля).
+
+## Проверено (команда + число)
+
+* `scripts/run_tests.sh tests/hermes_cli/test_user_admin.py -q` → **14 passed**.
+* `+ test_acl_bindings.py + test_dashboard_users.py` → **184 passed, 0 failed, 8 skipped**.
+* `ruff check --config ruff.pre-commit.toml` на оба файла → All checks passed.
+* `python -m scripts.code_health --base feature/multiuser-access` → **0 blocking, 0 advisory**.
+* Живая проба `HERMES_HOME=$(mktemp -d)`:
+  * `user add demo1 --telegram-id 555000111` → **exit 0**; SOUL 7252 Б, опросник 5530 Б,
+    привязка `tg:555000111`, маршрут `bot_profile: null`, токенов Telegram в config.yaml **0**,
+    `users.jsonl` и `credentials/demo1.password` — режим **600**;
+  * повторный `user add demo1` → **exit 2** («profile 01-demo1 already exists»);
+  * `user list` → строка `demo1 / 01-demo1 / bound yes / password yes / route yes`;
+  * `user remove demo1 --yes` → удалены маршрут, привязка, запись users-file, файл пароля, профиль.
+
+## Замечания для следующего прогона
+
+1. Профили и ACL-реестр привязаны к `get_default_hermes_root()`, а НЕ к `HERMES_HOME`.
+   Проба с `HERMES_HOME` вне `~/.hermes` (например `/var/tmp/ua-probe-XXXX`) изолирована
+   полностью; `HERMES_HOME` внутри `~/.hermes` пишет профиль в боевой `profiles/`.
+   Первая проба так и сделала — созданное удалено (профиль, `acl/`, запись маршрута), боевой
+   `config.yaml` и `profile_routes: []` не изменились.
+2. `tests/hermes_cli/test_profiles.py::...lazy_skill_count...` и
+   `test_left_core_migration.py::test_old_mcp_serve...` падают и на базе (страж
+   `home_io_guard` на путь worktree) — предсуществующие, не связаны с правкой.
+3. Пароли владельцу не передавались (по указанию оркестратора — после закрытия карточки).
