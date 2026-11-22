@@ -33,7 +33,8 @@ ws.mkdir()
 
 
 def git(*args):
-    return subprocess.run(["git", "-C", str(ws), *args], capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(ws), *args], capture_output=True, text=True,
+                          timeout=120)
 
 
 git("init", "-q", "-b", "wt/t_probe_git")
