@@ -7444,3 +7444,160 @@ Discovered 1963 test files (~14978 tests) under ['tests/hermes_cli']; running wi
 [ 37.1% |  5559/~14978 | ✓5933 | ✗ 841] ✓ tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py (2✓, 4.6s)
 [ 37.1% |  5564/~14978 | ✓5938 | ✗ 841] ✓ tests/hermes_cli/test_kanban_cli_failure_limit_config.py (5✓, 2.2s)
 [ 37.2% |  5565/~14978 | ✓5939 | ✗ 841] ✓ tests/hermes_cli/test_kanban_cli_exit_status.py (1✓, 6.4s)
+[ 37.2% |  5578/~14978 | ✓5954 | ✗ 841] ✓ tests/hermes_cli/test_kanban_auto_continue.py (15✓, 31.3s)
+[ 37.2% |  5579/~14978 | ✓5955 | ✗ 841] ✓ tests/hermes_cli/test_kanban_comment_queries.py (1✓, 4.1s)
+[ 37.3% |  5589/~14978 | ✓5965 | ✗ 841] ✓ tests/hermes_cli/test_kanban_cli.py (10✓, 21.5s)
+[ 37.4% |  5602/~14978 | ✓5978 | ✗ 841] ✓ tests/hermes_cli/test_kanban_closed_card_never_runs.py (13✓, 15.8s)
+[ 37.4% |  5606/~14978 | ✓5982 | ✗ 841] ✓ tests/hermes_cli/test_kanban_complete_live_claim_guard.py (4✓, 13.9s)
+[ 37.5% |  5610/~14978 | ✓5986 | ✗ 841] ✓ tests/hermes_cli/test_kanban_count_notify_subs.py (4✓, 5.5s)
+[ 37.5% |  5612/~14978 | ✓5988 | ✗ 841] ✓ tests/hermes_cli/test_kanban_create_body_file.py (2✓, 5.1s)
+[ 37.5% |  5614/~14978 | ✓6003 | ✗ 841] ✓ tests/hermes_cli/test_kanban_credential_startup_exit.py (15✓, 4.9s)
+[ 37.6% |  5634/~14978 | ✓6029 | ✗ 841] ✓ tests/hermes_cli/test_kanban_boards.py (26✓, 37.2s)
+[ 37.6% |  5635/~14978 | ✓6031 | ✗ 842] ✗ tests/hermes_cli/test_kanban_creator_origin.py (2✓ 1✗, 12.2s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_creator_origin.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║             kn.add_notify_sub(conn, task_id=owner, platform="telegram", chat_id="chat",
+  ║                              delivery_mode="wake", notifier_profile="default")
+  ║             if surface == "builtin":
+  ║                 tid = decompose_triage_task(conn, owner, root_assignee="default",
+  ║                                            children=[{"title": "child"}])[0]
+  ║             elif surface == "db":
+  ║                 tid = kb.create_task(conn, title="child", creator_task_id=owner)
+  ║             else:
+  ║                 import json
+  ║                 import argparse
+  ║                 from hermes_cli.kanban import kanban_command
+  ║                 from hermes_cli.kanban_parser import build_parser
+  ║                 parser = argparse.ArgumentParser()
+  ║                 build_parser(parser.add_subparsers())
+  ║                 monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
+  ║                 assert kanban_command(parser.parse_args(["kanban", "create", "child", "--json"])) == 0
+  ║                 tid = json.loads(capsys.readouterr().out)["id"]
+  ║             assert kb.get_task(conn, tid).session_id == "durable"
+  ║             subs = kn.list_notify_subs(conn, tid)
+  ║ >           assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
+  ║ E           AssertionError: assert (1 == 1 and 'notify+wake' == 'wake'
+  ║ E            +  where 1 = len([{'task_id': 't_223993d7', 'platform': 'telegram', 'chat_id': 'chat', 'thread_id': '', ...}])
+  ║ E             
+  ║ E             - wake
+  ║ E             + notify+wake)
+  ║ 
+  ║ tests/hermes_cli/test_kanban_creator_origin.py:34: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_creator_origin.py::test_creator_origin_survives_without_dependency_parent[cli]
+  ║ 1 failed, 2 passed in 4.54s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_creator_origin.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 37.6% |  5639/~14978 | ✓6035 | ✗ 842] ✓ tests/hermes_cli/test_kanban_db_repair.py (4✓, 7.5s)
+[ 37.7% |  5644/~14978 | ✓6040 | ✗ 842] ✓ tests/hermes_cli/test_kanban_db_init.py (5✓, 13.5s)
+[ 37.7% |  5646/~14978 | ✓6042 | ✗ 842] ✓ tests/hermes_cli/test_kanban_decompose_db.py (2✓, 4.8s)
+[ 37.7% |  5651/~14978 | ✓6047 | ✗ 842] ✓ tests/hermes_cli/test_kanban_diagnostics.py (5✓, 3.6s)
+[ 37.8% |  5661/~14978 | ✓6057 | ✗ 842] ✓ tests/hermes_cli/test_kanban_decompose.py (10✓, 13.6s)
+[ 37.8% |  5663/~14978 | ✓6059 | ✗ 842] ✓ tests/hermes_cli/test_kanban_default_assignee.py (2✓, 7.1s)
+[ 37.8% |  5665/~14978 | ✓6061 | ✗ 842] ✓ tests/hermes_cli/test_kanban_dispatch_lock.py (2✓, 6.6s)
+[ 37.8% |  5668/~14978 | ✓6064 | ✗ 842] ✓ tests/hermes_cli/test_kanban_dispatch_tick_hook.py (3✓, 9.9s)
+[ 37.9% |  5683/~14978 | ✓6079 | ✗ 842] ✓ tests/hermes_cli/test_kanban_dispatcher_capacity_telemetry.py (15✓, 4.7s)
+[ 38.0% |  5685/~14978 | ✓6081 | ✗ 842] ✓ tests/hermes_cli/test_kanban_dispatch_unknown_assignee_event.py (2✓, 9.3s)
+[ 38.0% |  5691/~14978 | ✓6090 | ✗ 842] ✓ tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py (9✓, 18.4s)
+[ 38.0% |  5697/~14978 | ✓6090 | ✗ 848] ✗ tests/hermes_cli/test_kanban_gateway_restart_handoff.py (6✗, 11.3s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_gateway_restart_handoff.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:771: in open
+  ║     return io.open(self, mode, buffering, encoding, errors, newline)
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.worktrees/manifest.json')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.worktrees/manifest.json
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_worker_is_spawned_in_restart_safe_scope
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_worker_spawn_fails_closed_without_scope
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_scope_builder_fails_closed_if_binary_disappears
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_standalone_dispatcher_keeps_direct_worker_spawn
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_real_user_systemd_scope_preserves_worker_context
+  ║ 6 failed in 4.47s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_gateway_restart_handoff.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 38.1% |  5702/~14978 | ✓6095 | ✗ 848] ✓ tests/hermes_cli/test_kanban_empty_completion.py (5✓, 12.4s)
+[ 38.1% |  5707/~14978 | ✓6100 | ✗ 848] ✓ tests/hermes_cli/test_kanban_goal_judge_affinity.py (5✓, 3.4s)
+[ 38.1% |  5714/~14978 | ✓6110 | ✗ 848] ✓ tests/hermes_cli/test_kanban_gc_retention.py (10✓, 14.4s)
+[ 38.2% |  5722/~14978 | ✓6118 | ✗ 848] ✓ tests/hermes_cli/test_kanban_goal_mode.py (8✓, 5.8s)
+[ 38.2% |  5723/~14978 | ✓6119 | ✗ 848] ✓ tests/hermes_cli/test_kanban_goal_mode_worker_log.py (1✓, 2.9s)
+[ 38.2% |  5725/~14978 | ✓6121 | ✗ 848] ✓ tests/hermes_cli/test_kanban_graph_identity.py (2✓, 5.8s)
+[ 38.2% |  5727/~14978 | ✓6123 | ✗ 848] ✓ tests/hermes_cli/test_kanban_init_lock_bounded.py (2✓, 5.8s)
+[ 38.3% |  5730/~14978 | ✓6126 | ✗ 848] ✓ tests/hermes_cli/test_kanban_keypool_red_proof.py (3✓, 4.8s)
+[ 38.3% |  5740/~14978 | ✓6137 | ✗ 848] ✓ tests/hermes_cli/test_kanban_keypool_integration.py (11✓, 13.0s)
+[ 38.4% |  5755/~14978 | ✓6152 | ✗ 848] ✓ tests/hermes_cli/test_kanban_keypool_release.py (15✓, 9.4s)
+[ 38.7% |  5803/~14978 | ✓6206 | ✗ 848] ✓ tests/hermes_cli/test_kanban_db.py (54✓ 1s, 77.8s)
+[ 38.8% |  5804/~14978 | ✓6212 | ✗ 848] ✓ tests/hermes_cli/test_kanban_managed_exit_reconciliation.py (6✓, 2.7s)
+[ 38.9% |  5826/~14978 | ✓6234 | ✗ 850] ✗ tests/hermes_cli/test_kanban_core_functionality.py (22✓ 2✗, 96.1s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_core_functionality.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[sqlite]
+  ║ FAILED tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_disables_corrupt_board_without_traceback[guard]
+  ║ 2 failed, 22 passed in 45.83s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_core_functionality.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 39.0% |  5838/~14978 | ✓6247 | ✗ 850] ✓ tests/hermes_cli/test_kanban_host_cap.py (13✓, 25.9s)
+[ 39.0% |  5841/~14978 | ✓6250 | ✗ 850] ✓ tests/hermes_cli/test_kanban_list_undecodable_text.py (3✓, 8.2s)
+[ 39.0% |  5844/~14978 | ✓6254 | ✗ 850] ✓ tests/hermes_cli/test_kanban_lifecycle_hooks.py (4✓, 11.0s)
+[ 39.0% |  5845/~14978 | ✓6256 | ✗ 850] ✓ tests/hermes_cli/test_kanban_managed_result_pid.py (2✓, 7.2s)
+[ 39.1% |  5856/~14978 | ✓6267 | ✗ 850] ✓ tests/hermes_cli/test_kanban_memory_guard.py (11✓, 16.1s)
+[ 39.2% |  5868/~14978 | ✓6279 | ✗ 850] ✓ tests/hermes_cli/test_kanban_owner_lost_budget.py (12✓, 17.2s)
+[ 39.2% |  5870/~14978 | ✓6281 | ✗ 850] ✓ tests/hermes_cli/test_kanban_per_profile_cap.py (2✓, 7.5s)
+[ 39.2% |  5874/~14978 | ✓6285 | ✗ 850] ✓ tests/hermes_cli/test_kanban_parent_reopen_invalidation.py (4✓, 12.0s)
+[ 39.2% |  5877/~14978 | ✓6288 | ✗ 850] ✓ tests/hermes_cli/test_kanban_project_link.py (3✓, 5.9s)
+
+real	24m10,037s
+user	85m44,848s
+sys	7m45,525s
+EXIT=124
