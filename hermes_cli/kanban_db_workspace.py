@@ -496,9 +496,10 @@ def _preserve_scratch_workspace(
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
-    so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
-    only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    so cleanup never blocks completion. ``scratch`` is removed unless it holds
+    git work that exists nowhere else (:func:`_preserve_scratch_workspace`);
+    ``worktree`` only when provably free of work (clean tree, every commit
+    reachable from a remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
