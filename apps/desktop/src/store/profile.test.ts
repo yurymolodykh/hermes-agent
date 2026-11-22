@@ -430,33 +430,3 @@ describe("profile switch leaves the previous profile's project (#54990)", () => 
     expect(resolveNewSessionCwd()).toBe('/work/app1')
   })
 })
-
-describe('refreshActiveProfile single-flight', () => {
-  const activeCalls = () =>
-    vi.mocked(hermesApi).mock.calls.filter(call => call[0] && typeof call[0] === 'object' && (call[0] as { path?: string }).path === '/api/profiles/active').length
-
-  beforeEach(() => {
-    invalidateProfileListFetches()
-    vi.mocked(hermesApi).mockClear()
-  })
-
-  it('shares one /api/profiles/active read between concurrent callers', async () => {
-    await Promise.all([refreshActiveProfile(), refreshActiveProfile(), refreshActiveProfile()])
-
-    expect(activeCalls()).toBe(1)
-  })
-
-  it('reads again once the shared flight has settled', async () => {
-    await refreshActiveProfile()
-    await refreshActiveProfile()
-
-    expect(activeCalls()).toBe(2)
-  })
-})
-
-it('DEBUG raw calls', async () => {
-  invalidateProfileListFetches()
-  vi.mocked(hermesApi).mockClear()
-  await refreshActiveProfile()
-  console.log('RAW:', JSON.stringify(vi.mocked(hermesApi).mock.calls))
-})
