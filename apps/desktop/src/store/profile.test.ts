@@ -29,7 +29,6 @@ vi.mock('@/store/gateway', () => ({
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
-  hermesApi: vi.fn(async () => ({ active: 'default', current: 'default' })),
   setApiRequestProfile: vi.fn()
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
@@ -43,7 +42,6 @@ const {
   newSessionInProfile,
   prewarmProfileBackend,
   prewarmProfilePick,
-  refreshActiveProfile,
   refreshProfiles,
   selectProfile
 } = await import('./profile')
@@ -55,7 +53,7 @@ const { $connectionsRegistry } = await import('@/store/connection-registry-state
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
-const { getProfiles, hermesApi } = await import('@/hermes')
+const { getProfiles } = await import('@/hermes')
 
 const profile = (name: string, isDefault = false): ProfileInfo => ({
   has_env: false,
