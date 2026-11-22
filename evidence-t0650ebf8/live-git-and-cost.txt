@@ -1,22 +1,17 @@
-<frozen site>:101: RuntimeWarning: Unexpected value in sys.prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_0650ebf8/../../.venv
-<frozen site>:101: RuntimeWarning: Unexpected value in sys.exec_prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_0650ebf8/../../.venv
 === часть 1: git-worktree ===
-порог сработал: True, время: 25.7 мс
+порог сработал: True, время: 39.9 мс
 refs/hermes-wip/: ['refs/hermes-wip/t_probe_git']
 содержимое mid.py в ref: 'partial = True\n'
-HEAD не сдвинут: 235eca59b30d
+HEAD не сдвинут: 63cbaf16a3ff
 mid.py остался в рабочем дереве: True
-каталог архивов: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-git-es4gxrw4/kanban-home/kanban/attachments/t_probe_git существует: False
+каталог архивов: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-git-nhygx_pa/kanban-home/kanban/attachments/t_probe_git существует: False
 tar-архивов: []
 напоминание называет ref: True
 напоминание НЕ упоминает архив: True
 
 === часть 2: стоимость архива на большом дереве ===
-файлов=200 исходно=0.8 МБ -> архив=0.01 МБ за 51 мс
-файлов=2000 исходно=4.0 МБ -> архив=0.05 МБ за 444 мс
-файлов=5000 исходно=5.0 МБ -> архив=0.12 МБ за 815 мс
+файлов=200 исходно=0.8 МБ -> архив=0.01 МБ за 44 мс
+файлов=2000 исходно=4.0 МБ -> архив=0.05 МБ за 455 мс
+файлов=5000 исходно=5.0 МБ -> архив=0.12 МБ за 816 мс
 
-PROBE_HOME=/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-git-es4gxrw4
-файлов=100 несжимаемых=10 МБ -> архив=10 МБ за 1973 мс
-файлов=1000 несжимаемых=102 МБ -> архив=103 МБ за 8078 мс
-файлов=2000 несжимаемых=1024 МБ -> архив=210 МБ за 11746 мс
+PROBE_HOME=/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-git-nhygx_pa

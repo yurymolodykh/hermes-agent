@@ -248,6 +248,7 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
         serial += 1
         target = out_dir / f"wip-{stamp}-{serial}.tar.gz"
     total = 0
+    complete = True
     try:
         with tarfile.open(target, "w:gz") as tar:
             for rel in paths:
@@ -256,15 +257,19 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
                     continue
                 total += src.stat().st_size
                 if total > _ARCHIVE_MAX_BYTES:
+                    complete = False
                     break
                 tar.add(src, arcname=rel, recursive=False)
     except (OSError, tarfile.TarError):
         target.unlink(missing_ok=True)
         return None
-    try:
-        (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
-    except OSError:
-        pass
+    if complete:
+        # A truncated archive is not this tree's copy: recording its fingerprint
+        # would make the next unchanged call reuse it and drop the rest forever.
+        try:
+            (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
+        except OSError:
+            pass
     return str(target)
 
 
