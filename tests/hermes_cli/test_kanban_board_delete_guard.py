@@ -126,7 +126,7 @@ def test_hard_delete_refuses_and_keeps_unsaved_scratch_work(fresh_home):
 
 
 def test_hard_delete_with_force_reports_what_it_discards(fresh_home):
-    task_id, ws = _board_with_scratch_task("forceboard", unsaved=True)
+    _task_id, ws = _board_with_scratch_task("forceboard", unsaved=True)
 
     res = kb.remove_board("forceboard", archive=False, force=True)
 
@@ -159,7 +159,7 @@ def test_force_on_a_clean_board_reports_nothing(fresh_home):
 
 def test_archive_rename_path_is_unchanged(fresh_home):
     """The default (archive) path moves the tree, so preserved work travels with it."""
-    task_id, ws = _board_with_scratch_task("archboard", unsaved=True)
+    task_id, _ws = _board_with_scratch_task("archboard", unsaved=True)
 
     res = kb.remove_board("archboard", archive=True)
 
