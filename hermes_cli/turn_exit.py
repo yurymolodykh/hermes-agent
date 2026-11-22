@@ -87,13 +87,27 @@ def credential_failure_flags(exc) -> dict:
 
     Same predicates as the one-shot CLI's ``_ensure_runtime_credentials``: a quota/rate-limit
     ``AuthError`` is transient, only an explicit re-authentication requirement is terminal. The
-    cause chain is walked because agent construction wraps the resolver's error."""
+    cause chain is walked because agent construction wraps the resolver's error.
+
+    ``KeyPoolSlotBusy`` (every per-card key occupied) is transient for the same reason a quota
+    wall is: the card never started, and its work is still owed. It maps to the CONFIGURATION
+    exit (75, EX_TEMPFAIL) so the dispatcher requeues it with no failure counted; a plain
+    ``KeyPoolError`` (pool not in force, key rejected mid-run) stays a crash, since a retry
+    cannot heal it."""
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
+        if _is_key_pool_slot_busy(exc):
+            return {"credentials_rate_limited": True, "credentials_terminal": False}
         if isinstance(exc, AuthError):
             return {"credentials_rate_limited": is_rate_limited_auth_error(exc),
                     "credentials_terminal": bool(exc.relogin_required)}
         exc = exc.__cause__ or exc.__context__
     return {}
+
+
+def _is_key_pool_slot_busy(exc) -> bool:
+    """True when *exc* is the key pool's "every card key is taken" wait state."""
+    from agent.kanban_key_pool import KeyPoolSlotBusy
+    return isinstance(exc, KeyPoolSlotBusy)

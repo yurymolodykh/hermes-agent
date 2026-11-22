@@ -157,7 +157,12 @@ def test_owner_lost_never_trips_the_breaker_even_repeatedly(board):
 
 
 def test_a_plain_crash_still_counts_and_trips_at_the_limit(board):
-    """The exemption is narrow: a real crash keeps the documented retry budget."""
+    """The exemption is narrow: a real crash keeps the documented retry budget.
+
+    It trips the breaker — and since the cause is the card's own run, the trip
+    continues the card instead of parking it (``kanban.auto_continue``). The
+    counter, not the status, is what proves the budget was spent.
+    """
     conn, _ = board
     _dead_run(conn, "t_crash", 1)
     kbd.detect_crashed_workers(conn)
@@ -165,8 +170,28 @@ def test_a_plain_crash_still_counts_and_trips_at_the_limit(board):
 
     _dead_run(conn, "t_crash", 1)
     kbd.detect_crashed_workers(conn)
-    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", None) == ["t_crash"]
-    assert _state(conn, "t_crash")["status"] == "blocked"
+    state = _state(conn, "t_crash")
+    assert int(state["consecutive_failures"]) == kbd.DEFAULT_FAILURE_LIMIT
+    assert state["status"] == "ready", "a card-internal trip continues the work"
+    kinds = [e.kind for e in kb.list_events(conn, "t_crash")]
+    assert "auto_continued" in kinds and "gave_up" not in kinds
+
+
+def test_a_plain_crash_blocks_when_auto_continue_is_disabled(board, monkeypatch):
+    """With ``kanban.auto_continue: false`` the documented old behaviour returns."""
+    from hermes_cli import kanban_auto_continue as kac
+
+    monkeypatch.setattr(
+        kac, "resolve_settings", lambda: kac.AutoContinueSettings(enabled=False, max_splits=2),
+    )
+    conn, _ = board
+    _dead_run(conn, "t_crash_off", 1)
+    kbd.detect_crashed_workers(conn)
+    _dead_run(conn, "t_crash_off", 1)
+    kbd.detect_crashed_workers(conn)
+
+    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", None) == ["t_crash_off"]
+    assert _state(conn, "t_crash_off")["status"] == "blocked"
 
 
 # --- 3. the checkpoint the submitter leaves behind ---------------------------------------------

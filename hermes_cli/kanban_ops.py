@@ -40,6 +40,34 @@ def _poll_loop(interval: float, tick) -> int:
         return 0
 
 
+def _resolve_failure_limit(cli_value, config_value) -> int:
+    """``--failure-limit`` > ``kanban.failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
+
+    A CLI flag is the more explicit signal; the config is what the operator
+    actually wrote in ``config.yaml``; the module default is the last resort.
+    Values below 1 fall through, matching the gateway's own sanity floor.
+    """
+    for candidate in (cli_value, config_value):
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value >= 1:
+            return value
+    return kbd.DEFAULT_FAILURE_LIMIT
+
+
+def _kanban_failure_limit_setting():
+    """``kanban.failure_limit`` from config, or None when unreadable/unset.
+
+    Reads through :func:`_kanban_config`, the same loader the gateway uses, so
+    the CLI dispatch path and the gateway see the SAME threshold; a local
+    default here is what made ``hermes kanban dispatch`` run at 2 while
+    ``config.yaml`` said 3.
+    """
+    return _kanban_config().get("failure_limit")
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -59,8 +87,11 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
+    # kanban.max_in_progress_per_profile, kanban.max_spawn and
+    # kanban.failure_limit with the same semantics as the gateway dispatch path.
+    # ``--failure-limit`` stays an explicit opt-in: its parser default (None
+    # below) must not mask the config the way a hardcoded DEFAULT_FAILURE_LIMIT
+    # did — that silently ran this path at 2 while config.yaml said 3.
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
@@ -78,16 +109,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        failure_limit = _resolve_failure_limit(
+            getattr(args, "failure_limit", None), _kanban_cfg.get("failure_limit"),
+        )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        failure_limit = _resolve_failure_limit(getattr(args, "failure_limit", None), None)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            failure_limit=failure_limit,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
@@ -263,7 +298,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         kbd.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            failure_limit=_resolve_failure_limit(
+                getattr(args, "failure_limit", None), _kanban_failure_limit_setting(),
+            ),
             on_tick=_on_tick,
         )
     finally:

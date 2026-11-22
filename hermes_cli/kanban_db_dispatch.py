@@ -27,6 +27,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli import kanban_db_capacity as _kbcap
+from hermes_cli import kanban_auto_continue as _kac
 from hermes_cli import kanban_db_worker_env as _kbenv
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -173,6 +174,13 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    auto_split: list[str] = field(default_factory=list)
+    """Cards this tick split into child cards after burning their retry counter
+    twice in one generation (``kanban.auto_continue``)."""
+    auto_split_failed: list[str] = field(default_factory=list)
+    """Cards whose split could not be produced (no auxiliary LLM client, API
+    error, malformed reply). They went back into work with an ``auto_continued``
+    event carrying the reason — never blocked, never losing their workspace."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -1551,44 +1559,27 @@ def _record_task_failure(
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
-        conn.execute(
-            "UPDATE tasks SET status = 'blocked', "
-            + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-               if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+        # state; the timeout/crash path already did. An exhausted counter is NOT
+        # automatically a human's problem: a card-internal cause continues the
+        # card, and a second burn splits it (kanban_auto_continue).
+        plan = _kac.plan_for_trip(
+            conn, task_id,
+            outcome=outcome,
+            extra=event_payload_extra,
+            failures=failures,
+            effective_limit=effective_limit,
+            limit_source=limit_source,
+            force_trip=force_trip,
+            retry_status=retry_status,
         )
-        payload = {
-            "failures": failures,
-            "effective_limit": effective_limit,
-            "limit_source": limit_source,
-            "error": error,
-            "trigger_outcome": outcome,
-            "retry_status": retry_status,
-        }
-        run_id = None
-        if end_run:
-            # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
-            )
-        if force_trip:
-            # The caller applied its own bounded policy, so the counter cannot
-            # judge this block: ``recompute_ready`` holds it for an operator.
-            payload["sticky"] = True
-        if event_payload_extra:
-            payload.update(event_payload_extra)
-        _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
-        return True
+        tripped = _kac.apply_trip(
+            conn, task_id, plan,
+            outcome=outcome, error=error, failures=failures,
+            effective_limit=effective_limit, limit_source=limit_source,
+            retry_status=retry_status, release_claim=release_claim, end_run=end_run,
+            extra=event_payload_extra, sticky=force_trip,
+        )
+        return tripped
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
@@ -2534,6 +2525,13 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # Cards whose retry counter burned twice in one generation wait for a split.
+    # OUTSIDE any write txn (the decomposer is an aux LLM call) and BEFORE the
+    # spawn budget is computed: a split moves the card to ``todo`` and its
+    # children to ``ready``, which changes what this tick can spawn. A dry run
+    # must not create child cards, so it skips the phase entirely.
+    if not dry_run:
+        result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

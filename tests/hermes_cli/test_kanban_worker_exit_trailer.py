@@ -103,10 +103,22 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
         assert kb.get_task(conn, tid).status == "ready"
 
 
-def test_plain_budget_trip_still_auto_recovers(kanban_home):
+def test_plain_budget_trip_still_auto_recovers(kanban_home, monkeypatch):
     """A unified-budget trip carries no ``sticky`` marker, so the two recovery paths on main
     survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
-    ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
+    ``assign_task`` to a fresh profile (counter reset by design) promotes it too.
+
+    Pinned to the ``kanban.auto_continue: false`` lifecycle: a plain budget trip only parks a
+    card at all on the opt-out path. Under the default the same trip continues the card
+    (``test_kanban_auto_continue.py``), which is precisely why the recovery paths below had to
+    keep working — they are the operator's escape hatch, not the only way back.
+    """
+    from hermes_cli import kanban_auto_continue as kac
+
+    monkeypatch.setattr(
+        kac, "resolve_settings",
+        lambda: kac.AutoContinueSettings(enabled=False, max_splits=2),
+    )
     with kbc.connect() as conn:
         tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
         for tid in tids:

@@ -728,7 +728,7 @@ def _failures(conn, task_id: str) -> int:
     ).fetchone()[0])
 
 
-def test_review_transitions_preserve_consecutive_failures(conn) -> None:
+def test_review_transitions_preserve_consecutive_failures(conn, monkeypatch) -> None:
     """M2 regression: review transitions neither reset nor increment the
     circuit-breaker counter.
 
@@ -736,7 +736,18 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     request_review -> request_changes -> re-request keeps the counter at 1;
     a crash after request_changes increments it to 2 and trips a
     failure_limit=2 breaker. Only complete_task's success path resets it.
+
+    The trip below is pinned to ``kanban.auto_continue: false``: that is the
+    lifecycle where an exhausted counter still means ``blocked``. Under the
+    default the same crash is continued (``auto_continued``) — the counter
+    assertions above and below hold either way, which is the point of the test.
     """
+    from hermes_cli import kanban_auto_continue as kac
+
+    monkeypatch.setattr(
+        kac, "resolve_settings",
+        lambda: kac.AutoContinueSettings(enabled=False, max_splits=2),
+    )
     task_id = kb.create_task(conn, title="flaky feature", assignee="builder")
     with kb.write_txn(conn):
         conn.execute(

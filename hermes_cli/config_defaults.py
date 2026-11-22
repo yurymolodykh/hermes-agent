@@ -1868,9 +1868,9 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
-        # Auto-subscribe the originating gateway/TUI session to completion + block events when
-        # kanban_create is called from a session with a persistent delivery channel. Disable for
-        # profiles that prefer explicit kanban_notify-subscribe calls per task.
+        # Auto-subscribe the originating session to completion + block events when kanban_create is
+        # called from a session with a persistent delivery channel. Disable for profiles that
+        # prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
         # Chat that receives status pings when a task is created outside any chat
         # context (bare shell, cron, worker without subscribers): "platform:chat_id".
@@ -1900,9 +1900,6 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
-        # Global cap: positive int = the HOST never has more than N tasks 'running' across all
-        # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
-        # MemTotal is unreadable (macOS/Windows) None means no cap.
         # Global concurrency cap (#33488): when set to a positive int, the HOST never has more than N tasks
         # in 'running' at once — counted across every active board and across both the ready and review
         # dispatch lanes (workers are OS processes sharing one machine's memory, so the cap bounds the
@@ -1912,11 +1909,8 @@ DEFAULT_CONFIG = {
         # cap. Set an explicit value to override the derived default in either direction.
         "max_in_progress": None,
         # Per-profile cap: positive int = no single profile runs more than N workers even if the
-        # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
-        # when fan-out would saturate one profile's model/API quota/browser pool.
-        # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
-        # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
-        # pool while leaving other profiles idle. See #21582.
+        # global caps allow; blocked tasks defer to the next tick. Unset (None) means "no per-profile
+        # cap" — backward-compatible; use it when fan-out would saturate one profile's quota. #21582
         "max_in_progress_per_profile": None,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
@@ -1930,6 +1924,12 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # A counter exhausted by a CAUSE OF THE CARD'S OWN (budget, max_runtime_seconds, a bare
+        # worker crash) continues the card; a second burn in the same generation splits it into
+        # child cards. False = the old blocked + gave_up. Max split generations per card; spent ->
+        # blocked with kind='needs_input' / reason='auto_continue_exhausted'. 0 = continue, then block.
+        "auto_continue": True,
+        "auto_continue_max_splits": 2,
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

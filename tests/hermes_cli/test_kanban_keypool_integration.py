@@ -193,6 +193,26 @@ def test_slot_probe_reserves_headroom_for_workers_spawned_this_tick(
     assert kbd._keypool_has_free_slot(reserve=2) is False
 
 
+def test_reserve_raises_the_slot_busy_subclass_when_every_key_is_taken(
+    kanban_home, monkeypatch, tmp_path, live_pid
+):
+    """The exhaustion branch must raise ``KeyPoolSlotBusy``, not a bare ``KeyPoolError``.
+
+    That subclass is the whole contract: ``gateway.session_kanban`` maps it to the transient
+    exit (75) so the dispatcher requeues the card without charging ``consecutive_failures``
+    (22.11.2026: a worker that never started still blocked the card). A plain
+    ``KeyPoolError`` — a pool that is not in force, a key rejected mid-run — deliberately
+    stays a crash, so the two must not collapse into one class.
+    """
+    kp = _pool(monkeypatch, tmp_path, card_keys=1)
+    kp.reserve_for_card("t_occupant", 1, pid=live_pid())
+    from agent.kanban_key_pool import KeyPoolSlotBusy
+
+    with pytest.raises(KeyPoolSlotBusy) as exc:
+        kp.reserve_for_card("t_contender", 2, pid=live_pid())
+    assert "no free card key slot" in str(exc.value)
+
+
 # ── startup exit contract ──────────────────────────────────────────────────
 
 

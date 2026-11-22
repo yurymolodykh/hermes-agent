@@ -1,54 +1,79 @@
-# PROGRESS — t_af262aaf (лимит итераций теряет готовую работу: сохранять до остановки)
+# PROGRESS — t_35fe5619 (исчерпан счётчик повторов: автопродолжение и авто-сплит)
 
-## Состояние: РАБОТА ЗАВЕРШЕНА И ЗАКОММИЧЕНА (код, 211 тестов, проба 32/32, база красная 16 LEAK)
+## Состояние: код завершён, линт/health чистые, целевые тесты зелёные. Идут широкий регресс и коммит.
 
-* Верхушка ветки: `3ab1936e05` (3 коммита над `0a1960695e`: код 9f7f8b581c, проба 08c4d6fbd4,
-  фикс линта пробы 3ab1936e05)
+* Ветка: `wt/t_35fe5619`, worktree `.worktrees/t_35fe5619`
+* База: `3bbf87774c` (HEAD ветки на старте попытки)
+* Модель/провайдер: `deepseek-v4-flash` / `letovo` (дефолт профиля, не подменялась)
 
-* Ветка: `wt/t_af262aaf`, worktree `.worktrees/t_af262aaf`
-* База: `0a1960695e`
-* Отчёт: `REPORT-budget-stop.md`
-* Проба: `verify-budget-stop-live.py` + `PROBE-budget-stop-output.txt` (32/32)
-  Красная база: `verify-budget-stop-baseline-red.py` (16/32, 16 LEAK на `0a1960695e`)
+> Прежнее содержимое этого файла относилось к карточке `t_af262aaf` (бюджет итераций) — оно
+> закоммичено там (`wt/t_af262aaf`, верхушка `3ab1936e05`, отчёт `REPORT-budget-stop.md`) и здесь
+> не нужно.
 
-### Что сделано
+### Что сделано (унаследовано от предыдущей попытки + доработано сейчас)
 
-1. **Сохранение до предела.** `agent/turn_iteration_prep.py` (85 %, было 0,9) пакует дерево
-   под `refs/hermes-wip/<task>` — без коммита в ветку. `agent/turn_finalizer.py::
-   _checkpoint_work_before_stop` на пределе коммитит содержательные файлы в ветку с темой
-   `WIP бюджет: N/N` ДО `_record_kanban_budget_exhausted`. Новый модуль
-   `agent/kanban_budget_checkpoint.py` (checkpoint_wip / preserve_wip_ref / card_workspace /
-   describe_stop), tar.gz-фолбэк в `task_attachments_dir` без git.
-2. **Честный статус.** `describe_stop` пишет «остановлено по бюджету N/N · работа в коммит X
-   (ветка B) · сохранено файлов: K (…) · осталось: …» в `last_failure_error` и в событие
-   `timed_out` (`budget_used/budget_max/stop_note`). Исправлено: `event_payload_extra` теперь
-   попадает и на нетрипнутую ветку `_record_task_failure`.
-3. **Размер карточки.** `agent/kanban_card_sizing.py`: `40 + 30 × пунктов приёмки`; бюджет из
-   конфига ПРОФИЛЯ-ИСПОЛНИТЕЛЯ; предупреждение в ответе `kanban_create` (`sizing_warning`).
-   Правило и замер (383 прогона, ловит 19 % остановов при 5 % ложных) записаны в навык
-   `kanban-card-sizing` (копии default + 01-orchestrator), раздел Р12 + раздел про чекпоинт.
-4. Вынос `describe_suppression` в `hermes_cli/kanban_db_suppression.py` — файл-фасад диспетчера
-   вырос на 6 строк и обязан уменьшаться (ratchet FILE_LINES).
+1. **Новый модуль `hermes_cli/kanban_auto_continue.py`** (564 стр.): `AutoContinueSettings`,
+   `resolve_settings` (читает `kanban.auto_continue` / `auto_continue_max_splits`),
+   `ineligible_reason` (классификация причины: своя причина карточки vs внешняя),
+   `plan_for_trip` (чистая функция решения: continue / split / block-exhausted),
+   `apply_trip` (запись статуса + события `auto_continued` / `auto_split`),
+   `run_split_phase` (сплит вне write-txn, вызов декомпозера), `pending_split_ids`.
+2. **`hermes_cli/kanban_db_dispatch.py`**: `_record_task_failure` больше не ставит `blocked`
+   напрямую — решение уходит в `_kac.plan_for_trip` / `_kac.apply_trip`. В
+   `_dispatch_once_locked` добавлена фаза `run_split_phase` (после reclaim/crash, ДО расчёта
+   spawn-бюджета; при `dry_run` не выполняется). `DispatchResult` получил поля
+   `auto_split` / `auto_split_failed`.
+3. **`hermes_cli/kanban_db_graph.py`**: `decompose_triage_task` принимает `source_statuses`
+   (по умолчанию `("triage",)`, для сплита — `("ready","todo","blocked")`) и `allow_redecompose`
+   (повторный сплит — новое поколение детей); проверка статуса остаётся optimistic-concurrency
+   стражем, не политикой.
+4. **`hermes_cli/kanban_decompose.py`**: путь сплита упавшей карточки (детерминированные дети при
+   недоступном aux-LLM, входные локаторы `PROGRESS.md` + отчёт родителя).
+5. **`hermes_cli/config_defaults.py`**: новые ключи `kanban.auto_continue: True`,
+   `kanban.auto_continue_max_splits: 2`.
+6. **П.8 критерия — устранено (сегодня).** Причина расхождения `config.yaml: failure_limit: 3`
+   против факта `effective_limit=2`: CLI-путь `hermes kanban dispatch` (и `kanban daemon`) передавал
+   в `dispatch_once` жёсткий `kbd.DEFAULT_FAILURE_LIMIT` (2), игнорируя `kanban.failure_limit`.
+   Добавлены `_resolve_failure_limit` (приоритет `--failure-limit` > `kanban.failure_limit` >
+   `DEFAULT_FAILURE_LIMIT`, значения <1 проваливаются) и `_kanban_failure_limit_setting`
+   в `hermes_cli/kanban_ops.py`; дефолты `--failure-limit` в `hermes_cli/kanban_parser.py`
+   переведены с `kbd.DEFAULT_FAILURE_LIMIT` на `None`, чтобы флаг стал явным opt-in.
+   Проверено вживую: при `HERMES_HOME=/home/hermes/.hermes` → `_kanban_failure_limit_setting()=3`,
+   `_resolve_failure_limit(None, 3)=3`, `_cmd_dispatch` передаёт 3. Gateway-путь читал конфиг верно
+   и раньше.
+7. **Ratchet `FILE_LINES`** по `config_defaults.py` устранён сжатием комментариев (3139→3138).
 
-### Проверки (все выполнены)
+### Тесты
 
-* 14 passed — новые наборы (`test_kanban_budget_wip_checkpoint`, `test_kanban_card_sizing`)
-* 101 passed — + финализатор/восстановление/handoff/env-provisioning
-* 96 passed, 1 skipped — канбан dispatch/db/closed-card/budget-warning
-* 1001 passed, 11 failed, 4 skipped — широкий канбан-прогон (118 файлов); те же 11 падают на базе
-* `code_health --base 0a1960695e`: 0 blocking, 0 advisory (10 файлов)
-* `ruff check` 10 файлов: All checks passed
-* Живая проба 32/32 OK; на базе 16/32 (16 LEAK)
+* `tests/hermes_cli/test_kanban_auto_continue.py` — **15 passed** (сценарии 1–6 + чистота `plan_*`).
+* `tests/hermes_cli/test_kanban_cli_failure_limit_config.py` — **5 passed** (новый, п.8).
+* `tests/hermes_cli/test_kanban_db.py` — 30 passed, 1 skipped (обновлён
+  `test_stale_claim_reclaim_without_spawn_counts_toward_breaker`: `ready` + `auto_continued`).
+* `tests/hermes_cli/test_kanban_owner_lost_budget.py` — обновлён + новый тест на `auto_continue: false`.
 
-### Ограничения
+### Проверки
 
-* Живой воркер с настоящим `agent.max_turns` не прогонялся: бюджет в пробе урезан программно.
-* Windows-путь не проверен (только Linux).
-* `manual_review`: увидеть коммит в `hermes kanban show` на реальном останове после перезапуска.
-* `agent.max_turns` не менял — часть 3 сдаёт правило, не числа.
+* `python -m scripts.code_health --base HEAD` → **0 blocking, 0 advisory** (8 файлов).
+* `ruff check` по всем изменённым файлам → **All checks passed** (1 автофикс сортировки `__all__`).
+* Известный шум окружения: `tests/hermes_cli/test_kanban_db.py` завершается ненулевым кодом из-за
+  `tests/home_io_guard.py`, ругающегося на путь тест-venv `~/.hermes/installs/.../site-packages`.
+  **Воспроизведено на базе (git stash → тот же отказ) — не регрессия этой карточки**; все 30 тестов
+  проходят.
+
+### Инцидент по пути (зафиксировано)
+
+`refs/stash` общий на весь репозиторий, поэтому `git stash pop` в этом worktree притянул чужой WIP
+карточки `t_afdf38ac` (`gateway/session_worker_construct.py`,
+`tests/gateway/test_named_route_applies_card_key.py`). Чужие файлы из моего дерева убраны
+(`git reset` + `git checkout --` + `rm`), чужой патч целиком сохранён в `stash@{1}` — ничего не
+потеряно. Стэши не удалял: они общие и могут понадобиться той карточке.
+**Урок: не пользоваться `git stash` в worktree при параллельных карточках; для проб базы брать
+`git worktree add` или `git show HEAD:<file>`.**
 
 ### Осталось
 
-1. Слияние в `feature/multiuser-access` — оркестратор (страж деревьев). Верхушка: `3ab1936e05`.
-2. `manual_review` после перезапуска шлюза: на реальном останове по бюджету в `hermes kanban show`
-   видно коммит и текст «остановлено по бюджету … осталось …».
+1. Широкий регресс по канбану + точечный коммит.
+2. Отчёт `REPORT-auto-continue.md` + живая проба.
+3. Отчёт о самопроверке по чек-листу ревьюера 09 — комментарием к карточке.
+4. `manual_review`: увидеть `auto_continued` / `auto_split` в `hermes kanban show` на реальном
+   прогоне после перезапуска шлюза.
