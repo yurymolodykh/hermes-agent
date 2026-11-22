@@ -108,10 +108,25 @@ def note_promotion(conn: sqlite3.Connection, task_id: str, *, author: str) -> bo
         return False
 
 
+def note_if_ready(
+    conn: sqlite3.Connection, task_id: str, status: str, *, author: str,
+) -> bool:
+    """Guard for callers that create a card in an arbitrary status.
+
+    A card born ``ready`` crosses no promotion, so the advisory — which hangs off
+    promotion — would miss exactly the population it exists for. Any other
+    status gets nothing: it will be advised when it is actually promoted.
+    """
+    if status != "ready":
+        return False
+    return note_promotion(conn, task_id, author=author)
+
+
 __all__ = [
     "SIZING_COMMENT_TAG",
     "comment_body",
     "has_sizing_comment",
+    "note_if_ready",
     "note_promotion",
     "promotion_note",
 ]
