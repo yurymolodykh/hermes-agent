@@ -304,3 +304,28 @@ def test_preserved_workspace_is_reported_on_the_card(kanban_home, origin_repo):
     # Serialized payload survives the round trip through SQLite as JSON.
     assert str(ws) in str(preserved[0].payload)
     assert preserved[0].payload["path"] == str(ws)
+
+
+def test_gc_does_not_delete_a_preserved_workspace(kanban_home, origin_repo):
+    """``kanban gc`` must not be the back door that destroys what completion kept."""
+    import argparse
+
+    from hermes_cli import kanban_ops
+
+    with kbc.connect() as conn:
+        task_id, ws = _scratch_task(conn)
+        repo = _clone_into(origin_repo, ws / "clone")
+        (repo / "work.txt").write_text("x\n", encoding="utf-8")
+        _git("add", "work.txt", cwd=repo)
+        _git("commit", "-m", "unpushed", cwd=repo)
+        kb.complete_task(conn, task_id, result="done")
+        assert kb.archive_task(conn, task_id)
+        assert repo.is_dir(), "completion must already have preserved it"
+
+        rc = kanban_ops._cmd_gc(
+            argparse.Namespace(event_retention_days=0, log_retention_days=0)
+        )
+        assert rc == 0
+        assert repo.is_dir(), "gc reaped a workspace holding unsaved git work"
+        assert (repo / "work.txt").exists()
+
