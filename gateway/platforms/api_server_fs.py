@@ -103,6 +103,22 @@ async def _owned_session(session_id: Optional[str], profile: Optional[str]) -> O
     return await get_session_detail(session_id, cast("Any", None), profile=profile)
 
 
+def _refuse_credential_path(target) -> None:
+    """Refuse a credential tree this listener must never hand out as bytes.
+
+    The panel's own read guard is a basename denylist (``.env``, ``auth.json``, the HERMES_HOME
+    credential stores), which leaves a private key under ``~/.ssh`` or ``~/.aws`` readable. This
+    platform is a network surface — the same one the chat runs its turns on — so it also applies
+    the gateway's outbound credential denylist (``gateway.platforms.base``, the guard every native
+    media upload already passes), which denies those home subdirectories and the system prefixes.
+    """
+    from fastapi import HTTPException
+    from gateway.platforms import base
+
+    if base._path_under_denied_prefix(base._resolve_path(target, strict=True) or target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+
+
 def _session_param(request: web.Request) -> Optional[str]:
     return request.query.get("session_id")
 
@@ -162,6 +178,7 @@ async def _download(adapter, request: web.Request) -> web.StreamResponse:
     target = await panel._fs_download_path(path, profile, session_id, session=session)
     panel._hosted_fs_read_guard(target, request)
     target, st = panel._fs_regular_file(target, panel._fs_profile_home(profile))
+    _refuse_credential_path(target)
     await asyncio.to_thread(panel._refuse_live_database, target)
     if st.st_size > _MANAGED_FILE_MAX_BYTES:
         return _too_large()
@@ -198,6 +215,7 @@ async def _data_url(adapter, request: web.Request) -> web.StreamResponse:
     if not await asyncio.to_thread(panel._is_host_file, str(target), profile):
         panel._hosted_fs_read_guard(target, request)
     target, st = panel._fs_regular_file(target, panel._fs_profile_home(profile))
+    _refuse_credential_path(target)
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         return _too_large()
     # A transcript image is read again on every remount: let an unchanged file cost a 304.

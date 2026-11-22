@@ -1,0 +1,27 @@
+OK   adapter started on 127.0.0.1:8649
+OK   download 200 — status=200
+OK   download exact size — 2988017 bytes
+OK   download sha256 — 5e754cc223dc9c4d…
+OK   download Content-Disposition attachment — attachment; filename*=UTF-8''SNO-economics-report-2026-11-13.html
+OK   download Content-Type — text/html
+OK   HEAD 200 with Content-Length — 200 2988017
+OK   read-data-url 200 — status=200
+OK   read-data-url sha256 matches — 5e754cc223dc9c4d…
+OK   read-data-url prefix — data:text/html;base64
+API server rejected invalid API key: remote='127.0.0.1' peer_ip='127.0.0.1' method='GET' path='/api/fs/download?path=/home/hermes/win-transfer/deliver-2111/SNO-economics-report-2026-11-13.html' user_agent='Python/3.14 aiohttp/3.14.5'
+OK   no token -> 401 — status=401
+OK   missing path -> 404 with detail — 404 {'detail': 'File not found'}
+OK   sensitive .env -> 403 — status=403
+OK   credential key -> 403 — status=403
+OK   credential dir config -> 403 — status=403
+OK   outside locked root -> 403 — 403 {'detail': 'Path is outside the managed read boundary'}
+OK   over the size ceiling -> 413 — 413 {'detail': 'File too large'}
+OK   own session_id -> 200 same bytes — status=200
+OK   unknown session_id -> 404 — 404 {'detail': 'Session not found'}
+OK   own session_id data-url -> 200 same bytes — status=200
+OK   (info) session key known — agent:main:a…
+OK   unknown profile -> 404 — status=404
+OK   no write route under /api/fs
+OK   registered read surface — GET /api/fs/download,GET /api/fs/read-data-url,HEAD /api/fs/download,HEAD /api/fs/read-data-url
+
+24/24 checks passed

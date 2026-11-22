@@ -137,6 +137,26 @@ async def test_download_refuses_a_sensitive_file(client, home):
 
 
 @pytest.mark.asyncio
+async def test_download_refuses_a_credential_home_tree(client, tmp_path, monkeypatch):
+    """A network listener does not hand out ``~/.ssh``/``~/.aws`` even where the panel's basename
+    denylist alone would: the gateway's outbound credential denylist applies too."""
+    import os
+    import pathlib
+
+    key = tmp_path / ".ssh" / "id_ed25519"
+    key.parent.mkdir()
+    key.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+    assert os.path.expanduser("~") == str(tmp_path)
+
+    for route in ("/api/fs/download", "/api/fs/read-data-url"):
+        response = await client.get(route, params={"path": str(key)}, headers=AUTH)
+        assert response.status == 403, route
+
+
+@pytest.mark.asyncio
 async def test_download_refuses_a_path_outside_the_locked_root(client, home, monkeypatch):
     """With a managed files root configured, a path outside it is the panel's 403."""
     root = home / "managed"
