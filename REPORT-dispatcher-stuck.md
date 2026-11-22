@@ -1,6 +1,6 @@
 # t_30b89c61 — `kanban dispatcher stuck`: механизм, правка, доказательства
 
-Дата: 22.11.2026, 02:35–04:10 МСК. Ветка карточки `wt/t_30b89c61`, верхушка **`1f3dd09424`**.
+Дата: 22.11.2026, 02:35–04:10 МСК. Ветка карточки `wt/t_30b89c61`, верхушка **`5da2c4c3f5`**.
 Рабочий каталог доказательств: `/home/hermes/.hermes/kanban/workspaces/t_30b89c61/evidence/`.
 
 ---
@@ -89,11 +89,13 @@ AFTER  repo      18ee183313  capacity_bound_present=True
 (прод), запрос к базе с выводом — `evidence/mechanism-db-query.txt`.
 
 ### (б) Коммит и публикация — частично, нужен оркестратор
-Верхушка ветки карточки: **`1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4`**.
+Верхушка ветки карточки: **`5da2c4c3f5444c82872f476892c4965d1d6dc6c3`**.
 Локальная = удалённая (`refs/heads/wt/t_30b89c61` в `ours`):
 ```
-LOCAL =1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4
-REMOTE=1f3dd09424be7e4ceab235b9fb7c303d2a58f6b4
+$ git rev-parse HEAD
+5da2c4c3f5444c82872f476892c4965d1d6dc6c3
+$ git ls-remote ours refs/heads/wt/t_30b89c61
+5da2c4c3f5444c82872f476892c4965d1d6dc6c3	refs/heads/wt/t_30b89c61
 ```
 Слияние в `ours/feature/multiuser-access` **не делалось**: страж деревьев
 (`bin/card-tree-guard.py`) блокирует это карточке, по постановке слияние делает оркестратор.
@@ -138,7 +140,7 @@ real_stall (слот свободен, спавна нет)    = 0
 
 ```
 BEFORE 6308ff67cc (прод) : passed=484 failed=51  absent_files=2
-AFTER  1f3dd09424 (правка): passed=501 failed=52 absent_files=0
+AFTER  eda4feff3f (правка): passed=501 failed=52 absent_files=0
 DELTA: passed +17
 ```
 
@@ -158,7 +160,7 @@ DELTA: passed +17
 
 ## 4. Что осталось человеку/оркестратору
 
-1. **Слияние** `wt/t_30b89c61` (`1f3dd09424`) в `ours/feature/multiuser-access` — страж деревьев
+1. **Слияние** `wt/t_30b89c61` (`5da2c4c3f5`) в `ours/feature/multiuser-access` — страж деревьев
    запрещает это карточке. Конфликтов не ожидается: 5 коммитов, из них правка — 2 файла кода
    + 2 файла тестов, остальное — merge актуального `ours`.
 2. **Рестарт шлюза** после слияния (карточке запрещён). Без рестарта прод продолжает слать
