@@ -170,26 +170,33 @@ def _configured_limit() -> int | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-config", action="store_true",
+                        help="omit kanban.failure_limit entirely: expect DEFAULT_FAILURE_LIMIT")
     args = parser.parse_args()
 
-    root = _bootstrap()
+    root = _bootstrap(None if args.no_config else 3)
     kac, kb, kbc, kbd = _load()
+    expected = kbd.DEFAULT_FAILURE_LIMIT if args.no_config else 3
     kb.init_db()
     conn = kbc.connect()
-    out: dict = {"temp_root": str(root), "config_failure_limit": _configured_limit(),
+    out: dict = {"temp_root": str(root), "expected_effective_limit": expected,
+                 "config_failure_limit": _configured_limit(),
                  "default_failure_limit": kbd.DEFAULT_FAILURE_LIMIT, "results": []}
     try:
         out["results"].append(_timeout_path(conn, kb, kac, kbd, variant="A: config only"))
         out["results"].append(_timeout_path(conn, kb, kac, kbd,
                                             variant="B: per-task max_retries=3",
                                             per_task_retries=3))
-        out["results"].append(_timeout_path(conn, kb, kac, kbd,
-                                            variant="C: dispatch_once(failure_limit=3)",
-                                            dispatch_limit=3))
+        # With no config the per-task variant still pins 3, so it is skipped there.
+        if not args.no_config:
+            out["results"].append(_timeout_path(conn, kb, kac, kbd,
+                                                variant="C: dispatch_once(failure_limit=3)",
+                                                dispatch_limit=3))
         out["results"].append(_crash_path(conn, kb, kac, kbd, variant="A: config only"))
-        out["results"].append(_crash_path(conn, kb, kac, kbd,
-                                          variant="C: dispatch_once(failure_limit=3)",
-                                          dispatch_limit=3))
+        if not args.no_config:
+            out["results"].append(_crash_path(conn, kb, kac, kbd,
+                                              variant="C: dispatch_once(failure_limit=3)",
+                                              dispatch_limit=3))
     finally:
         conn.close()
 
@@ -198,11 +205,17 @@ def main() -> int:
     else:
         print(f"config kanban.failure_limit = {out['config_failure_limit']}")
         print(f"DEFAULT_FAILURE_LIMIT      = {out['default_failure_limit']}")
+        print(f"expected effective_limit   = {expected}")
         for r in out["results"]:
             print(f"  {r['path']:8s} {r['variant']:40s} -> "
                   f"effective_limit={r['effective_limit']} source={r['limit_source']} "
                   f"failures={r['failures']}")
-    ok = all(r["effective_limit"] == 3 for r in out["results"])
+    if args.no_config:
+        # No config must book the module default on the dispatcher paths.
+        checked = [r for r in out["results"] if r["limit_source"] == "dispatcher"]
+        ok = bool(checked) and all(r["effective_limit"] == expected for r in checked)
+    else:
+        ok = all(r["effective_limit"] == expected for r in out["results"])
     return 0 if ok else 1
 
 

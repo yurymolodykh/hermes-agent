@@ -1,54 +1,48 @@
-# PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
+# PROGRESS — t_63278be8: Д-1 `failure_limit` в sweep'ах, Д-2 сплит вне dispatch-lock
 
-## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
+## Состояние: код и тесты готовы, доказательства сняты. Остались `REPORT-fixes.md`, самопроверка, коммит и передача.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
-* База для сравнения: `beeb9623539`
-* Содержимое правки = `git diff beeb9623539`
-* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_63278be8`, ветка `wt/t_63278be8`
+* База: ветка `t_4cb8f83b` (merge `3b7eda61838e`)
+* Свой venv: `.venv` (site-packages скопированы из общего дерева: `pip install` без сети не идёт,
+  а пробы/тесты требуют `pytest` + `ruamel.yaml`)
+* ВНИМАНИЕ: наследуется `HERMES_DELEGATED_CHILD_CONTEXT` — он делает всё под `~/.hermes` read-only.
+  Пробы обязаны его снимать, иначе `sqlite3.OperationalError: unable to open database file`.
 
 ## Сделано
 
-### Патч 1 — класс `owner_unavailable` (PR #152921, перенос по смыслу, не `git apply`)
+### Д-1 — `kanban.failure_limit` доходит до путей таймаута и краха
 
-* `hermes_state_errors.py:99-103` — `PERSISTENCE_ERROR_CAUSES` += `"owner_unavailable"` (перед `"unknown"`).
-* `hermes_state_errors.py` — `_PERSISTENCE_CAUSE_BY_PHRASE` += `(("owner_unavailable",), …)` и
-  `(("worker_receipt_timeout",), "owner_unavailable")`, **после** `foreign key constraint failed` и
-  **перед** `_PERMISSION_MARKERS`; комментарий PR сохранён (фраза, не тип; RPC теряет тип; импорт
-  фасада воркера инвертировал бы зависимость листового модуля).
-* Докстринг `classify_persistence_error` дополнен.
-* `agent/turn_explainers.py:53-56` — `_PERSISTENCE_CAUSES` += `"owner_unavailable"` + комментарий.
-* `locales/*.yaml` — 17 файлов, ключ `explainer.persistence.owner_unavailable` после `turn_lease`.
-* `tests/agent/test_turn_completion_explainer.py` — 3 новых теста (+параметризация).
+* `enforce_max_runtime(..., failure_limit=DEFAULT_FAILURE_LIMIT)` → `_record_task_failure(..., failure_limit=...)`
+* `_account_crashes(..., failure_limit=DEFAULT_FAILURE_LIMIT)` → оба вызова `_record_task_failure`
+* `detect_crashed_workers(..., failure_limit=...)` → `_account_crashes`
+* `_run_reclaim_phase` передаёт лимит в оба sweep'а
+* Дефолт оставлен `DEFAULT_FAILURE_LIMIT`: без конфига поведение не менялось (проба `--no-config`)
 
-### Патч 2 — уборщик не убивает живых воркеров (issue #157057, диффа нет)
+### Д-2 — сплит вынесен из-под блокировки диспетчера (вариант 1)
 
-* `hermes_cli/kanban_db_dispatch.py::_reap_terminal_worker_row` — перед сигналом проба
-  `_worker_alive(pid, fingerprint)`; живой → `_log.debug` + `return` (строка остаётся в выборке);
-  мёртвый → снятие улик. Ветка сигнала удалена.
-* Докстринги `reap_terminal_workers` и `DispatchResult.reaped_terminal_workers` приведены к факту.
-* `tests/hermes_cli/test_kanban_terminal_worker_reaper.py` — 5 тестов переписаны под контракт.
-* `website/docs/user-guide/features/kanban.md:138` — описание диспетчера обновлено.
+* Новый модуль `hermes_cli/kanban_db_dispatch_split.py`: `run_split_before_tick` (сплит без
+  dispatch-lock, под своим неблокирующим `.split.lock`) + `run_tick` (сплит → затем один
+  `_dispatch_once_locked` под `_dispatch_tick_lock`)
+* `_dispatch_once_locked` больше не вызывает `run_split_phase`; комментарий-указатель оставлен
+* `kanban_db_connect._dispatch_split_lock` — отдельный `.split.lock` (flock, неблокирующий)
+* `dispatch_once` делегирует в `_kbdsp.run_tick`; докстринг описывает порядок и причину
+* Сплит идёт ДО тика намеренно: сплит переводит сгоревшую карточку в `todo`, детей в `ready` —
+  именно это тик должен заспавнить
 
-Не тронуто: `TERMINAL_WORKER_REAP_GRACE_SECONDS`, `reclaim`-логика, `_terminate_reclaimed_worker`,
-`enforce_max_runtime`, `kanban_auto_continue.py`, `kanban_profile_scope.py`, пороги ретраев.
+## Проверки (сняты)
 
-## Проверки (все сняты)
+* `tests/hermes_cli/test_kanban_failure_limit_sweeps.py` + `test_kanban_split_outside_dispatch_lock.py`:
+  **6 passed**; на базе `3b7eda61838e` — **4 failed** (красная база доказана,
+  `evidence-t63278be8/tests-base-3b7eda61838e.log`)
+* Проба Д-1 (`evidence-t63278be8/probe_fl_exact.py`): патч — все 5 вариантов `effective_limit=3`;
+  база — A=2, B=3, C=2, crash A=2, crash C=2 (ровно как в вердикте)
+* Проба Д-2 (`evidence-t63278be8/probe_split_two_process.py`): патч — `parent_skipped_locked=false`,
+  `spawned_during_split=true`, тик 0.42 с при декомпозере 6 с, 2 вызова сплита на 2 тика;
+  база — `parent_skipped_locked=true`, `spawned_during_split=false`
 
-* reaper-тесты: 5 passed; на базе — 2 failed (красная база доказана).
-* explainer-тесты: 34 passed; на базе 4 новых падают (`-k owner`).
-* reaper + explainer + outbox: 61 passed.
-* Смежные наборы состояния: 109 passed, 7 skipped.
-* `ruff check` — All checks passed. `code_health --base beeb9623539` — 0 blocking, 0 advisory.
-* По-файлово `tests/hermes_cli/*kanban*` (99 файлов): база 17 FAIL / 82 PASS, патч 16 FAIL / 83 PASS;
-  `diff` наборов = единственная строка `test_kanban_terminal_worker_reaper.py`.
-* `tests/hermes_state` по-файлово: 134 падающих файла, все предсуществующие (страж
-  `home_io_guard.py:160` ругается на путь worktree; выборка 12 файлов даёт одинаковые числа на
-  базе и с правкой).
+## Следующий шаг
 
-## Следующий шаг для будущей попытки
-
-1. `git add -A && git commit` сообщением с номером карточки (t_4cb8f83b), затем
-   `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
-   `REPORT-patches.md`, `evidence-t4cb8f83b/`.
-2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.
+1. `REPORT-fixes.md` (Д-1/Д-2/Д-3/Д-4/Д-5 + выбор варианта Д-2 + непроверенное)
+2. Прогон по-файлово `tests/hermes_cli/*kanban*` база vs патч, `ruff`, `code_health`
+3. `kanban_comment` — самопроверка по чек-листу 09; `kanban_complete` с artifacts

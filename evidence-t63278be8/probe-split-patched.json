@@ -1,8 +1,15 @@
 {
- "slowed_decomposer_seconds": 6.0,
- "skipped_locked": false,
+ "temp_root": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-split-0x533cem",
+ "slow_decomposer_seconds": 6.0,
+ "parent_tick_seconds": 0.45,
+ "parent_skipped_locked": false,
+ "parent_spawned": [
+  "t_57b3090e"
+ ],
  "spawned_during_split": true,
- "tick_elapsed_seconds": 0.54,
- "split_calls_per_tick": 1,
- "second_tick_skipped_locked": false
+ "child": {
+  "child_tick_seconds": 6.37,
+  "child_skipped_locked": false
+ },
+ "split_calls_for_two_ticks": 2
 }
