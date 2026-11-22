@@ -307,6 +307,31 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     expect(vi.mocked(getProfiles)).toHaveBeenCalledTimes(3)
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'test1'])
   })
+
+  it('keeps the previous array identity when a re-read returns identical rows', async () => {
+    // /api/profiles answers a FRESH array every read; publishing it as-is re-ran
+    // every consumer effect. In the Webapp that includes useUnservedProfiles,
+    // whose effect reads the served-profile roster (/api/profiles +
+    // /api/gateway-connections + /api/status) — so an unchanged list multiplied
+    // one background read into four requests on an idle tab.
+    const rows = [profile('default', true), profile('healthops')]
+    $profiles.set(rows)
+    vi.mocked(getProfiles).mockResolvedValueOnce({ profiles: rows.map(row => ({ ...row })) })
+    await refreshProfiles()
+
+    expect($profiles.get()).toBe(rows)
+  })
+
+  it('publishes a new array when the rows actually changed', async () => {
+    const rows = [profile('default', true), profile('healthops')]
+    $profiles.set(rows)
+    vi.mocked(getProfiles).mockResolvedValueOnce({ profiles: [profile('default', true)] })
+
+    await refreshProfiles()
+
+    expect($profiles.get()).not.toBe(rows)
+    expect($profiles.get().map(row => row.name)).toEqual(['default'])
+  })
 })
 
 describe('stale profile-list fetches across a backend switch (#85731)', () => {
