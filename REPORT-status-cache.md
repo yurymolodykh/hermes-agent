@@ -159,7 +159,24 @@ tests/gateway/test_hosted_rooms_schema_cache.py  | 183 ++++++++++++++
 tests/hermes_cli/test_status_probe_cache.py      | 247 +++++++++++++++++++++
 ```
 
-## 6. Ограничения и что осталось вне рамок
+## 6. Доработка после ревью round 1 (22.11.2026)
+
+* Блокер D1 снят по конвенции репозитория: в дерево влита целевая ветка
+  (`git merge ours/feature/multiuser-access`), конфликт в служебном `PROGRESS.md` разрешён
+  версией **целевой** ветки (`git checkout --theirs PROGRESS.md`); собственные заметки живут
+  здесь, в отчёте. Merge-коммит `d1ae725e05c`.
+* Числа в отчёте исправлены по факту: ключей `/api/status` **37** (добавлены `auth_flows`,
+  `auth_providers`, `gateway_exit_reason`, `gateway_updated_at`), вставок **776**, строк
+  `tests/hermes_cli/test_status_probe_cache.py` — **247**. Утверждение «PAYLOAD SHAPE IDENTICAL»
+  остаётся верным (37 == 37, `diff` пуст).
+* После слияния прогнаны заново: целевые 8 файлов — **78 passed**; ruff — All checks passed;
+  `code_health --base beeb9623539` — **0 blocking, 0 advisory**; замеры latency повторены
+  (см. §1).
+* Публикация: `ops-card-merge.py --task t_f4d564cb` → exit 0, расписка
+  `card-publish/t_f4d564cb.json`, readback локально = удалённо = `0a50140d892`;
+  `--dry-run` → `already_ancestor: true`.
+
+## 7. Ограничения и что осталось вне рамок
 
 1. **Живой шлюз не рестартовался** (по границе карточки): замеры сделаны на собственном
    uvicorn-процессе с тем же кодом, а не на боевом порту 9120. После выкатки нужен один
