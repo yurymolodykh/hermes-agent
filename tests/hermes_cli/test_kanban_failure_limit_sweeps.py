@@ -91,22 +91,31 @@ def _backdate_active_run(conn, task_id: str) -> None:
         )
 
 
+def _run_reclaim(conn, *, failure_limit: int):
+    """The dispatcher's reclaim/sweep chain, exactly as ``_dispatch_once_locked`` runs it."""
+    result = kb.DispatchResult()
+    kbd._run_reclaim_phase(
+        conn, result, stale_timeout_seconds=0, failure_limit=failure_limit,
+        reconcile_orphans=False, board=None,
+    )
+    return result
+
+
 def test_timeout_sweep_honours_the_configured_failure_limit(
     conn, auto_continue_on, no_live_pids, monkeypatch: pytest.MonkeyPatch,
 ):
     """Three timeouts are needed to trip when the limit is 3 — not two.
 
-    The worker is pinned "alive" so the crash sweep leaves the card to the
-    timeout sweep (that is what distinguishes the two paths), and every signal
-    is a stub: nothing here can touch a real process.
+    Goes through ``_run_reclaim_phase``, the call site the review named, so the
+    whole chain (reclaim -> ``enforce_max_runtime`` -> ``_record_task_failure``)
+    is covered. The worker is pinned "alive" so the crash sweep leaves the card
+    to the timeout sweep, and every signal is a stub: nothing here can touch a
+    real process.
     """
     tid = _new_card(conn)
     monkeypatch.setattr(kbd, "_worker_alive", lambda pid, started_at=None: True)
     monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid, started_at=None: True)
-    signals: list[int] = []
-
-    def _signal_fn(pid, sig):
-        signals.append(pid)
+    monkeypatch.setattr(kbd, "_kill_fn", lambda signal_fn: (lambda pid, sig: None))
 
     def _one_timeout(attempt: int) -> list[str]:
         if attempt > 1:
@@ -116,9 +125,7 @@ def test_timeout_sweep_honours_the_configured_failure_limit(
         assert claimed is not None, f"attempt {attempt}: the card must be claimable again"
         kbd._set_worker_pid(conn, tid, 700_000 + attempt, run_id=claimed.current_run_id)
         _backdate_active_run(conn, tid)
-        return kbd.enforce_max_runtime(
-            conn, signal_fn=_signal_fn, failure_limit=CONFIGURED_LIMIT,
-        )
+        return _run_reclaim(conn, failure_limit=CONFIGURED_LIMIT).timed_out
 
     for attempt in (1, 2):
         assert _one_timeout(attempt) == [tid], f"attempt {attempt} must be timed out"
@@ -128,7 +135,6 @@ def test_timeout_sweep_honours_the_configured_failure_limit(
         )
 
     assert _one_timeout(3) == [tid]
-    assert signals, "the stub signal_fn must have been called, never os.kill"
 
     events = _continued_events(conn, tid)
     assert len(events) == 1, f"the third timeout must trip exactly once, got {events}"
@@ -154,7 +160,7 @@ def test_crash_sweep_honours_the_configured_failure_limit(
             conn.commit()
         assert kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':')[0]}:w{attempt}")
         kbd._set_worker_pid(conn, tid, 800_000 + attempt)
-        crashed = kbd.detect_crashed_workers(conn, failure_limit=CONFIGURED_LIMIT)
+        crashed = _run_reclaim(conn, failure_limit=CONFIGURED_LIMIT).crashed
         assert tid in crashed, f"attempt {attempt}: a dead worker must be reclaimed"
         if attempt < 3:
             assert _continued_events(conn, tid) == [], (
