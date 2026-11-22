@@ -174,6 +174,7 @@ def main() -> int:
         before_sha = hashlib.sha256(before.encode()).hexdigest()
         status, applied = call(base, "POST", "/api/profiles/01-testuser/soul/apply-questionnaire", {
             "address_form": "ты",
+            "address_style": "без обращения",
             "answer_length": "кратко",
             "boundaries": ["no_external_uploads"],
             "terms": "МПД = мультипрофильный доступ",

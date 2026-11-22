@@ -1,15 +1,59 @@
 # PROGRESS — t_819d3353: SOUL-клон для 01-<login> + опросник персонализации
 
-## Состояние: ГОТОВО И ЗАКОММИЧЕНО
+## Состояние: КРУГ 2 ГОТОВ — дефект ревью (address_style) исправлен, ветка закоммичена
 
 * Дерево: `/home/hermes/.hermes/kanban/workspaces/t_819d3353`, ветка `wt/t_819d3353`
-* База: `0a1960695e`
-* **Верхушка ветки: `1c4dce2c24`**
-* Отчёт: `REPORT-soul-seed.md`
+* База карточки: `0a1960695e`; рабочий коммит круга 1: `1c4dce2c24` (слит оркестратором в
+  `feature/multiuser-access` как `8c02518532`); merge-коммит в ветке: `7ddd6106a6`
+* **Верхушка ветки круга 2: `06faae7b4c`**
+* Отчёт: `REPORT-soul-seed.md` (обновлён: uvicorn вместо TestClient + раздел про дефект)
 * Доказательства: `evidence/` (`live_probe.py`, `live_probe.final.json`, `SOUL-01-testuser.md`,
-  `SOUL-QUESTIONNAIRE.md`, `MEMORY-01-testuser.md`)
+  `SOUL-QUESTIONNAIRE.md`, `MEMORY-01-testuser.md` — перегенерированы в круге 2)
 
-### Что сделано
+### Круг 2: что было дефектом и что исправлено
+
+`address_style` печатался в `hermes_cli/data/soul-questionnaire.md:31`, принимался
+`ProfileSoulQuestionnaire`, но `hermes_acl_soul.py` ключа не знал (`grep -c` → 0): `_section_reply`
+собирал bullets только из `answer_length`/`answer_format`/`uncertainty`/`display_name`, ответ
+молча терялся. Тесты были зелёными, потому что проверяли реализованное поведение.
+
+1. `_REPLY_LINES` + `_reply_bullet`: `address_style` рендерится в «Ответ пользователю», каждый
+   напечатанный выбор даёт собственную формулировку, свободный текст пишется дословно; подпись
+   `- Как обращаться в ответе:` внесена в `_OWNED_LINE_PREFIXES` (идемпотентность).
+2. `_section_work` пересобирает 4 слота из таблицы каждый раз (повтор переписывает, а не копит) и
+   пишет свободный ответ как `- <подпись>: <ответ>` — `planning = «по обстоятельствам»` и
+   `reporting = «итог + что проверено»` больше не no-op.
+3. `questionnaire_answer_keys()` / `questionnaire_printed_choices()` — разбор самого файла
+   опросника; `SAME_AS_DEFAULT = {("failure_mode", "сказать сразу")}` — единственный осознанный no-op.
+4. `soul-questionnaire.md:16` — `address_form` печатается как `ты / вы`.
+5. `TestInterfaceMatchesImplementation` — 9 `def test_` (параметризация → +40): каждый напечатанный
+   выбор каждого поля обязан менять SOUL; каждое поле `ProfileSoulQuestionnaire` обязано быть
+   напечатано; каждое напечатанное поле известно реализации; факты 5–6 идут в память, SOUL не
+   трогают. Тест читает файл, а не захардкоженный список.
+6. `evidence/live_probe.py` теперь отправляет `address_style: "без обращения"`.
+
+### Проверки круга 2
+
+* `tests/hermes_cli/test_profile_soul_seed.py` — **89 passed** (было 49).
+* `tests/hermes_cli/test_profile_route_owner_scope.py` — **73 passed**; вместе — 162 passed.
+* Смежная регрессия вне `~/.hermes` (`/tmp/soulbranch3.O5zjGY`, 6 файлов) — **304 passed, 3 skipped**.
+* Живая проба: (а) 60 строк / 4025 симв., роль, 0 маркеров; (в) `changed_sections=["Роль","Границы",
+  "Ответ пользователю"]`, sha `0621417f…`→`f2a8e5d0…`, в diff есть
+  «- Как обращаться в ответе: без обращения — сразу к делу, без имени и приветствий.»;
+  (г) пустой → sha идентичен; (д) 403 / 200.
+* `python -m scripts.code_health --base HEAD` → 0 blocking, 0 advisory; ruff — All checks passed.
+* Красная база `7ddd6106a6`: `address_style` × 3 = `changed=False`, `planning`/`reporting`
+  напечатанные варианты = `changed=False`, `questionnaire_printed_choices` отсутствует (ImportError).
+* **Осадок живой CLI-проверки убран:** `hermes profile delete -y 01-cliuser|plaingroup` — каталоги
+  отсутствуют, в `gateway_state.json:served_profiles` их больше нет; рестарт шлюза не потребовался.
+
+### Остаточное
+
+* Оркестратор: слияние `wt/t_819d3353` (`06faae7b4c`) в `feature/multiuser-access` и публикация в `ours`.
+
+### Круг 1 (для истории)
+
+#### Что сделано
 
 1. `hermes_acl_soul.py` (новый, stdlib) — `personal_soul_for`, `build_user_soul`,
    `apply_questionnaire`, `seed_questionnaire`, `questionnaire_text`, CLI `main`.
@@ -27,7 +71,7 @@
 9. `/home/hermes/workspaces/01-orchestrator/ops/soul-clone-for-user.py` — тонкая обёртка
    над платформенным модулем (правка не живёт только в ops).
 
-### Проверки
+#### Проверки
 
 * `test_profile_soul_seed.py` — **49 passed** (требовалось ≥10).
 * `test_profile_route_owner_scope.py` — **73 passed** (не уменьшилось).
