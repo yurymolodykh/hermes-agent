@@ -211,6 +211,37 @@ def test_workspace_without_a_repo_still_removed(kanban_home):
         assert _events(conn, task_id, PRESERVED_EVENT) == []
 
 
+def test_vendored_tool_dirs_are_not_scanned(kanban_home):
+    """node_modules/.venv hold thousands of files; scanning them buys nothing."""
+    with kbc.connect() as conn:
+        task_id, ws = _scratch_task(conn)
+        (ws / "node_modules" / "pkg").mkdir(parents=True)
+        (ws / ".venv" / "lib").mkdir(parents=True)
+
+        assert kb.complete_task(conn, task_id, result="done")
+
+        assert not ws.exists()
+        assert _events(conn, task_id, PRESERVED_EVENT) == []
+
+
+def test_scan_that_stops_at_the_depth_cap_preserves(kanban_home, monkeypatch):
+    """Too deep to verify is not the same fact as clean — keep the dir."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    monkeypatch.setattr(kbw, "_SCRATCH_REPO_SCAN_MAX_DEPTH", 1)
+    with kbc.connect() as conn:
+        task_id, ws = _scratch_task(conn)
+        deep = ws / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        (deep / "data.txt").write_text("deep\n", encoding="utf-8")
+
+        assert kb.complete_task(conn, task_id, result="done")
+
+        assert ws.is_dir()
+        payload = _events(conn, task_id, PRESERVED_EVENT)[0].payload
+        assert payload["reason"] == "workspace tree too deep to verify"
+
+
 # ---------------------------------------------------------------------------
 # Every deletion path carries the guard
 # ---------------------------------------------------------------------------
