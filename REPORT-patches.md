@@ -142,13 +142,23 @@ setup-hermes.sh», поэтому изоляция по файлам воспр�
 
 | | база `beeb9623539` | ветка с правкой |
 |---|---|---|
-| PASS-файлов | 81 | 81 |
-| FAIL-файлов | 18 | 18 |
-| набор падающих файлов | идентичен | идентичен |
+| PASS-файлов | 82 | 83 |
+| FAIL-файлов | 17 | 16 |
+| набор падающих файлов | идентичен, кроме одного | идентичен, кроме одного |
 
-Сравнение (`diff` с нормализованным временем) — «IDENTICAL failure sets (base == patched)».
-Причины падений предсуществующие и относятся к окружению/фикстурам (отсутствие systemd-scope
-возможностей, гонки готовности шлюза), не к правке.
+`diff` нормализованных наборов:
+
+```
+9d8
+< FAIL tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+```
+
+Единственное различие — файл reaper-тестов: на базе `2 failed, 3 passed`, с правкой `5 passed`.
+Остальные 16 падающих файлов совпадают дословно. Их причины предсуществующие и относятся к
+окружению worktree (`tests/home_io_guard.py:160` — «file I/O against the REAL hermes home:
+…/.git/worktrees/t_4cb8f83b/hermes-update-pull»; systemd-scope/готовность шлюза), не к правке.
+Логи: `evidence-t4cb8f83b/kanban-perfile-base-beeb9623539.log`,
+`evidence-t4cb8f83b/kanban-perfile-patched.log`, `evidence-t4cb8f83b/diff-failure-sets.txt`.
 
 Наборы состояния и объяснителя:
 
@@ -158,7 +168,7 @@ setup-hermes.sh», поэтому изоляция по файлам воспр�
 | `tests/agent/test_turn_completion_explainer.py` | 34 passed |
 | `tests/agent/test_outbox_full_copy.py` + explainer + reaper | 61 passed |
 | `tests/hermes_state/test_disk_full_error.py`, `test_storage_health_latch.py`, `test_state_db_corrupt_quarantine.py`, `test_deleted_wal_generation_guard.py`, `tests/agent/test_compression_closed_adoption.py`, `test_outbox_full_copy.py`, `test_turn_completion_explainer.py` | 109 passed, 7 skipped |
-| `tests/hermes_state/` целиком | см. §5 |
+| `tests/hermes_state/` по-файлово (227 файлов) | 134 падающих файла — см. §5 п. 4 |
 
 ## 4. Критерий 5 — ruff и code_health
 
@@ -193,3 +203,18 @@ code health: 4 files vs beeb96235392: 0 blocking, 0 advisory (2.2s)
 5. **`keyring` отсутствует** в окружении прогона: `tests/hermes_cli/test_vault_key_cli.py` падает
    на сборе `ModuleNotFoundError: No module named 'keyring'`. Файл не импортируется ни на базе, ни
    на правке — исключён из по-файлового прогона.
+6. **`tests/hermes_cli/test_kanban_worker_terminal_scope.py`** и родственные падения в worktree
+   зависят от профилей живого `~/.hermes` — их прогон не менялся карточкой, но и не чинился.
+
+## 6. Доказательства в дереве
+
+`evidence-t4cb8f83b/`:
+
+* `probe_explain.py`, `probe_explain-output.txt` — живая проба классификации и объяснения
+  (owner_unavailable против unknown);
+* `kanban-perfile-base-beeb9623539.log`, `kanban-perfile-patched.log` — по-файловые прогоны
+  набора канбана на базе и с правкой;
+* `diff-failure-sets.txt` — diff наборов (единственное различие — файл reaper-тестов);
+* `hermes_state-perfile-patched.log` — по-файловый прогон `tests/hermes_state`;
+* `state-sample-base-vs-patched.txt` — выборка 12 падающих файлов состояния: одинаковые числа
+  на базе и с правкой.

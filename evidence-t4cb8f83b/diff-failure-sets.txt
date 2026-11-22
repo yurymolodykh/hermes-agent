@@ -1,0 +1,17 @@
+diff по-файловых наборов tests/hermes_cli/*kanban* (99 файлов), база beeb9623539 против ветки с правкой:
+
+    9d8
+    < FAIL tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+
+Единственное различие — файл reaper-тестов: на базе 2 failed / 3 passed (красный),
+с правкой 5 passed (зелёный). Остальные 16 падающих файлов совпадают дословно.
+
+Базовый набор:  FAIL-файлов 17, PASS-файлов 82, всего 99
+Патченный:      FAIL-файлов 16, PASS-файлов 83, всего 99
+
+Причина остальных падений предсуществующая и относится к окружению worktree:
+  * tests/home_io_guard.py:160 — "file I/O against the REAL hermes home:
+    …/.git/worktrees/t_4cb8f83b/hermes-update-pull" (тесты рассчитаны на обычный checkout);
+  * фикстуры systemd-scope / готовности шлюза.
+Подтверждение: выборка 12 падающих файлов даёт 56 failed, 12 passed, 16 errors
+одинаково на базе и с правкой (см. state-sample-base-vs-patched.txt).
