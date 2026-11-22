@@ -1,47 +1,3 @@
-# PROGRESS — t_78e323fe: scratch-workspace не должен удалять git-работу
-
-## Состояние: ГОТОВО к сдаче (приёмка проверена, живые доказательства в evidence/)
-
-Ветка `wt/t_78e323fe`, дерево `/home/hermes/.hermes/hermes-agent/.worktrees/t_78e323fe`.
-База карточки: `beeb9623539`. Ниже — унаследованный текст другой карточки (t_819d3353),
-он к этой задаче не относится.
-
-1. `hermes_cli/kanban_db_workspace.py` — `_preserve_scratch_workspace(conn, task_id, wp)`:
-   обход workspace (подкаталоги, глубина ≤ 8, без `node_modules/.venv/.git/…`), поиск
-   git-репозиториев; для каждого — грязное дерево, stash, коммиты недостижимые из remote
-   (`log HEAD --branches --not --remotes`), отсутствие remote-веток. Любая неопределённость
-   → «сохранять». При сохранении: WARNING + событие `workspace_cleanup_preserved_unsaved_work`
-   (`path`, `repo`, `reason`).
-2. Предикат стоит на всех трёх путях удаления scratch: `_cleanup_workspace` (complete/archive),
-   `_try_cleanup_parent_workspaces`, `kanban_ops._cmd_gc` (ночной gc печатает
-   `; N preserved for unsaved git work`).
-3. `worktree` и `dir` не тронуты; retention/чекпойнты не тронуты.
-4. `website/docs/user-guide/features/kanban.md` — исключение и имя события задокументированы.
-5. `tests/hermes_cli/test_kanban_scratch_unsaved_work.py` — 14 тестов.
-6. `evidence/probe_scratch_guard.py` / `.json` — живая проба через реальный `hermes kanban`
-   на изолированных `HERMES_HOME` + `HERMES_KANBAN_HOME`: verdict pass.
-
-### Проверено чем
-
-* 14 passed в новом файле; с `test_kanban_gc_retention.py` + `test_kanban_swarm.py` — 33 passed.
-* Краснота каждой ветки доказана раздельно: снят guard в `_cleanup_workspace` → 7 падений;
-  в `_try_cleanup_parent_workspaces` → падает deferred-тест; в `_cmd_gc` → падает gc-тест
-  (`GC complete: 1 workspace(s) … removed`) хотя completion каталог сохранил — gc был
-  обходным путём, теперь закрыт.
-* `code_health --base beeb9623539`: 0 blocking, 0 advisory; `ruff check` — All checks passed.
-
-### Не регрессия
-
-`test_kanban_worktree_teardown.py::test_tree_dirtied_between_check_and_removal_preserved`,
-два spawn-теста в `test_kanban_db.py`, три в `test_kanban_core_functionality.py` падают
-на неизменённой базе (`import cli` / `home_io_guard` в worktree-окружении).
-
-### Остаточное
-
-Оркестратор: merge `wt/t_78e323fe` и рестарт. Потеря t_3e4b45f4 этим не восстанавливается.
-
----
-
 # PROGRESS — t_819d3353: SOUL-клон для 01-<login> + опросник персонализации
 
 ## Состояние: КРУГ 2 ГОТОВ — дефект ревью (address_style) исправлен, ветка закоммичена
@@ -560,3 +516,10 @@ UnscopedSecretError, cold/with-scope → OK.
 * Полный `tests/hermes_cli/` шумит падениями `test_agent_import_left_core.py`
   (guard на worktree-путь) — окружение, не регрессия; набор ограничен kanban-файлами.
 * `scratch/` держать ВНЕ дерева карточки: `code_health` сканирует и его.
+
+---
+
+## t_78e323fe (scratch-workspace vs unsaved git work)
+
+Работа закрыта: см. `REPORT-scratch-workspace-unsaved-work.md` и `evidence/probe_scratch_guard.*`.
+Этот файл карточка не правила, чтобы не конфликтовать при слиянии.
