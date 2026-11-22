@@ -729,8 +729,12 @@ const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
 // Coalesce tick-driven sidebar list refreshes: sessions.changed fires (floored
 // to 2s server-side) on every state.db write during a streaming turn, and the
 // full list refresh is heavier than the active_list snapshot. Trailing-edge
-// scheduled, so the burst's last write always lands.
-const SESSIONS_LIST_TICK_GAP_MS = 10_000
+// scheduled, so the burst's last write always lands. 30s (not 10s): on a busy
+// gateway state.db moves continuously — the kanban dispatcher alone writes every
+// tick — so a 10s gap turned an IDLE tab into a steady 6 reads/min for the list
+// plus the cron-jobs read it chains (refreshSessions also refreshes cron jobs).
+// The card's freshness contract is "event or ≤30s", which this still meets.
+const SESSIONS_LIST_TICK_GAP_MS = 30_000
 // A typing burst keeps the composer's contentEditable input handling on the
 // same renderer main thread as the list refresh above (#95033): with a large
 // session store, one refresh pass can block keystroke echo long enough that
