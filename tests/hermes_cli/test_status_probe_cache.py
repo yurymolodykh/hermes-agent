@@ -58,7 +58,10 @@ def test_concurrent_probes_share_one_computation(status_router, monkeypatch):
 
     async def fake_collect(profile_dir, requested_profile, signed_out):
         calls.append(1)
-        await asyncio.sleep(0.05)
+        # Yield repeatedly so every other poller reaches the cache while this pass is still open:
+        # without single flight they would each start their own computation instead of waiting.
+        for _ in range(50):
+            await asyncio.sleep(0)
         return {"version": "test", "gateway_running": True, "gateway_state": "running"}
 
     monkeypatch.setattr(status_router, "_collect_status", fake_collect)
