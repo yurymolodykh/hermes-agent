@@ -2115,6 +2115,8 @@ def dispatch_once(
     """
     result = _kbdsp.run_tick(
         conn, board,
+        locked_tick=_dispatch_once_locked,
+        skipped_result=DispatchResult,
         spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run, max_spawn=max_spawn,
         max_in_progress=max_in_progress, failure_limit=failure_limit,
         stale_timeout_seconds=stale_timeout_seconds, default_assignee=default_assignee,

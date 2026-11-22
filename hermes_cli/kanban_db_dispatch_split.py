@@ -54,17 +54,33 @@ def run_split_before_tick(
 
 
 def run_tick(
-    conn: sqlite3.Connection, board: Optional[str], **tick_kwargs,
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    *,
+    locked_tick=None,
+    skipped_result=None,
+    **tick_kwargs,
 ):
     """Split outside the lock, then take it for one ``_dispatch_once_locked`` pass.
 
-    ``tick_kwargs`` go to ``_dispatch_once_locked`` verbatim; ``dry_run`` is read
-    from them so the split phase and the tick can never disagree about it. A
-    contended lock yields ``DispatchResult(skipped_locked=True)`` and writes
-    nothing, as before — the split has already happened, which is intentional:
-    it needs no dispatch lock and its own lock keeps it single.
+    ``tick_kwargs`` go to ``locked_tick`` verbatim; ``dry_run`` is read from them
+    so the split phase and the tick can never disagree about it. A contended lock
+    yields ``DispatchResult(skipped_locked=True)`` and writes nothing, as before —
+    the split has already happened, which is intentional: it needs no dispatch
+    lock and its own lock keeps it single.
+
+    ``locked_tick``/``skipped_result`` are injected by ``dispatch_once`` rather
+    than re-imported here: this module sits below ``kanban_db_dispatch`` and a
+    late ``from ... import`` rebuilds a SECOND module object whenever the caller
+    dropped ``hermes_cli.kanban_db*`` from ``sys.modules`` (the documented test
+    fixture pattern). The tick would then run the twin module's function, so a
+    monkeypatched seam — and every ``DispatchResult`` field the caller reads —
+    would silently belong to a different object.
     """
-    from hermes_cli.kanban_db_dispatch import DispatchResult, _dispatch_once_locked
+    if locked_tick is None or skipped_result is None:  # pragma: no cover - callers pass both
+        from hermes_cli.kanban_db_dispatch import DispatchResult, _dispatch_once_locked
+        locked_tick = _dispatch_once_locked if locked_tick is None else locked_tick
+        skipped_result = DispatchResult if skipped_result is None else skipped_result
 
     dry_run = bool(tick_kwargs.get("dry_run"))
     try:
@@ -75,13 +91,13 @@ def run_tick(
         db_path = None
     split = run_split_before_tick(conn, db_path, dry_run=dry_run)
     if db_path is None:
-        result = _dispatch_once_locked(conn, **tick_kwargs)
+        result = locked_tick(conn, **tick_kwargs)
     else:
         with _kbc._dispatch_tick_lock(db_path) as held:
             if not held:
-                result = DispatchResult(skipped_locked=True)
+                result = skipped_result(skipped_locked=True)
             else:
-                result = _dispatch_once_locked(conn, **tick_kwargs)
+                result = locked_tick(conn, **tick_kwargs)
                 _kbc._maybe_checkpoint_wal(conn, db_path)  # still under the lock
     if split is not None:
         result.auto_split, result.auto_split_failed = split
