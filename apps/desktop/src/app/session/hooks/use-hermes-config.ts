@@ -60,6 +60,38 @@ interface HermesConfigOptions {
   activeSessionIdRef: MutableRefObject<string | null>
 }
 
+// One shared in-flight config+defaults pair per (connection, profile). Bursting
+// callers join it; the slot clears as soon as it settles so the next caller (a
+// save, a scope change) reads fresh values.
+let configReadInflight: null | { key: string; promise: Promise<[Awaited<ReturnType<typeof getHermesConfig>>, Awaited<ReturnType<typeof getHermesConfigDefaults>>]> } = null
+
+function readHermesConfigOnce(
+  connection: ReturnType<typeof $connection.get>,
+  profile: string
+): Promise<[Awaited<ReturnType<typeof getHermesConfig>>, Awaited<ReturnType<typeof getHermesConfigDefaults>>]> {
+  const key = `${connection?.connectionId ?? connection?.baseUrl ?? ''}::${profile}`
+
+  if (configReadInflight?.key === key) {
+    return configReadInflight.promise
+  }
+
+  const flight = {
+    key,
+    promise: Promise.all([getHermesConfig(), getHermesConfigDefaults().catch(() => ({}) as never)]) as Promise<
+      [Awaited<ReturnType<typeof getHermesConfig>>, Awaited<ReturnType<typeof getHermesConfigDefaults>>]
+    >
+  }
+
+  configReadInflight = flight
+  void flight.promise.catch(() => undefined).then(() => {
+    if (configReadInflight === flight) {
+      configReadInflight = null
+    }
+  })
+
+  return flight.promise
+}
+
 export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
   const [voiceMaxRecordingSeconds, setVoiceMaxRecordingSeconds] = useState(DEFAULT_VOICE_SECONDS)
   const [sttEnabled, setSttEnabled] = useState(true)
@@ -77,7 +109,14 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
       const profile = $activeGatewayProfile.get()
 
       try {
-        const [config, defaults] = await Promise.all([getHermesConfig(), getHermesConfigDefaults().catch(() => ({}))])
+        // Two REST reads per refresh (config + defaults), and the callers arrive in
+        // bursts — a session.info edge, a draft mount and a scope change land in the
+        // same second. Measured on an idle Webapp tab they showed up as 5–7
+        // /api/config requests inside one second. They ask the same question of the
+        // same backend, so share one in-flight pair instead of stacking them; a
+        // caller that arrives after it settled starts a fresh read, which keeps
+        // "save settings, see the result" immediate.
+        const [config, defaults] = await readHermesConfigOnce(connection, profile)
 
         const canPublish = () => profileRefreshEpochRef.current === profileRefreshEpoch && shouldPublish()
 
