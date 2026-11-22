@@ -3702,6 +3702,8 @@ def promote_task(
             return False, f"task {task_id} status changed during promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
+    # Advisory, after the transaction: the promotion stands whatever the estimate says.
+    kanban_db_sizing.note_promotion(conn, task_id, author=actor or "operator")
     return True, None
 
 
@@ -4377,6 +4379,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli import kanban_db_sizing
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     _dir_holds_board,
