@@ -1,0 +1,18 @@
+Выборка 12 падающих файлов tests/hermes_state, один и тот же набор путей, два прогона
+(интерпретатор test-environment, `-q -p no:randomly`):
+
+  с правкой (wt/t_4cb8f83b):        56 failed, 12 passed, 16 errors in 78.93s
+  база beeb9623539 (те же файлы):   56 failed, 12 passed, 16 errors in 86.79s
+
+Итог: числа совпадают до единицы — падения не связаны с правкой.
+
+Корневая причина (из вывода):
+  tests/home_io_guard.py:160 → AssertionError: TEST BUG: file I/O against the REAL hermes
+  home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_4cb8f83b/hermes-update-pull
+
+Страж home_io_guard считает домашним каталогом путь worktree и запрещает запись;
+эти тесты рассчитаны на обычный checkout. В worktree карточки они падают на любой ревизии.
+
+Полный по-файловый прогон всех 227 файлов tests/hermes_state: 134 падающих файла,
+набор см. hermes_state-perfile-patched.log. Смежные по смыслу наборы (классификация
+persistence-ошибок, диск, карантин, deleted-WAL, outbox) прогнаны отдельно: 109 passed, 7 skipped.

@@ -243,4 +243,52 @@ describe('useHermesConfig refreshHermesConfig', () => {
 
     expect($terminalFontFamily.get()).toBe('Hack Nerd Font')
   })
+
+  it('shares one config+defaults read across a burst of background refreshes', async () => {
+    // Measured on an idle Webapp tab: /api/config arrived 5–7 times inside one
+    // second — a session.info edge, a draft mount and a scope change landing
+    // together, each doing its own config + defaults pair. Background callers
+    // must ride one in-flight read.
+    mockConfig({ display: { show_reasoning: 'false' } })
+    vi.mocked(getHermesConfig).mockClear()
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await Promise.all([
+        result.current.refreshHermesConfig(),
+        result.current.refreshHermesConfig(),
+        result.current.refreshHermesConfig()
+      ])
+    })
+
+    expect(vi.mocked(getHermesConfig)).toHaveBeenCalledTimes(1)
+  })
+
+  it('still reads fresh config for a forced refresh during an idle in-flight one', async () => {
+    // A scope change or an explicit reseed must not be answered by the read it
+    // superseded — that response describes the state before the change.
+    const background = deferred<Awaited<ReturnType<typeof getHermesConfig>>>()
+    vi.mocked(getHermesConfig).mockReturnValueOnce(background.promise)
+    mockConfig({ display: { show_reasoning: 'true' } })
+    vi.mocked(getHermesConfig).mockClear()
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    let idle!: Promise<void>
+    let forced!: Promise<void>
+    act(() => {
+      idle = result.current.refreshHermesConfig()
+      forced = result.current.refreshHermesConfig(true)
+    })
+
+    await act(async () => {
+      await forced
+    })
+    background.resolve({ display: { show_reasoning: 'false' } })
+    await act(async () => {
+      await idle
+    })
+
+    expect(vi.mocked(getHermesConfig)).toHaveBeenCalledTimes(2)
+    expect($showReasoning.get()).toBe(true)
+  })
 })

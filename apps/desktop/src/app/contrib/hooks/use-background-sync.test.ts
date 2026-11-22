@@ -36,6 +36,7 @@ import {
   rehydrateLiveSessionStatuses,
   resetTypingActivityTracking,
   resolveActiveTranscriptSession,
+  SESSIONS_LIST_TICK_GAP_MS,
   TRANSCRIPT_RETURN_REFRESH_MIN_GAP_MS,
   useBackgroundSync
 } from './use-background-sync'
@@ -1301,7 +1302,7 @@ describe('typing-aware sessions.changed deferral', () => {
     await act(async () => {
       // One SESSIONS_LIST_TICK_GAP_MS covers both the immediate first tick
       // and any trailing timer the burst armed.
-      vi.advanceTimersByTime(10_000)
+      vi.advanceTimersByTime(SESSIONS_LIST_TICK_GAP_MS)
       await Promise.resolve()
     })
     refreshSessions.mockClear()

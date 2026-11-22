@@ -1,0 +1,135 @@
+FAIL tests/hermes_state/conftest.py :: no tests ran in 0.07s
+FAIL tests/hermes_state/__init__.py :: no tests ran in 0.07s
+FAIL tests/hermes_state/test_append_message_after_close.py :: 4 failed, 1 passed in 4.38s
+FAIL tests/hermes_state/test_append_messages_batch.py :: 6 failed, 4 passed in 8.11s
+FAIL tests/hermes_state/test_auto_archived_lineage_reactivation.py :: 6 failed in 5.20s
+FAIL tests/hermes_state/test_automatic_ended_stamp.py :: 6 failed, 4 passed in 6.40s
+FAIL tests/hermes_state/test_auto_vacuum_holder_gate.py :: 1 failed in 1.23s
+FAIL tests/hermes_state/test_auto_vacuum_in_process_holder_gate.py :: 2 failed in 2.07s
+FAIL tests/hermes_state/test_background_review_session_isolation.py :: 2 failed, 6 passed in 1.93s
+FAIL tests/hermes_state/test_bot_chat_archive_retire.py :: 2 failed, 5 passed in 4.42s
+FAIL tests/hermes_state/test_bounded_recent_sessions.py :: 6 failed, 4 passed in 7.93s
+FAIL tests/hermes_state/test_compacted_message_reactions.py :: 2 failed in 2.13s
+FAIL tests/hermes_state/test_compacted_tool_result_paints_once.py :: 1 failed in 1.48s
+FAIL tests/hermes_state/test_compaction_carried_tail_not_cloned.py :: 14 errors in 12.73s
+FAIL tests/hermes_state/test_composite_carrier_rewind.py :: 12 failed in 10.37s
+FAIL tests/hermes_state/test_compression_created_source.py :: 13 failed, 1 passed in 12.18s
+FAIL tests/hermes_state/test_compression_lease_refresh_before_publish.py :: 3 failed, 3 passed in 4.82s
+FAIL tests/hermes_state/test_compression_lineage_guard.py :: 17 failed in 18.13s
+FAIL tests/hermes_state/test_compression_watermark_commit.py :: 16 failed in 18.63s
+FAIL tests/hermes_state/test_corrupt_row_robustness.py :: 2 failed, 1 passed, 2 errors in 5.19s
+FAIL tests/hermes_state/test_delegate_marker_backfill_v33.py :: 3 failed in 3.14s
+FAIL tests/hermes_state/test_delete_branched_root_leftovers.py :: 1 failed in 1.36s
+FAIL tests/hermes_state/test_delete_compression_chain.py :: 8 failed, 1 passed in 9.18s
+FAIL tests/hermes_state/test_deleted_wal_checkpoint_guard.py :: 2 failed in 3.84s
+FAIL tests/hermes_state/test_deleted_wal_generation_guard.py :: 11 failed, 6 passed, 7 skipped in 16.14s
+FAIL tests/hermes_state/test_delete_mode_read_busy_wait.py :: 2 errors in 3.25s
+FAIL tests/hermes_state/test_display_dedupe_pruned_tool_payload.py :: 1 failed, 1 passed in 2.04s
+FAIL tests/hermes_state/test_display_projection_parity.py :: 12 failed in 11.43s
+FAIL tests/hermes_state/test_display_read_identity_work.py :: 2 failed in 2.30s
+FAIL tests/hermes_state/test_display_read_removed_rows.py :: 3 failed in 3.67s
+FAIL tests/hermes_state/test_display_set_one_generation.py :: 1 failed in 1.63s
+FAIL tests/hermes_state/test_display_split_heal.py :: 3 failed in 3.14s
+FAIL tests/hermes_state/test_downgrade_delete_guard.py :: 2 failed in 2.10s
+FAIL tests/hermes_state/test_empty_sweep_archived_transcript.py :: 5 failed in 4.61s
+FAIL tests/hermes_state/test_fts_cjk_index_retirement.py :: 5 errors in 4.59s
+FAIL tests/hermes_state/test_fts_cjk_retirement_concurrency.py :: 18 errors in 15.39s
+FAIL tests/hermes_state/test_fts_fresh_bootstrap_admission.py :: 1 failed in 1.98s
+FAIL tests/hermes_state/test_fts_layout_drift.py :: 13 failed, 1 passed, 5 errors in 15.49s
+FAIL tests/hermes_state/test_fts_orphan_shadow_repair.py :: 1 failed in 1.44s
+FAIL tests/hermes_state/test_fts_projection_integrity.py :: 1 failed, 1 passed in 2.07s
+FAIL tests/hermes_state/test_fts_rebuild_admission.py :: 6 failed, 15 passed, 6 errors in 14.35s
+FAIL tests/hermes_state/test_fts_rebuild_corruption_class.py :: 4 errors in 3.71s
+FAIL tests/hermes_state/test_fts_runtime_rebuild.py :: 17 failed, 31 passed in 19.55s
+FAIL tests/hermes_state/test_fts_tool_write_bounds.py :: 1 failed, 4 passed in 3.64s
+FAIL tests/hermes_state/test_fts_trigram_cron_exclusion.py :: 8 failed, 2 passed in 8.64s
+FAIL tests/hermes_state/test_fts_trigram_subagent_exclusion.py :: 6 failed in 5.74s
+FAIL tests/hermes_state/test_fts_update_of_narrowing.py :: 2 failed, 2 passed in 2.85s
+FAIL tests/hermes_state/test_get_anchored_view.py :: 5 failed in 4.62s
+FAIL tests/hermes_state/test_get_messages_around.py :: 5 failed, 1 passed in 5.24s
+FAIL tests/hermes_state/test_get_messages_include_compacted.py :: 37 failed, 10 passed in 55.65s
+FAIL tests/hermes_state/test_hermes_state_compression_busy_retry.py :: 2 failed, 2 passed in 3.08s
+FAIL tests/hermes_state/test_hermes_state.py :: 102 failed, 194 passed in 193.20s (0:03:13)
+FAIL tests/hermes_state/test_import_deleted_session.py :: 3 failed in 3.61s
+FAIL tests/hermes_state/test_ledger_delete_consistency.py :: 1 failed, 17 passed in 12.50s
+FAIL tests/hermes_state/test_legacy_refusal_repair.py :: 5 failed in 4.55s
+FAIL tests/hermes_state/test_list_sessions_recency.py :: 1 failed in 1.60s
+FAIL tests/hermes_state/test_message_uid.py :: 24 failed, 6 passed in 23.40s
+FAIL tests/hermes_state/test_named_profile_session_db.py :: 7 failed in 1.96s
+FAIL tests/hermes_state/test_orphan_gateway_session_repair.py :: 13 failed, 1 passed in 12.80s
+FAIL tests/hermes_state/test_orphan_sweep_cross_backend.py :: 6 failed, 4 passed in 9.13s
+FAIL tests/hermes_state/test_pinned_archived_sidebar.py :: 3 failed in 3.78s
+FAIL tests/hermes_state/test_pinned_lineage.py :: 2 failed in 3.08s
+FAIL tests/hermes_state/test_prune_activity_recency.py :: 2 failed in 3.42s
+FAIL tests/hermes_state/test_readonly_fts_decode_error.py :: 2 failed in 2.65s
+FAIL tests/hermes_state/test_read_path_transient_ioerr.py :: 2 failed, 2 passed in 3.76s
+FAIL tests/hermes_state/test_reasoning_roundtrip.py :: 6 failed in 7.14s
+FAIL tests/hermes_state/test_repaired_history_commit_coverage.py :: 6 failed in 1.66s
+FAIL tests/hermes_state/test_repair_unavailable_health.py :: 1 error in 1.48s
+FAIL tests/hermes_state/test_replace_messages_archive_siblings.py :: 5 failed in 6.21s
+FAIL tests/hermes_state/test_replace_messages_archives_suffix_only.py :: 2 failed in 2.05s
+FAIL tests/hermes_state/test_reset_lineage_delete_queued_work.py :: 9 failed in 11.39s
+FAIL tests/hermes_state/test_reset_owner_housekeeping.py :: 4 failed in 7.04s
+FAIL tests/hermes_state/test_resolve_resume_session_id.py :: 4 failed in 4.05s
+FAIL tests/hermes_state/test_restore_alternation_repair.py :: 3 failed in 3.95s
+FAIL tests/hermes_state/test_resume_summary_carrier_once.py :: 1 failed in 1.97s
+FAIL tests/hermes_state/test_retain_refused_turn.py :: 7 failed, 2 passed in 8.04s
+FAIL tests/hermes_state/test_retired_wal_generation_capture.py :: 7 failed, 1 passed, 1 skipped in 7.57s
+FAIL tests/hermes_state/test_rewind_surfaces_invariant.py :: 11 errors in 3.03s
+FAIL tests/hermes_state/test_runtime_destructive_mutations.py :: 7 failed, 5 passed in 12.53s
+FAIL tests/hermes_state/test_runtime_import_mutations.py :: 1 failed, 1 passed in 2.30s
+FAIL tests/hermes_state/test_runtime_rewind_carrier_handoff.py :: 1 failed in 1.33s
+FAIL tests/hermes_state/test_runtime_rewind_mutations.py :: 8 failed in 9.34s
+FAIL tests/hermes_state/test_runtime_schema.py :: 1 failed, 1 passed in 1.99s
+FAIL tests/hermes_state/test_runtime_worker_children.py :: 1 failed, 4 passed in 4.38s
+FAIL tests/hermes_state/test_runtime_worker_compaction.py :: 4 failed in 12.57s
+FAIL tests/hermes_state/test_runtime_worker_compression_admission.py :: 1 failed, 1 passed in 5.10s
+FAIL tests/hermes_state/test_runtime_worker_compression_annotations.py :: 3 failed in 6.42s
+FAIL tests/hermes_state/test_runtime_worker_compression_flush.py :: 1 failed in 2.50s
+FAIL tests/hermes_state/test_runtime_worker_history.py :: 2 failed, 1 passed in 16.10s
+FAIL tests/hermes_state/test_runtime_worker_metadata.py :: 3 failed, 1 passed in 12.41s
+FAIL tests/hermes_state/test_runtime_worker_operations.py :: 1 failed in 1.98s
+FAIL tests/hermes_state/test_runtime_worker_read_fence.py :: 1 failed in 2.38s
+FAIL tests/hermes_state/test_search_or_relaxed_fallback.py :: 7 passed, 2 errors in 3.60s
+FAIL tests/hermes_state/test_session_archived_round_trip.py :: 1 failed in 2.89s
+FAIL tests/hermes_state/test_session_archiving.py :: 1 failed, 3 passed in 7.80s
+FAIL tests/hermes_state/test_session_db_context_manager.py :: 1 failed, 2 passed in 4.29s
+FAIL tests/hermes_state/test_session_db_profile_stamp.py :: 1 failed, 6 passed in 12.73s
+FAIL tests/hermes_state/test_session_db_read_conn_pool.py :: 1 failed, 6 passed, 18 errors in 42.27s
+FAIL tests/hermes_state/test_session_db_read_path_split.py :: 7 errors in 11.95s
+FAIL tests/hermes_state/test_session_delete_hook.py :: 1 failed, 1 passed in 3.87s
+FAIL tests/hermes_state/test_session_delete_profile_isolation.py :: 1 failed in 3.13s
+FAIL tests/hermes_state/test_session_export_timings.py :: 3 failed in 4.76s
+FAIL tests/hermes_state/test_session_import_keep_flags.py :: 2 failed in 5.01s
+FAIL tests/hermes_state/test_session_import_value_validation.py :: 2 failed, 7 passed in 9.72s
+FAIL tests/hermes_state/test_session_lifecycle_status.py :: 3 failed, 13 passed in 6.39s
+FAIL tests/hermes_state/test_session_list_index_choice.py :: 3 failed in 4.99s
+FAIL tests/hermes_state/test_session_list_page_cost.py :: 1 error in 2.59s
+FAIL tests/hermes_state/test_session_md_export.py :: 1 failed, 2 passed in 3.87s
+FAIL tests/hermes_state/test_session_read_state.py :: 3 failed, 3 passed in 7.17s
+FAIL tests/hermes_state/test_session_turn_lease.py :: 3 failed, 18 passed in 22.39s
+FAIL tests/hermes_state/test_shared_session_db_registry.py :: ..
+FAIL tests/hermes_state/test_stale_tool_call_marker_session_repair.py :: 7 failed, 7 passed in 10.24s
+FAIL tests/hermes_state/test_state_db_corrupt_quarantine.py :: 10 failed, 8 passed in 23.46s
+FAIL tests/hermes_state/test_state_db_file_identity.py :: 8 failed, 2 passed in 42.81s
+FAIL tests/hermes_state/test_state_db_fts_segment_collision_probe.py :: 2 failed in 3.34s
+FAIL tests/hermes_state/test_state_db_lock_fail_closed.py :: 2 failed, 3 passed in 3.44s
+FAIL tests/hermes_state/test_state_db_maintenance_conformance.py :: 7 failed in 13.00s
+FAIL tests/hermes_state/test_state_db_malformed_repair.py :: 21 failed, 2 passed in 37.77s
+FAIL tests/hermes_state/test_state_db_repair_live_writer_guard.py :: 9 failed, 2 passed in 12.82s
+FAIL tests/hermes_state/test_state_db_second_process_maintenance.py :: 1 passed, 1 error in 4.10s
+FAIL tests/hermes_state/test_state_db_stats.py :: 7 passed, 1 skipped, 5 errors in 9.21s
+FAIL tests/hermes_state/test_storage_health_latch.py :: 4 failed, 4 passed in 12.57s
+FAIL tests/hermes_state/test_sweep_orphaned_sessions.py :: 25 failed, 2 passed in 52.20s
+FAIL tests/hermes_state/test_tail_rewind_semantics.py :: 7 failed in 14.56s
+FAIL tests/hermes_state/test_terminal_retirement.py :: 6 failed, 15 passed in 39.48s
+FAIL tests/hermes_state/test_transcript_handoff_rows_cost.py :: 3 failed in 5.12s
+FAIL tests/hermes_state/test_transcript_read_snapshot.py :: 2 failed, 1 warning in 5.56s
+FAIL tests/hermes_state/test_unaddressed_rewrite_identity.py :: 1 failed, 2 passed in 5.54s
+FAIL tests/hermes_state/test_wal_lock_guard_lifecycle.py :: 3 failed in 5.25s
+FAIL tests/hermes_state/test_wal_lock_guard.py :: 1 failed in 2.38s
+FAIL tests/hermes_state/test_watermark_interplay.py :: 3 failed in 5.32s
+FAIL tests/hermes_state/test_write_lock_patience.py :: 5 failed, 4 passed in 20.09s
+FAIL tests/hermes_state/test_writer_conn_thread_safety.py :: 4 failed, 1 passed in 5.90s
+FAIL tests/hermes_state/_wal_generation_harness.py :: no tests ran in 0.35s
+failed_files=134

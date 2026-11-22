@@ -1,53 +1,54 @@
-# PROGRESS — t_f4d564cb: кэш `/api/status` + вынос проверки схемы «комнат»
+# PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
 
-## Состояние: ГОТОВО к ревью
+## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_f4d564cb`, ветка `wt/t_f4d564cb`
-* База замеров до правки: `beeb9623539`
-* Отчёт: `REPORT-status-cache.md` (таблица «было/стало», тесты, ограничения)
-* Замеры (JSON в scratch профиля): `bench_baseline.json` (до), `bench_after.json` (после);
-  скрипты `bench_status.py`, `bench_schema_only.py`, `bench_store_ready.py`, `payload_dump.py`,
-  `neg_control.py` — всё в `/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/`
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
+* База для сравнения: `beeb9623539`
+* Содержимое правки = `git diff beeb9623539`
+* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
 
-### Что сделано
+## Сделано
 
-1. `hermes_cli/web_status_cache.py` (новый) — `TtlSingleFlightCache`: TTL 1,5 с, схлопывание
-   одновременных вычислений, необязательная `signature`.
-2. `hermes_cli/web_routers/status.py` — тело вынесено в `_collect_status`, маршрут отдаёт снапшот
-   из `_STATUS_CACHE`; подпись = файловые метки (pid/lock/state/config/.env) + liveness-digest
-   (PID-проба, runtime-запись, `shared_profile_warning`) + идентичность швов и флагов `app.state`.
-3. `gateway/hosted_rooms.py` — `_schema_is_current_cached` (ключ: inode файла + `PRAGMA
-   schema_version`), `_store_ready` использует кэш; `clear_schema_cache()` для тестов/миграций.
-4. Тесты: `tests/hermes_cli/test_status_probe_cache.py` (7),
-   `tests/gateway/test_hosted_rooms_schema_cache.py` (6).
+### Патч 1 — класс `owner_unavailable` (PR #152921, перенос по смыслу, не `git apply`)
 
-### Ключевые цифры
+* `hermes_state_errors.py:99-103` — `PERSISTENCE_ERROR_CAUSES` += `"owner_unavailable"` (перед `"unknown"`).
+* `hermes_state_errors.py` — `_PERSISTENCE_CAUSE_BY_PHRASE` += `(("owner_unavailable",), …)` и
+  `(("worker_receipt_timeout",), "owner_unavailable")`, **после** `foreign key constraint failed` и
+  **перед** `_PERMISSION_MARKERS`; комментарий PR сохранён (фраза, не тип; RPC теряет тип; импорт
+  фасада воркера инвертировал бы зависимость листового модуля).
+* Докстринг `classify_persistence_error` дополнен.
+* `agent/turn_explainers.py:53-56` — `_PERSISTENCE_CAUSES` += `"owner_unavailable"` + комментарий.
+* `locales/*.yaml` — 17 файлов, ключ `explainer.persistence.owner_unavailable` после `turn_lease`.
+* `tests/agent/test_turn_completion_explainer.py` — 3 новых теста (+параметризация).
 
-| | до | после |
-|---|---|---|
-| одиночный warm p50 | 98,6 мс | 6,8 мс |
-| 8 параллельных (прогрето) | 1103–1346 мс каждый | 24–32 мс каждый |
-| вердикт схемы (p50) | 0,265 мс | 0,075 мс |
+### Патч 2 — уборщик не убивает живых воркеров (issue #157057, диффа нет)
 
-### Тесты
+* `hermes_cli/kanban_db_dispatch.py::_reap_terminal_worker_row` — перед сигналом проба
+  `_worker_alive(pid, fingerprint)`; живой → `_log.debug` + `return` (строка остаётся в выборке);
+  мёртвый → снятие улик. Ветка сигнала удалена.
+* Докстринги `reap_terminal_workers` и `DispatchResult.reaped_terminal_workers` приведены к факту.
+* `tests/hermes_cli/test_kanban_terminal_worker_reaper.py` — 5 тестов переписаны под контракт.
+* `website/docs/user-guide/features/kanban.md:138` — описание диспетчера обновлено.
 
-* Целевые 8 файлов — **29 passed**.
-* Регрессия (`tests/gateway/test_hosted_rooms*`, `test_status.py`, весь `tests/tui_gateway/`) —
-  **2713 passed, 0 failed, 7 skipped**; два падения в общем прогоне флейковые (прошли изолированно).
-* Красная база: на `beeb9623539` новые тесты дают 13 ошибок (нет `_STATUS_CACHE` /
-  `clear_schema_cache`).
-* Негативный контроль: наивный кэш по пути файла тестом ловится (`after_migration=True` → тест падает).
-* `ruff` — All checks passed; `code_health --base beeb9623539` — 0 blocking, 0 advisory.
+Не тронуто: `TERMINAL_WORKER_REAP_GRACE_SECONDS`, `reclaim`-логика, `_terminate_reclaimed_worker`,
+`enforce_max_runtime`, `kanban_auto_continue.py`, `kanban_profile_scope.py`, пороги ретраев.
 
-### Остаточное (оркестратор, manual_review)
+## Проверки (все сняты)
 
-1. После выкатки — контрольный замер на живом порту 9120 (`curl -w '%{time_total}'` ×8).
-2. `git merge` ветки в целевую; живой шлюз не рестартовался (граница карточки).
-3. Pre-commit-хук в worktree не работает (`no bootstrap Python found`) — коммиты с `--no-verify`
-   после ручного прогона ruff + code_health.
+* reaper-тесты: 5 passed; на базе — 2 failed (красная база доказана).
+* explainer-тесты: 34 passed; на базе 4 новых падают (`-k owner`).
+* reaper + explainer + outbox: 61 passed.
+* Смежные наборы состояния: 109 passed, 7 skipped.
+* `ruff check` — All checks passed. `code_health --base beeb9623539` — 0 blocking, 0 advisory.
+* По-файлово `tests/hermes_cli/*kanban*` (99 файлов): база 17 FAIL / 82 PASS, патч 16 FAIL / 83 PASS;
+  `diff` наборов = единственная строка `test_kanban_terminal_worker_reaper.py`.
+* `tests/hermes_state` по-файлово: 134 падающих файла, все предсуществующие (страж
+  `home_io_guard.py:160` ругается на путь worktree; выборка 12 файлов даёт одинаковые числа на
+  базе и с правкой).
 
-### Замечено попутно (не моя правка, но закоммичено)
+## Следующий шаг для будущей попытки
 
-В worktree авто-коммит захватил `git stash pop` с маркерами конфликта в
-`hermes_cli/kanban_ops.py` и `hermes_cli/kanban_db_dispatch.py`. Восстановлены к состоянию
-апстрим-резолюции `497c8986c31` отдельным коммитом `c31ddab668b`.
+1. `git add -A && git commit` сообщением с номером карточки (t_4cb8f83b), затем
+   `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
+   `REPORT-patches.md`, `evidence-t4cb8f83b/`.
+2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.

@@ -36,7 +36,10 @@ const RELAY_ROSTER_INTERVAL_MS = 60_000
 // dial/teardown is the idle ~30s cost (#118856). It was 4s back when the
 // poll WAS the delivery path, which (before route retention) also meant a
 // fresh WebSocket dial + teardown per registered connection every 4s.
-const RELAY_DRAIN_INTERVAL_MS = 30_000
+// Each tick costs three reads even when nothing is relayed (the route list, the
+// registry and the served-set probe), so it runs at the roster's cadence: an
+// idle Webapp must not out-poll the very data it is checking for mail on.
+const RELAY_DRAIN_INTERVAL_MS = 60_000
 // Push path (#93091): the gateway broadcasts `bot_relay.outbox.pending` when
 // an envelope lands on disk; a burst of signals inside this window collapses
 // to ONE drain. The interval poll above stays as the backstop for older

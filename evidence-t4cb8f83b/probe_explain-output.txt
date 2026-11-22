@@ -1,0 +1,9 @@
+<frozen site>:101: RuntimeWarning: Unexpected value in sys.prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b/../../.venv
+<frozen site>:101: RuntimeWarning: Unexpected value in sys.exec_prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b/../../.venv
+cause: owner_unavailable
+in tuple: True
+key: explainer.persistence.owner_unavailable
+--- owner_unavailable
+⚠️ Нет ответа: ход остановлен, потому что этот воркер Hermes не смог связаться с процессом, которому принадлежит хранилище сеансов (шлюзом) — он завершает работу для обновления, перезапускается или его цикл событий завис — поэтому это сообщение не сохранено. Диск и другие процессы Hermes здесь ни при чём: отправьте сообщение ещё раз, а если ошибка повторяется, запустите `hermes -p 03-software-engineer gateway status`.
+--- unknown
+⚠️ Нет ответа: Hermes не смог сохранить этот разговор и остановился, чтобы не потерять ваши сообщения. Возможные причины: на диске закончилось место или базу данных держит другой процесс Hermes. Закройте другие окна Hermes, запустите `hermes -p 03-software-engineer doctor` для проверки хранилища, затем отправьте сообщение ещё раз.

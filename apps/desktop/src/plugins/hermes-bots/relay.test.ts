@@ -70,7 +70,8 @@ vi.mock('./data', () => ({
 }))
 
 const RELAY_PUSH_DEBOUNCE_MS = 250
-const RELAY_DRAIN_INTERVAL_MS = 30_000
+// Mirrors relay.ts's backstop cadence; keep in step when that constant moves.
+const RELAY_DRAIN_INTERVAL_MS = 60_000
 
 const route = (
   id: string,
