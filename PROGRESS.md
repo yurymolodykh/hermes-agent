@@ -72,4 +72,13 @@
 
 ## Осталось
 
-Ничего: критерии приёмки закрыты, изменения закоммичены, карточка сдаётся.
+Код, тесты и проверки закрыты. Остался **только публикационный гейт**:
+
+1. `ops-card-merge.py --task t_97c86dea` отказывает «репозиторий вне реестра публикации»,
+   хотя `/home/hermes/.hermes/hermes-agent` в `git-autopush.yaml` есть. Похоже, `repo_of(ws)`
+   возвращает путь рабочего дерева (`.worktrees/t_97c86dea`), а не корень репозитория —
+   проверять `repo_of` в `ops/bin/ops-card-merge.py` (строка ~185).
+2. Целевая ветка объявлена: `/home/hermes/workspaces/01-orchestrator/ops/state/card-publish-target/t_97c86dea.json`
+   → `feature/multiuser-access` (как у всех соседних карточек).
+3. После слияния в `feature/multiuser-access` — повторить `kanban_complete`
+   (гейт требует `git merge-base --is-ancestor 581a4d0c99c feature/multiuser-access`).
