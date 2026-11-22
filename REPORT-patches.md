@@ -182,10 +182,14 @@ code health: 4 files vs beeb96235392: 0 blocking, 0 advisory (2.2s)
    изоляция по файлам воспроизведена вручную. Полный набор `tests/hermes_cli/` в одном процессе
    даёт кросс-файловое загрязнение (111 «падений», которых нет при по-файловом прогоне) —
    это свойство окружения, а не правки.
-4. **`tests/hermes_state/` целиком** — фоновый прогон; результат в PROGRESS. Смежные наборы
+4. **`tests/hermes_state/` целиком — 134 падающих файла, все предсуществующие.** Корень виден в
+   сообщении стража: `tests/home_io_guard.py:160` — `TEST BUG: file I/O against the REAL hermes
+   home: …/.git/worktrees/t_4cb8f83b/hermes-update-pull`. Эти тесты рассчитаны на обычный checkout
+   и падают в worktree независимо от правки: выборка из 12 падающих файлов даёт **56 failed,
+   12 passed, 16 errors одинаково** на базе `beeb9623539` и с правкой. Смежные по смыслу наборы
    (`test_disk_full_error`, `test_storage_health_latch`, `test_state_db_corrupt_quarantine`,
    `test_deleted_wal_generation_guard`, `test_compression_closed_adoption`, `test_outbox_full_copy`,
-   `test_turn_completion_explainer`) отдельно прогнаны и зелены.
+   `test_turn_completion_explainer`) отдельно прогнаны и зелены — 109 passed, 7 skipped.
 5. **`keyring` отсутствует** в окружении прогона: `tests/hermes_cli/test_vault_key_cli.py` падает
    на сборе `ModuleNotFoundError: No module named 'keyring'`. Файл не импортируется ни на базе, ни
    на правке — исключён из по-файлового прогона.
