@@ -2170,10 +2170,15 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
+
+    A card landing in ``ready`` gets the card-sizing advisory
+    (``hermes_cli.kanban_db_sizing``) — after the transaction, never inside it, and
+    never as a veto: the promotion stands whatever the estimate says.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    sized: list[str] = []
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
@@ -2217,7 +2222,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
+                if resume_status == "ready":
+                    sized.append(task_id)
                 promoted += 1
+    for task_id in sized:
+        kanban_db_sizing.note_promotion(conn, task_id, author="dispatcher")
     return promoted
 
 
