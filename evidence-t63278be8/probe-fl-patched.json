@@ -1,0 +1,37 @@
+[
+ {
+  "variant": "A: config failure_limit=3, no per-task",
+  "path": "timeout",
+  "effective_limit": 3,
+  "limit_source": "dispatcher",
+  "failures": 3
+ },
+ {
+  "variant": "B: per-task max_retries=3",
+  "path": "timeout",
+  "effective_limit": 3,
+  "limit_source": "task",
+  "failures": 3
+ },
+ {
+  "variant": "C: dispatch_once(failure_limit=3)",
+  "path": "timeout",
+  "effective_limit": 3,
+  "limit_source": "dispatcher",
+  "failures": 3
+ },
+ {
+  "variant": "A: config failure_limit=3, crash path",
+  "path": "crash",
+  "effective_limit": 3,
+  "limit_source": "dispatcher",
+  "failures": 3
+ },
+ {
+  "variant": "C: dispatch_once(failure_limit=3), crash path",
+  "path": "crash",
+  "effective_limit": 3,
+  "limit_source": "dispatcher",
+  "failures": 3
+ }
+]

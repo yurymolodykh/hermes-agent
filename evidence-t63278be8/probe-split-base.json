@@ -1,0 +1,8 @@
+{
+ "slowed_decomposer_seconds": 6.0,
+ "skipped_locked": true,
+ "spawned_during_split": false,
+ "tick_elapsed_seconds": 0.46,
+ "split_calls_per_tick": 1,
+ "second_tick_skipped_locked": false
+}
