@@ -157,14 +157,16 @@ def _cmd_status(kp, as_json: bool) -> int:
                 "differently and does not print this block."
             )
 
-    print("\nkeys (occupied/limit):")
+    print("\nkeys (occupied/limit, busy today):")
     if not status.get("keys"):
         print("  (no card keys)")
     for row in status.get("keys") or []:
         tasks = ", ".join(str(t) for t in row.get("task_ids") or []) or "—"
+        busy = float(row.get("busy_seconds") or 0.0)
         print(
             f"  key #{row.get('key_id')} ({row.get('key_label')}): "
-            f"{row.get('used')}/{row.get('limit')}  [{tasks}]"
+            f"{row.get('used')}/{row.get('limit')}  "
+            f"busy {busy / 3600:.2f}h today ({row.get('cards') or 0} card(s))  [{tasks}]"
         )
 
     print("\nreservations:")
