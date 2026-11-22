@@ -4,8 +4,10 @@
 
 * Ветка: `wt/t_35fe5619`, worktree `.worktrees/t_35fe5619`
 * База: `3bbf87774c`
-* Верхушка ветки: цепочка `d8e2a4a634` → `d95cfff41b` → `48c1beb911` → этот коммит PROGRESS
-  (tip: `a5c28550f9`)
+* Верхушка ветки: цепочка `d8e2a4a634` → `d95cfff41b` → `48c1beb911` → коммит с этим PROGRESS.
+  Точный tip бери командой `git -C .worktrees/t_35fe5619 rev-parse HEAD`; он же записан в handoff
+  карточки (`kanban_complete.metadata.commit`). Хеш не печатается здесь, чтобы файл не устаревал
+  от собственного amend'а.
 * Модель/провайдер: `deepseek-v4-flash` / `letovo` (дефолт профиля, не подменялась)
 
 ### Что сделано
