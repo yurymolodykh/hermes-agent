@@ -1,5 +1,7 @@
-== probe: HERMES_KANBAN_HOME=/tmp/probe-t97c86dea-p3dy
-== create (CLI path, hermes_cli.main:main)
-Created t_5d499eca  (ready, assignee=03-software-engineer)
+== probe: HERMES_KANBAN_HOME=/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/probe-t97c86dea-emy22glz
+== 1. over-budget card (10 acceptance items, budget 180, estimate 340)
+⚠  kanban: t_fd08bb5f создана БЕЗ АДРЕСАТА — уведомления о падении в чат не пойдут. Задайте kanban.default_notify_chat или `hermes kanban notify-subscribe`.
 
 ⚠  Gateway is running but kanban.dispatch_in_gateway=false in config.yaml — the task will sit in 'ready' until you flip it back on and restart the gateway, OR run the legacy standalone daemon (`hermes kanban daemon --force`).
+Created t_fd08bb5f  (ready, assignee=03-software-engineer)
+== 2. card that fits (1 acceptance item, estimate 70)
