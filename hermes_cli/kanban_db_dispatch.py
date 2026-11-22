@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli import kanban_db_capacity as _kbcap
 from hermes_cli import kanban_auto_continue as _kac
+from hermes_cli import kanban_db_day_window as _kbday
 from hermes_cli import kanban_db_worker_env as _kbenv
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -2023,6 +2024,21 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
+def resolve_day_window_cap(
+    base_cap: Optional[int],
+    *,
+    now: Optional[float] = None,
+) -> Optional[int]:
+    """Effective cap for this tick with the daytime window applied.
+
+    One-line hop to ``hermes_cli.kanban_db_day_window`` (the module may only
+    shrink, so the logic lives in the sibling). Called on EVERY tick from
+    :func:`_tick_spawn_budget`, so the 08:00 / 18:00 edges move the cap in a
+    long-lived gateway process without a restart.
+    """
+    return _kbday.resolve_day_window_cap(base_cap, now=now)
+
+
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
@@ -2418,7 +2434,12 @@ def _tick_spawn_budget(
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+
+    ``max_in_progress`` is additionally passed through the daytime window on
+    every tick (:func:`resolve_day_window_cap`), so 08:00 and 18:00 move the cap
+    without a restart. With no ``kanban.day_*`` config that is a no-op.
     """
+    max_in_progress = resolve_day_window_cap(max_in_progress)
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.

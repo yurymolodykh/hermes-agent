@@ -1912,6 +1912,19 @@ DEFAULT_CONFIG = {
         # global caps allow; blocked tasks defer to the next tick. Unset (None) means "no per-profile
         # cap" — backward-compatible; use it when fan-out would saturate one profile's quota. #21582
         "max_in_progress_per_profile": None,
+        # Daytime layer over max_in_progress: inside `day_window` (in `day_window_tz`) the host cap
+        # becomes min(max_in_progress, day_max_in_progress); outside it the base cap applies
+        # unchanged. Re-read on EVERY dispatcher tick, so 08:00 and 18:00 take effect without a
+        # restart, and the level change is logged once per transition. Unset (the shipped default)
+        # = no daytime layer at all: behaviour is exactly the pre-window one. A malformed value
+        # degrades to the base cap with one WARN — it never stops dispatch.
+        "day_max_in_progress": None,
+        # ["HH:MM", "HH:MM"] — start inclusive, end exclusive. A window that wraps past midnight
+        # is rejected (it is far more often a typo than an intent) and falls back to the base cap.
+        "day_window": None,
+        # IANA zone the window is expressed in. Unknown zone → UTC+3 with one WARN, because a
+        # silently disabled window would hand the owner the wide cap all day.
+        "day_window_tz": "Europe/Moscow",
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
