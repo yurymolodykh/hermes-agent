@@ -56,6 +56,7 @@ def _make_remote(env: dict, root: Path) -> tuple[Path, Path]:
 
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="scratch-guard-probe."))
+    # health: allow PS-P05 -- measurement probe, not a served-profile child: every HERMES_*/kanban var that could point a child at live state is stripped below.
     env = dict(os.environ)
     env["HERMES_HOME"] = str(root / "hermes")
     # kanban_home() prefers HERMES_KANBAN_HOME and falls back to the OPERATOR's real
