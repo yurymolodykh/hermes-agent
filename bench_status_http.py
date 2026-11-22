@@ -65,7 +65,7 @@ def main() -> int:
 
     def one() -> float:
         t0 = time.perf_counter()
-        with urllib.request.urlopen(url, timeout=30) as r:
+        with urllib.request.urlopen(url, timeout=float(os.environ.get("REQ_TIMEOUT","30"))) as r:
             json.loads(r.read())
         return time.perf_counter() - t0
 
@@ -76,7 +76,7 @@ def main() -> int:
     print(f"serial /api/status median : {serial[len(serial) // 2] * 1000:.1f} ms")
 
     bursts = []
-    for _ in range(5):
+    for _ in range(int(os.environ.get("BURSTS","5"))):
         cond = threading.Condition()
         ready = [False] * 8
         out = [0.0] * 8
