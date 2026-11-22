@@ -62,6 +62,23 @@ export const $activeProfile = atom<string>('default')
 const NO_PROFILES: ProfileInfo[] = []
 export const $profiles = atom<ProfileInfo[]>(NO_PROFILES)
 
+// Signature-gate the publish (the same pattern the sidebar session lists use):
+// /api/profiles answers a fresh array every read, and a new array identity
+// re-runs every consumer's effect — in the Webapp that includes
+// `useUnservedProfiles`, whose effect reads the served-profile roster
+// (/api/profiles + /api/gateway-connections + /api/status). Publishing an
+// unchanged list therefore multiplied each background profiles read into three
+// more requests. Keep the previous array when the content did not move.
+function sameProfileList(left: ProfileInfo[], right: ProfileInfo[]): boolean {
+  return left.length === right.length && left.every((profile, index) => JSON.stringify(profile) === JSON.stringify(right[index]))
+}
+
+function publishProfiles(next: ProfileInfo[]): ProfileInfo[] {
+  const previous = $profiles.get()
+
+  return sameProfileList(previous, next) ? previous : next
+}
+
 // Successful lists belong to their source, not whichever gateway is active
 // when a rail renders. A re-home repaints from this cache until the incoming
 // source serves its own list, so a failed incoming read can neither borrow the
@@ -129,7 +146,7 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
               $profilesByConnection.set(new Map($profilesByConnection.get()).set(source, profiles))
             }
 
-            $profiles.set(profiles)
+            $profiles.set(publishProfiles(profiles))
           })
         }
 
