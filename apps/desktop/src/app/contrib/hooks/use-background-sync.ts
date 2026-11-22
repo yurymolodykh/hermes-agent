@@ -734,7 +734,9 @@ const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
 // tick — so a 10s gap turned an IDLE tab into a steady 6 reads/min for the list
 // plus the cron-jobs read it chains (refreshSessions also refreshes cron jobs).
 // The card's freshness contract is "event or ≤30s", which this still meets.
-const SESSIONS_LIST_TICK_GAP_MS = 30_000
+// Exported so the coalescing tests size their fake-clock advances from the real
+// gap instead of a hardcoded scale that silently stopped covering it.
+export const SESSIONS_LIST_TICK_GAP_MS = 30_000
 // A typing burst keeps the composer's contentEditable input handling on the
 // same renderer main thread as the list refresh above (#95033): with a large
 // session store, one refresh pass can block keystroke echo long enough that
