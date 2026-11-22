@@ -3,9 +3,7 @@ import type { HermesApiRequest } from '@/global'
 import type { UiPreferencesBridge, UiPreferencesSnapshot } from './ui-preferences/sync'
 
 const PATH = '/api/ui-preferences'
-// UI preferences are user-paced settings; a minute-late cross-device paint is
-// invisible, and focus/visibility already refreshes immediately on return.
-const POLL_MS = 60_000
+const POLL_MS = 10_000
 
 /**
  * The Webapp's door to the serving machine's UI preferences store. The server

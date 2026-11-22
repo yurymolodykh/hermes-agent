@@ -13,11 +13,8 @@ interface ServingHost {
   url: string
 }
 
-/** How often the open page re-reads the saved connections, which native Desktop may change too.
- *  A saved-connection edit is a rare, deliberate action; 30s (plus the focus read in
- *  browser-saved-connections) is prompt enough and stops the page from being a steady
- *  /api/gateway-connections client while it sits open. */
-const SAVED_CONNECTIONS_POLL_MS = 30_000
+/** How often the open page re-reads the saved connections, which native Desktop may change too. */
+const SAVED_CONNECTIONS_POLL_MS = 5_000
 
 /**
  * Gateways in the Webapp: which host serves the page and, behind the sign-in gate, signing out of

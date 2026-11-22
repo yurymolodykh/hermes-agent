@@ -59,16 +59,10 @@ export const hermesConfigKey = (
   return slot == null ? HERMES_CONFIG_KEY : ([...HERMES_CONFIG_KEY, slot] as const)
 }
 
-// staleTime 30s → serve cache on every mount inside the window, and revalidate at
-// most once per window (focus/visibility still refresh on return). The old 0
-// revalidated on EVERY mount, so a remount burst (settings panes, dialogs) sent
-// 5–7 identical `/api/config` reads in one second — the single largest source of
-// an idle tab's traffic. Local saves stay instant: `hermesConfigCacheWriter`
-// mirrors the saved record into this same cache, so no refetch is needed.
+// staleTime 0 → serve cache instantly, background-revalidate on every mount.
 // `profile` scopes both the query key and the fetch. Omitting it still targets
 // the app-wide active profile (`profileScoped(undefined)` fallback), but the
 // cache slot is the active gateway's — not the bare root key.
-const HERMES_CONFIG_STALE_MS = 30_000
 export const useHermesConfigRecord = (profile?: ProfileScope) => {
   // Reactive read, not a store getter: under the React Compiler a value with
   // no reactive inputs is computed once per component instance, so a
@@ -96,7 +90,7 @@ export const useHermesConfigRecord = (profile?: ProfileScope) => {
 
       return getHermesConfigRecord(profile ?? undefined)
     },
-    staleTime: HERMES_CONFIG_STALE_MS,
+    staleTime: 0,
     // Keep structural sharing so an unchanged refetch (every consumer mount at
     // staleTime 0, every invalidate) yields the SAME object and consumers'
     // memos/autosave effects don't re-arm. The read origin lives in a WeakMap
