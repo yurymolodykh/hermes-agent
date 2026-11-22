@@ -25,7 +25,7 @@ PRESERVED = "workspace_cleanup_preserved_unsaved_work"
 def _run(args: list[str], *, cwd: Path, env: dict, check: bool = True):
     result = subprocess.run(
         args, cwd=cwd, env=env, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=300,
+        encoding="utf-8", errors="replace", timeout=300, check=False,
     )
     if check and result.returncode != 0:
         raise SystemExit(f"FAILED {' '.join(args)}\n{result.stdout}\n{result.stderr}")

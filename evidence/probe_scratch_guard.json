@@ -1,21 +1,21 @@
 {
-  "hermes_home": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.zjpecy29/hermes",
+  "hermes_home": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.fd293pq5/hermes",
   "repo": "/home/hermes/.hermes/hermes-agent/.worktrees/t_78e323fe",
   "cases": {
     "unsaved_local_commit": {
       "complete_rc": 0,
-      "workspace": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.zjpecy29/kanban-home/kanban/workspaces/t_35987f9e",
+      "workspace": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.fd293pq5/kanban-home/kanban/workspaces/t_049d68ab",
       "workspace_exists": true,
       "unpushed_file_present": true,
       "preserved_event": [
         {
           "kind": "workspace_cleanup_preserved_unsaved_work",
           "payload": {
-            "path": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.zjpecy29/kanban-home/kanban/workspaces/t_35987f9e",
-            "repo": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.zjpecy29/kanban-home/kanban/workspaces/t_35987f9e/clone",
+            "path": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.fd293pq5/kanban-home/kanban/workspaces/t_049d68ab",
+            "repo": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.fd293pq5/kanban-home/kanban/workspaces/t_049d68ab/clone",
             "reason": "commits unreachable from any remote branch"
           },
-          "created_at": 1795363698,
+          "created_at": 1795364055,
           "run_id": null
         }
       ],
@@ -23,7 +23,7 @@
     },
     "clean_pushed": {
       "complete_rc": 0,
-      "workspace": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.zjpecy29/kanban-home/kanban/workspaces/t_eb725862",
+      "workspace": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/scratch-guard-probe.fd293pq5/kanban-home/kanban/workspaces/t_68b2ab72",
       "workspace_exists": false,
       "preserved_event": [],
       "status": "done"
