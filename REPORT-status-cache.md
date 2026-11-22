@@ -91,11 +91,33 @@ TTL 1,5 с сам по себе недостаточен для гарантии
 |---|---|
 | `tests/hermes_cli/test_status_probe_cache.py`, `tests/gateway/test_hosted_rooms_schema_cache.py` | **13 passed** |
 | + `tests/gateway/test_hosted_rooms_read_path.py`, `test_hosted_rooms.py`, `test_status.py`, `test_web_server_status_topology_cache.py`, `test_web_status_watchdog_surfaces.py`, `test_shared_profile_warning.py`, `test_status_probe_off_loop.py`, `test_dashboard_auth_status_endpoint.py` | **166 passed, 6 skipped** (10 файлов) |
-| Регрессия: `tests/gateway/test_hosted_rooms_read_path.py`, `tests/gateway/test_hosted_rooms.py`, `tests/gateway/test_status.py`, весь `tests/tui_gateway/` | **2713 passed, 0 failed, 7 skipped** (403 файла, 721 с) |
+| Регрессия: `tests/gateway/test_hosted_rooms_read_path.py`, `tests/gateway/test_hosted_rooms.py`, `tests/gateway/test_status.py`, весь `tests/tui_gateway/` | **2713 passed, 0 failed, 7 skipped** (403 файла, 721 с) — прогон раннером в round 1 |
 
 Два теста в общем прогоне (`test_unadmitted_peer_failure_does_not_block_next_healthy_member`,
 `test_session_rebuild_stops_previous_notification_poller`) один раз упали под параллельной
 нагрузкой 8 воркеров и **прошли при изолированном повторе** — флейк раннера, не регрессия.
+
+### Регрессия `tests/tui_gateway/` в этом контейнере (round 2)
+
+`scripts/run_tests.sh` здесь нерабочий (бутстрап: «no bootstrap Python found»), поэтому прогон
+шёл напрямую интерпретатором pm из test-environment — без пофайловой изоляции раннера. Это
+существенно: под настоящим `HOME` `tests/home_io_guard.py` валит тесты, которые читают
+`~/.hermes`, а без изоляции файлов добавляется межфайловое загрязнение. Итог и контроль:
+
+| Прогон | Результат |
+|---|---|
+| весь `tests/tui_gateway/`, реальный `HOME` | 63 failed / 3149 passed — доминируют `TEST BUG: file I/O against the REAL hermes home` |
+| весь `tests/tui_gateway/`, подменённый `HOME`+`HERMES_HOME` | **14 failed / 3198 passed / 1 skipped** |
+| 9 файлов с падениями, наша верхушка `4fafe5370ad` | 3 failed / 729 passed |
+| те же 9 файлов на **базе** `65db1ee540b` (архив в scratch) | 3 failed / 729 passed |
+
+`diff` списков `FAILED` между двумя последними прогонами **пуст** — те же три предсуществующих
+падения (`test_groups_methods.py` ×3), не связанных с правкой. Остальные 11 падений полного
+прогона directory-wide не воспроизводятся на тех же файлах отдельно и являются следствием
+отсутствия пофайловой изоляции; на базе те же файлы ведут себя идентично.
+
+Релевантные правке файлы под подменённым `HOME` зелёные: `test_readiness_singleflight.py`,
+`test_display_methods.py`, `test_gateway_bootstrap_recover.py` — **28 passed**.
 
 ### Красная база (до правки)
 
