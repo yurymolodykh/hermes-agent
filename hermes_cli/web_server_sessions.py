@@ -389,9 +389,25 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             db.close()
             raise
 
+    # Reuse a pooled read-only handle when one is idle for this exact file. Browsing reads are
+    # the per-request hot path (an /api/status poll, a session list, an analytics query); opening
+    # a fresh SessionDB per request pays connect + an 8 MB cache_size allocation + the schema
+    # probe every time — 60% of the whole read on a warm store. The pool validates the FILE
+    # identity, so a replaced/restored store is never answered from the old inode.
+    from hermes_cli.read_handle_pool import get_pool
+    from hermes_cli.read_handle_pool import _PooledHandle
+    from hermes_state_common import stat_db_file_identity
+
+    pool = get_pool()
+    pool_key = str(db_path)
+    identity = stat_db_file_identity(db_path)
+    pooled = pool.acquire(pool_key, identity)
+    if pooled is not None:
+        return _PooledHandle(pooled, pool_key, identity)
+
     try:
         try:
-            return _open_probed()
+            db = _open_probed()
         except sqlite3.OperationalError as exc:
             # A missing declared table/column is upgrade drift, not corruption (#140315): catch
             # an unowned store up once under its runtime lock, refuse by name when a gateway
@@ -403,7 +419,8 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             except DeclarativeDriftError as drift:
                 _log.warning("session store at %s is behind SCHEMA_SQL: %s", db_path, drift)
                 raise HTTPException(status_code=503, detail=str(drift)) from exc
-            return _open_probed()
+            db = _open_probed()
+        return _PooledHandle(db, pool_key, identity)
     except (sqlite3.DatabaseError, UnicodeDecodeError) as exc:
         from hermes_state_errors import is_malformed_db_error
         if isinstance(exc, sqlite3.DatabaseError) and is_malformed_db_error(exc):
