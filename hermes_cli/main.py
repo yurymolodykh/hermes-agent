@@ -2655,7 +2655,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy", "prompt-size", "resume", "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "tools", "uninstall", "update",
-        "usage", "vault",
+        "usage", "vault", "user",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -3250,6 +3250,9 @@ def _build_cli_parser():
     build_console_parser(subparsers, cmd_console=cmd_console)
     build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)
     build_skills_parser(subparsers, cmd_skills=cmd_skills)
+    from hermes_cli.user_admin import build_user_parser
+
+    build_user_parser(subparsers)
     build_bundles_parser(subparsers)
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
 
