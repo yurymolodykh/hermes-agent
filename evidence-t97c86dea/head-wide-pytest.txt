@@ -1,26 +1,226 @@
-........................................................................ [  0%]
-........................................................................ [  0%]
-........................................................................ [  1%]
-..................ss.................................................... [  1%]
-........................................................................ [  1%]
-........................................................................ [  2%]
-........................................................................ [  2%]
-........................................................................ [  2%]
-....................FFFFFFFFFFFFFFFF.F.F...F..FF.F....................--- Logging error ---
-Traceback (most recent call last):
-  File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/logging/handlers.py", line 79, in emit
-    if self.shouldRollover(record):
-       ~~~~~~~~~~~~~~~~~~~^^^^^^^^
-.Message: 'Could not build redacted plugin approval request'
-Arguments: ()
-. [  3%]
-........................................................................ [  3%]
-........................................................................ [  3%]
-......................F...s............................................. [  4%]
-................................................F....................... [  4%]
-........................................................................ [  4%]
-........................................................................ [  5%]
-.........F.............................................................. [  5%]
-..FFFFF...FF.............FF........FF................................... [  5%]
-......s..............................F.................................. [  6%]
-.....
+▶ not activated — using HERMES_PYTHON: /home/hermes/.hermes/kanban/workspaces/t_af262aaf/.venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1963 test files (~14978 tests) under ['tests/hermes_cli']; running with -j 6
+[  0.0% |     3/~14978 | ✓3 | ✗0] ✓ tests/hermes_cli/test_agent_env_advertisement.py (3✓, 2.6s)
+[  0.1% |    13/~14978 | ✓13 | ✗ 0] ✓ tests/hermes_cli/test_active_session_exclusivity.py (10✓, 5.0s)
+[  0.2% |    34/~14978 | ✓35 | ✗ 0] ✓ tests/hermes_cli/test_active_sessions.py (22✓, 8.2s)
+[  0.2% |    37/~14978 | ✓36 | ✗ 3] ✗ tests/hermes_cli/test_agent_import_left_core.py (1✓ 3✗, 7.1s)
+
+  ╔╍ Failed: tests/hermes_cli/test_agent_import_left_core.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_agent_import_left_core.py::test_old_spelling_without_the_plugin_names_the_install[argv0]
+  ║ FAILED tests/hermes_cli/test_agent_import_left_core.py::test_old_spelling_without_the_plugin_names_the_install[argv1]
+  ║ FAILED tests/hermes_cli/test_agent_import_left_core.py::test_a_scheduled_sync_on_a_home_nothing_migrated_installs_the_plugin_and_runs
+  ║ 3 failed, 1 passed in 2.81s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_agent_import_left_core.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  0.4% |    65/~14978 | ✓94 | ✗ 3] ✓ tests/hermes_cli/test_agent_plugins.py (58✓, 6.0s)
+[  0.4% |    67/~14978 | ✓ 97 | ✗  3] ✓ tests/hermes_cli/test_aggregator_overlap_twin_upstream.py (3✓, 2.9s)
+[  0.5% |    77/~14978 | ✓107 | ✗  3] ✓ tests/hermes_cli/test_ai_gateway_models.py (10✓, 3.3s)
+[  1.0% |   157/~14978 | ✓211 | ✗  3] ✓ tests/hermes_cli/test_acl_bindings.py (104✓, 13.8s)
+[  1.1% |   159/~14978 | ✓213 | ✗  3] ✓ tests/hermes_cli/test_alibaba_coding_plan_cn_provider_listing.py (2✓, 7.4s)
+[  1.2% |   175/~14978 | ✓233 | ✗  3] ✓ tests/hermes_cli/test_anon_connectors_token.py (20✓, 7.7s)
+[  1.3% |   197/~14978 | ✓251 | ✗  5] ✗ tests/hermes_cli/test_actual_provider.py (18✓ 2✗ 2s, 22.5s)
+
+  ╔╍ Failed: tests/hermes_cli/test_actual_provider.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_actual_provider.py::test_actual_agent_side_routing_keeps_chat_completions_for_any_model
+  ║ FAILED tests/hermes_cli/test_actual_provider.py::test_actual_agent_init_repairs_stale_responses_mode
+  ║ 2 failed, 18 passed, 2 skipped in 7.78s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_actual_provider.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  1.3% |   200/~14978 | ✓254 | ✗  5] ✓ tests/hermes_cli/test_anon_first_notice.py (3✓, 3.2s)
+[  1.5% |   222/~14978 | ✓280 | ✗  5] ✓ tests/hermes_cli/test_anon_failure_modes.py (26✓, 5.8s)
+[  1.5% |   227/~14978 | ✓285 | ✗  5] ✓ tests/hermes_cli/test_anon_desktop_signin.py (5✓, 10.1s)
+[  1.6% |   235/~14978 | ✓295 | ✗  5] ✓ tests/hermes_cli/test_anon_surfaces.py (10✓, 4.6s)
+[  1.6% |   238/~14978 | ✓298 | ✗  5] ✓ tests/hermes_cli/test_anon_picker.py (3✓, 7.7s)
+[  1.8% |   272/~14978 | ✓336 | ✗  7] ✗ tests/hermes_cli/test_anon_challenge.py (38✓ 2✗, 22.0s)
+
+  ╔╍ Failed: tests/hermes_cli/test_anon_challenge.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_anon_challenge.py::TestPresenting::test_the_stdio_tui_gateway_hands_the_link_to_its_client
+  ║ FAILED tests/hermes_cli/test_anon_challenge.py::TestPresenting::test_a_stdio_write_failure_falls_back_to_the_terminal
+  ║ 2 failed, 38 passed in 10.18s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_anon_challenge.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  2.0% |   306/~14978 | ✓373 | ✗  9] ✗ tests/hermes_cli/test_anon_auth_core.py (37✓ 2✗, 24.2s)
+
+  ╔╍ Failed: tests/hermes_cli/test_anon_auth_core.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_anon_auth_core.py::TestModelPin::test_agent_init_pins_only_on_welcome_route
+  ║ FAILED tests/hermes_cli/test_anon_auth_core.py::TestBootstrapNeverCreates::test_reads_never_mint
+  ║ 2 failed, 37 passed in 10.98s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_anon_auth_core.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  2.0% |   307/~14978 | ✓374 | ✗  9] ✓ tests/hermes_cli/test_anthropic_model_flow_stale_oauth.py (1✓, 2.6s)
+[  2.2% |   328/~14978 | ✓395 | ✗  9] ✓ tests/hermes_cli/test_anon_sign_in_flow.py (21✓, 10.2s)
+[  2.2% |   330/~14978 | ✓397 | ✗  9] ✓ tests/hermes_cli/test_anthropic_oauth_flow.py (2✓, 2.8s)
+[  2.3% |   338/~14978 | ✓405 | ✗  9] ✓ tests/hermes_cli/test_anon_upgrade.py (8✓, 5.3s)
+[  2.3% |   343/~14978 | ✓410 | ✗  9] ✓ tests/hermes_cli/test_anthropic_oauth_routes_to_messages_api.py (5✓, 3.0s)
+[  2.3% |   348/~14978 | ✓415 | ✗  9] ✓ tests/hermes_cli/test_anthropic_models_pagination.py (5✓, 5.3s)
+[  2.3% |   350/~14978 | ✓417 | ✗  9] ✓ tests/hermes_cli/test_anthropic_picker_curated.py (2✓, 3.0s)
+[  2.4% |   352/~14978 | ✓419 | ✗  9] ✓ tests/hermes_cli/test_anthropic_pool_model_discovery.py (2✓, 2.6s)
+[  2.4% |   354/~14978 | ✓421 | ✗  9] ✓ tests/hermes_cli/test_anthropic_provider_persistence.py (2✓, 3.4s)
+[  2.4% |   365/~14978 | ✓445 | ✗  9] ✓ tests/hermes_cli/test_api_mode_aliases.py (24✓, 4.7s)
+[  2.5% |   367/~14978 | ✓447 | ✗  9] ✓ tests/hermes_cli/test_approvals_command.py (2✓, 4.5s)
+[  2.5% |   370/~14978 | ✓447 | ✗ 12] ✗ tests/hermes_cli/test_apply_model_switch_result_context.py (3✗, 9.3s)
+
+  ╔╍ Failed: tests/hermes_cli/test_apply_model_switch_result_context.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_apply_model_switch_result_context.py::test_picker_path_uses_provider_aware_context_on_codex
+  ║ FAILED tests/hermes_cli/test_apply_model_switch_result_context.py::test_picker_path_falls_back_to_model_info_when_resolver_empty
+  ║ FAILED tests/hermes_cli/test_apply_model_switch_result_context.py::test_global_switch_clears_context_pin_owned_by_previous_route
+  ║ 3 failed in 3.15s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_apply_model_switch_result_context.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  2.6% |   390/~14978 | ✓470 | ✗ 12] ✓ tests/hermes_cli/test_approval_transport.py (23✓, 10.5s)
+[  2.7% |   405/~14978 | ✓485 | ✗ 12] ✓ tests/hermes_cli/test_approvals_test.py (15✓, 3.9s)
+[  2.8% |   420/~14978 | ✓500 | ✗ 12] ✓ tests/hermes_cli/test_approvals_suggest.py (15✓, 5.5s)
+[  2.9% |   427/~14978 | ✓509 | ✗ 12] ✓ tests/hermes_cli/test_arcee_provider.py (9✓, 3.2s)
+[  2.9% |   430/~14978 | ✓512 | ✗ 12] ✓ tests/hermes_cli/test_archive_safe.py (3✓, 2.7s)
+[  2.9% |   432/~14978 | ✓514 | ✗ 12] ✓ tests/hermes_cli/test_at_context_completion_filter.py (2✓, 3.3s)
+[  2.9% |   434/~14978 | ✓516 | ✗ 12] ✓ tests/hermes_cli/test_atomic_json_write.py (2✓, 3.4s)
+[  2.9% |   437/~14978 | ✓519 | ✗ 12] ✓ tests/hermes_cli/test_atomic_yaml_write.py (3✓, 3.6s)
+[  2.9% |   439/~14978 | ✓521 | ✗ 12] ✓ tests/hermes_cli/test_audio_playback_guard.py (2✓, 6.4s)
+[  3.0% |   442/~14978 | ✓524 | ✗ 12] ✓ tests/hermes_cli/test_audio_router_scope.py (3✓, 6.8s)
