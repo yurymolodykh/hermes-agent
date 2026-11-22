@@ -99,7 +99,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
     "replaced", "deleted_wal", "disk", "session_row_missing", "outbox_full", "outbox_busy",
-    "permission_denied", "unknown",
+    "permission_denied", "owner_unavailable", "unknown",
 )
 
 # The managed worker's private retry journal (``worker-outboxes/<execution>/pending.json``) is
@@ -302,6 +302,15 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("locked", "busy"), "locked"),
     # A flush rejected by the session-row FK: the row was removed under a live agent (#123583).
     (("foreign key constraint failed",), "session_row_missing"),
+    # A worker persists by RPC to the gateway owner and never writes SQLite itself, so an
+    # unreachable owner is not a storage fault. Both strings mean the same thing from the
+    # worker's side -- "the owner did not answer" -- and the drain/restart/stall distinction
+    # is not present in the error, so they share one cause. Matched by phrase (not by
+    # WorkerPersistenceError type) because RPC-wrapped errors lose the exception type and
+    # str() is the bare token; importing the worker facade here would also invert this
+    # leaf module's dependency on the agent runtime.
+    (("owner_unavailable",), "owner_unavailable"),
+    (("worker_receipt_timeout",), "owner_unavailable"),
     # Permissions: the store cannot write at all, and freeing disk space is not the fix.
     (_PERMISSION_MARKERS, "permission_denied"),
 )
@@ -316,7 +325,9 @@ def classify_persistence_error(exc_or_str) -> str:
     corruption to the FTS index (the transcript store is not damaged); "replaced" =
     main-file replacement; "deleted_wal" = a retired sidecar generation requiring
     capture inspection; "session_row_missing" = the session row was deleted under a
-    live agent (FK rejection; the flush recreates it)."""
+    live agent (FK rejection; the flush recreates it); "owner_unavailable" = this
+    worker's persistence RPC reached no owner (the gateway is draining for an update,
+    restarting, or its event loop is stalled) -- not a storage fault."""
     if exc_or_str is None:
         return "unknown"
     # Lease refusals contain neither "locked" nor "busy": match by type first,

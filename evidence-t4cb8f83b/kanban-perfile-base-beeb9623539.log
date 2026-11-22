@@ -1,0 +1,20 @@
+=== failed files: 17
+82
+FAIL tests/hermes_cli/test_kanban_boards.py :: 1 failed, 25 passed in 16.92s
+FAIL tests/hermes_cli/test_kanban_core_functionality.py :: 3 failed, 21 passed in 14.50s
+FAIL tests/hermes_cli/test_kanban_creator_origin.py :: 1 failed, 2 passed in 1.79s
+FAIL tests/hermes_cli/test_kanban_db.py :: 2 failed, 52 passed, 1 skipped in 24.51s
+FAIL tests/hermes_cli/test_kanban_gateway_restart_handoff.py :: 6 failed in 2.16s
+FAIL tests/hermes_cli/test_kanban_managed_worker_loss.py :: 1 failed, 12 passed in 11.07s
+FAIL tests/hermes_cli/test_kanban_notify.py :: 14 failed, 13 passed in 12.34s
+FAIL tests/hermes_cli/test_kanban_resume_guard.py :: 12 failed in 17.22s
+FAIL tests/hermes_cli/test_kanban_terminal_worker_reaper.py :: 2 failed, 3 passed in 7.92s
+FAIL tests/hermes_cli/test_kanban_worker_restart_wait.py :: 1 failed, 3 passed in 4.16s
+FAIL tests/hermes_cli/test_kanban_worker_session_source.py :: 2 failed, 3 passed in 4.89s
+FAIL tests/hermes_cli/test_kanban_worker_socket_recovery.py :: 6 failed, 19 passed in 3.42s
+FAIL tests/hermes_cli/test_kanban_worker_spawn_toolsets.py :: 3 failed, 1 passed in 2.84s
+FAIL tests/hermes_cli/test_kanban_worker_terminal_cwd.py :: 1 failed in 1.32s
+FAIL tests/hermes_cli/test_kanban_worker_terminal_scope.py :: 3 failed, 1 passed in 1.83s
+FAIL tests/hermes_cli/test_kanban_worktree_teardown.py :: 1 failed, 18 passed in 10.53s
+FAIL tests/hermes_cli/test_pin_kanban_board_env.py :: 2 failed in 1.44s
+RESTORED
