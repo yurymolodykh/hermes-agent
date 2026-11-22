@@ -359,6 +359,128 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+_SCRATCH_REPO_SCAN_SKIP = frozenset({
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
+})
+_SCRATCH_REPO_SCAN_MAX_DEPTH = 4
+
+
+def _iter_scratch_repos(root: Path) -> list[Path]:
+    """Git working-tree roots at or below ``root`` (bounded scan), outermost first.
+
+    A scratch workspace is arbitrary user space: a worker may clone a repo into it
+    (or into a subdirectory of it). Nesting under a found repo is not descended —
+    a submodule's own work is already visible as a dirty entry in its parent.
+    """
+    found: list[Path] = []
+    try:
+        stack: list[tuple[Path, int]] = [(root, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if (current / ".git").exists():
+                found.append(current)
+                continue
+            if depth >= _SCRATCH_REPO_SCAN_MAX_DEPTH:
+                continue
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if entry.name in _SCRATCH_REPO_SCAN_SKIP:
+                            continue
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append((Path(entry.path), depth + 1))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    except Exception:
+        return found
+    return found
+
+
+def _scratch_repo_unsaved_reason(repo: Path) -> Optional[str]:
+    """Why *repo*'s work exists nowhere else, or ``None`` when it is clean and fully pushed.
+
+    Everything uncertain resolves toward "unsaved": the caller only skips a delete.
+    """
+    def _git_out(*args: str, timeout: int = 10) -> Optional[str]:
+        try:
+            result = _git(repo, *args, timeout=timeout)
+        except Exception:
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    status = _git_out("status", "--porcelain", "-z", "--untracked-files=normal")
+    if status is None:
+        return "cannot read git status"
+    if status.replace("\0", "").strip():
+        return "uncommitted changes"
+    remote_refs = _git_out("for-each-ref", "--format=%(refname)", "refs/remotes")
+    if remote_refs is None:
+        return "cannot list remote-tracking refs"
+    if not remote_refs.strip():
+        # Nothing was ever pushed: this history exists only in the scratch dir.
+        return "no remote-tracking refs (nothing pushed)"
+    unpushed = _git_out("log", "--oneline", "HEAD", "--branches", "--not", "--remotes")
+    if unpushed is None:
+        return "cannot compare refs against the remote"
+    if unpushed.strip():
+        return "commits unreachable from any remote branch"
+    stash = _git_out("stash", "list")
+    if stash is None or stash.strip():
+        return "stash entries"
+    return None
+
+
+def _scratch_workspace_unsaved_reason(wp: Path) -> Optional[tuple[Path, str]]:
+    """First (repo, reason) inside *wp* whose work must not be destroyed, or ``None``."""
+    for repo in _iter_scratch_repos(wp):
+        reason = _scratch_repo_unsaved_reason(repo)
+        if reason is not None:
+            return repo, reason
+    return None
+
+
+def _preserve_scratch_workspace(
+    conn: sqlite3.Connection, task_id: str, wp: Path
+) -> bool:
+    """Keep *wp* and record why when it holds git work that exists nowhere else.
+
+    ``True`` means the caller must NOT delete it. Skips the scan (and returns
+    ``False``) for a workspace with no repository at all, which is the common case.
+    """
+    try:
+        if not wp.is_dir():
+            return False
+        unsaved = _scratch_workspace_unsaved_reason(wp)
+        if unsaved is None:
+            return False
+        repo, reason = unsaved
+        _kb._log.warning(
+            "Preserving scratch workspace for task %s: unsaved work (%s) in %s — %s "
+            "is left on disk; declare it as an artifact or use worktree:/dir: to keep it",
+            task_id, reason, repo, wp,
+        )
+        try:
+            _kb._append_event(
+                conn, task_id, "workspace_cleanup_preserved_unsaved_work",
+                {"path": str(wp), "repo": str(repo), "reason": reason},
+            )
+        except sqlite3.Error:
+            pass
+        return True
+    except Exception:
+        # Never let the check itself delete or block: an exception here means
+        # "cannot tell", and the only safe verdict for that is "preserve".
+        _kb._log.warning(
+            "Preserving scratch workspace for task %s: unsaved-work check failed at %s",
+            task_id, wp,
+        )
+        return True
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -402,7 +524,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818. Containment runs first so an unmanaged dir that is
             # never removed does not pay for (or log) the shared-use scan.
             if _is_managed_scratch_path(wp):
-                if not _defer_shared_workspace_cleanup(conn, task_id, path):
+                if _defer_shared_workspace_cleanup(conn, task_id, path):
+                    pass
+                elif _preserve_scratch_workspace(conn, task_id, wp):
+                    pass  # unsaved git work inside — logged + event, kept on disk
+                else:
                     release_lsp_clients(str(wp))
                     shutil.rmtree(wp, ignore_errors=True)
                     _kb._log.debug("Removed scratch workspace: %s", wp)
@@ -529,6 +655,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             if _is_managed_scratch_path(wp):
                 if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+                    continue
+                if _preserve_scratch_workspace(conn, parent_id, wp):
                     continue
                 release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
