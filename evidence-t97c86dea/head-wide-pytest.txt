@@ -5690,3 +5690,304 @@ Discovered 1963 test files (~14978 tests) under ['tests/hermes_cli']; running wi
   ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
 
 [ 28.2% |  4217/~14978 | ✓4337 | ✗ 585] ✓ tests/hermes_cli/test_gateway_launchd_runtime.py (1✓ 1s, 3.8s)
+[ 28.2% |  4219/~14978 | ✓4337 | ✗ 590] ✗ tests/hermes_cli/test_gateway_launch_lifetime.py (5✗, 15.5s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_launch_lifetime.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ /home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ /home/hermes/.hermes/hermes-agent/.worktrees/t_97c86dea/tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ /home/hermes/.hermes/hermes-agent/.worktrees/t_97c86dea/tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ /home/hermes/.hermes/hermes-agent/.worktrees/t_97c86dea/tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_launch_lifetime.py::test_retained_tui_worktree_survives_stale_prune_while_its_session_resumes[True]
+  ║ FAILED tests/hermes_cli/test_gateway_launch_lifetime.py::test_retained_tui_worktree_survives_stale_prune_while_its_session_resumes[False]
+  ║ FAILED tests/hermes_cli/test_gateway_launch_lifetime.py::test_retained_tui_worktree_kept_while_any_session_in_it_resumes[quoted_home]
+  ║ FAILED tests/hermes_cli/test_gateway_launch_lifetime.py::test_retained_tui_worktree_kept_while_any_session_in_it_resumes[after_new]
+  ║ FAILED tests/hermes_cli/test_gateway_launch_lifetime.py::test_retained_tui_worktree_kept_while_any_session_in_it_resumes[terminal_closed]
+  ║ 5 failed in 6.19s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_launch_lifetime.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.4% |  4248/~14978 | ✓4421 | ✗ 590] ✓ tests/hermes_cli/test_gateway_connections_ssh.py (84✓, 45.8s)
+[ 28.4% |  4254/~14978 | ✓4442 | ✗ 591] ✗ tests/hermes_cli/test_gateway_launch_supervisor.py (21✓ 1✗, 11.6s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_launch_supervisor.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║             extra.append("--all")
+  ║         if getattr(args, "system", False):
+  ║             extra.append("--system")
+  ║         if getattr(args, "force", False):
+  ║             extra.append("--force")
+  ║         if getattr(args, "detach", False):
+  ║             extra.append("--detach")
+  ║         try:
+  ║             unit = schedule_deferred_restart("restart", extra_args=extra)
+  ║         except DeferredRestartUnavailable as exc:
+  ║             print_error(
+  ║                 "Refusing to restart the gateway from a process inside its own service cgroup.\n"
+  ║                 f"  {exc}\n"
+  ║                 "  Restarting here would kill this turn and every sibling worker.\n"
+  ║                 "  Run it from a shell outside the gateway, or as a detached timer:\n"
+  ║                 "    systemd-run --user --on-active=5 --collect --unit hermes-deferred-restart -- hermes gateway restart"
+  ║             )
+  ║ >           sys.exit(1)
+  ║ E           SystemExit: 1
+  ║ 
+  ║ hermes_cli/gateway.py:5485: SystemExit
+  ║ ----------------------------- Captured stdout call -----------------------------
+  ║ ✗ Refusing to restart the gateway from a process inside its own service cgroup.
+  ║   systemd-run --user is unavailable (no reachable user D-Bus session); cannot schedule a restart outside this process's cgroup
+  ║   Restarting here would kill this turn and every sibling worker.
+  ║   Run it from a shell outside the gateway, or as a detached timer:
+  ║     systemd-run --user --on-active=5 --collect --unit hermes-deferred-restart -- hermes gateway restart
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_launch_supervisor.py::test_restart_of_a_manual_gateway_stops_it_and_runs_a_new_one
+  ║ 1 failed, 21 passed in 3.76s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_launch_supervisor.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.4% |  4257/~14978 | ✓4445 | ✗ 591] ✓ tests/hermes_cli/test_gateway_migrate_compensator_resume.py (3✓, 5.5s)
+[ 28.5% |  4268/~14978 | ✓4459 | ✗ 592] ✗ tests/hermes_cli/test_gateway_linger.py (14✓ 1✗, 11.2s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_linger.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:787: in read_text
+  ║     with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+  ║          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:771: in open
+  ║     return io.open(self, mode, buffering, encoding, errors, newline)
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.worktrees/manifest.json')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.worktrees/manifest.json
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ ----------------------------- Captured stdout call -----------------------------
+  ║ Installing user systemd service to: /var/tmp/hermes-pytest-1001/r-mk1ysn7y/pytest-of-hermes/pytest-0/test_systemd_install_calls_lin0/systemd/user/hermes-gateway.service
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_linger.py::test_systemd_install_calls_linger_helper
+  ║ 1 failed, 14 passed in 3.21s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_linger.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.5% |  4270/~14978 | ✓4459 | ✗ 594] ✗ tests/hermes_cli/test_gateway_listener_retirement.py (2✗, 10.5s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_listener_retirement.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_listener_retirement.py::test_gateway_listener_is_never_idle_and_refuses_retirement
+  ║ FAILED tests/hermes_cli/test_gateway_listener_retirement.py::test_standalone_serve_keeps_the_permit_protocol
+  ║ 2 failed in 3.40s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_listener_retirement.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.5% |  4273/~14978 | ✓4462 | ✗ 594] ✓ tests/hermes_cli/test_gateway_migrate_converged_host.py (3✓, 7.6s)
+[ 28.6% |  4284/~14978 | ✓4476 | ✗ 596] ✗ tests/hermes_cli/test_gateway_lifecycle_guards.py (14✓ 2✗, 20.8s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_lifecycle_guards.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         monkeypatch.setattr(gw, "find_gateway_pids", lambda *a, **k: [])
+  ║         monkeypatch.setattr(gw, "_served_by_another_host_gateway", lambda: SimpleNamespace(home=host_home))
+  ║         asked: list = []
+  ║         coder_work = {"active_agents": 1, "active_work": [_WORK["active_work"][0] | {"session": "agent:coder:telegram:dm:7"}]}
+  ║         monkeypatch.setattr(control_socket, "query_gateway_control",
+  ║                             lambda home, verb, params=None, **kw: asked.append((home, params)) or (
+  ║                                 coder_work if (params or {}).get("profile") == "coder" else _WORK))
+  ║         requests: list = []
+  ║         monkeypatch.setattr(control_socket, "request_unserve_profile",
+  ║                             lambda home, name: requests.append(("unserve", name)) or {"unserved": name})
+  ║         monkeypatch.setattr(control_socket, "request_serve_profile_hot",
+  ║                             lambda home, name: requests.append(("serve", name)) or {"served": name})
+  ║         command = getattr(gw, f"_cmd_{verb}")
+  ║     
+  ║         with pytest.raises(SystemExit) as exc:
+  ║             command(SimpleNamespace(all=False, system=False, force=False, interrupt=False))
+  ║     
+  ║         out = capsys.readouterr().out
+  ║         assert exc.value.code == 1 and requests == []
+  ║ >       assert asked == [(host_home, {"profile": "coder"})]
+  ║ E       AssertionError: assert [] == [(PosixPath('...e': 'coder'})]
+  ║ E         
+  ║ E         Right contains one more item: (PosixPath('/var/tmp/hermes-pytest-1001/r-yglrbb14/pytest-of-hermes/pytest-0/test_host_served_profile_refus1/root'), {'profile': 'coder'})
+  ║ E         Use -v to get more diff
+  ║ 
+  ║ tests/hermes_cli/test_gateway_lifecycle_guards.py:257: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_lifecycle_guards.py::test_restart_refuses_on_the_published_active_agents_of_an_older_gateway
+  ║ FAILED tests/hermes_cli/test_gateway_lifecycle_guards.py::test_host_served_profile_refuses_before_unserving_its_live_turns[restart]
+  ║ 2 failed, 14 passed in 9.53s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_lifecycle_guards.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.6% |  4289/~14978 | ✓4476 | ✗ 601] ✗ tests/hermes_cli/test_gateway_model_switch_cli.py (5✗, 8.0s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_model_switch_cli.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_97c86dea/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_model_switch_cli.py::test_new_after_a_model_switch_leaves_the_ended_session_alone
+  ║ FAILED tests/hermes_cli/test_gateway_model_switch_cli.py::test_model_before_the_first_turn_commits_on_the_session_that_turn_runs
+  ║ FAILED tests/hermes_cli/test_gateway_model_switch_cli.py::test_the_owners_refusal_is_asked_in_the_clis_model_guard_prompt
+  ║ FAILED tests/hermes_cli/test_gateway_model_switch_cli.py::test_a_declined_owner_warning_switches_nothing
+  ║ FAILED tests/hermes_cli/test_gateway_model_switch_cli.py::test_one_turn_restore_does_not_rewrite_the_session
+  ║ 5 failed in 2.77s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_model_switch_cli.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.7% |  4294/~14978 | ✓4481 | ✗ 601] ✓ tests/hermes_cli/test_gateway_multiplex_refusal.py (5✓, 3.3s)
+[ 28.7% |  4298/~14978 | ✓4482 | ✗ 604] ✗ tests/hermes_cli/test_gateway_multiplex_s6.py (1✓ 3✗, 8.0s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_multiplex_s6.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ 
+  ║ s6_host = (PosixPath('/var/tmp/hermes-pytest-1001/r-v2c8xldn/pytest-of-hermes/pytest-0/test_resolved_default_is_writt0/data'), <tests.hermes_cli.test_gateway_multiplex_s6._FakeS6 object at 0x75672f5cfa80>)
+  ║ 
+  ║     def test_resolved_default_is_written_once_and_never_on_a_guard(s6_host):
+  ║         root, _fake = s6_host
+  ║         guard = mode.MultiplexDecision(False, "guard", "profile(s) 'alpha' still run their own gateway")
+  ║         assert mode.persist_resolved_default(guard, root) is False
+  ║         assert mode.explicit_multiplex_flag(root) is None
+  ║         on = mode.MultiplexDecision(True, "default", "unset; default applies")
+  ║         assert mode.persist_resolved_default(on, root) is True
+  ║         text = (root / "config.yaml").read_text(encoding="utf-8")
+  ║         assert "# my config" in text and "multiplex_profiles: true" in text  # comment-preserving writer
+  ║         assert mode.persist_resolved_default(on, root) is False  # already explicit: once
+  ║         # A retired ``false`` is rewritten in place, never silently: the one-time notice reaches the
+  ║         # gateway start (log_multiplex_decision prints it) and the next ``hermes update`` summary.
+  ║         (root / "config.yaml").write_text("# my config\ngateway:\n  multiplex_profiles: false\n", encoding="utf-8")
+  ║         from gateway.config import GatewayConfig
+  ║         decision = mode.resolve_multiplex_mode(GatewayConfig.from_dict({"gateway": {"multiplex_profiles": False}}))
+  ║ >       assert decision.source == "retired-opt-out"
+  ║ E       AssertionError: assert 'guard' == 'retired-opt-out'
+  ║ E         
+  ║ E         - retired-opt-out
+  ║ E         + guard
+  ║ 
+  ║ tests/hermes_cli/test_gateway_multiplex_s6.py:122: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_gateway_multiplex_s6.py::test_parked_named_slots_do_not_veto_the_unset_default
+  ║ FAILED tests/hermes_cli/test_gateway_multiplex_s6.py::test_migrate_folds_an_up_named_slot_in_process_and_boot_shares_the_rule
+  ║ FAILED tests/hermes_cli/test_gateway_multiplex_s6.py::test_resolved_default_is_written_once_and_never_on_a_guard
+  ║ 3 failed, 1 passed in 2.61s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_multiplex_s6.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 28.7% |  4303/~14978 | ✓4488 | ✗ 604] ✓ tests/hermes_cli/test_gateway_multiplex_s6_markers.py (6✓, 3.6s)
+[ 29.0% |  4339/~14978 | ✓4500 | ✗ 634] ✗ tests/hermes_cli/test_gateway_migrate_multiplex.py (12✓ 30✗, 26.5s)
+
+  ╔╍ Failed: tests/hermes_cli/test_gateway_migrate_multiplex.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_parked_profile_remains_in_migration_inventory
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_migration_removes_parked_footprint_without_waiting_for_it_to_serve
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_apply_clears_the_manifest_on_success_and_the_compensator_restores
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_migration_preserves_root_system_service_user_for_default_install
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_rollback_that_cannot_bring_the_gateway_back_reports_failure_and_keeps_the_manifest
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_secondary_port_binder_is_notice_with_ingress_and_blocker_without
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_serves_profile_prefix_is_read_from_adapter_classes
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_migrates_when_unblocked_and_only_warns_when_blocked
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_refuses_to_cross_service_user_or_home_boundary[secondary_service0-1000-profiles/coder-different service domain]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_refuses_to_cross_service_user_or_home_boundary[secondary_service1-1000-profiles/coder-different service domain]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_refuses_to_cross_service_user_or_home_boundary[secondary_service2-2000-profiles/coder-UNIX privilege boundary]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_refuses_to_cross_service_user_or_home_boundary[secondary_service3-1000-external-outside]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_still_migrates_same_user_same_scope_profiles_under_the_default_tree
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_update_hook_folds_a_unit_less_default_when_every_secondary_shares_one_manager
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_auto_multiplex_migration_false_opts_out_of_the_update_hook_but_not_the_explicit_command
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_explicit_migrate_with_no_standalone_secondaries_still_flips_flag_and_restarts_default
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_failed_default_bringup_compensates_to_one_detached_gateway
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_interrupted_apply_is_resumed_from_the_manifest_not_short_circuited
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_every_installed_unit_of_a_secondary_is_removed_and_recorded
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_interruption_after_the_default_unit_exists_is_still_interrupted_not_already_multiplexed[False]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_interruption_after_the_default_unit_exists_is_still_interrupted_not_already_multiplexed[True]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_failure_anywhere_in_the_destructive_phase_restores_the_removed_secondaries[failing_op0]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_failure_anywhere_in_the_destructive_phase_restores_the_removed_secondaries[failing_op1]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_failure_anywhere_in_the_destructive_phase_restores_the_removed_secondaries[failing_op2]
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_known_bringup_refusal_is_rejected_before_any_secondary_is_touched
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_migrate_leaves_exactly_one_host_unit_serving_every_profile_and_is_idempotent
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_half_migrated_host_converges_on_a_re_run
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_migrate_enables_the_survivor_before_it_removes_anything
+  ║ FAILED tests/hermes_cli/test_gateway_migrate_multiplex.py::test_migrate_refuses_when_the_survivor_cannot_be_enabled
+  ║ 30 failed, 12 passed in 13.01s
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_gateway_migrate_multiplex.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
