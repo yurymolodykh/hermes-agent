@@ -1,13 +1,20 @@
 $ hermes kanban boards create smokeboard  -> exit 0
 Board 'smokeboard' created.
   Display name: Smokeboard
-  DB path:      /home/hermes/.hermes/kanban/boards/smokeboard/kanban.db
+  DB path:      /home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/kanbanhome/kanban/boards/smokeboard/kanban.db
   Use `hermes kanban boards switch smokeboard` to make it current.
-Traceback (most recent call last):
-  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/smoke_boards_rm.py", line 50, in <module>
-    tid = kb.create_task(conn, title="smoke scratch")
-  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/hermes_cli/kanban_db.py", line 1302, in create_task
-    raise ValueError(
-    ...<3 lines>...
-    )
-ValueError: refusing a card with no author and no named assignee on the live board: pass created_by= (who filed it) and a concrete assignee profile; probes and tests must pin HERMES_KANBAN_HOME to a temporary directory
+board dir exists: True /home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/kanbanhome/kanban/boards/smokeboard
+$ hermes kanban boards rm smokeboard --delete  -> exit 1
+
+STDERR: kanban boards rm: board 'smokeboard' holds scratch workspaces with unsaved work that exists nowhere else (/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/kanbanhome/kanban/boards/smokeboard/workspaces/t_180aca1e); recover them first, or re-run with --force to delete the board anyway
+CHECK refused(rc!=0): True
+CHECK board intact: True
+CHECK file intact: True
+CHECK event recorded: 1 ['created', 'workspace_cleanup_preserved_unsaved_work']
+$ hermes kanban boards rm smokeboard --delete --force  -> exit 0
+Deleted scratch workspaces with unsaved work (--force):
+  /home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/kanbanhome/kanban/boards/smokeboard/workspaces/t_180aca1e
+Board 'smokeboard' deleted.
+CHECK forced(rc==0): True
+CHECK forced names the path: True
+CHECK board gone: True
