@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Hashable, Optional
 
-__all__ = ["TtlSingleFlightCache", "STATUS_CACHE_TTL_SECONDS", "STATUS_CACHE_MAX_ENTRIES"]
+__all__ = ["STATUS_CACHE_MAX_ENTRIES", "STATUS_CACHE_TTL_SECONDS", "TtlSingleFlightCache"]
 
 #: 1.5 s: inside the 2 s a client tolerates after a gateway restart, and long enough that a 1/s
 #: poller hits the cache on every tick instead of recomputing the whole probe.
