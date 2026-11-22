@@ -63,6 +63,20 @@ TTL 1,5 с сам по себе недостаточен для гарантии
 Рестарт шлюза меняет PID-файл и runtime-запись → подпись другая → пересчёт **на следующем опросе**
 (тест `test_gateway_restart_reaches_the_probe_on_the_next_poll`).
 
+### Стоимость самой подписи кэша
+
+Подпись считается на event loop при каждом опросе (это замена дорогого прохода, но её тоже надо
+знать). `bench_sig_warm.py`, 2000 итераций после прогрева импортов:
+
+| | p50 | p95 | max | > 5 мс |
+|---|---|---|---|---|
+| `_status_cache_signature` | **0,87 мс** | 1,39 мс | 10,6 мс | 1 из 2000 |
+
+Первый вызов в процессе стоит ~1,4 с — это однократная загрузка `hermes_cli.process_identity`
+(её же платит и сам `_collect_status`), а не работа подписи. Внутри подписи дороже всего
+`shared_profile_warning()` (0,68 мс из 0,87): он читает spawn-ledger, потому что предупреждение о
+совместном использовании профиля — живой вердикт, и его нельзя выводить из mtime файла.
+
 ## 3. Тесты
 
 Тестовое окружение: `/home/hermes/.hermes/installs/800f6fec1bb76b19/test-environment/gen-e4f274747dd64d2e887e1719bfbcc3a9/venv/bin/python`,
@@ -72,7 +86,7 @@ TTL 1,5 с сам по себе недостаточен для гарантии
 | Набор | Результат |
 |---|---|
 | `tests/hermes_cli/test_status_probe_cache.py`, `tests/gateway/test_hosted_rooms_schema_cache.py` | **13 passed** |
-| + `tests/gateway/test_hosted_rooms_read_path.py`, `test_web_server_status_topology_cache.py`, `test_web_status_watchdog_surfaces.py`, `test_shared_profile_warning.py`, `test_status_probe_off_loop.py`, `test_dashboard_auth_status_endpoint.py` | **29 passed** (8 файлов) |
+| + `tests/gateway/test_hosted_rooms_read_path.py`, `test_hosted_rooms.py`, `test_status.py`, `test_web_server_status_topology_cache.py`, `test_web_status_watchdog_surfaces.py`, `test_shared_profile_warning.py`, `test_status_probe_off_loop.py`, `test_dashboard_auth_status_endpoint.py` | **166 passed, 6 skipped** (10 файлов) |
 | Регрессия: `tests/gateway/test_hosted_rooms_read_path.py`, `tests/gateway/test_hosted_rooms.py`, `tests/gateway/test_status.py`, весь `tests/tui_gateway/` | **2713 passed, 0 failed, 7 skipped** (403 файла, 721 с) |
 
 Два теста в общем прогоне (`test_unadmitted_peer_failure_does_not_block_next_healthy_member`,
