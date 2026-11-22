@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from contextlib import closing
 from functools import partial
 from pathlib import Path
@@ -430,6 +431,62 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_hosted_room_events_cursor'"
     ).fetchone() is not None and conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (_KIND_INDEX,)).fetchone() is not None
+
+
+# ``_schema_is_current`` reads one ``PRAGMA table_info`` per required table plus two index lookups, and
+# every store open runs it (``_store_ready`` is the ``ready`` hook of the shared connector), so it lands
+# in the hot path of every room read. The answer only changes when the schema does, and SQLite bumps
+# ``PRAGMA schema_version`` on every DDL statement and on a rolled-back migration. That integer plus the
+# file's identity is therefore a complete key with no time component: a migration (in this or any other
+# process sharing the database) is detected on the next open, and a replaced/removed file — new inode —
+# is a miss. Only the ``table_info`` scan is skipped; ``settled`` below it is re-checked every call.
+_SCHEMA_CACHE_MAX_FILES = 16
+# key: (resolved path, st_dev, st_ino) -> (schema_version, verdict)
+_schema_cache: dict[tuple[str, int, int], tuple[int, bool]] = {}
+_schema_cache_lock = threading.Lock()
+
+
+def _file_identity(path: DbPath) -> tuple[str, int, int] | None:
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return (str(Path(path).resolve()), int(stat.st_dev), int(stat.st_ino))
+
+
+def _schema_version(conn: sqlite3.Connection) -> int | None:
+    try:
+        return int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    except (sqlite3.Error, TypeError, IndexError):
+        return None
+
+
+def _schema_is_current_cached(conn: sqlite3.Connection, db_path: DbPath) -> bool:
+    """``_schema_is_current`` memoised per (file identity, ``schema_version``).
+
+    Falls back to the full check whenever the cheap key cannot be read (an in-memory database, an
+    unreadable path, a SQLite error): a readiness probe must never answer from a cache it cannot key.
+    """
+    identity = _file_identity(db_path)
+    version = _schema_version(conn) if identity is not None else None
+    if identity is None or version is None:
+        return _schema_is_current(conn)
+    with _schema_cache_lock:
+        cached = _schema_cache.get(identity)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+    verdict = _schema_is_current(conn)
+    with _schema_cache_lock:
+        if identity not in _schema_cache and len(_schema_cache) >= _SCHEMA_CACHE_MAX_FILES:
+            _schema_cache.pop(next(iter(_schema_cache)), None)
+        _schema_cache[identity] = (version, verdict)
+    return verdict
+
+
+def clear_schema_cache() -> None:
+    """Drop the memoised schema verdicts (a caller that just changed the schema on purpose)."""
+    with _schema_cache_lock:
+        _schema_cache.clear()
 
 
 def default_db_path() -> Path:
