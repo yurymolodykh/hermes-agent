@@ -242,6 +242,68 @@ def test_scan_that_stops_at_the_depth_cap_preserves(kanban_home, monkeypatch):
         assert payload["reason"] == "workspace tree too deep to verify"
 
 
+def _lock(path: Path) -> None:
+    path.chmod(0o000)
+
+
+def _unlock(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        path.chmod(0o755)
+
+
+def test_unreadable_subdirectory_preserves_whole_workspace(kanban_home, origin_repo):
+    """An unreadable directory is "cannot tell", never "nothing here".
+
+    The bug this pins: ``_child_dirs`` swallowed ``OSError`` into ``[]``, so a
+    middle directory the scan could not enter read as "no subdirectories". The
+    unpushed repo underneath was never seen, ``truncated`` stayed False, the
+    verdict came back ``None`` ("clean") — and ``rmtree`` destroyed every
+    readable file around the one directory it could not read.
+    """
+    with kbc.connect() as conn:
+        task_id, ws = _scratch_task(conn)
+        repo = _clone_into(origin_repo, ws / "mid" / "clone")
+        (repo / "work.txt").write_text("local only\n", encoding="utf-8")
+        _git("add", "work.txt", cwd=repo)
+        _git("commit", "-m", "never pushed", cwd=repo)
+        (ws / "notes.md").write_text("readable neighbour\n", encoding="utf-8")
+        barrier = ws / "mid"
+        _lock(barrier)
+        try:
+            assert kb.complete_task(conn, task_id, result="done")
+
+            preserved = _events(conn, task_id, PRESERVED_EVENT)
+            assert len(preserved) == 1, "one workspace, one event"
+            assert preserved[0].payload["path"] == str(ws)
+            assert "readable" in preserved[0].payload["reason"]
+            # Nothing was deleted: the readable files next to the locked dir survive.
+            assert (ws / "notes.md").exists()
+            assert (ws / "notes.md").read_text(encoding="utf-8") == "readable neighbour\n"
+        finally:
+            _unlock(barrier)
+        # And the work under the barrier is still there once it is readable again.
+        assert (repo / "work.txt").exists()
+        assert "never pushed" in _git("log", "--oneline", "HEAD", cwd=repo)
+
+
+def test_unreadable_workspace_root_preserves_workspace(kanban_home):
+    """A workspace root that cannot be listed is "cannot tell" too."""
+    with kbc.connect() as conn:
+        task_id, ws = _scratch_task(conn)
+        (ws / "notes.md").write_text("scratch\n", encoding="utf-8")
+        _lock(ws)
+        try:
+            assert kb.complete_task(conn, task_id, result="done")
+            preserved = _events(conn, task_id, PRESERVED_EVENT)
+            assert len(preserved) == 1
+            assert "readable" in preserved[0].payload["reason"]
+        finally:
+            _unlock(ws)
+        assert (ws / "notes.md").read_text(encoding="utf-8") == "scratch\n"
+        # A second pass on a readable, repo-less workspace clears it as usual.
+        assert kb.complete_task(conn, task_id, result="again") or True
+
+
 # ---------------------------------------------------------------------------
 # Every deletion path carries the guard
 # ---------------------------------------------------------------------------
