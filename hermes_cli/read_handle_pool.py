@@ -171,7 +171,7 @@ class _PooledHandle:
     cross-request data race rather than a bug report.
     """
 
-    __slots__ = ("_db", "_pool_key", "_identity", "_closed")
+    __slots__ = ("_closed", "_db", "_identity", "_pool_key")
 
     def __init__(self, db, pool_key: str, identity) -> None:
         object.__setattr__(self, "_db", db)

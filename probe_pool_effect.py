@@ -24,9 +24,9 @@ os.environ["HERMES_TEST_ISOLATION"] = "1"
 os.environ.setdefault("HERMES_STATE_DB_GUARD_BYPASS", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import sqlite3  # noqa: E402
+import sqlite3
 
-from hermes_state import SessionDB  # noqa: E402
+from hermes_state import SessionDB
 
 _connects = {"n": 0}
 _orig_connect = sqlite3.connect
@@ -58,7 +58,7 @@ def read_once(db_path: Path) -> int:
         d.close()
 
 
-from hermes_cli.web_server_sessions import _open_session_db_at_path as _open  # noqa: E402
+from hermes_cli.web_server_sessions import _open_session_db_at_path as _open
 
 
 def main() -> int:
@@ -111,7 +111,7 @@ def main() -> int:
         try:
             for _ in range(5):
                 read_once(db_path)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errs.append(repr(exc))
 
     t0 = time.perf_counter()
