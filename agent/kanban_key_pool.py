@@ -60,6 +60,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from agent import kanban_key_pool_state as _state
 from agent import kanban_key_pool_usage as _usage
 
+#: Facade seam for the Moscow-day bucket key. Callers and tests read the day
+#: boundary through the facade, so the accounting window lives with the code
+#: that reserves the slot rather than only in the sibling module.
+_usage_today = _usage.usage_today
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
