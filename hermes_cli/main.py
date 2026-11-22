@@ -2379,7 +2379,6 @@ def _coalesce_session_name_args(argv: list) -> list:
             i += 1
     return result
 
-
 from hermes_cli.profile_cmd import cmd_profile
 
 
