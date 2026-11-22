@@ -73,18 +73,26 @@
 * `pytest tests/hermes_cli/test_kanban_promotion_sizing.py -q` → **8 passed**
 * `python -m scripts.code_health --base 65db1ee540b` → **0 blocking, 0 advisory** (3 файла)
 * `ruff check --select BLE001,S110,E722,F,RUF006` по новым файлам → All checks passed
-* Широкий регресс `tests/hermes_cli` — см. `PROGRESS.md` / итог в комментарии карточки
+* Широкий регресс `tests/hermes_cli`: head — 29 упавших файлов из 1055 выполненных
+  (обрезка `timeout 1500` на 54.2 %); те же 29 перегнаны на базе `65db1ee540b` —
+  28 падают идентично (среда, не наш код), `test_backup_preflight.py` проходит на head
+  изолированно. Итог: **ноль регрессий от этого изменения**. Подробно —
+  `evidence-t97c86dea/wide-regression-compare.md`.
 
 ## Живая проба (CLI, временная kanban-база)
 
-`HERMES_KANBAN_HOME=$(mktemp -d)`, живая доска не тронута. Полные выводы:
-`evidence-t97c86dea/PROBE-show.txt`, `PROBE-cli-create.txt`.
+Воспроизводимый скрипт `evidence-t97c86dea/live_probe.py` (изолированный
+`HERMES_KANBAN_HOME`, живая доска не тронута), прогон на текущем HEAD через реальный
+CLI-вход `hermes_cli.main:main`. Полный вывод — `evidence-t97c86dea/PROBE-cli-create.txt`.
 
 ```
-Created t_fa39fab9  (ready, assignee=03-software-engineer)
-...
-Comments (1):
-  [2026-11-22 23:06] 02-hermes-platform: **card-sizing** карточка не влезает в бюджет профиля-исполнителя.
+Created t_0a04f39d  (ready, assignee=03-software-engineer)
+Created t_af845441  (ready, assignee=03-software-engineer)
+
+=== 1. hermes kanban show t_0a04f39d
+  status:    ready
+  assignee:  03-software-engineer
+  [2026-11-23 00:29] user: **card-sizing** карточка не влезает в бюджет профиля-исполнителя.
   - исполнитель: `03-software-engineer`
   - пунктов приёмки: 10
   - ожидаемо итераций: 340
@@ -92,9 +100,10 @@ Comments (1):
   - превышение: 160
   Рекомендация: разделить карточку или вынести часть пунктов приёмки в отдельную карточку
   с `parents` = эта. Промоушен не заблокирован …
-```
 
-Парная проба с одним пунктом приёмки (`t_5d499eca`) — комментариев нет, статус `ready`.
+=== 2. hermes kanban show t_af845441
+  status:    ready          (1 пункт приёмки → комментариев нет)
+```
 
 ## Что осталось за границей карточки
 
