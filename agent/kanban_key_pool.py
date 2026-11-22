@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "KeyPoolError",
+    "KeyPoolSlotBusy",
+    "KeyPoolWait",
     "KeyPoolConfig",
     "Reservation",
     "KeyBinding",
@@ -137,8 +139,9 @@ _binding_error: Optional["KeyPoolError"] = None
 _file_lock_holder = threading.local()
 
 
-class KeyPoolError(RuntimeError):
-    """A key-pool operation failed in a way the caller must handle."""
+# The exception types live in their own sibling (this facade is over its line
+# ratchet); re-exporting keeps ``agent.kanban_key_pool.KeyPoolError`` the one path callers use.
+from agent.kanban_key_pool_errors import KeyPoolError, KeyPoolSlotBusy, KeyPoolWait
 
 
 # ── paths ───────────────────────────────────────────────────────────────────
@@ -277,20 +280,17 @@ class KeyPoolConfig:
     def inactive_reason(self) -> Optional[str]:
         """Why this file does not put the pool in force, or ``None`` if it does.
 
-        Two conditions are *structural* rather than a matter of taste, and each
-        one silently breaks one of the owner's hard requirements if the pool is
-        allowed to run without it:
+        Two conditions are *structural*, each silently breaking one of the owner's
+        hard requirements if the pool runs without it:
 
-        * **no card keys** (or fewer than two keys in total) — there is nothing
-          to distribute, so the honest behaviour is the plain single-key scheme
-          (mission requirement 5). Running instead would fail every card with
-          "no free card key", which is not "behaviour identical to today".
-        * **empty ``base_url``** — the endpoint guard in :func:`apply_card_key`
-          compares the runtime URL against ``cfg.base_url``; with an empty value
-          that comparison cannot be made, and a card key would be handed to
-          whatever host the runtime happens to point at (another provider, a
-          fallback endpoint). A pool key is a secret for ONE host, so a key
-          file that does not name that host is unusable.
+        * **no card keys** (or fewer than two keys in total) — nothing to
+          distribute, so the honest behaviour is the plain single-key scheme
+          (mission requirement 5); running instead fails every card with "no free
+          card key", which is not "behaviour identical to today";
+        * **empty ``base_url``** — :func:`apply_card_key` compares the runtime URL
+          against ``cfg.base_url``, so with an empty value a card key would go to
+          whatever host the runtime points at. A pool key is a secret for ONE
+          host.
         """
         if not self.enabled:
             return "config_disabled"
@@ -538,7 +538,7 @@ def _state_lock(path: Path) -> Iterator[None]:
                 break
             except (BlockingIOError, OSError, PermissionError) as exc:
                 if time.monotonic() >= deadline:
-                    raise KeyPoolError(
+                    raise KeyPoolWait(
                         f"timed out after {_LOCK_TIMEOUT_SECONDS:.0f}s waiting for "
                         f"the key-pool state lock at {lock_path}"
                     ) from exc
@@ -1295,7 +1295,7 @@ def reserve_for_card(
                     f"#{fid} ({rec.get('reason')} @ {rec.get('status_code')})"
                     for fid, rec in sorted(failed.items())
                 )
-            raise KeyPoolError(
+            raise KeyPoolSlotBusy(
                 f"no free card key slot: every card key is full at "
                 f"{max_per_key} card(s) per key ({occupancy}).{detail} The "
                 f"background key is never handed to a card. Wait for a card to "

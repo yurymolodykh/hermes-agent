@@ -90,14 +90,24 @@ def _validate_children_graph(children: list) -> None:
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
+    source_statuses: tuple[str, ...] = ("triage",), allow_redecompose: bool = False,
 ) -> Optional[list[str]]:
-    """Fan a triage task out into children and move the root to ``todo``; the root
-    waits on every child and wakes (``ready``) when all are done.
+    """Fan a source-column task out into children and move the root to ``todo``;
+    the root waits on every child and wakes (``ready``) when all are done.
 
     ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
     ``parents`` (indices into this list), optional workspace overrides.
-    Returns child ids in input order, or None when the root is missing / not
-    in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+    ``source_statuses`` names the statuses this fan-out accepts: the triage column
+    by default, ``("ready", "todo", "blocked")`` when the dispatcher splits a card
+    that burned its retry counter (``kanban_auto_continue``). That check is an
+    optimistic-concurrency guard, not policy: the caller already decided the card
+    is splittable, and a card that moved on meanwhile must not be overwritten.
+    ``allow_redecompose`` admits a root that already decomposed once — a
+    repeated-failure split is a NEW generation of children over the same card,
+    whereas a triage card is decomposed exactly once.
+    Returns child ids in input order, or None when the root is missing / not in an
+    accepted status, or has already decomposed. Atomic: malformed entries abort
+    fan-out.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
@@ -109,6 +119,7 @@ def decompose_triage_task(
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)
+    allowed = set(source_statuses)
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.
@@ -118,11 +129,11 @@ def decompose_triage_task(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if root_row is None or root_row["status"] != "triage":
+        if root_row is None or root_row["status"] not in allowed:
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
-        if conn.execute(
+        if not allow_redecompose and conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
             (task_id,),
         ).fetchone():

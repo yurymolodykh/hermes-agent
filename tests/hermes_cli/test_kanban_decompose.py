@@ -250,3 +250,114 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+# ---------------------------------------------------------------------------
+# The failed-card split (kanban_auto_continue): a card that burned its retry
+# counter is subdivided here, and each child must inherit where the work lives.
+# ---------------------------------------------------------------------------
+
+
+def _failed_card(kanban_home, *, workspace: str | None = None):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="big job", assignee="engineer")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 3, last_failure_error = 'pid 42 exited with code 1', "
+            "workspace_path = ? WHERE id = ?",
+            (workspace, tid),
+        )
+        conn.commit()
+    return tid
+
+
+def test_decompose_failed_card_stamps_the_previous_workspace_locator(kanban_home):
+    """Each child body names the parent's workspace, PROGRESS.md and the parent card id.
+
+    Without this a fresh worker restarts from zero and burns the same budget again.
+    """
+    tid = _failed_card(kanban_home, workspace="/srv/work/t_parent")
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "two halves",
+        "tasks": [
+            {"title": "finish the code", "body": "keep going", "assignee": "engineer", "parents": []},
+            {"title": "write the report", "body": "report it", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_failed_card(tid, generation=1, author="dispatcher")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, cid) for cid in outcome.child_ids]
+    assert root.status == "todo", "the root waits for its children"
+    for child in children:
+        assert "/srv/work/t_parent" in child.body
+        assert "/srv/work/t_parent/PROGRESS.md" in child.body
+        assert f"`{tid}`" in child.body
+
+
+def test_decompose_failed_card_says_so_when_no_workspace_exists(kanban_home):
+    """A card that never materialized a worktree gets an honest instruction, not a fake path."""
+    tid = _failed_card(kanban_home, workspace=None)
+    payload = jsonlib.dumps({
+        "fanout": True, "rationale": "split",
+        "tasks": [{"title": "a", "body": "b", "assignee": "engineer", "parents": []}],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_failed_card(tid, generation=1, author="dispatcher")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert "не успела материализовать рабочее дерево" in child.body
+    assert "/PROGRESS.md" not in child.body
+
+
+def test_decompose_failed_card_refuses_a_tighten_only_reply(kanban_home):
+    """``fanout=false`` is not an answer for a card that burned its budget."""
+    tid = _failed_card(kanban_home)
+    payload = jsonlib.dumps({"fanout": False, "rationale": "one unit", "title": "tighter", "body": "b"})
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_failed_card(tid, generation=1, author="dispatcher")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "declined to split" in outcome.reason
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status != "todo"
+
+
+def test_decompose_failed_card_refuses_a_triage_only_status(kanban_home):
+    """A closed card must never be re-opened by a late dispatcher tick."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="done already")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        conn.commit()
+    outcome = decomp.decompose_failed_card(tid, generation=1)
+    assert outcome.ok is False
+    assert "not splittable" in outcome.reason

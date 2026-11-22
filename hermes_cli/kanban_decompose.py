@@ -27,7 +27,7 @@ from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
-    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body, _truncate,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -334,6 +334,214 @@ def decompose_task(
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
     return _apply_fanout(task_id, parsed, routing, audit_author)
+
+
+_FAILURE_SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
+
+A card burned its whole retry budget and its work still is not finished: the job
+is objectively bigger than one worker's run. Your job is to split the REMAINING
+work into a small graph of concrete child tasks, each small enough for one
+worker run, and route each to the best-matching profile.
+
+You will be given:
+  - The card's title and body (the original assignment)
+  - What the failed attempt already did and where it stopped: the worker's own
+    report / last error, and the workspace path holding its committed work
+  - The list of available profiles (each with name + description)
+  - The fallback "default_assignee" used when no profile fits
+
+Do NOT re-plan work the report says is finished. Children that build on the
+existing work must say so and name the artifacts, commit or PROGRESS.md path
+they inherit, so a fresh worker continues instead of starting over.
+
+Output a single JSON object with this exact shape:
+
+  {
+    "fanout": true,
+    "rationale": "<one sentence on why this split>",
+    "tasks": [
+      {
+        "title": "<concrete task title, imperative voice, <= 80 chars>",
+        "body":  "<detailed spec: goal, approach, acceptance criteria, and the
+                  exact input locators (paths, PROGRESS.md, commit) to start from>",
+        "assignee": "<profile name from the roster, or null for default>",
+        "parents": [<int>, ...]
+      },
+      ...
+    ]
+  }
+
+Rules:
+  - "parents" is a list of INDICES (0-based) into this same "tasks" list,
+    expressing actual data dependencies. Tasks with no parents run in
+    PARALLEL. Tasks with parents wait until every parent completes.
+  - Use 2-5 tasks. Each must be finishable in one worker run; if a piece is
+    still too big, say so in its body rather than hiding the size.
+  - Every child's acceptance criteria must be checkable by the worker itself.
+  - Pick assignees from the roster by matching the task to the profile's
+    DESCRIPTION. When nothing matches well, use null and the system routes to
+    the default_assignee.
+
+No preamble, no closing remarks, no code fences. Output only the JSON object.
+"""
+
+_FAILURE_USER_TEMPLATE = """Task id: {task_id}
+Title: {title}
+Body:
+{body}
+
+The card already failed {failures} time(s) in a row and the retry counter is
+exhausted (split generation {generation}).
+Last error / stop note:
+{last_error}
+
+Workspace with the attempt's committed work: {workspace}
+Progress notes (read this first): {progress}
+
+Available profiles (assignees you may pick from):
+{roster}
+
+Default assignee (used when no profile fits a task): {default_assignee}
+"""
+
+
+def _load_failed_task(task_id: str) -> tuple[Optional[kb.Task], str]:
+    """``(task, "")`` for a card the dispatcher may split, else ``(None, reason)``.
+
+    Accepts the statuses the auto-continue policy leaves a card in while it waits
+    for its split: ``ready`` (a continuation burned in this generation) plus
+    ``todo``/``blocked`` (a card that raced an operator action). Anything already
+    closed is refused so a late tick cannot re-open finished work.
+    """
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    if task is None:
+        return None, "unknown task id"
+    if task.status not in ("ready", "todo", "blocked"):
+        return None, f"task is not splittable (status={task.status!r})"
+    return task, ""
+
+
+def _failed_card_prompt_fields(task: kb.Task, *, generation: int) -> dict[str, str]:
+    """Prompt fields for a failed card: its own words plus where the work lives."""
+    workspace = task.workspace_path or "(not materialized yet)"
+    progress = (
+        f"{workspace.rstrip('/')}/PROGRESS.md"
+        if workspace.startswith("/") else "PROGRESS.md in the card workspace"
+    )
+    return {
+        **_task_prompt_fields(task),
+        "failures": str(int(task.consecutive_failures or 0)),
+        "generation": str(generation),
+        "last_error": _truncate(task.last_failure_error or "(no error recorded)", 2000),
+        "workspace": workspace,
+        "progress": progress,
+    }
+
+
+def _stamp_progress_locator(children: list[dict], task: kb.Task) -> None:
+    """Append the previous attempt's workspace + PROGRESS.md locator to each child.
+
+    Only when the worker gets a real path: a guessed one would send the child to
+    a directory that does not exist. The body keeps whatever the LLM wrote and
+    gains a short, checkable section at the end.
+    """
+    workspace = (task.workspace_path or "").strip()
+    if workspace.startswith("/"):
+        locator = (
+            f"\n\nГде лежит работа предыдущей попытки: `{workspace}` — прочитай "
+            f"`{workspace.rstrip('/')}/PROGRESS.md` перед началом; коммиты и файлы "
+            f"оттуда наследуются, а не переделываются. Карточка-родитель: `{task.id}`."
+        )
+    else:
+        locator = (
+            f"\n\nПредыдущая попытка не успела материализовать рабочее дерево; "
+            f"начни с нуля и сразу заведи `PROGRESS.md`. Карточка-родитель: `{task.id}`."
+        )
+    for child in children:
+        body = (child.get("body") or "").rstrip()
+        child["body"] = (body + locator).strip()
+
+
+def decompose_failed_card(
+    task_id: str,
+    *,
+    generation: int = 1,
+    author: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> DecomposeOutcome:
+    """Split a card that exhausted its retry counter into child cards.
+
+    Same contract as :func:`decompose_task` — expected failures (card not
+    splittable, no aux client, API error, malformed reply, no children) come
+    back as ``ok=False`` with a reason, never as a raise. The caller
+    (``kanban_auto_continue.run_split_phase``) treats that as "continue the card
+    anyway": an unavailable decomposer must not park the work.
+
+    ``fanout=false`` is refused here: a card that burned its budget cannot be
+    "tightened" into one smaller run by prose — the operator's rule is that the
+    split happens or the card continues. Children are created with the root as
+    their parent and the root is parked in ``todo`` until they finish.
+    """
+    task, reason = _load_failed_task(task_id)
+    if task is None:
+        return DecomposeOutcome(task_id, False, reason)
+
+    routing = _load_routing(root_assignee=task.assignee)
+    raw, reason = _call_aux(
+        "decompose", task_id, aux_task="kanban_decomposer", system=_FAILURE_SYSTEM_PROMPT,
+        user=_FAILURE_USER_TEMPLATE.format(
+            **_failed_card_prompt_fields(task, generation=generation),
+            roster=_format_roster(routing.roster),
+            default_assignee=routing.default_assignee,
+        ),
+        max_tokens=4000, timeout=timeout or 180, log=logger,
+    )
+    if raw is None:
+        return DecomposeOutcome(task_id, False, reason)
+
+    parsed = _extract_json_blob(raw, _FENCE_RE)
+    if parsed is None:
+        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+    if not parsed.get("fanout"):
+        return DecomposeOutcome(
+            task_id, False,
+            "decomposer declined to split a card that already burned its retry budget",
+        )
+
+    audit_author = author or _profile_author()
+    children, reason = _clean_children(task_id, parsed.get("tasks") or [], routing)
+    if reason:
+        return DecomposeOutcome(task_id, False, reason)
+    if not children:
+        return DecomposeOutcome(task_id, False, "decomposer returned no children")
+
+    # Children must know where the previous attempt's work lives: a fresh worker
+    # otherwise restarts from zero and burns the same budget again.
+    _stamp_progress_locator(children, task)
+
+    try:
+        with kbc.connect_closing() as conn:
+            child_ids = decompose_triage_task(
+                conn,
+                task_id,
+                root_assignee=routing.orchestrator,
+                children=children,
+                author=audit_author,
+                auto_promote=routing.auto_promote,
+                source_statuses=("ready", "todo", "blocked"),
+                allow_redecompose=True,
+            )
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
+    except Exception as exc:
+        logger.exception("decompose: DB error on failed card %s", task_id)
+        return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
+    if not child_ids:
+        return DecomposeOutcome(task_id, False, "card moved out of a splittable status")
+    return DecomposeOutcome(
+        task_id, True, f"split into {len(child_ids)} children", fanout=True, child_ids=child_ids,
+    )
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

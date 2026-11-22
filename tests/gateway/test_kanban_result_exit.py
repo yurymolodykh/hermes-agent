@@ -75,3 +75,34 @@ def test_managed_start_failure_books_the_one_shot_credential_exit(tmp_path, monk
 
     session_kanban.record_start_failure(frame, error)
     assert session_kanban.worker_exit_code(path, context) == expected
+
+
+def _key_pool_failures():
+    from agent.kanban_key_pool import KeyPoolError, KeyPoolSlotBusy
+
+    busy = KeyPoolSlotBusy("no free card key slot: every card key is full at 1 card(s) per key")
+    wrapped = RuntimeError("agent init failed")
+    wrapped.__cause__ = KeyPoolSlotBusy("no free card key slot (#2 1/1, #3 1/1)")
+    return [
+        (busy, kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        (wrapped, kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        # Anything the pool refuses for a reason a retry cannot heal stays a crash.
+        (KeyPoolError("key pool is not in force (no_card_keys)"), 1),
+        (KeyPoolError("this card's reserved key #3 was rejected by the provider"), 1),
+    ]
+
+
+@pytest.mark.parametrize("error, expected", _key_pool_failures())
+def test_key_pool_slot_exhaustion_does_not_charge_the_card(tmp_path, monkeypatch, error, expected):
+    """Every card key occupied is a resource WAIT, not a work failure (22.11.2026 report).
+
+    A worker that could not even reserve a key exits on the transient sentinel (75) so the
+    dispatcher requeues it with ``consecutive_failures`` untouched. Only the exhaustion
+    subclass qualifies: a pool that is not in force, or a key the provider rejected mid-run,
+    is a configuration fact and stays a crash so it is never mistaken for contention.
+    """
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+
+    session_kanban.record_start_failure(frame, error)
+    assert session_kanban.worker_exit_code(path, context) == expected

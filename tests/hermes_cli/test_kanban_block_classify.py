@@ -1,13 +1,30 @@
-"""block_task() classifies an untyped breaker block in place (#117363)."""
+"""block_task() classifies an untyped breaker block in place (#117363).
+
+The breaker now CONTINUES a card whose counter burned on the card's own cause
+(``kanban.auto_continue``), so an untyped plain-counter block only exists on the
+opt-out path — which is exactly the lifecycle this feature protects. These tests
+therefore pin ``auto_continue: false``; the default-on policy is covered by
+``test_kanban_auto_continue.py``.
+"""
 import os
 import time
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban_auto_continue as kac
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture(autouse=True)
+def _legacy_breaker_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore the pre-``auto_continue`` block so a plain breaker block exists."""
+    monkeypatch.setattr(
+        kac, "resolve_settings",
+        lambda: kac.AutoContinueSettings(enabled=False, max_splits=2),
+    )
 
 
 @pytest.fixture

@@ -248,9 +248,9 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
 
 def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
     """A claim that expires without a worker ever spawning is a non-success
-    attempt (#111306): each automatic reclaim advances ``consecutive_failures``
-    and the breaker trips at ``failure_limit`` instead of the card spinning
-    claim -> reclaim -> claim forever."""
+    attempt (#111306): each reclaim advances ``consecutive_failures`` and trips
+    the breaker at ``failure_limit``. The trip CONTINUES the card rather than
+    parking it (``kanban.auto_continue``); see ``test_kanban_auto_continue.py``."""
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="never spawned", assignee="a")
         host = kb._claimer_id().split(":", 1)[0]
@@ -268,9 +268,9 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
                 "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (t,),
             ).fetchone()
             assert row["consecutive_failures"] == expected
-        assert row["status"] == "blocked"
+        assert row["status"] == "ready"
         kinds = [e.kind for e in kb.list_events(conn, t)]
-        assert kinds[-2:] == ["reclaimed", "gave_up"]
+        assert kinds[-2:] == ["reclaimed", "auto_continued"]
 
 
 def test_stale_claim_extend_live_worker_does_not_count_failure(
