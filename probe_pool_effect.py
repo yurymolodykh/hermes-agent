@@ -47,7 +47,7 @@ def seed(db_path: Path) -> None:
 
 
 def read_once(db_path: Path) -> int:
-    d = _open(db_path)
+    d = _open(db_path, read_only=True)
     try:
         rows = d.list_sessions_rich(limit=50, compact_rows=True)
         now = time.time()
@@ -62,6 +62,7 @@ from hermes_cli.web_server_sessions import _open_session_db_at_path as _open  # 
 
 
 def main() -> int:
+    baseline = "--baseline" in sys.argv
     db_path = _HOME / "state.db"
     seed(db_path)
     sqlite3.connect = _counting_connect  # count AFTER the seed writer is closed
@@ -69,12 +70,37 @@ def main() -> int:
     from hermes_cli.read_handle_pool import get_pool
     get_pool().clear()
 
+    if baseline:
+        import hermes_cli.read_handle_pool as rhp
+
+        class _NoPool:
+            def acquire(self, key, identity):
+                return None
+
+            def release(self, key, db, identity):
+                db.close()
+                return True
+
+            def discard(self, db):
+                db.close()
+
+            def clear(self):
+                pass
+
+            def drop_path(self, key):
+                pass
+
+        rhp.get_pool = lambda: _NoPool()
+
     # 1) sequential: pool must warm once and then stop opening connections
     _connects["n"] = 0
-    t0 = time.perf_counter()
+    per = []
     for _ in range(20):
+        t = time.perf_counter()
         read_once(db_path)
-    seq_ms = (time.perf_counter() - t0) / 20 * 1000
+        per.append((time.perf_counter() - t) * 1000)
+    per.sort()
+    seq_ms = per[len(per) // 2]
     seq_connects = _connects["n"]
 
     # 2) concurrent: 8 workers x 5 rounds
