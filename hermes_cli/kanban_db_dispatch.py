@@ -562,16 +562,20 @@ def _terminate_reclaimed_worker(
 
 
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """End host-local workers that outlived their run (issue #111791) — a worker
-    that called ``kanban_complete`` and then hung keeps its ``state.db`` sidecar
-    fds open and no ``running``-only sweep can see it once ``tasks.worker_pid`` is
-    cleared. Keys on the closed ``task_runs`` row's retained pid + spawn
-    fingerprint: a legacy row (NULL fingerprint) or a recycled PID is never
-    signalled; a pid that is simply gone just has its evidence cleared. A run
-    that ended less than ``TERMINAL_WORKER_REAP_GRACE_SECONDS`` ago is left
-    alone so a worker still finalising after its own transition is not killed.
-    One row's failure (signal, /proc probe) is logged and skips only that row.
-    Returns the task ids whose worker was terminated."""
+    """Retire the retained pid + spawn fingerprint of closed runs whose worker is gone.
+
+    ``reap_terminal_workers`` used to force-kill a worker that was still alive after its run
+    closed (issue #111791). ``ended_at`` is stamped at the card's transition
+    (``review_requested``, ``kanban_complete``), not at the process's exit, so "still alive
+    past the grace" proves nothing about the worker being finished: a worker finalising its
+    turn was killed mid-write, which lost the session row and left the owner's admissions
+    refused for the gateway's lifetime (issue #157057). Liveness is therefore a kill
+    precondition, never a reason to signal: a live worker is left alone (its row stays in the
+    candidate set and is re-checked on the next tick) and only an exited one has its evidence
+    retired. A legacy row (NULL fingerprint) is never touched; a recycled PID is stale
+    evidence and is dropped. One row's failure (/proc probe, write) is logged and skips only
+    that row. Returns the task ids whose worker this sweep ended — empty as long as nothing is
+    signalled; ``signal_fn`` stays a test hook."""
     rows = conn.execute(
         "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
@@ -597,26 +601,20 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint)
-    termination = None
-    if alive:
-        termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
-        if not termination["terminated"]:
-            return  # still alive: try again next tick
+    if _worker_alive(pid, fingerprint):
+        # The run row closed at the card's transition, not at the worker's exit: a live pid may
+        # still be writing its result. Defer, never signal (issue #157057).
+        _kb._log.debug(
+            "kanban dispatch: worker pid %s of task %s is still alive after its run closed; "
+            "deferring the reap to the next tick", pid, row["task_id"],
+        )
+        return
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
             (row["id"], pid, fingerprint),
         )
-        if alive:
-            _kb._append_event(
-                conn, row["task_id"], "terminal_worker_reaped",
-                {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
-            )
-    if alive:
-        reaped.append(row["task_id"])
 
 
 def _worker_survived_termination(termination: dict) -> bool:
