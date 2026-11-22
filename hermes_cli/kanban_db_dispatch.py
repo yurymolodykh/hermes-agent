@@ -109,8 +109,9 @@ class DispatchResult:
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
     reaped_terminal_workers: list[str] = field(default_factory=list)
-    """Task ids whose worker outlived its closed run and was terminated by
-    :func:`reap_terminal_workers`."""
+    """Task ids whose closed-run worker evidence :func:`reap_terminal_workers`
+    retired this tick. A worker that is still running is never signalled, so
+    this only ever holds rows no longer in the candidate set (empty today)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
