@@ -16,6 +16,11 @@ import os
 import sys
 import tempfile
 
+# Running this file puts *its own directory* first on sys.path, which would import the
+# venv's installed hermes-agent instead of this worktree's code. Pin the checkout.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+
 kanban_home = tempfile.mkdtemp(prefix="probe-t97c86dea-")
 os.environ["HERMES_KANBAN_HOME"] = kanban_home
 os.environ.pop("HERMES_KANBAN_DB", None)

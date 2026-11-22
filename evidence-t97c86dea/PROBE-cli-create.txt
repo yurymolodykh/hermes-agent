@@ -1,22 +1,22 @@
-== probe: HERMES_KANBAN_HOME=/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/probe-t97c86dea-dnyf3zg5
+== probe: HERMES_KANBAN_HOME=/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/probe-t97c86dea-anu0rypd
 == 1. over-budget card (10 acceptance items, budget 180, estimate 340)
-⚠  kanban: t_7a0c6d1f создана БЕЗ АДРЕСАТА — уведомления о падении в чат не пойдут. Задайте kanban.default_notify_chat или `hermes kanban notify-subscribe`.
+⚠  kanban: t_0a04f39d создана БЕЗ АДРЕСАТА — уведомления о падении в чат не пойдут. Задайте kanban.default_notify_chat или `hermes kanban notify-subscribe`.
 
 ⚠  Gateway is running but kanban.dispatch_in_gateway=false in config.yaml — the task will sit in 'ready' until you flip it back on and restart the gateway, OR run the legacy standalone daemon (`hermes kanban daemon --force`).
-Created t_7a0c6d1f  (ready, assignee=03-software-engineer)
+Created t_0a04f39d  (ready, assignee=03-software-engineer)
 == 2. card that fits (1 acceptance item, estimate 70)
-⚠  kanban: t_8c33642a создана БЕЗ АДРЕСАТА — уведомления о падении в чат не пойдут. Задайте kanban.default_notify_chat или `hermes kanban notify-subscribe`.
+⚠  kanban: t_af845441 создана БЕЗ АДРЕСАТА — уведомления о падении в чат не пойдут. Задайте kanban.default_notify_chat или `hermes kanban notify-subscribe`.
 
 ⚠  Gateway is running but kanban.dispatch_in_gateway=false in config.yaml — the task will sit in 'ready' until you flip it back on and restart the gateway, OR run the legacy standalone daemon (`hermes kanban daemon --force`).
-Created t_8c33642a  (ready, assignee=03-software-engineer)
+Created t_af845441  (ready, assignee=03-software-engineer)
 
-=== 1. hermes kanban show t_7a0c6d1f
-Task t_7a0c6d1f: ЖИВАЯ ПРОБА: размер карточки на промоушене
+=== 1. hermes kanban show t_0a04f39d
+Task t_0a04f39d: ЖИВАЯ ПРОБА: размер карточки на промоушене
   status:    ready
   assignee:  03-software-engineer
   workspace: scratch
   max-retries: 2 (default)
-  created:   2026-11-23 00:26 by user
+  created:   2026-11-23 00:29 by user
 
 Body:
 ## Приёмка
@@ -32,16 +32,30 @@ Body:
 - критерий 10
 
 
-Events (1):
-  [2026-11-23 00:26] created {'assignee': '03-software-engineer', 'status': 'ready', 'parents': [], 'creator_task_id': None, 'tenant': None, 'workspace_kind': 'scratch', 'workspace_path': None, 'branch_name': None, 'project_id': None, 'skills': None, 'goal_mode': None, 'model_override': None, 'provider_override': None}
+Comments (1):
+  [2026-11-23 00:29] user: **card-sizing** карточка не влезает в бюджет профиля-исполнителя.
 
-=== 2. hermes kanban show t_8c33642a
-Task t_8c33642a: ЖИВАЯ ПРОБА 2: маленькая карточка без предупреждения
+- исполнитель: `03-software-engineer`
+- пунктов приёмки: 10
+- ожидаемо итераций: 340
+- бюджет профиля (`agent.max_turns`): 180
+- превышение: 160
+
+Рекомендация: разделить карточку или вынести часть пунктов приёмки в отдельную
+карточку с `parents` = эта. Промоушен не заблокирован — правило предупреждающее,
+решение за оркестратором. Формула оценки: `40 + 30 × пунктов приёмки`.
+
+Events (2):
+  [2026-11-23 00:29] created {'assignee': '03-software-engineer', 'status': 'ready', 'parents': [], 'creator_task_id': None, 'tenant': None, 'workspace_kind': 'scratch', 'workspace_path': None, 'branch_name': None, 'project_id': None, 'skills': None, 'goal_mode': None, 'model_override': None, 'provider_override': None}
+  [2026-11-23 00:29] commented {'author': 'user', 'len': 443, 'preview': '**card-sizing** карточка не влезает в бюджет профиля-исполнителя.\n\n- исполнитель: `03-software-engineer`\n- пунктов приёмки: 10\n- ожидаемо итераций: 340\n- бюджет профиля (`agent.max_turns`): 180\n- превышение: 160\n\nРекомендация: разделить карточку или вынести часть пунктов приёмки в отдельную\nкарточку с `parents` = эта. Промоушен не заблокирован — правило предупреждающее,\nрешение за оркестратором. Формула оценки: `40 + 30 × пунктов приёмки`.'}
+
+=== 2. hermes kanban show t_af845441
+Task t_af845441: ЖИВАЯ ПРОБА 2: маленькая карточка без предупреждения
   status:    ready
   assignee:  03-software-engineer
   workspace: scratch
   max-retries: 2 (default)
-  created:   2026-11-23 00:26 by user
+  created:   2026-11-23 00:29 by user
 
 Body:
 ## Приёмка
@@ -49,4 +63,4 @@ Body:
 
 
 Events (1):
-  [2026-11-23 00:26] created {'assignee': '03-software-engineer', 'status': 'ready', 'parents': [], 'creator_task_id': None, 'tenant': None, 'workspace_kind': 'scratch', 'workspace_path': None, 'branch_name': None, 'project_id': None, 'skills': None, 'goal_mode': None, 'model_override': None, 'provider_override': None}
+  [2026-11-23 00:29] created {'assignee': '03-software-engineer', 'status': 'ready', 'parents': [], 'creator_task_id': None, 'tenant': None, 'workspace_kind': 'scratch', 'workspace_path': None, 'branch_name': None, 'project_id': None, 'skills': None, 'goal_mode': None, 'model_override': None, 'provider_override': None}

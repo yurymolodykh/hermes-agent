@@ -1,16 +1,17 @@
 # PROGRESS — t_97c86dea: card-sizing advisory on promotion (CLI hole)
 
-## Состояние: реализация + тесты готовы, идёт широкий регресс и живая проба
+## Состояние: реализация + тесты + проба готовы; идёт широкий регресс (сверка с базой пофайлово)
 
 * Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_97c86dea`, ветка `wt/t_97c86dea`
 * База: `65db1ee540b`
 * Python с pytest: `/home/hermes/.hermes/kanban/workspaces/t_af262aaf/.venv/bin/python`
+* Артефакты: `evidence-t97c86dea/`
 * (Прежний `PROGRESS.md` от карточки t_4cb8f83b сохранён как `PROGRESS.stale-t4cb8f83b.md`.)
 
-## Что сделано
+## Что сделано (закоммичено)
 
-1. **Новый sibling-модуль** `hermes_cli/kanban_db_sizing.py` (117 строк):
-   `comment_body` / `promotion_note` / `has_sizing_comment` / `note_promotion`.
+1. **Новый sibling-модуль** `hermes_cli/kanban_db_sizing.py`:
+   `comment_body` / `promotion_note` / `has_sizing_comment` / `note_promotion` / `note_if_ready`.
    Правило advisory: ни блокировки, ни смены статуса; начало тела —
    `**card-sizing**` = ключ идемпотентности (одна карточка → максимум один комментарий).
    Бюджет берётся у assignee через `agent.kanban_card_sizing.assignee_iteration_budget`;
@@ -20,7 +21,8 @@
      и обрабатываются ПОСЛЕ транзакции (author `dispatcher`);
    * `promote_task` — операторский промоушен (author = actor);
    * `create_task` — карточка, сразу рождённая в `ready` (ровно CLI-путь
-     `hermes kanban create`: `initial_status="running"` → `ready` без открытых родителей).
+     `hermes kanban create`: `initial_status="running"` → `ready` без открытых родителей);
+     через шим `note_if_ready`.
 3. **Вынос из фасада** (фасад 4404 → 4365 строк): `_has_sticky_block`, `_latest_event`,
    `_resume_status_from_events` перенесены в новый `hermes_cli/kanban_db_promotion.py`
    и реэкспортированы в конце `kanban_db.py` (цикл как у прочих sibling-модулей: поздний импорт фасада).
@@ -30,16 +32,36 @@
    CLI-создание сразу в `ready`; unknown budget → тишина.
    Красная база доказана: с вырезанными вызовами 4 из 8 падают.
 
-## Проверки
+## Проверки (артефакты в `evidence-t97c86dea/`)
 
-* `pytest tests/hermes_cli/test_kanban_promotion_sizing.py -q` → 8 passed.
-* `python -m scripts.code_health --base 65db1ee540b` → 0 blocking, 0 advisory.
+* `focused-pytest.txt` — `pytest tests/hermes_cli/test_kanban_promotion_sizing.py -q` → 8 passed.
+* `code-health.txt` — `python -m scripts.code_health --base 65db1ee540b` → **0 blocking, 0 advisory**.
+* `PROBE-cli-create.txt` — живая проба на текущем HEAD через реальный CLI-вход
+  `hermes_cli.main:main`: карточка с 10 пунктами приёмки на `03-software-engineer`
+  (бюджет 180, оценка 340, превышение 160) → один `**card-sizing**` комментарий, статус
+  остаётся `ready`; карточка с 1 пунктом → комментариев нет.
+* `live_probe.py` — воспроизводимый скрипт пробы (изолированный `HERMES_KANBAN_HOME`,
+  реальную доску не трогает).
 * `ruff --select BLE001,S110,E722,F,RUF006` по новым файлам → All checks passed.
-* `pytest tests/hermes_cli -q` — запущен в фоне (`proc_2af14bfb9665`).
+
+## Важно про окружение (не путать с регрессией)
+
+Прямой `pytest` в этом рабочем дереве даёт **ложные** падения: дерево лежит внутри
+`~/.hermes`, а `tests/home_io_guard.py` запрещает любой I/O по реальному hermes home
+(`TEST BUG: file I/O against the REAL hermes home`). Поэтому широкий регресс гоняется
+в чистой копии **вне** `~/.hermes`:
+
+    git archive <rev> | tar -x -C /home/hermes/ksz-probe/<dir>/{head|base}
+    cd <copy> && TMPDIR=/home/hermes/ksz-probe/tmp \
+      HERMES_PYTHON=/home/hermes/.hermes/kanban/workspaces/t_af262aaf/.venv/bin/python \
+      bash scripts/run_tests.sh tests/hermes_cli/ -q -j 7 --file-retries 0
+
+`tests/hermes_cli` — ~1963 файла / ~15k тестов, полный проход не укладывается в 25 минут
+ни на одном дереве; поэтому запуск идёт с `timeout 1500`, а каждый упавший файл
+**доотдельно** перегоняется на базе `65db1ee540b` — сверка пофайловая, а не по проценту.
 
 ## Осталось
 
-1. Дождаться широкого регресса `tests/hermes_cli`; сверить падения с базой.
-2. Живая проба: CLI-карточка с 10 пунктами приёмки на `03-software-engineer`, показать
-   `hermes kanban show <id>` с комментарием, сложить вывод в `evidence-t97c86dea/`.
-3. Финал: `git commit`, `kanban_comment`, `kanban_complete` с artifacts.
+1. Дособрать head-capped прогон, выписать упавшие файлы, перегнать их на базе,
+   записать `evidence-t97c86dea/wide-regression-compare.txt`.
+2. Обновить PROGRESS/evidence, закоммитить, `kanban_comment` с числами, `kanban_complete`.
