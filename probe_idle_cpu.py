@@ -31,7 +31,7 @@ os.environ.setdefault("HERMES_STATE_DB_GUARD_BYPASS", "1")
 base_tree = os.environ.get("BASE_TREE")
 sys.path.insert(0, base_tree or str(Path(__file__).resolve().parent))
 
-from hermes_state import SessionDB  # noqa: E402
+from hermes_state import SessionDB
 
 
 def _free_port() -> int:
