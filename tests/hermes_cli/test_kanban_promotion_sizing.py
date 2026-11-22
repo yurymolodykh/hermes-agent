@@ -135,6 +135,32 @@ def test_operator_promote_writes_the_same_advisory(kanban_home: Path) -> None:
         assert len(_sizing_comments(conn, tid)) == 1
 
 
+def test_cli_created_card_lands_ready_with_the_advisory(kanban_home: Path) -> None:
+    """The CLI hole: ``hermes kanban create`` defaults to ``initial_status="running"``,
+    which ``initial_task_state`` resolves to ``ready`` with no open parents — such a card
+    never crosses a promotion, so creation is its only chance to be sized."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="cli big card", body=BIG, assignee="03-software-engineer",
+            created_by="operator-01",
+        )
+
+        assert kb.get_task(conn, tid).status == "ready"
+        comments = _sizing_comments(conn, tid)
+        assert len(comments) == 1
+        assert comments[0].author == "operator-01"
+
+
+def test_created_card_that_fits_gets_no_advisory(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="cli small card", body=SMALL, assignee="03-software-engineer",
+            created_by="operator-01",
+        )
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _sizing_comments(conn, tid) == []
+
+
 def test_unknown_budget_stays_silent(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No readable budget means no guess: the rule stays silent rather than inventing a cap."""
     monkeypatch.setattr(

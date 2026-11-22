@@ -1434,6 +1434,12 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            # A card that enters the board already ``ready`` (the CLI default: no
+            # open parents) never crosses a promotion, so the sizing advisory — which
+            # hangs off promotion — would miss exactly the population it exists for.
+            # Written after the txn, advisory only, at most one per card.
+            if task_status == "ready":
+                kanban_db_sizing.note_promotion(conn, task_id, author=created_by or "creator")
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
