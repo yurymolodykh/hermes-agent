@@ -173,6 +173,12 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    budget_hold: Optional[str] = None
+    """Which concurrency cap stopped this tick before the lane loops ran:
+    ``"max_in_progress"`` (host-level, every slot in use) or ``"max_spawn"``
+    (per-board cap). The tick returns with an otherwise EMPTY result in that
+    case — no skipped bucket is filled — which is why :func:`capacity_bound`
+    needs this marker: a full host cap is saturation, not a stall."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -184,6 +190,49 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """
     from hermes_cli.kanban_db_suppression import describe_suppression as _impl
     return _impl(results)
+
+
+def capacity_bound(results: Iterable[Optional[DispatchResult]]) -> bool:
+    """True when the tick(s) held NO work back for any reason but capacity.
+
+    A saturated pool is health, not a stall: the dispatcher deferred every
+    ready/review card because the card API keys are all leased
+    (``skipped_keypool_capped``) or the assignee is at
+    ``max_in_progress_per_profile`` (``skipped_per_profile_capped``). The
+    workers already running are proof the host is fine, so the "dispatcher
+    stuck … check profile health (venv, PATH, credentials)" warning must not
+    fire on this tick — that hint sent a 21.11 investigation into a venv that
+    had no defect.
+
+    Any other hold (``env_unready``, respawn guard, ``rate_limited``,
+    ``skipped_locked``, memory pressure, unassigned/nonspawnable rows) makes
+    this ``False``: those stay operator-actionable warnings.
+
+    ``budget_hold`` outranks everything else on its own tick. The reclaim
+    phase runs BEFORE the spawn-budget gate, so a tick stopped by a full host
+    cap can also carry ``crashed``/``stale``/``timed_out`` (a dead worker was
+    requeued a line earlier, freeing nothing this tick). Those are lifecycle
+    facts already written to ``task_events`` and must not turn a saturated
+    tick into a "check profile health" warning — measured live on 22.11: one
+    of 22 saturated ticks carried ``crashed`` and re-armed the false alarm.
+    """
+    saw_capacity = False
+    for res in results:
+        if res is None:
+            continue
+        if res.respawn_guarded or res.rate_limited or res.skipped_env_unready:
+            return False
+        if res.skipped_locked or res.memory_pressure:
+            return False
+        if res.budget_hold:  # the cap stopped the tick before the lane loops
+            saw_capacity = True
+            continue
+        if res.skipped_unassigned or res.skipped_nonspawnable or res.auto_blocked \
+                or res.crashed or res.stale or res.timed_out:
+            return False
+        if res.skipped_keypool_capped or res.skipped_per_profile_capped:
+            saw_capacity = True
+    return saw_capacity
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2391,12 +2440,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.budget_hold = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.budget_hold = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

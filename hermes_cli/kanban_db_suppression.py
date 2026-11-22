@@ -20,6 +20,8 @@ class _TickResult(Protocol):
     skipped_env_unready: list
     skipped_locked: object
     memory_pressure: Optional[str]
+    skipped_per_profile_capped: Optional[list]
+    budget_hold: Optional[str]
 
 
 def describe_suppression(results: Iterable[Optional[_TickResult]]) -> str:
@@ -43,8 +45,14 @@ def describe_suppression(results: Iterable[Optional[_TickResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_keypool_capped:  # a key hold reads as "stuck" otherwise
             counts["keypool_capped"] = counts.get("keypool_capped", 0) + len(res.skipped_keypool_capped)
+        per_profile = getattr(res, "skipped_per_profile_capped", None) or []
+        if per_profile:  # same for an assignee at its own cap
+            counts["per_profile_capped"] = counts.get("per_profile_capped", 0) + len(per_profile)
         if res.skipped_env_unready:  # a host condition, named so it is not read as a stall
             counts["env_unready"] = counts.get("env_unready", 0) + len(res.skipped_env_unready)
+        budget_hold = getattr(res, "budget_hold", None)
+        if budget_hold:  # a full host/per-board cap: saturation, not a stall
+            counts[f"budget_hold:{budget_hold}"] = counts.get(f"budget_hold:{budget_hold}", 0) + 1
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
