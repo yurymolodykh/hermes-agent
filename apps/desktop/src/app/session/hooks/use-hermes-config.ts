@@ -61,17 +61,20 @@ interface HermesConfigOptions {
 }
 
 // One shared in-flight config+defaults pair per (connection, profile). Bursting
-// callers join it; the slot clears as soon as it settles so the next caller (a
-// save, a scope change) reads fresh values.
+// background callers join it; the slot clears as soon as it settles so the next
+// caller reads fresh values. `force` callers (scope change, explicit reseed) never
+// join — they carry an intent that a response already in flight would answer from
+// the state before their change.
 let configReadInflight: null | { key: string; promise: Promise<[Awaited<ReturnType<typeof getHermesConfig>>, Awaited<ReturnType<typeof getHermesConfigDefaults>>]> } = null
 
 function readHermesConfigOnce(
   connection: ReturnType<typeof $connection.get>,
-  profile: string
+  profile: string,
+  force: boolean
 ): Promise<[Awaited<ReturnType<typeof getHermesConfig>>, Awaited<ReturnType<typeof getHermesConfigDefaults>>]> {
   const key = `${connection?.connectionId ?? connection?.baseUrl ?? ''}::${profile}`
 
-  if (configReadInflight?.key === key) {
+  if (!force && configReadInflight?.key === key) {
     return configReadInflight.promise
   }
 
@@ -82,6 +85,8 @@ function readHermesConfigOnce(
     >
   }
 
+  // A forced read supersedes the slot: it is the newest question, and a later
+  // background caller should join it rather than the read it replaced.
   configReadInflight = flight
   void flight.promise.catch(() => undefined).then(() => {
     if (configReadInflight === flight) {
@@ -116,7 +121,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         // same backend, so share one in-flight pair instead of stacking them; a
         // caller that arrives after it settled starts a fresh read, which keeps
         // "save settings, see the result" immediate.
-        const [config, defaults] = await readHermesConfigOnce(connection, profile)
+        const [config, defaults] = await readHermesConfigOnce(connection, profile, force)
 
         const canPublish = () => profileRefreshEpochRef.current === profileRefreshEpoch && shouldPublish()
 
