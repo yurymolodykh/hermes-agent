@@ -76,6 +76,11 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         or budget.used < min(ratio * budget.max_total, budget.max_total - 1)
     ):
         return False
+    # Only the current tool-result tail is mutable; an older turn may already be cached.
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    if (not messages or messages[-1].get("role") != "tool"
+            or messages[-1].get(_DB_PERSISTED_MARKER)):
+        return False
     notice = ITERATION_BUDGET_WARNING_TEMPLATE.format(
         used=budget.used, maximum=budget.max_total
     )
@@ -86,25 +91,26 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
             "review; otherwise persist a kanban_comment handoff and "
             "continue. A diff or commit alone is not completion evidence."
         )
-        # Park the tree under a ref as well: the model may still be mid-edit when the
-        # budget stops it, and a reachable ref survives the stop without a branch commit.
+        # Park the tree as well: the model may still be mid-edit when the budget stops
+        # it. A git card gets a reachable ref (no branch commit); a scratch card has no
+        # repository at all, so it gets the same board-side tarball the hard stop writes.
         try:
-            from agent.kanban_budget_checkpoint import preserve_wip_ref
-            _wip_ref = preserve_wip_ref()
+            from agent.kanban_budget_checkpoint import preserve_wip_tree
+            _wip = preserve_wip_tree()
         except (ImportError, OSError, subprocess.SubprocessError):
-            # The notice must still reach the model: parking the ref is a bonus on
+            # The notice must still reach the model: saving a copy is a bonus on
             # top of the instruction to checkpoint, not a precondition for it.
-            _wip_ref = None
-        if _wip_ref:
+            _wip = None
+        if _wip is not None and _wip.mode == "git" and _wip.locator:
             notice += (
-                f" Your working tree is parked at {_wip_ref} (reachable with "
+                f" Your working tree is parked at {_wip.locator} (reachable with "
                 "`git stash apply` / `git diff`), so a budget stop no longer loses it."
             )
-    # Only the current tool-result tail is mutable; an older turn may already be cached.
-    from agent.context_compressor import _DB_PERSISTED_MARKER
-    if (not messages or messages[-1].get("role") != "tool"
-            or messages[-1].get(_DB_PERSISTED_MARKER)):
-        return False
+        elif _wip is not None and _wip.mode == "archive" and _wip.locator:
+            notice += (
+                " This workspace is not a git repository, so a copy of it was written "
+                f"to {_wip.locator} — that archive survives the budget stop."
+            )
     message = messages[-1]
     content = message.get("content", "")
     if isinstance(content, str):
