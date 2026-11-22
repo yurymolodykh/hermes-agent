@@ -1438,8 +1438,9 @@ def create_task(
             # open parents) never crosses a promotion, so the sizing advisory — which
             # hangs off promotion — would miss exactly the population it exists for.
             # Written after the txn, advisory only, at most one per card.
-            if task_status == "ready":
-                kanban_db_sizing.note_promotion(conn, task_id, author=created_by or "creator")
+            kanban_db_sizing.note_if_ready(
+                conn, task_id, task_status, author=created_by or "creator",
+            )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

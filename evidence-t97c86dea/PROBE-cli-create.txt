@@ -1,0 +1,5 @@
+== probe: HERMES_KANBAN_HOME=/tmp/probe-t97c86dea-p3dy
+== create (CLI path, hermes_cli.main:main)
+Created t_5d499eca  (ready, assignee=03-software-engineer)
+
+⚠  Gateway is running but kanban.dispatch_in_gateway=false in config.yaml — the task will sit in 'ready' until you flip it back on and restart the gateway, OR run the legacy standalone daemon (`hermes kanban daemon --force`).
