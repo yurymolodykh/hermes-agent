@@ -229,3 +229,161 @@ def test_trace_failure(kanban_home, monkeypatch, tmp_path):
     with kbc.connect_closing() as conn:
         r = kbd.dispatch_once(conn)
     print("spawned", r.spawned, "calls", calls, "res", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_exc(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real_spawn = kbd._call_spawn_fn
+    def boom(*a, **k):
+        print("\nCALL_SPAWN_FN_REACHED")
+        raise RuntimeError("simulated")
+    monkeypatch.setattr(kbd, "_call_spawn_fn", boom)
+    real_rec = kbd._record_task_failure
+    def rec(conn_, task_id, reason, **kw):
+        print("RECORD", repr(reason)[:120], kw.get("outcome"))
+        return real_rec(conn_, task_id, reason, **kw)
+    monkeypatch.setattr(kbd, "_record_task_failure", rec)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("after:", {k: v for k, v in r.__dict__.items() if v})
+    print("CALL_SPAWN_FN_REACHED?", "yes" )
+
+
+def test_trace_split(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    import hermes_cli.kanban_db_dispatch_split as sp
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real = sp._kac.run_split_phase
+    def traced(conn_):
+        out = real(conn_)
+        print("\nSPLIT ->", out)
+        rows = [dict(r) for r in conn_.execute("select id,status,claim_lock,assignee from tasks")]
+        print("ROWS AFTER SPLIT", rows)
+        return out
+    monkeypatch.setattr(sp._kac, "run_split_phase", traced)
+    with kbc.connect_closing() as conn:
+        r = kbd.dispatch_once(conn)
+    print("result", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_real(kanban_home, monkeypatch, tmp_path):
+    import tests.hermes_cli.test_kanban_keypool_integration as T
+    kb, kbc, kbd = kanban_home
+    T._pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = T._ready_card(kb, kbc)
+    spawned: list = []
+    orig = kbd._dispatch_lane_task
+    def traced(conn_, row, assignee, result, **kw):
+        out = orig(conn_, row, assignee, result, **kw)
+        print("\nLANE", row["id"], "->", out, "res:", {k: v for k, v in result.__dict__.items() if v})
+        return out
+    monkeypatch.setattr(kbd, "_dispatch_lane_task", traced)
+    res = T._run_tick(kbd, kbc, spawned)
+    print("FINAL", res.spawned, spawned, {k: v for k, v in res.__dict__.items() if v})
+
+
+def test_trace_real2(kanban_home, monkeypatch, tmp_path):
+    import tests.hermes_cli.test_kanban_keypool_integration as T
+    kb, kbc, kbd = kanban_home
+    T._pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = T._ready_card(kb, kbc)
+    print("\ncreated", task_id, "db", kb.kanban_db_path(board=None))
+    with kbc.connect_closing() as conn:
+        print("rows in conn:", [dict(r) for r in conn.execute("select id,status,assignee,claim_lock from tasks")])
+        print("lane:", [dict(r) for r in kbd._lane_rows(conn, "ready")])
+    import hermes_cli.kanban_db_dispatch_split as sp
+    real_locked = kbd._dispatch_once_locked
+    def traced(conn_, **kw):
+        print("LOCKED sees:", [dict(r) for r in conn_.execute("select id,status,assignee from tasks")])
+        return real_locked(conn_, **kw)
+    monkeypatch.setattr(sp, "_dispatch_once_locked", traced, raising=False)
+    import hermes_cli.kanban_db_dispatch as d
+    monkeypatch.setitem(sys.modules["hermes_cli.kanban_db_dispatch"].__dict__, "_dispatch_once_locked", traced)
+    print("tick:", kbd.dispatch_once(kbc.connect()))
+
+
+def test_trace_real3(kanban_home, monkeypatch, tmp_path):
+    import tests.hermes_cli.test_kanban_keypool_integration as T
+    kb, kbc, kbd = kanban_home
+    T._pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = T._ready_card(kb, kbc)
+    real_rows = kbd._lane_rows
+    def rows(conn_, status):
+        out = real_rows(conn_, status)
+        print("\nLANE_ROWS", status, [r["id"] for r in out])
+        return out
+    monkeypatch.setattr(kbd, "_lane_rows", rows)
+    real_budget = kbd._tick_spawn_budget
+    def budget(*a, **k):
+        out = real_budget(*a, **k)
+        print("BUDGET", out)
+        return out
+    monkeypatch.setattr(kbd, "_tick_spawn_budget", budget)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("RES", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_inner(kanban_home, monkeypatch, tmp_path):
+    import tests.hermes_cli.test_kanban_keypool_integration as T
+    kb, kbc, kbd = kanban_home
+    T._pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = T._ready_card(kb, kbc)
+    pe = kbd._profile_exists_fn()
+    print("\nalpha exists?", pe("alpha"))
+    print("respawn guard:", kbd.check_respawn_guard(kbc.connect(), task_id, lane="ready"))
+    print("keypool free:", kbd._keypool_has_free_slot(reserve=0))
+    real_guard = kbd.check_respawn_guard
+    def guard(conn_, tid, **kw):
+        out = real_guard(conn_, tid, **kw)
+        print("GUARD", tid, kw, "->", out)
+        return out
+    monkeypatch.setattr(kbd, "check_respawn_guard", guard)
+    real_kp = kbd._keypool_has_free_slot
+    def kpf(reserve=0):
+        out = real_kp(reserve)
+        print("KEYPOOL_SLOT", reserve, "->", out)
+        return out
+    monkeypatch.setattr(kbd, "_keypool_has_free_slot", kpf)
+    real_anon = kbd._refuse_anonymous_card
+    def anon(conn_, row, result, *, dry_run):
+        out = real_anon(conn_, row, result, dry_run=dry_run)
+        print("ANON ->", out)
+        return out
+    monkeypatch.setattr(kbd, "_refuse_anonymous_card", anon)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("RES", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_seq(kanban_home, monkeypatch, tmp_path):
+    import tests.hermes_cli.test_kanban_keypool_integration as T
+    kb, kbc, kbd = kanban_home
+    T._pool(monkeypatch, tmp_path, card_keys=1)
+    task_id = T._ready_card(kb, kbc)
+    real_claim = kb.claim_task
+    def claim(conn_, tid, **kw):
+        out = real_claim(conn_, tid, **kw)
+        print("\nSTEP claim", tid, "->", getattr(out, "id", None))
+        return out
+    monkeypatch.setattr(kbd, "claim_task", claim, raising=False)
+    monkeypatch.setitem(kb.__dict__, "claim_task", claim)
+    real_fn = kbd._call_spawn_fn
+    def csf(*a, **k):
+        print("STEP call_spawn_fn", a[0])
+        try:
+            out = real_fn(*a, **k)
+        except Exception as exc:
+            print("STEP spawn raised:", type(exc).__name__, str(exc)[:120])
+            raise
+        print("STEP spawn ->", out)
+        return out
+    monkeypatch.setattr(kbd, "_call_spawn_fn", csf)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("RES", {k: v for k, v in r.__dict__.items() if v})
