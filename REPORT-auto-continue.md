@@ -120,35 +120,137 @@ HERMES_HOME=/home/hermes/.hermes  budget config:
 корневым `HERMES_HOME=/home/hermes/.hermes`, действует 3. Расхождение в корневом конфиге
 устранено кодом; отдельного «молчаливого дефолта» больше нет ни на одном пути.
 
+## 4a. Замечание оркестратора 22.11: исчерпание пула карточных ключей — тоже не провал
+
+Оркестратор нашёл в журнале `t_e4cf9f2a`: воркер не смог стартовать
+(`agent.kanban_key_pool.KeyPoolError: no free card key slot: every card key is full at 1 card(s)
+per key (#2 1/1, #3 1/1, …)`), диспетчер записал это как `crashed` c `exit_code 1` и сжёг бюджет
+повторов. Замечание принято — это ожидание ресурса, а не падение работы; карточка к тому же не
+начала работу.
+
+Реализовано в этой же ветке:
+
+* `agent/kanban_key_pool_errors.py` — типы вынесены в сиблинг (фасад `kanban_key_pool.py` уже за
+  ratchet'ом по строкам); `KeyPoolError` остаётся базой, добавлены `KeyPoolSlotBusy`
+  («все карточные слоты заняты») и `KeyPoolWait` (таймаут файловой блокировки пула).
+  `agent.kanban_key_pool.KeyPoolError` по-прежнему единственный путь импорта для вызывающих.
+* `hermes_cli/turn_exit.py::credential_failure_flags` — `KeyPoolSlotBusy` в цепочке причин даёт
+  `credentials_rate_limited: True` → воркер выходит кодом 75, и диспетчер возвращает карточку в
+  `ready` **без инкремента** `consecutive_failures` и без `gave_up` (тот же путь, что у quota wall).
+* Простой `KeyPoolError` (пул не включён, ключ отвергнут провайдером на ходу) остаётся `crashed`:
+  повтор его не лечит, и выдавать его за контеншн нельзя.
+
+Тест: `tests/gateway/test_kanban_result_exit.py::test_key_pool_slot_exhaustion_does_not_charge_the_card`
+(4 параметра: busy → 75, обёрнутая busy → 75, «пул не включён» → 1, «ключ отвергнут» → 1) —
+**25 passed** в файле.
+
 ## 5. Проверки
+
+**Целевые наборы (все зелёные):**
 
 * `tests/hermes_cli/test_kanban_auto_continue.py` — **15 passed**
 * `tests/hermes_cli/test_kanban_cli_failure_limit_config.py` — **5 passed**
-* `tests/hermes_cli/test_kanban_db.py` — 30 passed, 1 skipped (обновлён
-  `test_stale_claim_reclaim_without_spawn_counts_toward_breaker`: теперь `ready` + `auto_continued`)
-* `tests/hermes_cli/test_kanban_owner_lost_budget.py` — обновлён под новую политику + новый тест
-  `test_a_plain_crash_blocks_when_auto_continue_is_disabled`
-* `python -m scripts.code_health --base HEAD` → **0 blocking, 0 advisory** (8 файлов)
-* `ruff check` по всем изменённым файлам → **All checks passed** (один автофикс сортировки `__all__`)
-* Ratchet `FILE_LINES` по `hermes_cli/config_defaults.py` (файл был 3139 при пределе 3138) устранён
-  сжатием комментариев до 3138 — новый код в фасад не добавлялся.
+* `tests/gateway/test_kanban_result_exit.py` — **25 passed** (включая 4 новых параметра про пул ключей)
+* `tests/hermes_cli/test_kanban_restart_interrupt_budget.py` — **7 passed** (обновлён тест «обычный
+  краш ещё считается»: провал по-прежнему инкрементится, но трип даёт `ready` + `auto_continued`;
+  добавлен парный тест `..._blocks_when_auto_continue_is_off` — `blocked` + `gave_up`)
 
-**Известный шум окружения (не регрессия).** `tests/hermes_cli/test_kanban_db.py` завершается
-ненулевым кодом при 30 зелёных тестах: `tests/home_io_guard.py` ругается на путь тест-venv
-`~/.hermes/installs/.../site-packages/_pytest/main.py`. **Воспроизведено на базе** (изменения
-отложены, прогон тот же) — страж окружения, а не поведение карточки.
+**Широкий регресс по канбану** (`tests/hermes_cli/test_kanban*.py`, `tests/gateway/test_kanban*.py`,
+`tests/agent/test_kanban*.py` — 122 файла, раннер `scripts/run_tests.sh`, изолированный
+`HERMES_HOME`):
 
-## 6. Ограничения и что осталось человеку (`manual_review`)
+```
+=== Summary: 122 files, 1015 tests passed, 9 failed, 3 files CRASHED, 4 skipped (237 с, 8 workers) ===
+```
 
-* **Не проверено на живом воркере с настоящим бюджетом.** Все тесты — на изолированной БД и
-  подменённом декомпозере (никакой сети). Живая карточка, реально сжёгшая `agent.max_turns`,
-  должна дать `auto_continued` в `hermes kanban show` — это `manual_review` после перезапуска шлюза.
+*Все 9 отказавших тестов и все 3 «CRASHED» воспроизводятся на базе `3bbf87774c` без моих правок*
+(прогнал тот же набор против `git archive 3bbf87774c` в отдельном каталоге — тот же 9 failed):
+
+* `test_kanban_test_board_isolation.py`, `test_kanban_creator_origin.py[cli]`,
+  `test_kanban_worker_socket_recovery.py` (6), `test_kanban_worker_restart_wait.py` — 9 failed на базе
+  и на ветке **одинаково** (в этих файлах я не менял ни строки; причины — окружение прогона:
+  живая доска, `notify+wake` вместо `wake`, GatewayClientError).
+* 3 файла «interpreter killed by SIGTERM» (`test_kanban_owner_lost_budget.py`,
+  `test_kanban_anonymous_card_fuse.py`, `test_kanban_dispatch_claim_allowlist.py`) — на ветке при
+  одиночном прогоне: **29 passed**, то есть это гонка раннера под 8 воркерами, а не результат правки.
+* 16 файлов «все тесты прошли, но pytest вышел ненулевым» — `tests/home_io_guard.py` ругается на путь
+  тест-venv (`~/.hermes/installs/.../site-packages/_pytest/main.py`) при разборе traceback. Тот же шум
+  воспроизводится на базе; лечится изолированным `HERMES_HOME` + прямым `python -m pytest`, и в этом
+  режиме те же файлы дают «N passed» с кодом 0.
+
+**Линт / health:**
+
+* `python -m scripts.code_health --base HEAD` → **0 blocking, 0 advisory**
+  (на финальном коммите — «1 files vs d8e2a4a634: 0 blocking, 0 advisory»).
+* `ruff check` (пин из `pyproject.toml`) по изменённым файлам: **All checks passed**, кроме
+  предсуществующих 71 находки в `agent/kanban_key_pool.py` (`UP006`/`RUF022`/`UP037`/`UP024`,
+  питон-3.14-апгрейды старого кода). Доказательство, что это не мой вклад: тот же файл из базы
+  `3bbf87774c` даёт **тот же набор 71** (`ruff` по `git show HEAD:agent/kanban_key_pool.py`), а
+  `code_health` (который считает дельту) даёт 0 blocking по файлу.
+* Ratchet `FILE_LINES` по `agent/kanban_key_pool.py` (фасад был 2068 при пределе 2067 из-за
+  добавленного ре-экспорта) — снят в тот же день: вынес типы в `agent/kanban_key_pool_errors.py`,
+  фасад импортирует. По `hermes_cli/config_defaults.py` ratchet снят сжатием комментариев.
+
+## 6. Живые пробы на настоящей БД (не тесты, не стабы)
+
+Три прогона в отдельных `HERMES_HOME` на реальном SQLite-борде, с реальным
+`detect_crashed_workers` / `dispatch_once` / `run_split_phase` и реальным выводом
+`hermes kanban show`.
+
+**Проба 1 — самопродолжение.** Два «мёртвых» прогона одной карточки.
+
+```
+attempt 1: detect_crashed_workers -> ['t_ab0a7c8f'] status=ready failures=1
+attempt 2: detect_crashed_workers -> ['t_ab0a7c8f'] status=ready failures=2
+  auto_continued {"reason":"counter_exhausted","failures":2,"effective_limit":2,
+                  "limit_source":"dispatcher","generation":0,"max_splits":2,"attempt":1}
+kanban show:  status: ready   Events: … auto_continued {…}      (gave_up отсутствует)
+```
+
+**Проба 2 — три подряд краха и недоступный декомпозер** (`AuxiliaryClientUnavailable` в
+пустом доме — то есть путь п.5 критерия в живом виде):
+
+```
+crash 2: failures=2 auto_events=['auto_continued']
+crash 3: failures=3 auto_events=['auto_continued', 'auto_split_queued']
+dispatch_once: auto_split= [] auto_split_failed= ['t_903fe108']
+  auto_continued {"reason":"split_unavailable","detail":"LLM error: AuxiliaryClientUnavailable",
+                  "attempt":2}
+parent: {'status': 'ready'}          <- работа не запаркована и не потеряна
+```
+
+**Проба 3 — механика сплита** (aux-LLM в одноразовом доме недоступен, поэтому список детей
+задан детерминированно; всё остальное — настоящий код: `run_split_phase` → `decompose_triage_task`
+→ `task_links` → `todo`-парковка родителя):
+
+```
+crash3: {'status': 'ready', 'consecutive_failures': 3}
+run_split_phase: split= ['t_cdb9608c'] failed= []
+parent: {'id': 't_cdb9608c', 'status': 'todo'}
+parent events tail: ['auto_split_queued', 'decomposed', 'auto_split']
+  auto_split {'child_ids': ['t_c01510b5', 't_90eeed49'], 'generation': 1}
+kanban show:  parents:   t_90eeed49, t_c01510b5
+              Comments:  Decomposed into t_c01510b5, t_90eeed49. Root will wake when all
+                         children complete.        (обоих детей видно, связи parent→child есть)
+```
+
+## 7. Ограничения и что осталось человеку (`manual_review`)
+
+* **Не проверено на живом воркере с настоящим бюджетом.** Живая карточка, реально сжёгшая
+  `agent.max_turns`, должна дать `auto_continued` в `hermes kanban show` — но это требует
+  выката ветки на шлюз, то есть карточки выката, а не этой. Со стороны кода поведение
+  подтверждено пробами 1–3 выше и 15 автотестами.
+* **Aux-LLM декомпозер вживую не вызывался**: в одноразовом доме его нет (`AuxiliaryClientUnavailable`),
+  и это ровно тот путь, который п.5 требует (продолжить). Сама ветка «LLM вернул детей» проверена
+  стабом в `test_second_burn_splits_card_into_linked_children` и в пробе 3 через настоящий
+  graph-write.
 * **Windows-путь не проверялся** (только Linux).
-* **Aux-LLM декомпозер вживую не вызывался** — контракт «ожидаемые отказы как `ok=False`»
-  проверен стабами, реальный вызов `decompose_failed_card` с живой моделью не прогонялся.
 * Схема БД не менялась — состояние живёт в `task_events`, миграций нет.
+* Уточнение по окружению: `kanban_db_path()` в этой версии резолвит доску от `cwd`, а не от `$HOME`
+  (коммит `c0e8d0acd2`), поэтому живые пробы пинуют `HERMES_KANBAN_DB` — иначе декомпозер читает
+  не ту доску, что видит проба.
 
-## 7. Инцидент по пути (фиксируется честно)
+## 8. Инцидент по пути (фиксируется честно)
 
 `refs/stash` в git общий на весь репозиторий (не на worktree). Я сделал `git stash push` для пробы
 базы, а `git stash pop` притянул **чужой** WIP карточки `t_afdf38ac`

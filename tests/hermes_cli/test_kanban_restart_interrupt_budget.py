@@ -146,7 +146,13 @@ def test_gateway_restart_never_trips_the_breaker_even_repeatedly(board):
 
 
 def test_ordinary_crash_still_counts_and_trips_at_the_limit(board, monkeypatch):
-    """The exemption is narrow: a real crash keeps the documented retry budget."""
+    """The exemption is narrow: a real crash keeps the documented retry budget.
+
+    Tripping the breaker no longer parks the card on a human (the owner's
+    ``auto_continue`` policy): the crash still COUNTS a failure, and the trip
+    continues the card. The previous blocked+``gave_up`` outcome is pinned
+    separately with ``kanban.auto_continue: false``.
+    """
     conn, _ = board
     _dead_run(conn, "t_crash1", exit_code=1)
     kbd.detect_crashed_workers(conn)
@@ -154,5 +160,31 @@ def test_ordinary_crash_still_counts_and_trips_at_the_limit(board, monkeypatch):
 
     _dead_run(conn, "t_crash1", exit_code=1)
     kbd.detect_crashed_workers(conn)
-    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", None) == ["t_crash1"]
-    assert _state(conn, "t_crash1")["status"] == "blocked"
+    state = _state(conn, "t_crash1")
+    assert int(state["consecutive_failures"]) == 2, "a real crash keeps spending the budget"
+    assert state["status"] == "ready"
+    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", None) == []
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = 't_crash1' ORDER BY id")]
+    assert "auto_continued" in kinds
+    assert "gave_up" not in kinds
+
+
+def test_ordinary_crash_trip_still_blocks_when_auto_continue_is_off(board, monkeypatch):
+    """``kanban.auto_continue: false`` restores the pre-policy behaviour exactly."""
+    conn, _ = board
+    monkeypatch.setattr(
+        kbd._kac, "resolve_settings",
+        lambda: kbd._kac.AutoContinueSettings(enabled=False, max_splits=2),
+    )
+    _dead_run(conn, "t_crash2", exit_code=1)
+    kbd.detect_crashed_workers(conn)
+    _dead_run(conn, "t_crash2", exit_code=1)
+    kbd.detect_crashed_workers(conn)
+
+    assert getattr(kbd.detect_crashed_workers, "_last_auto_blocked", None) == ["t_crash2"]
+    assert _state(conn, "t_crash2")["status"] == "blocked"
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = 't_crash2' ORDER BY id")]
+    assert "gave_up" in kinds
+    assert "auto_continued" not in kinds
