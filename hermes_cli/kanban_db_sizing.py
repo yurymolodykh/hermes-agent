@@ -23,7 +23,6 @@ import sqlite3
 from typing import Optional
 
 _log = logging.getLogger(__name__)
-
 # First line of the advisory; also the idempotency key (a card carries at most one).
 SIZING_COMMENT_TAG = "**card-sizing**"
 
