@@ -446,3 +446,69 @@ cd <worktree> && /home/hermes/.hermes/hermes-agent/.venv/bin/python -m scripts.c
 `t_afdf38ac`. Чужой патч сохранён в `stash@{1}`, ничего не потеряно.
 **Урок: не пользоваться `git stash` в worktree при параллельных карточках;** для пробы базы —
 `git archive <rev> | tar -x -C <tmp>` (так и делалось в этой попытке) или `git show HEAD:<file>`.
+
+---
+
+# PROGRESS — t_4911f964 (авто-сплит на холодном кэше под multiplex)
+
+## Состояние: правка + тесты готовы, идёт набор тестов канбана, остаётся коммит
+
+Ветка `wt/t_4911f964`, дерево `/home/hermes/.hermes/hermes-agent/.worktrees/t_4911f964`,
+база `497c8986c3`.
+
+### Дефект (воспроизведён, не по описанию)
+
+Фаза сплита звалась из тика диспетчера без profile secret scope. Под
+`gateway.multiplex_profiles: true` первый `get_secret` в холодном процессе даёт
+`UnscopedSecretError`; `agent/auxiliary_client` ловит ровно этот класс и молча
+откатывается на `os.environ`, где profile-scoped ключа нет. Итог:
+`decompose_failed_card` → `ok=False` → `_mark_split_unavailable` → карточка
+продолжается. Когда aux-клиент уже в `_client_cache`, секрет не перечитывается и
+сплит проходит — отсюда «после рестарта мёртв, через минуты сам чинится».
+
+Проба: (`…/cache/scratch/t4911/probe_scope.py`) cold/no-scope → FAIL
+UnscopedSecretError, cold/with-scope → OK.
+
+### Что сделано
+
+1. `hermes_cli/kanban_profile_scope.py` (новый, ~45 стр.) — `default_profile_secret_scope()`,
+   единственный владелец контекста (no-op вне multiplex).
+2. `hermes_cli/kanban_auto_continue.py::run_split_phase` — обёрнут в
+   `with default_profile_secret_scope(), _pin_first_board_resolution():`
+   (шимы с late-import). Владелец aux-вызова — сама фаза ⇒ покрыты все вызывающие.
+3. `gateway/kanban_watchers_dispatcher.py::_default_profile_secret_scope` — делегирован
+   в тот же модуль (двух копий контекста нет).
+4. `hermes_cli/kanban_specify.py` — `SECRET_SCOPE_FAILURE`, `_is_secret_scope_failure`,
+   `aux_failure_reason`, `failure_class`; scope-дефект → `secret-scope: LLM error …`,
+   прочие → прежний `LLM error: <Exc>`.
+5. `kanban_auto_continue` — `_mark_split_unavailable` пишет `failure_class`;
+   `AutoState.split_failure_class`; `plan_after_failure(..., split_failure_class=…)` →
+   `decomposer_failure_class` в payload блока.
+6. Семантика «декомпозер недоступен → карточка продолжается» сохранена.
+
+### Тесты `tests/hermes_cli/test_kanban_split_secret_scope.py` (4)
+
+1. холодный кэш + multiplex → тик даёт детей;
+2. рестарт (сброс кэша) → первый же сплит даёт детей без прогрева;
+3. `secret-scope:` в `detail` + `failure_class="secret_scope"` в событии/AutoState/payload;
+4. настоящий отказ провайдера остаётся `LLM error: …`, класс пуст, карточка продолжается.
+
+* Красное на прежнем коде (файлы откачены, модуль убран): **4 failed** —
+  `…/t4911/red-final.txt` (первый тест: `failed=['t_…']` вместо детей).
+* Зелёное после: **45 passed** — `…/t4911/green-final.txt`.
+* `code_health --base HEAD` → 0 blocking, 0 advisory; ruff по 5 файлам — passed.
+
+### Следующий шаг
+
+1. `…/t4911/kanban-set.txt` — набор `tests/**/test_kanban*.py`; приложить хвост.
+2. Коммит в `wt/t_4911f964`.
+3. `REPORT-t4911-split-scope.md` + комментарий-самопроверка в карточку.
+4. Живая проба Б (первый сплит сразу после рестарта) — карточка @15-sre-qa.
+
+### Среда
+
+* `scripts/run_tests.sh` в worktree падает («no bootstrap Python found»): гонять
+  `HERMES_PYTHON=$(ls -t /home/hermes/.hermes/installs/*/test-environment/gen-*/venv/bin/python | head -1)`.
+* Полный `tests/hermes_cli/` шумит падениями `test_agent_import_left_core.py`
+  (guard на worktree-путь) — окружение, не регрессия; набор ограничен kanban-файлами.
+* `scratch/` держать ВНЕ дерева карточки: `code_health` сканирует и его.

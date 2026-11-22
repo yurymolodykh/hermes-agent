@@ -28,6 +28,10 @@ HERMES_KANBAN_SPECIFY_MAX_TOKENS = max(1500, env_int("HERMES_KANBAN_SPECIFY_MAX_
 
 logger = logging.getLogger(__name__)
 
+# Class marker prefixed to an aux-failure reason when the cause was a missing
+# profile secret scope (a plumbing defect, not a provider answer). Callers split
+# on it to keep the two failure classes apart in the journal.
+SECRET_SCOPE_FAILURE = "secret-scope"
 
 _SYSTEM_PROMPT = """You are the Kanban triage specifier for the Hermes Agent board.
 A user dropped a rough idea into the Triage column. Your job is to turn it
@@ -143,6 +147,42 @@ def _task_prompt_fields(task: kb.Task) -> dict[str, str]:
     }
 
 
+def _is_secret_scope_failure(exc: BaseException) -> bool:
+    """Does ``exc`` (or a wrapped cause) mean the profile secret scope was missing?
+
+    That failure is a defect in the caller's own scoping, not a provider refusal:
+    it must stay distinguishable in the journal, because the two demand opposite
+    reactions (fix the call path vs. wait out / route around the provider).
+    """
+    from agent.secret_scope import UnscopedSecretError
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, UnscopedSecretError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def aux_failure_reason(exc: BaseException) -> str:
+    """Journal reason for a failed aux call, tagged with the failure CLASS.
+
+    ``secret-scope:`` is the class marker for "this profile had no secret scope
+    bound" — a configuration/plumbing defect, never a provider answer. Everything
+    else keeps the historical ``LLM error: <ExcType>`` shape.
+    """
+    if _is_secret_scope_failure(exc):
+        return f"{SECRET_SCOPE_FAILURE}: LLM error {type(exc).__name__}"
+    return f"LLM error: {type(exc).__name__}"
+
+
+def failure_class(reason: str) -> str:
+    """``"secret_scope"`` when ``reason`` carries the scope marker, else ``""``."""
+    return "secret_scope" if str(reason or "").startswith(f"{SECRET_SCOPE_FAILURE}:") else ""
+
+
 def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
               max_tokens: int, timeout: int, log: logging.Logger = logger) -> tuple[Optional[str], str]:
     """One auxiliary LLM call; ``(reply_text, "")`` or ``(None, reason)``.
@@ -177,7 +217,7 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
     except Exception as exc:
         suffix = " — skipping" if verb == "specify" else ""
         log.info("%s: API call failed for %s (%s)%s", verb, task_id, exc, suffix)
-        return None, f"LLM error: {type(exc).__name__}"
+        return None, aux_failure_reason(exc)
     finally:
         if affinity_token is not None:
             reset_affinity_scope(affinity_token)

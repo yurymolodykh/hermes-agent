@@ -44,6 +44,23 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _pin_first_board_resolution():
+    """Env-pin-first board resolution for the aux LLM call inside the split phase.
+
+    Same context the neighbouring auto-decompose tick enters: the decomposer
+    connects with no board kwarg, and on a host whose env pins
+    ``HERMES_KANBAN_DB`` a per-slug resolution would read a board nobody writes.
+    """
+    from hermes_cli.kanban_db import pin_first_board_resolution
+    return pin_first_board_resolution()
+
+
+def default_profile_secret_scope():
+    """The launch profile's secret scope while multiplexing; no-op otherwise."""
+    from hermes_cli.kanban_profile_scope import default_profile_secret_scope as _scope
+    return _scope()
+
+
 def _json_dict(value) -> dict:
     """Parse a JSON payload column; ``{}`` for NULL/garbage/unexpected types."""
     from hermes_cli.kanban_db import _json_dict as _impl
@@ -159,6 +176,7 @@ def plan_after_failure(
     generation: int,
     continuations: int,
     split_failures: int = 0,
+    split_failure_class: str = "",
     settings: Optional[AutoContinueSettings] = None,
 ) -> FailurePlan:
     """Decide block / continue / split for a tripped card (pure, no I/O)."""
@@ -209,6 +227,9 @@ def plan_after_failure(
                 "attempts_continued": continuations,
                 "decomposer_unavailable": True,
                 "split_failures": split_failures,
+                # Why it was unavailable, as a class: a missing profile secret
+                # scope is OUR defect and must not read as a provider refusal.
+                "decomposer_failure_class": split_failure_class,
             },
         )
     # A continuation burned in this generation: the work is objectively bigger
@@ -229,6 +250,9 @@ class AutoState:
     continuations: int = 0
     split_pending: bool = False
     split_failures: int = 0
+    split_failure_class: str = ""
+    """Class of the newest ``split_unavailable`` detail (``"secret_scope"`` when the
+    decomposer could not read its credentials, ``""`` for a provider/parse failure)."""
 
 
 def read_state(conn: sqlite3.Connection, task_id: str) -> AutoState:
@@ -254,6 +278,7 @@ def read_state(conn: sqlite3.Connection, task_id: str) -> AutoState:
     generation = 0
     continuations = 0
     split_failures = 0
+    split_failure_class = ""
     split_pending = False
     count_continuations = True
     for idx, row in enumerate(rows):
@@ -267,13 +292,18 @@ def read_state(conn: sqlite3.Connection, task_id: str) -> AutoState:
         elif kind == "auto_continued":
             if count_continuations:
                 continuations += 1
-                if _json_dict(row["payload"]).get("reason") == "split_unavailable":
+                payload = _json_dict(row["payload"])
+                if payload.get("reason") == "split_unavailable":
                     split_failures += 1
+                    if not split_failure_class:
+                        # Newest failure wins: it is the one a human will act on.
+                        split_failure_class = str(payload.get("failure_class") or "")
         elif kind == "auto_split_queued" and idx == 0:
             split_pending = True
     return AutoState(
         generation=generation, continuations=continuations,
         split_pending=split_pending, split_failures=split_failures,
+        split_failure_class=split_failure_class,
     )
 
 
@@ -305,6 +335,7 @@ def plan_for_trip(
         generation=state.generation,
         continuations=state.continuations,
         split_failures=state.split_failures,
+        split_failure_class=state.split_failure_class,
     )
     if plan.mode == "split" and retry_status != "ready":
         # A review run failed: the work product exists and only its verdict is
@@ -490,14 +521,21 @@ def _mark_split(conn: sqlite3.Connection, task_id: str, child_ids: list[str], ge
 
 
 def _mark_split_unavailable(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
-    """The decomposer could not run: continue the card instead of parking it."""
+    """The decomposer could not run: continue the card instead of parking it.
+
+    ``detail`` keeps the reason verbatim, and ``failure_class`` names its class so
+    a missing profile secret scope is not read as "the provider refused us" later.
+    """
     from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_specify import failure_class
+    detail = reason[:300]
     with _kb.write_txn(conn):
         _kb._append_event(
             conn, task_id, "auto_continued",
             {
                 "reason": "split_unavailable",
-                "detail": reason[:300],
+                "detail": detail,
+                "failure_class": failure_class(detail),
                 "attempt": read_state(conn, task_id).continuations + 1,
                 "at": int(time.time()),
             },
@@ -513,6 +551,12 @@ def run_split_phase(
     On any failure the card is returned to work (``auto_continued`` carrying the
     reason) — an unavailable decomposer never parks a card and never discards
     work already done in its workspace.
+
+    The phase binds the launch profile's secret scope and the env-board pin for
+    itself, because the caller is a gateway tick (or the CLI) with no turn scope:
+    under ``gateway.multiplex_profiles`` an unscoped credential read fails closed,
+    and the resulting "LLM error" only ever went away once an aux client happened
+    to be cached — which is why the first split after every restart was lost.
     """
     settings = resolve_settings()
     if not settings.enabled:
@@ -520,31 +564,32 @@ def run_split_phase(
 
     split: list[str] = []
     failed: list[str] = []
-    for task_id in pending_split_ids(conn):
-        if len(split) + len(failed) >= max(per_tick, 1):
-            break
-        generation = read_state(conn, task_id).generation + 1
-        if decompose_fn is None:
-            from hermes_cli import kanban_decompose as _decomp
-            outcome = _decomp.decompose_failed_card(task_id, generation=generation)
-        else:
-            outcome = decompose_fn(task_id, generation=generation)
-        ok = bool(getattr(outcome, "ok", False))
-        child_ids = list(getattr(outcome, "child_ids", None) or [])
-        if ok and child_ids:
-            _mark_split(conn, task_id, child_ids, generation)
-            split.append(task_id)
-            logger.info(
-                "kanban auto-continue: %s split into %d children (generation %d)",
-                task_id, len(child_ids), generation,
-            )
-        else:
-            _mark_split_unavailable(conn, task_id, str(getattr(outcome, "reason", "") or "no children"))
-            failed.append(task_id)
-            logger.info(
-                "kanban auto-continue: %s could not be split (%s); continuing",
-                task_id, getattr(outcome, "reason", "") or "no children",
-            )
+    with default_profile_secret_scope(), _pin_first_board_resolution():
+        for task_id in pending_split_ids(conn):
+            if len(split) + len(failed) >= max(per_tick, 1):
+                break
+            generation = read_state(conn, task_id).generation + 1
+            if decompose_fn is None:
+                from hermes_cli import kanban_decompose as _decomp
+                outcome = _decomp.decompose_failed_card(task_id, generation=generation)
+            else:
+                outcome = decompose_fn(task_id, generation=generation)
+            ok = bool(getattr(outcome, "ok", False))
+            child_ids = list(getattr(outcome, "child_ids", None) or [])
+            if ok and child_ids:
+                _mark_split(conn, task_id, child_ids, generation)
+                split.append(task_id)
+                logger.info(
+                    "kanban auto-continue: %s split into %d children (generation %d)",
+                    task_id, len(child_ids), generation,
+                )
+            else:
+                _mark_split_unavailable(conn, task_id, str(getattr(outcome, "reason", "") or "no children"))
+                failed.append(task_id)
+                logger.info(
+                    "kanban auto-continue: %s could not be split (%s); continuing",
+                    task_id, getattr(outcome, "reason", "") or "no children",
+                )
     return split, failed
 
 
