@@ -33,20 +33,25 @@ def at(hh, mm, day=16):
 
 
 def probe_window() -> int:
-    settings = daywin._load_settings()
-    day_cap, window, tz = settings
-    print("config settings:", {
-        "day_max_in_progress": day_cap,
-        "window": [t.strftime("%H:%M") for t in window] if window else None,
-        "tz": getattr(tz, "key", tz),
+    live = daywin._load_settings()
+    print("live _load_settings() ->", {
+        "day_max_in_progress": live[0],
+        "window": [t.strftime("%H:%M") for t in live[1]] if live[1] else None,
+        "tz": getattr(live[2], "key", live[2]),
     })
+    print("  (shipped default is unset = no daytime layer until the owner sets kanban.day_*)")
 
+    # The card's contract: day_max_in_progress=4, window 08:00-18:00 Europe/Moscow.
+    Moscow = ZoneInfo("Europe/Moscow")
+    settings = (4, (daywin.dt_time(8, 0), daywin.dt_time(18, 0)), Moscow)
+    day_cap, window, tz = settings
     base_cap = 7
     failures = 0
-    print(f"\nbase_cap={base_cap}  day_cap={day_cap}  tz={getattr(tz, 'key', tz)}")
+    print(f"\nbase_cap={base_cap}  day_cap={day_cap}  "
+          f"window={window[0]:%H:%M}-{window[1]:%H:%M}  tz={getattr(tz, 'key', tz)}")
     for hh, mm, expected in [(7, 59, 7), (8, 0, 4), (17, 59, 4), (18, 0, 7)]:
         daywin.reset_state()
-        got = daywin.resolve_day_window_cap(base_cap, now=at(hh, mm))
+        got = daywin.resolve_day_window_cap(base_cap, now=at(hh, mm), settings=settings)
         mark = "OK " if got == expected else "FAIL"
         failures += got != expected
         print(f"  {mark} {hh:02d}:{mm:02d} Europe/Moscow -> {got} (expected {expected})")
