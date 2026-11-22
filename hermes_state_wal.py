@@ -59,7 +59,10 @@ def _mode_from_row(row) -> str:
     return str(row[0]).strip().lower() if row and row[0] is not None else ""
 
 
-def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+_JOURNAL_PROBE_UNSET = object()
+
+
+def _probe_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     """Read the journal mode from the DB header; ``None`` if undeterminable (new DB, or PRAGMA failed) ->
     callers take their fail-closed "refuse to downgrade" branch. ``disk i/o error`` can be transient on
     virtualized block devices (XFS on cloud hosts), so it is retried a few times first."""
@@ -81,6 +84,39 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
         return str(mode).strip().lower() if mode is not None else None
     logger.debug("_on_disk_journal_mode: retries exhausted on disk read (%s)", last_exc)
     return None
+
+
+def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+    """``_probe_journal_mode`` memoized ON THE CONNECTION, so one connection pays the probe once.
+
+    SQLite state is per connection and the journal mode is a property of the FILE, so a connection
+    that established the mode keeps answering the same value: re-probing on every caller paid a
+    ``PRAGMA`` round trip per read-path predicate and per writer open (``_open_writer_conn`` probes
+    twice for one open). A NEW connection has no memo and therefore always probes — that is the
+    "mandatory on reconnect" rule, enforced by construction rather than by remembering to reset.
+
+    The memo is invalidated by :func:`invalidate_journal_mode_memo` after every PRAGMA that can
+    change the mode (all of them live in this module), so the enabling/fallback paths still read
+    the mode they just produced. A mode flipped by ANOTHER process mid-connection is not observed
+    here; it never was (the probe was advisory for choosing the transition, not a lock).
+    """
+    memo = getattr(conn, "_journal_mode_memo", _JOURNAL_PROBE_UNSET)
+    if memo is not _JOURNAL_PROBE_UNSET:
+        return memo
+    mode = _probe_journal_mode(conn)
+    try:
+        conn._journal_mode_memo = mode
+    except AttributeError:  # a connection subclass without __dict__: just skip the memo
+        pass
+    return mode
+
+
+def invalidate_journal_mode_memo(conn: sqlite3.Connection) -> None:
+    """Drop the per-connection journal-mode memo before/after a PRAGMA that can change the mode."""
+    try:
+        conn._journal_mode_memo = _JOURNAL_PROBE_UNSET
+    except AttributeError:
+        pass
 
 
 def _apply_wal_size_limit(conn: sqlite3.Connection) -> None:
@@ -431,8 +467,11 @@ def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
         previous_timeout = 0
     conn.execute("PRAGMA busy_timeout=0")
     try:
+        invalidate_journal_mode_memo(conn)
         return _mode_from_row(conn.execute(f"PRAGMA journal_mode={mode}").fetchone())
     finally:
+        # The mode just changed (or failed to): never let the pre-switch memo answer next time.
+        invalidate_journal_mode_memo(conn)
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
 
