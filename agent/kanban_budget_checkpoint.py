@@ -192,6 +192,8 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
     # attachments-root override), so the archive lands where a human looks for it.
     from hermes_cli.kanban_db import task_attachments_dir
     out_dir = task_attachments_dir(task_id)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
     target = out_dir / f"wip-{stamp}.tar.gz"
@@ -320,7 +322,7 @@ def checkpoint_wip(
     *,
     reason: str,
     used: int,
-    max_total: int,
+
     workspace: Optional[Path] = None,
     task_id: Optional[str] = None,
 ) -> WipCheckpoint:
