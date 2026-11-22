@@ -49,7 +49,6 @@ import logging
 import os
 import socket
 import sys
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -58,6 +57,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from agent import kanban_key_pool_state as _state
 from agent import kanban_key_pool_usage as _usage
 
 logger = logging.getLogger(__name__)
@@ -567,266 +567,33 @@ def _state_lock(path: Path) -> Iterator[None]:
 
 # ── state persistence ──────────────────────────────────────────────────────
 
+# The on-disk format lives in ``agent.kanban_key_pool_state``: this facade is
+# over its line ratchet, and the file shape is a self-contained topic. These
+# names stay because every reservation path and the quarantine sibling use them.
 
 def _read_state(path: Path) -> Dict[str, Any]:
-    """Read the state file and fold it into the *slot* form.
-
-    Two on-disk shapes are readable, and the reader never loses a reservation:
-
-    * **legacy (v1)** — ``reservations[str(key_id)] = {task_id, pid, ...}``, one
-      flat record per key, i.e. the key was exclusive. It is exactly one slot,
-      so it is read as a one-element ``slots`` list.
-    * **slots (v2)** — ``reservations[str(key_id)] = {key_id, key_label, slots:
-      [{task_id, pid, ...}, ...]}``.
-
-    Writing is deliberately backward compatible too (see :func:`_write_state`):
-    a key holding one card is still written as the flat v1 record. A worker
-    started by the previous build during a rolling restart therefore keeps
-    reading the file, and a rollback to the exclusive scheme finds the state
-    intact instead of every card losing its key at once.
-    """
-    empty = {"version": 2, "reservations": {}, "failed_keys": {}, "rr_cursor": None,
-             "usage": {}}
-    if not path.exists():
-        return empty
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        # A torn state file must not block new work: the keys themselves live
-        # in a different file and every reservation is recoverable.
-        return dict(empty)
-    if not isinstance(raw, dict):
-        return dict(empty)
-    stored = raw.get("reservations")
-    if not isinstance(stored, dict):
-        stored = {}
-    reservations: Dict[str, Any] = {}
-    for key, entry in stored.items():
-        folded = _fold_reservation(key, entry)
-        if folded is not None:
-            reservations[str(key)] = folded
-    failed_keys = raw.get("failed_keys")
-    if not isinstance(failed_keys, dict):
-        failed_keys = {}
-    # ``rr_cursor`` is the rotation cursor: the id of the last key handed out.
-    # It lives here, in the same file as ``reservations`` and ``failed_keys``,
-    # so a restarted process continues the same ring instead of starting over
-    # at the lowest id (a second state file would drift out of sync with this
-    # one on any partial write). Absent in a v1 file: ``None`` means "no turn
-    # taken yet" and the ring starts at the lowest free id.
-    cursor_raw = raw.get("rr_cursor")
-    try:
-        rr_cursor: Optional[int] = None if cursor_raw is None else int(cursor_raw)
-    except (TypeError, ValueError):
-        rr_cursor = None
-    # ``usage`` (per-key busy time for the current Moscow day) is optional: a
-    # state file written before the fairness change has none, and it must read
-    # exactly as before — no reservations lost, no bucket invented. Buckets from
-    # an earlier day are dropped here rather than at pick time, so every reader
-    # (status CLI included) sees one consistent window.
-    usage = _usage.filter_today(raw.get("usage"))
-    return {
-        "version": 2,
-        "reservations": reservations,
-        "failed_keys": failed_keys,
-        "rr_cursor": rr_cursor,
-        "usage": usage,
-    }
+    """Read the state file, folding legacy flat records into slots."""
+    return _state.read_state(path)
 
 
 def _fold_reservation(key: Any, entry: Any) -> Optional[Dict[str, Any]]:
     """Normalise one stored key record to ``{key_id, key_label, slots}``."""
-    if not isinstance(entry, dict):
-        return None
-    try:
-        key_id = int(entry.get("key_id") or key)
-    except (TypeError, ValueError):
-        return None
-    label = str(entry.get("key_label") or f"key-{key_id}")
-    raw_slots = entry.get("slots")
-    if isinstance(raw_slots, list):
-        slots = [dict(s) for s in raw_slots if isinstance(s, dict)]
-    else:
-        # Legacy flat record: every field except the key's own two belongs to
-        # the single slot the key used to hold exclusively.
-        slots = [
-            {k: v for k, v in entry.items() if k not in ("key_id", "key_label")}
-        ]
-    return {"key_id": key_id, "key_label": label, "slots": slots}
+    return _state.fold_reservation(key, entry)
 
 
 def _key_slots(entry: Any) -> List[Dict[str, Any]]:
     """The live slots of one key record (empty for anything unusable)."""
-    if not isinstance(entry, dict):
-        return []
-    slots = entry.get("slots")
-    if not isinstance(slots, list):
-        return []
-    return [s for s in slots if isinstance(s, dict)]
-
-
-# ── usage accounting (fairness between keys) ───────────────────────────────
-#
-# Fairness is measured in **occupied time**, not in hand-outs: a key that
-# served three one-minute cards is not "more used" than one that served a
-# single three-hour card. The bookkeeping lives in ``agent.kanban_key_pool_usage``
-# (this facade is over its line ratchet); these three wrappers are the only
-# names the reservation paths use, and ``_account_usage`` binds the pool's own
-# TTL so a caller cannot charge more than a reservation could have lived.
-
-def _usage_today(now: Optional[float] = None) -> str:
-    """The Moscow calendar date (``YYYY-MM-DD``) a usage bucket belongs to."""
-    return _usage.usage_today(now)
-
-
-def _usage_bucket(state: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
-    """Today's ``{key_id: {busy_seconds, cards, window}}``, rolling over in place."""
-    return _usage.usage_bucket(state, now)
-
-
-def _account_usage(
-    state: Dict[str, Any],
-    key_id: Any,
-    slot: Dict[str, Any],
-    *,
-    now: float,
-) -> None:
-    """Charge one DROPPED slot's busy time to its key (idempotent by construction).
-
-    Called from every place that removes a slot — sweep, task release, pid
-    release — and only there, which is what makes double charging impossible: a
-    slot exists in exactly one list, and the caller removes it in the same
-    branch that accounts for it.
-    """
-    _usage.account_slot(state, key_id, slot, now=now, ttl_seconds=_ttl_seconds())
-
-
-def _usage_seconds(state: Dict[str, Any], key_id: int, now: Optional[float] = None) -> float:
-    """Today's accumulated busy seconds for ``key_id`` (``0.0`` when it has none)."""
-    return _usage.busy_seconds(state, key_id, now)
-
-
-def _usage_lookup(usage: Dict[str, Any], key_id: int, today: str) -> float:
-    """Read-only busy seconds in an already-rolled-over bucket."""
-    return _usage.lookup(usage, key_id, today)
+    return _state.key_slots(entry)
 
 
 def _serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Render the in-memory slot state for disk, keeping v1 readable.
-
-    One slot → the flat v1 record (a previous build can still read it, and so
-    can every test that inspects the file directly). Two or more slots → the
-    v2 ``slots`` list. A key with no slots is dropped entirely instead of being
-    written as a husk.
-    """
-    out_reservations: Dict[str, Any] = {}
-    for key, entry in (state.get("reservations") or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        slots = _key_slots(entry)
-        if not slots:
-            continue
-        key_id = entry.get("key_id")
-        label = entry.get("key_label") or f"key-{key_id}"
-        if len(slots) == 1:
-            flat = dict(slots[0])
-            flat["key_id"] = key_id
-            flat["key_label"] = label
-            out_reservations[str(key)] = flat
-        else:
-            out_reservations[str(key)] = {
-                "key_id": key_id,
-                "key_label": label,
-                "slots": [dict(s) for s in slots],
-            }
-    out: Dict[str, Any] = {
-        "version": 2,
-        "reservations": out_reservations,
-        "failed_keys": dict(state.get("failed_keys") or {}),
-        "rr_cursor": state.get("rr_cursor"),
-    }
-    # Only written when there is something to say: an install that never
-    # accumulated a bucket keeps the exact state file it had before this change.
-    usage = state.get("usage")
-    if isinstance(usage, dict) and usage:
-        out["usage"] = {
-            str(k): dict(v) for k, v in usage.items() if isinstance(v, dict)
-        }
-    return out
-
-
-def _pick_key(
-    free: List[int],
-    occupied: Dict[int, List[Dict[str, Any]]],
-    last_key_id: Optional[int],
-    usage: Optional[Dict[str, Any]] = None,
-) -> int:
-    """Choose the next card key: least loaded, then least busy, then round-robin.
-
-    Three rules, in this order — the owner asked for both the rotation (card
-    K4-Р, 2026-11-08: «чтобы ключи постоянно ротировались, а не всегда
-    использовались первые 4») and the *even load* (this card: «нагрузка по 7
-    ключам — равномерная»):
-
-    1. **Least loaded.** The key with the fewest occupied slots wins. That is
-       what spreads two cards of a two-slot key onto two *different* keys
-       while there are free keys, instead of filling #2's second slot first.
-    2. **Least busy today.** Among the equally loaded candidates, prefer the
-       key with the smallest accumulated ``busy_seconds`` (the time its slots
-       were actually held today), inside a ``_USAGE_TOLERANCE_SECONDS``
-       tolerance. Load alone cannot see that one key has already served a
-       three-hour card while another served none — counting hand-outs would
-       not see it either. The tolerance is what keeps the metric from
-       over-fitting: two keys within a minute of each other are *equally*
-       busy, and the ring should keep turning instead of alternating on noise.
-    3. **Round-robin.** Among the survivors, prefer the first key *after*
-       ``last_key_id`` in ascending id order, wrapping at the end — the same
-       cursor as before, so a pool with no history still rotates exactly as it
-       did.
-
-    Leaving this as ``free[0]`` would reintroduce the reported defect: with
-    2 slots and 9 keys every card piles onto #2 before #3 is ever touched.
-    """
-    least = min(len(occupied.get(kid) or []) for kid in free)
-    candidates = [kid for kid in free if len(occupied.get(kid) or []) == least]
-    if usage:
-        today = _usage_today(None)
-        busy = {kid: _usage_lookup(usage, kid, today) for kid in candidates}
-        cheapest = min(busy.values())
-        candidates = [
-            kid for kid in candidates
-            if busy[kid] - cheapest <= _USAGE_TOLERANCE_SECONDS
-        ]
-    if last_key_id is None:
-        return candidates[0]
-    # First candidate strictly after the cursor, wrapping around the ring.
-    after = [kid for kid in candidates if kid > last_key_id]
-    return after[0] if after else candidates[0]
+    """Render the in-memory slot state for disk, keeping v1 readable."""
+    return _state.serialize_state(state)
 
 
 def _write_state(path: Path, state: Dict[str, Any]) -> None:
     """Atomic replace so a crash never leaves half a reservation behind."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(_serialize_state(state), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-    try:  # keys and state are both sensitive-ish; keep them owner-only
-        os.chmod(path, 0o600)
-    except OSError:  # pragma: no cover - Windows ACLs
-        pass
+    _state.write_state(path, state)
 
 
 # ── PID liveness ───────────────────────────────────────────────────────────
