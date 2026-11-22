@@ -7,6 +7,7 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 
 import concurrent.futures
 import importlib
+import json
 import logging
 import re
 import asyncio
@@ -569,7 +570,15 @@ def _status_liveness_digest(profile_dir: Optional[Path]) -> tuple:
                else get_running_pid_cached())
     except Exception:  # health: allow BLE001 -- the probe's own ladder degrades the same way
         pid = None
-    return (pid, runtime_digest)
+    # The warning is a live verdict over the spawn ledger (another installation using this home
+    # right now), so it cannot be inferred from the ledger file alone — a process that exits
+    # without touching it must still clear the warning on the next poll.
+    from hermes_cli.shared_profile_warning import shared_profile_warning
+    try:
+        warning = bool(shared_profile_warning())
+    except Exception:  # health: allow BLE001 -- advisory field, never a liveness verdict
+        warning = None
+    return (pid, runtime_digest, warning)
 
 
 def _status_cache_signature(profile_dir: Optional[Path]) -> tuple:
@@ -593,14 +602,7 @@ def _status_cache_signature(profile_dir: Optional[Path]) -> tuple:
         except OSError:
             stamps.append((str(path), None))
     # The spawn ledger is machine-rooted: an installation starting to share this profile must raise
-    # the warning on the next poll, not one TTL later.
-    try:
-        from hermes_cli.process_identity import _ledger_path
-        ledger = _ledger_path()
-        stat = ledger.stat()
-        stamps.append((str(ledger), stat.st_mtime_ns, stat.st_size, stat.st_ino))
-    except Exception:  # health: allow BLE001 -- absent/unreadable ledger means "no warning"
-        stamps.append(("spawn-ledger", None))
+    # the warning on the next poll, not one TTL later. Its verdict is in the digest above.
     seams = (
         id(gateway_status.get_running_pid_cached), id(gateway_status.read_runtime_status),
         id(_collect_profile_gateway_topology_cached), id(_load_configured_gateway_platforms),
