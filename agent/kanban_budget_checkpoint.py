@@ -204,11 +204,15 @@ _FINGERPRINT_FILE = ".wip-fingerprint"
 
 
 def _existing_archive(out_dir: Path, fingerprint: str) -> Optional[str]:
-    """The archive already holding this exact tree state, when one exists."""
+    """The archive already holding this exact tree state, when one exists.
+
+    Newest by mtime, not by name: two saves inside one second get a ``-N`` suffix
+    that sorts *before* the bare stamp, so a name sort would return the older copy.
+    """
     try:
         if (out_dir / _FINGERPRINT_FILE).read_text(encoding="utf-8").strip() != fingerprint:
             return None
-        previous = sorted(out_dir.glob("wip-*.tar.gz"))
+        previous = sorted(out_dir.glob("wip-*.tar.gz"), key=lambda p: p.stat().st_mtime_ns)
     except OSError:
         return None
     return str(previous[-1]) if previous else None

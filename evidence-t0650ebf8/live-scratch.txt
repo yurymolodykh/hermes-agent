@@ -1,12 +1,10 @@
-<frozen site>:101: RuntimeWarning: Unexpected value in sys.prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_0650ebf8/../../.venv
-<frozen site>:101: RuntimeWarning: Unexpected value in sys.exec_prefix, expected /home/hermes/.hermes/hermes-agent/.venv, got /home/hermes/.hermes/hermes-agent/.worktrees/t_0650ebf8/../../.venv
 max_iterations=180 ratio=0.6
 git в рабочем каталоге: None
 итераций израсходовано: 107, осталось: 73, архивов: 0
 
-[108-я итерация] порог сработал: True; время сохранения: 22.1 мс
+[108-я итерация] порог сработал: True; время сохранения: 57.3 мс
 архивов в каталоге: 1
-  /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-a0e4j9yj/kanban-home/kanban/attachments/t_probe_scratch/wip-20261122T220838.tar.gz  размер=949 байт
+  /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-3o141bdv/kanban-home/kanban/attachments/t_probe_scratch/wip-20261122T224904.tar.gz  размер=942 байт
 верхние записи архива (3): ['PROGRESS.md', 'report.md', 'nested/notes.txt']
 файлов в рабочем каталоге: 3 суммарно 118434 байт
 совпадение набора записей с рабочим каталогом: True
@@ -16,6 +14,6 @@ git в рабочем каталоге: None
 [после правки дерева] архивов: 2
 
 --- фрагмент напоминания в последнем результате инструмента ---
-[SYSTEM NOTICE — iteration budget checkpoint] You have used 108 of 180 iterations. Checkpoint durable progress now, then continue the task; do not stop solely because of this warning. While tools are still available, call kanban_complete only if all task requirements are verified, or kanban_request_review if it is ready for review; otherwise persist a kanban_comment handoff and continue. A diff or commit alone is not completion evidence. This workspace is not a git repository, so a copy of it was written to /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-a0e4j9yj/kanban-home/kanban/attachments/t_probe_scratch/wip-20261122T220838.tar.gz — that archive survives the budget stop.
+[SYSTEM NOTICE — iteration budget checkpoint] You have used 108 of 180 iterations. Checkpoint durable progress now, then continue the task; do not stop solely because of this warning. While tools are still available, call kanban_complete only if all task requirements are verified, or kanban_request_review if it is ready for review; otherwise persist a kanban_comment handoff and continue. A diff or commit alone is not completion evidence. This workspace is not a git repository, so a copy of it was written to /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-3o141bdv/kanban-home/kanban/attachments/t_probe_scratch/wip-20261122T224904.tar.gz — that archive survives the budget stop.
 
-PROBE_HOME=/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-a0e4j9yj
+PROBE_HOME=/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-t0650-3o141bdv
