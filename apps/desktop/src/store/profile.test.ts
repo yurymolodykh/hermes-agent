@@ -29,6 +29,7 @@ vi.mock('@/store/gateway', () => ({
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
+  hermesApi: vi.fn(async () => ({ active: 'default', current: 'default' })),
   setApiRequestProfile: vi.fn()
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
@@ -42,6 +43,7 @@ const {
   newSessionInProfile,
   prewarmProfileBackend,
   prewarmProfilePick,
+  refreshActiveProfile,
   refreshProfiles,
   selectProfile
 } = await import('./profile')
@@ -53,7 +55,7 @@ const { $connectionsRegistry } = await import('@/store/connection-registry-state
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
-const { getProfiles } = await import('@/hermes')
+const { getProfiles, hermesApi } = await import('@/hermes')
 
 const profile = (name: string, isDefault = false): ProfileInfo => ({
   has_env: false,
@@ -427,4 +429,34 @@ describe("profile switch leaves the previous profile's project (#54990)", () => 
 
     expect(resolveNewSessionCwd()).toBe('/work/app1')
   })
+})
+
+describe('refreshActiveProfile single-flight', () => {
+  const activeCalls = () =>
+    vi.mocked(hermesApi).mock.calls.filter(call => call[0] && typeof call[0] === 'object' && (call[0] as { path?: string }).path === '/api/profiles/active').length
+
+  beforeEach(() => {
+    invalidateProfileListFetches()
+    vi.mocked(hermesApi).mockClear()
+  })
+
+  it('shares one /api/profiles/active read between concurrent callers', async () => {
+    await Promise.all([refreshActiveProfile(), refreshActiveProfile(), refreshActiveProfile()])
+
+    expect(activeCalls()).toBe(1)
+  })
+
+  it('reads again once the shared flight has settled', async () => {
+    await refreshActiveProfile()
+    await refreshActiveProfile()
+
+    expect(activeCalls()).toBe(2)
+  })
+})
+
+it('DEBUG raw calls', async () => {
+  invalidateProfileListFetches()
+  vi.mocked(hermesApi).mockClear()
+  await refreshActiveProfile()
+  console.log('RAW:', JSON.stringify(vi.mocked(hermesApi).mock.calls))
 })
