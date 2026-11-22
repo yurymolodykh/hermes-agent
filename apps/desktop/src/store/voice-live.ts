@@ -19,17 +19,29 @@ let writeEpoch = 0
 
 let inflight: null | { key: string; promise: Promise<null | VoiceLiveStatus> } = null
 
+// The config snapshot re-reads this on every refresh (session.info edge, draft
+// mount, scope change). The resolved mode only changes when the config does, so
+// a background caller inside this window reuses the answer instead of paying a
+// round trip; a mode write always passes `force` and re-reads at once.
+const VOICE_STATUS_MAX_AGE_MS = 30_000
+let settledAt = 0
+let settledKey = ''
+
 // The single-flight slot is shared only within one (connection, profile, write)
 // scope; a switch or a write strands the older fetch instead of joining it.
 function voiceLiveScopeKey(): string {
   return `${backendScopeKey(activeGatewayConnectionId(), activeGatewayProfileKey())}::${writeEpoch}`
 }
 
-export async function refreshVoiceLiveStatus(): Promise<null | VoiceLiveStatus> {
+export async function refreshVoiceLiveStatus(force = false): Promise<null | VoiceLiveStatus> {
   const key = voiceLiveScopeKey()
 
   if (inflight?.key === key) {
     return inflight.promise
+  }
+
+  if (!force && settledKey === key && Date.now() - settledAt < VOICE_STATUS_MAX_AGE_MS) {
+    return $voiceLiveStatus.get()
   }
 
   const flight = {
@@ -40,6 +52,8 @@ export async function refreshVoiceLiveStatus(): Promise<null | VoiceLiveStatus> 
         // must not overwrite the status the current profile/connection reads.
         if (voiceLiveScopeKey() === key) {
           $voiceLiveStatus.set(status)
+          settledKey = key
+          settledAt = Date.now()
         }
 
         return status
@@ -81,5 +95,5 @@ export async function setVoiceChatMode(mode: 'chained' | 'gpt-live'): Promise<nu
 
   writeEpoch += 1
 
-  return refreshVoiceLiveStatus()
+  return refreshVoiceLiveStatus(true)
 }

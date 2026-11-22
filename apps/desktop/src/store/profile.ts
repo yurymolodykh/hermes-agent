@@ -114,10 +114,11 @@ let profileListEpoch = 0
 
 export function invalidateProfileListFetches(): void {
   profileListEpoch += 1
-  // Detach the single-flight slot too: a caller arriving AFTER a backend
+  // Detach the single-flight slots too: a caller arriving AFTER a backend
   // switch must start a fresh fetch against the new backend, not ride the
   // previous backend's in-flight retry chain.
   refreshInFlight = null
+  activeProfileInFlight = null
 }
 
 // Single-flight guard: on gateway open both useBackgroundSync and the
@@ -263,29 +264,44 @@ interface ActiveProfileResponse {
 
 // Pull the running backend's current profile + the available profile list.
 // Best-effort: failures (backend not up yet) leave the prior values intact.
-export async function refreshActiveProfile(): Promise<void> {
-  const epoch = profileListEpoch
+// Single-flight like refreshProfiles: boot, the activeGatewayProfile effect and
+// the rail's focus refresh arrive in the same second, and without this each one
+// issued its own /api/profiles/active (measured as bursts of 4 on an idle tab).
+let activeProfileInFlight: Promise<void> | null = null
 
-  try {
-    const res = await hermesApi<ActiveProfileResponse>({
-      path: '/api/profiles/active',
-      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
-    })
+export function refreshActiveProfile(): Promise<void> {
+  if (activeProfileInFlight) {
+    return activeProfileInFlight
+  }
 
-    // Same stale-response guard as refreshProfiles: a backend switch mid-fetch
-    // means this answer describes the PREVIOUS backend.
-    if (epoch === profileListEpoch) {
-      setActiveProfile(res.current || 'default')
+  activeProfileInFlight = (async () => {
+    const epoch = profileListEpoch
+
+    try {
+      const res = await hermesApi<ActiveProfileResponse>({
+        path: '/api/profiles/active',
+        timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+      })
+
+      // Same stale-response guard as refreshProfiles: a backend switch mid-fetch
+      // means this answer describes the PREVIOUS backend.
+      if (epoch === profileListEpoch) {
+        setActiveProfile(res.current || 'default')
+      }
+    } catch {
+      // Backend may not be ready; keep the last known value.
     }
-  } catch {
-    // Backend may not be ready; keep the last known value.
-  }
 
-  try {
-    await refreshProfiles()
-  } catch {
-    // Leave the cached list in place.
-  }
+    try {
+      await refreshProfiles()
+    } catch {
+      // Leave the cached list in place.
+    }
+  })().finally(() => {
+    activeProfileInFlight = null
+  })
+
+  return activeProfileInFlight
 }
 
 // Persist the choice and relaunch the backend under the new HERMES_HOME. The
