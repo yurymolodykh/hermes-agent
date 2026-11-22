@@ -1,54 +1,70 @@
-# PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
+# PROGRESS — t_b7850007: дневное окно 08–18 МСК ≤4 карточки + равномерная нагрузка по 7 ключам пула letovo
 
-## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
+## Состояние: ГОТОВО (все критерии приёмки закрыты), работа в коммите с номером карточки.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
-* База для сравнения: `beeb9623539`
-* Содержимое правки = `git diff beeb9623539`
-* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_b7850007`, ветка `wt/t_b7850007`
+* База сравнения: `8cbd0cde6eb`
+* Интерпретатор проверок: `/home/hermes/.hermes/hermes-agent/.venv/bin/python`
 
-## Сделано
+## Что доделано в этой попытке (остаток из карточки)
 
-### Патч 1 — класс `owner_unavailable` (PR #152921, перенос по смыслу, не `git apply`)
+1. `agent/kanban_key_pool.py:614-660` — восстановлена `_pick_key(free, occupied, last_key_id, usage=None)`
+   с новой логикой: (1) минимум активных слотов среди свободных (`min(len(occupied[kid]))`),
+   (2) среди них минимум `_usage.busy_seconds` с допуском `_USAGE_TOLERANCE_SECONDS = 60.0`
+   (`agent/kanban_key_pool.py:136`), (3) внутри допуска — прежний round-robin по курсору
+   `last_key_id` (первый строго больший, с переходом через край). Вызов на
+   `agent/kanban_key_pool.py:1234` соответствует сигнатуре; курсор обновляется вызывающим на
+   выданный ключ.
+2. `_account_usage` (`agent/kanban_key_pool.py:604-612`) делегирует в
+   `_usage.account_slot(state, key_id, slot, now=now, ttl_seconds=_ttl_seconds())`;
+   вызовы: `:802`, `:1452`, `:1519`.
+3. `agent/kanban_key_pool.py:1892` — `_usage_bucket(state, now)` → `_usage.usage_bucket(state, now)`.
+4. Фасадный шов: `agent/kanban_key_pool.py:66` — `_usage_today = _usage.usage_today`
+   (тест `test_day_boundary_is_moscow_not_utc` читает день через фасад).
+5. Импорты сиблингов: `agent/kanban_key_pool.py:60-61` — `_state`, `_usage`.
 
-* `hermes_state_errors.py:99-103` — `PERSISTENCE_ERROR_CAUSES` += `"owner_unavailable"` (перед `"unknown"`).
-* `hermes_state_errors.py` — `_PERSISTENCE_CAUSE_BY_PHRASE` += `(("owner_unavailable",), …)` и
-  `(("worker_receipt_timeout",), "owner_unavailable")`, **после** `foreign key constraint failed` и
-  **перед** `_PERMISSION_MARKERS`; комментарий PR сохранён (фраза, не тип; RPC теряет тип; импорт
-  фасада воркера инвертировал бы зависимость листового модуля).
-* Докстринг `classify_persistence_error` дополнен.
-* `agent/turn_explainers.py:53-56` — `_PERSISTENCE_CAUSES` += `"owner_unavailable"` + комментарий.
-* `locales/*.yaml` — 17 файлов, ключ `explainer.persistence.owner_unavailable` после `turn_lease`.
-* `tests/agent/test_turn_completion_explainer.py` — 3 новых теста (+параметризация).
+## Критерий 1 — тесты
 
-### Патч 2 — уборщик не убивает живых воркеров (issue #157057, диффа нет)
+`/home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest` по набору:
+`tests/hermes_cli/test_kanban_day_window.py`, `tests/agent/test_kanban_key_pool_fairness.py`,
+`tests/agent/test_kanban_key_pool.py`, `tests/hermes_cli/test_kanban_keypool_release.py`,
+`tests/hermes_cli/test_kanban_keypool_integration.py`, `tests/hermes_cli/test_kanban_keypool_red_proof.py`,
+`tests/hermes_cli/test_kanban_memory_guard.py`, `tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py`,
+`tests/hermes_cli/test_kanban_per_profile_cap.py`
 
-* `hermes_cli/kanban_db_dispatch.py::_reap_terminal_worker_row` — перед сигналом проба
-  `_worker_alive(pid, fingerprint)`; живой → `_log.debug` + `return` (строка остаётся в выборке);
-  мёртвый → снятие улик. Ветка сигнала удалена.
-* Докстринги `reap_terminal_workers` и `DispatchResult.reaped_terminal_workers` приведены к факту.
-* `tests/hermes_cli/test_kanban_terminal_worker_reaper.py` — 5 тестов переписаны под контракт.
-* `website/docs/user-guide/features/kanban.md:138` — описание диспетчера обновлено.
+→ **213 passed, 0 failed** (37.59s).
 
-Не тронуто: `TERMINAL_WORKER_REAP_GRACE_SECONDS`, `reclaim`-логика, `_terminate_reclaimed_worker`,
-`enforce_max_runtime`, `kanban_auto_continue.py`, `kanban_profile_scope.py`, пороги ретраев.
+## Критерий 2 — боевая проверка окна и равномерности
 
-## Проверки (все сняты)
+`/home/hermes/.hermes/hermes-agent/.venv/bin/python evidence-t_b7850007/criterion2_probe.py`
+(вывод — `evidence-t_b7850007/criterion2_output.txt`):
 
-* reaper-тесты: 5 passed; на базе — 2 failed (красная база доказана).
-* explainer-тесты: 34 passed; на базе 4 новых падают (`-k owner`).
-* reaper + explainer + outbox: 61 passed.
-* Смежные наборы состояния: 109 passed, 7 skipped.
-* `ruff check` — All checks passed. `code_health --base beeb9623539` — 0 blocking, 0 advisory.
-* По-файлово `tests/hermes_cli/*kanban*` (99 файлов): база 17 FAIL / 82 PASS, патч 16 FAIL / 83 PASS;
-  `diff` наборов = единственная строка `test_kanban_terminal_worker_reaper.py`.
-* `tests/hermes_state` по-файлово: 134 падающих файла, все предсуществующие (страж
-  `home_io_guard.py:160` ругается на путь worktree; выборка 12 файлов даёт одинаковые числа на
-  базе и с правкой).
+```
+base_cap=7  day_cap=4  window=08:00-18:00  tz=Europe/Moscow
+  OK  07:59 Europe/Moscow -> 7 (expected 7)
+  OK  08:00 Europe/Moscow -> 4 (expected 4)
+  OK  17:59 Europe/Moscow -> 4 (expected 4)
+  OK  18:00 Europe/Moscow -> 7 (expected 7)
+40 hand-outs over 4 of 7 keys (5 min each; quarantined: [6, 7, 8]):
+  key #2: cards=10; #3: 10; #4: 10; #5: 10
+  cards spread = 0 (limit 1)  total cards = 40 / 40
+RESULT: window_failures=0 fairness_failures=0
+```
 
-## Следующий шаг для будущей попытки
+Живой `_load_settings()` в профиле возвращает невыставленные значения (`None`) — дневной слой
+включается только когда владелец задаст `kanban.day_*`; гейт проверен на явно заданных
+значениях (base_cap=7, day_cap=4).
 
-1. `git add -A && git commit` сообщением с номером карточки (t_4cb8f83b), затем
-   `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
-   `REPORT-patches.md`, `evidence-t4cb8f83b/`.
-2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.
+## Критерий 3 — коммит и дифф
+
+Коммит с номером карточки — `git log -1`. `git diff --stat 8cbd0cde6eb` — 11 файлов,
+1494 вставки / 147 удалений.
+
+## Остаточные ограничения
+
+* `ruff` в `.venv` воркtree отсутствует (`No module named ruff`); линт-проверка не снималась,
+  критерии приёмки карточки её не требуют. Python-синтаксис подтверждён импортом модулей в пробах
+  и прогоном тестов.
+* Живой `~/.hermes/config.yaml` и `~/.hermes/kanban-keypool.state.json` не менялись; боевые
+  значения `kanban.day_*` не выставлялись (решение владельца, отдельный шаг выката).
+* Вливание в общую ветку и рестарт шлюза — за оркестратором, не этой карточкой.
