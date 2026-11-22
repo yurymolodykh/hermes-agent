@@ -520,7 +520,7 @@ def _store_ready(conn: sqlite3.Connection, db_path: Path) -> bool:
     """The store can serve rooms once its schema is current and the pre-isolation import has run."""
     from gateway.hosted_rooms_legacy_import import settled
 
-    return _schema_is_current(conn) and settled(conn, db_path)
+    return _schema_is_current_cached(conn, db_path) and settled(conn, db_path)
 
 
 def _initialize_store(conn: sqlite3.Connection, db_path: Path) -> None:
