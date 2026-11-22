@@ -300,8 +300,6 @@ def test_unreadable_workspace_root_preserves_workspace(kanban_home):
         finally:
             _unlock(ws)
         assert (ws / "notes.md").read_text(encoding="utf-8") == "scratch\n"
-        # A second pass on a readable, repo-less workspace clears it as usual.
-        assert kb.complete_task(conn, task_id, result="again") or True
 
 
 # ---------------------------------------------------------------------------
