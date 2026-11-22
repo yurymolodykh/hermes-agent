@@ -117,7 +117,8 @@ def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
     existing = users_file_path()
     if existing is not None:
         return existing, (lambda: None)
-    from hermes_cli.config import get_config_path, write_config_keys
+    from hermes_cli.config import get_config_path
+    from hermes_cli.config_backend import write_config_keys
 
     write_config_keys(get_config_path(), {"dashboard.basic_auth.users_file": USERS_FILE_RELATIVE})
 
@@ -136,7 +137,8 @@ def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
 
 
 def _routes_doc() -> tuple[Path, Any, list[dict]]:
-    from hermes_cli.config import get_config_path, read_config_doc
+    from hermes_cli.config import get_config_path
+    from hermes_cli.config_backend import read_config_doc
 
     path = get_config_path()
     try:
@@ -158,7 +160,7 @@ def write_route_undoable(login: str, profile: str, telegram_id: str) -> Callable
     ``bot_profile`` is null on purpose: every person is served by the owner's single
     Telegram bot (one reader per token — a second one is ``telegram_polling_conflict``).
     """
-    from hermes_cli.config import write_config_document
+    from hermes_cli.config_backend import write_config_document
 
     path, document, routes = _routes_doc()
     before = json.loads(json.dumps(document, default=str))
@@ -496,7 +498,7 @@ def remove_user(login: str, *, say: Callable[[str], None] = _out) -> dict[str, A
     kept = [route for route in routes
             if not (isinstance(route, dict) and route.get("profile") == profile)]
     if len(kept) != len(routes):
-        from hermes_cli.config import write_config_document
+        from hermes_cli.config_backend import write_config_document
 
         gateway = document.get("gateway")
         if isinstance(gateway, dict):
