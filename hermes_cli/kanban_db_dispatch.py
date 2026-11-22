@@ -2115,6 +2115,15 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    The auto-split phase runs AFTER the lock is released, guarded by its own
+    ``.split.lock``: it calls the decomposer (an aux LLM request, up to 180 s ×
+    3 attempts) and holding the single-writer guard across that call froze the
+    whole board — no reclaim, no promotion, no spawn for the duration (measured
+    616.8 s on a live board with ``dispatch_interval_seconds: 60``). Splitting
+    after the tick rather than before it means a card marked ``split_pending``
+    by this tick's failure accounting is split in the same tick, so the children
+    are spawned by the next one instead of waiting two intervals.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -2133,11 +2142,29 @@ def dispatch_once(
             keypool_exempt=keypool_exempt,
         )
 
+    def _split_outside_lock(result: DispatchResult) -> DispatchResult:
+        """Run the split phase with no dispatch lock held, at most once."""
+        if dry_run or result.skipped_locked:
+            return result
+        try:
+            split_db_path = _kb.kanban_db_path(board=board)
+        except Exception:
+            split_db_path = None
+        if split_db_path is None:
+            result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
+            return result
+        with _kbc._dispatch_split_lock(split_db_path) as split_held:
+            if not split_held:
+                # Another process is already paying for this board's decomposer.
+                return result
+            result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
+        return result
+
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
+        result = _split_outside_lock(_locked_tick())
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -2147,8 +2174,10 @@ def dispatch_once(
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
             _kbc._maybe_checkpoint_wal(conn, db_path)
-    # Lock released. Fire the tick observer strictly OUTSIDE the critical
-    # section: a slow subscriber must never stall a sibling dispatcher's tick.
+    # Lock released: the decomposer must never hold the board's write guard.
+    result = _split_outside_lock(result)
+    # Tick observer also runs strictly OUTSIDE the critical section: a slow
+    # subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
@@ -2605,13 +2634,9 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
-    # Cards whose retry counter burned twice in one generation wait for a split.
-    # OUTSIDE any write txn (the decomposer is an aux LLM call) and BEFORE the
-    # spawn budget is computed: a split moves the card to ``todo`` and its
-    # children to ``ready``, which changes what this tick can spawn. A dry run
-    # must not create child cards, so it skips the phase entirely.
-    if not dry_run:
-        result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
+    # The auto-split phase is deliberately NOT here: its decomposer is an aux
+    # LLM call (up to 180 s x 3 attempts) and this whole function runs under the
+    # board's single-writer lock. ``dispatch_once`` runs it after releasing it.
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
