@@ -1,0 +1,11 @@
+$ hermes kanban boards create smokeboard  -> exit 1
+
+STDERR: kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI
+Traceback (most recent call last):
+  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/smoke_boards_rm.py", line 43, in <module>
+    tid = kb.create_task(conn, title="smoke scratch")
+  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/hermes_cli/kanban_db.py", line 1302, in create_task
+    raise ValueError(
+    ...<3 lines>...
+    )
+ValueError: refusing a card with no author and no named assignee on the live board: pass created_by= (who filed it) and a concrete assignee profile; probes and tests must pin HERMES_KANBAN_HOME to a temporary directory
