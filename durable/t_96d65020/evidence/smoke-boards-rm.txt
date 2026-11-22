@@ -1,8 +1,10 @@
-$ hermes kanban boards create smokeboard  -> exit 1
-
-STDERR: kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI
+$ hermes kanban boards create smokeboard  -> exit 0
+Board 'smokeboard' created.
+  Display name: Smokeboard
+  DB path:      /home/hermes/.hermes/kanban/boards/smokeboard/kanban.db
+  Use `hermes kanban boards switch smokeboard` to make it current.
 Traceback (most recent call last):
-  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/smoke_boards_rm.py", line 43, in <module>
+  File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/smoke_boards_rm.py", line 50, in <module>
     tid = kb.create_task(conn, title="smoke scratch")
   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/hermes_cli/kanban_db.py", line 1302, in create_task
     raise ValueError(

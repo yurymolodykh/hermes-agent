@@ -12,9 +12,13 @@ REPO_ROOT = WORK.parents[1]  # the platform checkout that owns the shared .venv
 SITE = REPO_ROOT / ".venv" / "lib" / "python3.14" / "site-packages"
 
 home = HERE.parent / "home"
+kanban_home = HERE.parent / "kanbanhome"
 home.mkdir(parents=True, exist_ok=True)
-env = dict(os.environ, HERMES_HOME=str(home))
-for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"):
+kanban_home.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ, HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(kanban_home))
+for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_BOARD_PIN",
+            "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_BRANCH"):
     env.pop(var, None)
 env["PYTHONPATH"] = f"{WORK}:{SITE}"
 PY = sys.executable
@@ -35,12 +39,18 @@ def git(*args: str, cwd: Path) -> None:
 
 
 sys.path.insert(0, str(WORK))
+for _var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
+             "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_BOARD_PIN",
+             "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_BRANCH"):
+    os.environ.pop(_var, None)
+os.environ["HERMES_HOME"] = str(home)
+os.environ["HERMES_KANBAN_HOME"] = str(kanban_home)
 from hermes_cli import kanban_db as kb  # noqa: E402
 from hermes_cli import kanban_db_connect as kbc  # noqa: E402
 
 cli("boards", "create", "smokeboard")
 with kbc.connect_closing(board="smokeboard") as conn:
-    tid = kb.create_task(conn, title="smoke scratch")
+    tid = kb.create_task(conn, title="smoke scratch", created_by="smoke", assignee="02-hermes-platform")
 ws = kb.workspaces_root(board="smokeboard") / tid
 repo = ws / "clone"
 repo.mkdir(parents=True)
