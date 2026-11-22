@@ -136,3 +136,96 @@ def test_trace_claims(kanban_home, monkeypatch, tmp_path):
         print("keypool_free:", kbd._keypool_has_free_slot(reserve=0))
         claimed = kb.claim_task(conn, row["id"], ttl_seconds=None)
         print("claimed:", claimed.id if claimed else None)
+
+
+def test_trace_claim_none(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real_claim = kb.claim_task
+    def traced_claim(conn_, task_id, **kw):
+        out = real_claim(conn_, task_id, **kw)
+        print("\nCLAIM_CALL", task_id, kw, "->", getattr(out, "id", None))
+        if out is None:
+            row = conn_.execute("select id,status,claim_lock,claim_expires,worker_pid from tasks where id=?", (task_id,)).fetchone()
+            print("  row now:", dict(row))
+        return out
+    kb.claim_task = traced_claim
+    kbd.claim_task = traced_claim if hasattr(kbd, "claim_task") else None
+    monkeypatch.setattr(kb, "claim_task", traced_claim)
+    try:
+        with kbc.connect_closing() as conn:
+            r = kbd._dispatch_once_locked(conn)
+        print("result:", {k: v for k, v in r.__dict__.items() if v})
+    finally:
+        kb.claim_task = real_claim
+
+
+def test_trace_workspace(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real = kbd._kbw.resolve_workspace
+    def traced(task, **kw):
+        try:
+            out = real(task, **kw)
+            print("\nWS OK", out)
+            return out
+        except Exception as exc:
+            print("\nWS RAISED", type(exc).__name__, exc)
+            raise
+    monkeypatch.setattr(kbd._kbw, "resolve_workspace", traced)
+    env = kbd._kbenv.ensure_tree_install_state
+    def traced_env(p):
+        out = env(p)
+        print("ENV", p, "->", out)
+        return out
+    monkeypatch.setattr(kbd._kbenv, "ensure_tree_install_state", traced_env)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("result:", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_spawn(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real = kbd._call_spawn_fn
+    def traced(fn, task, ws, board):
+        print("\nSPAWN_FN", fn)
+        try:
+            out = real(fn, task, ws, board)
+            print("SPAWN ->", out)
+            return out
+        except Exception as exc:
+            print("SPAWN RAISED", type(exc).__name__, exc)
+            raise
+    monkeypatch.setattr(kbd, "_call_spawn_fn", traced)
+    with kbc.connect_closing() as conn:
+        r = kbd._dispatch_once_locked(conn)
+    print("result:", {k: v for k, v in r.__dict__.items() if v})
+
+
+def test_trace_failure(kanban_home, monkeypatch, tmp_path):
+    kb, kbc, kbd = kanban_home
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="probe", assignee="alpha")
+    real = kbd._record_task_failure
+    def traced(conn_, task_id, reason, **kw):
+        print("\nFAILURE_RECORDED", task_id, repr(reason)[:200], kw.get("outcome"))
+        return real(conn_, task_id, reason, **kw)
+    monkeypatch.setattr(kbd, "_record_task_failure", traced)
+    orig_spawn = kbd._default_spawn
+    calls = []
+    def fake(*a, **k):
+        calls.append(a[0].id if a else None)
+        print("FAKE_SPAWN_CALLED", calls)
+        return 4242
+    monkeypatch.setattr(kbd, "_default_spawn", fake)
+    with kbc.connect_closing() as conn:
+        r = kbd.dispatch_once(conn)
+    print("spawned", r.spawned, "calls", calls, "res", {k: v for k, v in r.__dict__.items() if v})
