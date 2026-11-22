@@ -1434,6 +1434,13 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            # A card that enters the board already ``ready`` (the CLI default: no
+            # open parents) never crosses a promotion, so the sizing advisory — which
+            # hangs off promotion — would miss exactly the population it exists for.
+            # Written after the txn, advisory only, at most one per card.
+            kanban_db_sizing.note_if_ready(
+                conn, task_id, task_status, author=created_by or "creator",
+            )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2100,63 +2107,7 @@ def _synthesize_ended_run(
 
 
 # --- Dependency resolution (todo -> ready) ---
-
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``blocked``/``unblocked``/``gave_up`` event says the
-    block must wait for an operator: an explicit ``kanban_block`` (#28712), or a
-    breaker trip ``_record_task_failure`` stamped ``sticky`` — the clean-exit
-    protocol-violation budget or a systemic same-error wave. Those trip on a
-    policy independent of ``consecutive_failures``, so ``recompute_ready``'s
-    counter check cannot see them — without this the trip is promoted back to
-    ``ready`` in the same tick and the card respawns forever. A plain
-    (unified-budget) ``gave_up`` carries no marker and is judged by the counter,
-    so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
-    releases it; a task with no such event at all (direct DB edit) auto-recovers.
-    """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if row and row["kind"] == "blocked":
-        return True
-    trip = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'gave_up' AND id > COALESCE("
-        "  (SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'unblocked'), 0) "
-        "ORDER BY id DESC LIMIT 1", (task_id, task_id),
-    ).fetchone()
-    return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
-
-
-def _latest_event(
-    conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
-) -> Optional[sqlite3.Row]:
-    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run)."""
-    sql = "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
-    params: tuple[Any, ...] = (task_id, kind)
-    if run_id is not None:
-        sql += " AND run_id = ?"
-        params = (*params, int(run_id))
-    return conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
-
-
-def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
-    """``review`` when the newest lifecycle event carries a review
-    ``resume_status``/``retry_status``/``source_status``, else ``ready`` (legacy)."""
-    row = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ("
-        "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'interrupted'"
-        ") ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    payload = _json_dict(_row_get(row, "payload"))
-    for key in ("resume_status", "retry_status", "source_status"):
-        if payload.get(key) == "review":
-            return "review"
-    return "ready"
+# Event-derived promotion readers live in ``kanban_db_promotion`` (imported at the tail).
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
@@ -2170,10 +2121,15 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
+
+    A card landing in ``ready`` gets the card-sizing advisory
+    (``hermes_cli.kanban_db_sizing``) — after the transaction, never inside it, and
+    never as a veto: the promotion stands whatever the estimate says.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    sized: list[str] = []
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
@@ -2217,7 +2173,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
+                if resume_status == "ready":
+                    sized.append(task_id)
                 promoted += 1
+    for task_id in sized:
+        kanban_db_sizing.note_promotion(conn, task_id, author="dispatcher")
     return promoted
 
 
@@ -3693,6 +3653,8 @@ def promote_task(
             return False, f"task {task_id} status changed during promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
+    # Advisory, after the transaction: the promotion stands whatever the estimate says.
+    kanban_db_sizing.note_promotion(conn, task_id, author=actor or "operator")
     return True, None
 
 
@@ -4368,6 +4330,12 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli import kanban_db_sizing
+from hermes_cli.kanban_db_promotion import (
+    _has_sticky_block,
+    _latest_event,
+    _resume_status_from_events,
+)
 from hermes_cli.kanban_db_boards import (
     _default_board_display_name,
     _dir_holds_board,
