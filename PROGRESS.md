@@ -1,84 +1,54 @@
-# PROGRESS — t_97c86dea: card-sizing advisory on promotion (CLI hole)
+# PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
 
-## Состояние: ГОТОВО — все критерии приёмки закрыты
+## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_97c86dea`, ветка `wt/t_97c86dea`
-* База: `65db1ee540b`
-* Python с pytest: `/home/hermes/.hermes/kanban/workspaces/t_af262aaf/.venv/bin/python`
-* Артефакты: `evidence-t97c86dea/`
-* (Прежний `PROGRESS.md` от карточки t_4cb8f83b сохранён как `PROGRESS.stale-t4cb8f83b.md`.)
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
+* База для сравнения: `beeb9623539`
+* Содержимое правки = `git diff beeb9623539`
+* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
 
-## Что сделано (закоммичено)
+## Сделано
 
-1. **Новый sibling-модуль** `hermes_cli/kanban_db_sizing.py`:
-   `comment_body` / `promotion_note` / `has_sizing_comment` / `note_promotion` / `note_if_ready`.
-   Правило advisory: ни блокировки, ни смены статуса; начало тела —
-   `**card-sizing**` = ключ идемпотентности (одна карточка → максимум один комментарий).
-   Бюджет берётся у assignee через `agent.kanban_card_sizing.assignee_iteration_budget`;
-   unknown/unlimited → молчание. Ошибки внутри оценки ловятся и логируются, промоушен не рушится.
-2. **Три точки вызова** в `hermes_cli/kanban_db.py`:
-   * `recompute_ready` — dispatcher tick: промоушеннутые в `ready` id собираются в `sized`
-     и обрабатываются ПОСЛЕ транзакции (author `dispatcher`);
-   * `promote_task` — операторский промоушен (author = actor);
-   * `create_task` — карточка, сразу рождённая в `ready` (ровно CLI-путь
-     `hermes kanban create`: `initial_status="running"` → `ready` без открытых родителей);
-     через шим `note_if_ready`.
-3. **Вынос из фасада** (фасад 4404 → 4365 строк): `_has_sticky_block`, `_latest_event`,
-   `_resume_status_from_events` перенесены в новый `hermes_cli/kanban_db_promotion.py`
-   и реэкспортированы в конце `kanban_db.py` (цикл как у прочих sibling-модулей: поздний импорт фасада).
-4. **Тесты** `tests/hermes_cli/test_kanban_promotion_sizing.py` — 8 тестов, все зелёные:
-   over-budget → 1 комментарий и статус `ready`; tick-путь; влезающая карточка → 0 комментариев;
-   повторный промоушен → второго комментария нет; операторский `promote_task`;
-   CLI-создание сразу в `ready`; unknown budget → тишина.
-   Красная база доказана: с вырезанными вызовами 4 из 8 падают.
+### Патч 1 — класс `owner_unavailable` (PR #152921, перенос по смыслу, не `git apply`)
 
-## Проверки (артефакты в `evidence-t97c86dea/`)
+* `hermes_state_errors.py:99-103` — `PERSISTENCE_ERROR_CAUSES` += `"owner_unavailable"` (перед `"unknown"`).
+* `hermes_state_errors.py` — `_PERSISTENCE_CAUSE_BY_PHRASE` += `(("owner_unavailable",), …)` и
+  `(("worker_receipt_timeout",), "owner_unavailable")`, **после** `foreign key constraint failed` и
+  **перед** `_PERMISSION_MARKERS`; комментарий PR сохранён (фраза, не тип; RPC теряет тип; импорт
+  фасада воркера инвертировал бы зависимость листового модуля).
+* Докстринг `classify_persistence_error` дополнен.
+* `agent/turn_explainers.py:53-56` — `_PERSISTENCE_CAUSES` += `"owner_unavailable"` + комментарий.
+* `locales/*.yaml` — 17 файлов, ключ `explainer.persistence.owner_unavailable` после `turn_lease`.
+* `tests/agent/test_turn_completion_explainer.py` — 3 новых теста (+параметризация).
 
-* `focused-pytest.txt` — `pytest tests/hermes_cli/test_kanban_promotion_sizing.py -q` → 8 passed.
-* `code-health.txt` — `python -m scripts.code_health --base 65db1ee540b` → **0 blocking, 0 advisory**.
-* `PROBE-cli-create.txt` — живая проба на текущем HEAD через реальный CLI-вход
-  `hermes_cli.main:main`: карточка с 10 пунктами приёмки на `03-software-engineer`
-  (бюджет 180, оценка 340, превышение 160) → один `**card-sizing**` комментарий, статус
-  остаётся `ready`; карточка с 1 пунктом → комментариев нет.
-* `live_probe.py` — воспроизводимый скрипт пробы (изолированный `HERMES_KANBAN_HOME`,
-  реальную доску не трогает).
-* `ruff --select BLE001,S110,E722,F,RUF006` по новым файлам → All checks passed.
+### Патч 2 — уборщик не убивает живых воркеров (issue #157057, диффа нет)
 
-## Важно про окружение (не путать с регрессией)
+* `hermes_cli/kanban_db_dispatch.py::_reap_terminal_worker_row` — перед сигналом проба
+  `_worker_alive(pid, fingerprint)`; живой → `_log.debug` + `return` (строка остаётся в выборке);
+  мёртвый → снятие улик. Ветка сигнала удалена.
+* Докстринги `reap_terminal_workers` и `DispatchResult.reaped_terminal_workers` приведены к факту.
+* `tests/hermes_cli/test_kanban_terminal_worker_reaper.py` — 5 тестов переписаны под контракт.
+* `website/docs/user-guide/features/kanban.md:138` — описание диспетчера обновлено.
 
-Прямой `pytest` в этом рабочем дереве даёт **ложные** падения: дерево лежит внутри
-`~/.hermes`, а `tests/home_io_guard.py` запрещает любой I/O по реальному hermes home
-(`TEST BUG: file I/O against the REAL hermes home`). Поэтому широкий регресс гоняется
-в чистой копии **вне** `~/.hermes`:
+Не тронуто: `TERMINAL_WORKER_REAP_GRACE_SECONDS`, `reclaim`-логика, `_terminate_reclaimed_worker`,
+`enforce_max_runtime`, `kanban_auto_continue.py`, `kanban_profile_scope.py`, пороги ретраев.
 
-    git archive <rev> | tar -x -C /home/hermes/ksz-probe/<dir>/{head|base}
-    cd <copy> && TMPDIR=/home/hermes/ksz-probe/tmp \
-      HERMES_PYTHON=/home/hermes/.hermes/kanban/workspaces/t_af262aaf/.venv/bin/python \
-      bash scripts/run_tests.sh tests/hermes_cli/ -q -j 7 --file-retries 0
+## Проверки (все сняты)
 
-`tests/hermes_cli` — ~1963 файла / ~15k тестов, полный проход не укладывается в 25 минут
-ни на одном дереве; поэтому запуск идёт с `timeout 1500`, а каждый упавший файл
-**доотдельно** перегоняется на базе `65db1ee540b` — сверка пофайловая, а не по проценту.
+* reaper-тесты: 5 passed; на базе — 2 failed (красная база доказана).
+* explainer-тесты: 34 passed; на базе 4 новых падают (`-k owner`).
+* reaper + explainer + outbox: 61 passed.
+* Смежные наборы состояния: 109 passed, 7 skipped.
+* `ruff check` — All checks passed. `code_health --base beeb9623539` — 0 blocking, 0 advisory.
+* По-файлово `tests/hermes_cli/*kanban*` (99 файлов): база 17 FAIL / 82 PASS, патч 16 FAIL / 83 PASS;
+  `diff` наборов = единственная строка `test_kanban_terminal_worker_reaper.py`.
+* `tests/hermes_state` по-файлово: 134 падающих файла, все предсуществующие (страж
+  `home_io_guard.py:160` ругается на путь worktree; выборка 12 файлов даёт одинаковые числа на
+  базе и с правкой).
 
-## Итог широкого регресса
+## Следующий шаг для будущей попытки
 
-* head (`timeout 1500`, `-j 7`): 1055 файлов выполнено (54.2 % от 1963), 29 файлов с падениями.
-* база `65db1ee540b`, те же 29 файлов: **28 падают идентично** (среда: gateway-супервизоры,
-  `doctor_pm_store_probe`, `enable_no_capabilities`, `login_backend_provenance`, …).
-* `test_backup_preflight.py` — падал в head только на общем прогоне (20-секундный таймаут
-  подпроцесса под нагрузкой `-j 7`), **изолированно на head проходит**: 3 passed in 3.5s.
-* **Ноль регрессий, объяснимых изменением карточки.**
-* Детали и сырые логи — `evidence-t97c86dea/wide-regression-compare.md`.
-
-## Осталось
-
-Код, тесты и проверки закрыты. Остался **только публикационный гейт**:
-
-1. `ops-card-merge.py --task t_97c86dea` отказывает «репозиторий вне реестра публикации»,
-   хотя `/home/hermes/.hermes/hermes-agent` в `git-autopush.yaml` есть. Похоже, `repo_of(ws)`
-   возвращает путь рабочего дерева (`.worktrees/t_97c86dea`), а не корень репозитория —
-   проверять `repo_of` в `ops/bin/ops-card-merge.py` (строка ~185).
-2. Целевая ветка объявлена: `/home/hermes/workspaces/01-orchestrator/ops/state/card-publish-target/t_97c86dea.json`
-   → `feature/multiuser-access` (как у всех соседних карточек).
-3. После слияния в `feature/multiuser-access` — повторить `kanban_complete`
-   (гейт требует `git merge-base --is-ancestor 581a4d0c99c feature/multiuser-access`).
+1. `git add -A && git commit` сообщением с номером карточки (t_4cb8f83b), затем
+   `kanban_comment` — самопроверка, `kanban_complete` с artifacts:
+   `REPORT-patches.md`, `evidence-t4cb8f83b/`.
+2. Не вливать в общее дерево и не перезапускать шлюз — отдельная карточка выката.
