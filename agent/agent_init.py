@@ -1087,13 +1087,12 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
     _set_defaults(agent, _SESSION_STATE)
 
-    # Filesystem checkpoint manager (transparent — not a tool)
-    from tools.checkpoint_manager import CheckpointManager
-    agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled, max_snapshots=checkpoint_max_snapshots,
-        max_total_size_mb=checkpoint_max_total_size_mb,
-        max_file_size_mb=checkpoint_max_file_size_mb,
-    )
+    # Filesystem checkpoint manager (transparent — not a tool); its module owns the wiring
+    # that gets a failed/repairing checkpoint onto the status rail, not just into agent.log.
+    from tools.checkpoint_locks import build_manager
+    agent._checkpoint_mgr = build_manager(
+        checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb,
+        checkpoint_max_file_size_mb, notice=agent._emit_startup_warning)
 
     agent._session_db = session_db  # optional SQLite store (CLI/gateway-provided)
     agent._parent_session_id = parent_session_id
