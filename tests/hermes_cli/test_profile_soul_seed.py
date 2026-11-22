@@ -220,6 +220,87 @@ class TestApplyQuestionnaire:
         assert soul.questionnaire_memory_entries({}) == []
 
 
+class TestInterfaceMatchesImplementation:
+    """Every question the printed questionnaire shows must reach something.
+
+    The suite above pinned the behaviour that existed; it stayed green while
+    ``hermes_cli/data/soul-questionnaire.md`` printed ``address_style`` and the implementation
+    ignored it. These read the questionnaire file and hold it against the implementation, so a new
+    printed question with no consumer fails here instead of reaching a person.
+    """
+
+    def test_every_printed_key_is_parsed_from_the_file(self):
+        keys = soul.questionnaire_answer_keys()
+        assert len(keys) >= 20, keys
+        for key in ("display_name", "address_form", "address_style", "planning", "extra"):
+            assert key in keys
+
+    def test_no_printed_key_is_unknown_to_the_implementation(self):
+        known = (
+            set(soul._REPLY_LINES) | set(soul._WORK_CHOICES) | set(soul.BOUNDARY_CHOICES)
+            | {"display_name", "address_form", "boundary_custom"} | set(soul.MEMORY_ONLY_KEYS)
+        )
+        assert [k for k in soul.questionnaire_answer_keys() if k not in known] == []
+
+    def test_every_value_in_web_models_is_printed(self):
+        """A field the API accepts but the questionnaire never asks is a knob nobody discovers."""
+        from hermes_cli.web_models import ProfileSoulQuestionnaire
+
+        fields = set(ProfileSoulQuestionnaire.model_fields)
+        parsed = set(soul.questionnaire_answer_keys())
+        # The four tick-box keys travel inside the ``boundaries`` list, so they are printed and
+        # accepted but are not model fields of their own.
+        assert parsed - set(soul.BOUNDARY_CHOICES) == fields - {"boundaries"}
+        assert set(soul.BOUNDARY_CHOICES) <= parsed
+
+    @pytest.mark.parametrize(
+        "key,choice",
+        [(k, c) for k, choices in soul.questionnaire_printed_choices().items() for c in choices],
+    )
+    def test_each_printed_choice_changes_the_soul(self, key, choice):
+        after, report = soul.apply_questionnaire(BASE, {key: choice})
+        if (key, choice) in soul.SAME_AS_DEFAULT:
+            assert after == BASE and report["changed_sections"] == []
+            return
+        assert after != BASE, f"{key}={choice!r} напечатан в опроснике, но SOUL не меняет"
+        assert report["changed_sections"], f"{key}={choice!r}: секция не названа в отчёте"
+
+    @pytest.mark.parametrize("key", sorted(soul.MEMORY_ONLY_KEYS))
+    def test_each_fact_key_reaches_the_memory(self, key):
+        entries = soul.questionnaire_memory_entries({key: "пример"})
+        assert len(entries) == 1 and entries[0].endswith("пример"), (key, entries)
+        assert soul.apply_questionnaire(BASE, {key: "пример"})[0] == BASE
+
+    def test_same_as_default_list_only_holds_printed_choices(self):
+        printed = soul.questionnaire_printed_choices()
+        for key, choice in soul.SAME_AS_DEFAULT:
+            assert choice in printed.get(key, []), (key, choice)
+
+    def test_free_typed_answer_is_written_rather_than_dropped(self):
+        for key in ("answer_length", "planning", "reporting", "uncertainty"):
+            after, _ = soul.apply_questionnaire(BASE, {key: "совсем своё правило"})
+            assert "совсем своё правило" in after, key
+
+    def test_apply_twice_with_fresh_keys_stays_idempotent(self):
+        answers = {
+            "address_style": "без обращения",
+            "answer_length": "средне",
+            "planning": "по обстоятельствам",
+            "suggest_improvements": "нет",
+        }
+        once, _ = soul.apply_questionnaire(BASE, answers)
+        twice, _ = soul.apply_questionnaire(once, answers)
+        assert once == twice
+        assert once.count("- Как обращаться в ответе:") == 1
+        assert once.count("- Перед работой:") == 1
+
+    def test_address_style_renders_inside_the_reply_section(self):
+        after, report = soul.apply_questionnaire(BASE, {"address_style": "по имени"})
+        reply = after.split("## Ответ пользователю", 1)[1].split("## Общие профили", 1)[0]
+        assert "называй пользователя по имени" in reply
+        assert "Роль" not in report["changed_sections"]
+
+
 # ---------------------------------------------------------------------------
 # HTTP: questionnaire path in the create answer, and the apply endpoint
 # ---------------------------------------------------------------------------

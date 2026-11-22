@@ -105,6 +105,7 @@ _OWNED_LINE_PREFIXES = (
     "- В отчёте: что сделано",
     "- О замеченной проблеме говори сам",
     "- Предлагать улучшения:",
+    "- Как обращаться в ответе:",
     "Обращение к пользователю:",
 )
 
@@ -466,32 +467,92 @@ def _section_boundaries(answers: Mapping[str, Any]) -> Optional[str]:
     return "\n".join(bullets) if bullets else None
 
 
+#: «Как вести работу» is a four-slot template: the default bullets, each replaceable by one
+#: printed choice or by a free-typed answer. These are the exact lines the questionnaire owns —
+#: stripped before re-applying, so a second run rewrites slots instead of appending duplicates.
+_WORK_OWNED_LINES = frozenset(
+    list(WORK_DEFAULT)
+    + [text for _index, choices in _WORK_CHOICES.values() for text in choices.values()]
+)
+
+#: Prefix of a free-typed slot line («- Перед работой: …»).
+_WORK_OWNED_PREFIXES = tuple(f"- {label}:" for label in (
+    "Перед работой", "Если не получается", "В отчёте", "Про улучшения",
+))
+
+
+def _strip_work(body: list[str]) -> list[str]:
+    """The slots a person did not answer, with the questionnaire-owned lines removed."""
+    out = [
+        line for line in body
+        if line.strip() and line.strip() not in _WORK_OWNED_LINES
+        and not line.strip().startswith(_WORK_OWNED_PREFIXES)
+    ]
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
 def _section_work(answers: Mapping[str, Any], body: list[str]) -> Optional[str]:
-    """«Как вести работу»: the default bullets, each replaced by the choice that was answered."""
-    lines = [ln for ln in _strip_owned(body) if ln.strip()] or list(WORK_DEFAULT)
-    while len(lines) < len(WORK_DEFAULT):
-        lines.append(WORK_DEFAULT[len(lines)])
+    """«Как вести работу»: four slots — the default bullets, each replaced by its answer.
+
+    A free-typed answer no printed choice matches is still written, verbatim, onto the slot it
+    belongs to: dropping it would make the questionnaire promise a knob it does not have. The
+    slots are rebuilt from the table every time (not from the previous text), so applying the same
+    answers twice rewrites them instead of stacking variants of the same slot.
+    """
+    labels = ("Перед работой", "Если не получается", "В отчёте", "Про улучшения")
+    lines: list[str] = list(WORK_DEFAULT)
     touched = False
-    for key, (index, choices) in _WORK_CHOICES.items():
-        answer = _answer(answers, key).lower()
-        match = next((text for prefix, text in choices.items() if answer.startswith(prefix)), "")
-        if match and index < len(lines):
-            lines[index] = match
+    for slot, label in enumerate(labels):
+        key = next((k for k, (index, _c) in _WORK_CHOICES.items() if index == slot), "")
+        answer = _answer(answers, key) if key else ""
+        if not answer:
+            continue
+        lowered = answer.lower()
+        match = next((t for prefix, t in _WORK_CHOICES[key][1].items() if lowered.startswith(prefix)), "")
+        if match:
+            touched = touched or match != lines[slot]
+            lines[slot] = match
+        else:
+            lines[slot] = f"- {label}: {answer}"
             touched = True
-    return "\n".join(lines) if touched else None
+    extras = [line for line in _strip_work(body) if line.strip() not in _WORK_OWNED_LINES
+              and not line.strip().startswith(_WORK_OWNED_PREFIXES)]
+    return "\n".join(lines + extras) if touched else None
+
+
+#: «Ответ пользователю»: ``answer key -> (bullet label, {printed choice: rendered line})``.
+#: A printed choice gets its own wording (a bare echo of "как угодно" instructs nothing); any
+#: other non-empty answer is kept verbatim, so a free-typed preference is never silently dropped
+#: — that silent drop is exactly how ``address_style`` shipped as a question that did nothing.
+_REPLY_LINES: dict[str, tuple[str, dict[str, str]]] = {
+    "answer_length": ("- Длина ответа", {}),
+    "answer_format": ("- Формат ответа", {}),
+    "uncertainty": ("- При неопределённости", {}),
+    "display_name": ("- Обращайся к пользователю", {}),
+    "address_style": ("- Как обращаться в ответе", {
+        "по имени": "называй пользователя по имени в начале ответа",
+        "без обращения": "без обращения — сразу к делу, без имени и приветствий",
+        "как угодно": "обращение не важно — выбирай по обстановке",
+    }),
+}
+
+
+def _reply_bullet(key: str, value: str) -> str:
+    """One rendered bullet: the printed choice's own wording, else the answer as given."""
+    label, choices = _REPLY_LINES[key]
+    answer = value.lower()
+    rendered = next((text for prefix, text in choices.items() if answer.startswith(prefix)), "")
+    return f"{label}: {rendered}" if rendered else f"{label}: {value}"
 
 
 def _section_reply(answers: Mapping[str, Any], body: list[str]) -> Optional[str]:
     """«Ответ пользователю»: the copied paragraphs plus one bullet per answered preference."""
     bullets = [
-        f"{label}: {value}"
-        for key, label, value in (
-            ("answer_length", "- Длина ответа", _answer(answers, "answer_length")),
-            ("answer_format", "- Формат ответа", _answer(answers, "answer_format")),
-            ("uncertainty", "- При неопределённости", _answer(answers, "uncertainty")),
-            ("display_name", "- Обращайся к пользователю", _answer(answers, "display_name")),
-        )
-        if value
+        _reply_bullet(key, value)
+        for key in _REPLY_LINES
+        if (value := _answer(answers, key))
     ]
     if not bullets:
         return None
@@ -558,6 +619,61 @@ def main(argv: Optional[list[str]] = None) -> int:
         target.write_text(text, encoding="utf-8")
     print(target)
     return 0
+
+
+#: Fields the questionnaire file declares but whose answers are facts for the profile's memory,
+#: not instructions for its SOUL (blocks 5–6 and where the person works).
+MEMORY_ONLY_KEYS = frozenset({
+    "area", "frequent_requests", "precise_domain", "terms",
+    "trusted_sources", "untrusted_sources", "extra",
+})
+
+#: Printed choices whose rendering lands on the default wording, so the SOUL stays byte-identical.
+#: Explicit so the pairing test can tell a deliberate no-op from a question that does nothing:
+#: ``failure_mode = «сказать сразу»`` *is* the default «Если не получается — скажи сразу…».
+#: Everything else printed must change the SOUL.
+SAME_AS_DEFAULT = frozenset({("failure_mode", "сказать сразу")})
+
+#: Backticked placeholder a free-text question leaves for the person to fill.
+_BLANK = "________________"
+
+
+def questionnaire_answer_keys(text: Optional[str] = None) -> list[str]:
+    """Every request field the questionnaire prints, read from the file itself.
+
+    A test that pinned the implementation's own key table would stay green while the printed
+    questionnaire promised a knob that does nothing (``address_style`` shipped exactly that way).
+    So the interface is parsed here, unfiltered: a question line carries its field in brackets
+    after the printed choices, a tick box ends with its field. A key the implementation does not
+    know therefore lands in the result and the pairing test fails — which is the point.
+    """
+    source = questionnaire_text() if text is None else text
+    keys: list[str] = []
+    for line in source.splitlines():
+        if line.lstrip().startswith("- [ ]"):
+            spans = re.findall(r"`([^`]+)`", line)
+            candidates = [spans[-1]] if spans and re.fullmatch(r"[a-z][a-z0-9_]+", spans[-1]) else []
+        else:
+            candidates = re.findall(r"\(`([a-z][a-z0-9_]+)`", line)
+        for key in candidates:
+            if key not in keys:
+                keys.append(key)
+    return keys
+
+
+def questionnaire_printed_choices(text: Optional[str] = None) -> dict[str, list[str]]:
+    """``key -> printed choices`` as the questionnaire file shows them (empty for free text)."""
+    source = questionnaire_text() if text is None else text
+    out: dict[str, list[str]] = {}
+    for line in source.splitlines():
+        bracketed = re.findall(r"\(`([a-z][a-z0-9_]+)`", line)
+        if not bracketed:
+            continue
+        head = line.split(f"`{bracketed[0]}`", 1)[0]
+        spans = re.findall(r"`([^`]+)`", head)
+        choices = [c.strip() for span in spans for c in span.split("/") if c.strip()]
+        out.setdefault(bracketed[0], [c for c in choices if c != _BLANK])
+    return out
 
 
 if __name__ == "__main__":
