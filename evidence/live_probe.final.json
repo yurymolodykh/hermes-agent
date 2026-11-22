@@ -1,17 +1,17 @@
 {
-  "home": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n",
+  "home": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1",
   "create_status": 200,
   "create_body": {
     "ok": true,
     "name": "01-testuser",
-    "path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n/profiles/01-testuser",
+    "path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1/profiles/01-testuser",
     "model_set": false,
     "model_error": "",
     "mcp_written": 0,
     "skills_disabled": 0,
     "hub_installs": [],
     "soul_set": false,
-    "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n/profiles/01-testuser/SOUL-QUESTIONNAIRE.md"
+    "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1/profiles/01-testuser/SOUL-QUESTIONNAIRE.md"
   },
   "soul_lines": 60,
   "soul_chars": 4025,
@@ -24,7 +24,7 @@
     "upgreat": 0,
     "needs_source": 0
   },
-  "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n/profiles/01-testuser/SOUL-QUESTIONNAIRE.md",
+  "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1/profiles/01-testuser/SOUL-QUESTIONNAIRE.md",
   "questionnaire_exists": true,
   "apply_status": 200,
   "apply_body": {
@@ -35,27 +35,27 @@
       "Границы",
       "Ответ пользователю"
     ],
-    "soul_sha256": "4d307ea7276e07ef6a799a25c0172c68b439b3ffd368baae84105643c8de3068",
+    "soul_sha256": "f2a8e5d058eae35b14c9d25d56e83d63045be79f3e272eb5cfbfbe80616555ac",
     "memory_entries": [
       "Свои термины: МПД = мультипрофильный доступ"
     ],
     "memory_error": ""
   },
   "apply_before_sha": "0621417f2563f32c063a14c78db00a4e0869f8904ec7ac2818f02aa497182371",
-  "apply_after_sha": "4d307ea7276e07ef6a799a25c0172c68b439b3ffd368baae84105643c8de3068",
-  "apply_diff": "--- before\n+++ after\n@@ -8,5 +8,7 @@\n \n+Обращение к пользователю: на «ты».\n+\n ## Границы\n \n-- Особых границ не задано: действуй по инвариантам ниже и спрашивай перед необратимыми действиями.\n+- Не отправляй файлы и данные пользователя на внешние сервисы без прямого поручения.\n \n@@ -56,2 +58,4 @@\n \n+- Длина ответа: кратко.\n+\n ## Общие профили-специалисты",
+  "apply_after_sha": "f2a8e5d058eae35b14c9d25d56e83d63045be79f3e272eb5cfbfbe80616555ac",
+  "apply_diff": "--- before\n+++ after\n@@ -8,5 +8,7 @@\n \n+Обращение к пользователю: на «ты».\n+\n ## Границы\n \n-- Особых границ не задано: действуй по инвариантам ниже и спрашивай перед необратимыми действиями.\n+- Не отправляй файлы и данные пользователя на внешние сервисы без прямого поручения.\n \n@@ -56,2 +58,5 @@\n \n+- Длина ответа: кратко.\n+- Как обращаться в ответе: без обращения — сразу к делу, без имени и приветствий.\n+\n ## Общие профили-специалисты",
   "memory_entries": "Свои термины: МПД = мультипрофильный доступ",
   "empty_status": 200,
   "empty_body": {
     "ok": true,
     "changed": false,
     "changed_sections": [],
-    "soul_sha256": "4d307ea7276e07ef6a799a25c0172c68b439b3ffd368baae84105643c8de3068",
+    "soul_sha256": "f2a8e5d058eae35b14c9d25d56e83d63045be79f3e272eb5cfbfbe80616555ac",
     "memory_entries": [],
     "memory_error": ""
   },
-  "empty_sha_before": "4d307ea7276e07ef6a799a25c0172c68b439b3ffd368baae84105643c8de3068",
-  "empty_sha_after": "4d307ea7276e07ef6a799a25c0172c68b439b3ffd368baae84105643c8de3068",
+  "empty_sha_before": "f2a8e5d058eae35b14c9d25d56e83d63045be79f3e272eb5cfbfbe80616555ac",
+  "empty_sha_after": "f2a8e5d058eae35b14c9d25d56e83d63045be79f3e272eb5cfbfbe80616555ac",
   "empty_identical": true,
   "foreign_create_status": 403,
   "foreign_create_body": {
@@ -65,13 +65,13 @@
   "own_create_body": {
     "ok": true,
     "name": "01-bob",
-    "path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n/profiles/01-bob",
+    "path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1/profiles/01-bob",
     "model_set": false,
     "model_error": "",
     "mcp_written": 0,
     "skills_disabled": 0,
     "hub_installs": [],
     "soul_set": false,
-    "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-wwpe549n/profiles/01-bob/SOUL-QUESTIONNAIRE.md"
+    "questionnaire_path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/soulprobe-nu_1_qi1/profiles/01-bob/SOUL-QUESTIONNAIRE.md"
   }
 }
