@@ -2579,7 +2579,8 @@ def _dispatch_once_locked(
     )
     # The auto-split phase is deliberately NOT here: its decomposer is an aux
     # LLM call (up to 180 s x 3 attempts) and this whole function runs under the
-    # board's single-writer lock. ``dispatch_once`` runs it after releasing it.
+    # board's single-writer lock. ``dispatch_once`` runs it BEFORE taking that
+    # lock, under its own non-blocking ``.split.lock``.
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
