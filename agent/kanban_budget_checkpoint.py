@@ -237,6 +237,12 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
     if unchanged:
         return unchanged
     target = out_dir / f"wip-{stamp}.tar.gz"
+    # Two saves inside one second must not overwrite each other: a changed tree
+    # in the same tick still deserves its own file.
+    serial = 1
+    while target.exists():
+        serial += 1
+        target = out_dir / f"wip-{stamp}-{serial}.tar.gz"
     total = 0
     try:
         with tarfile.open(target, "w:gz") as tar:
