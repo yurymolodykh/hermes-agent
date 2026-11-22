@@ -2168,6 +2168,22 @@ def pool_status() -> Dict[str, Any]:
                 "task_ids": [],
             })
         keys.sort(key=lambda row: int(row["key_id"]))
+    # Today's busy time per key: what the rotation actually balances on, so
+    # `hermes kanban keypool status` shows the same number the picker uses
+    # instead of leaving an even-looking `used` column as the only evidence.
+    for row in keys:
+        record = usage_today.get(str(row["key_id"]))
+        if not isinstance(record, dict):
+            record = {}
+        try:
+            row["busy_seconds"] = round(float(record.get("busy_seconds") or 0.0), 1)
+        except (TypeError, ValueError):
+            row["busy_seconds"] = 0.0
+        try:
+            row["cards"] = int(record.get("cards") or 0)
+        except (TypeError, ValueError):
+            row["cards"] = 0
+        row["usage_window"] = _usage_today(now)
     failed = []
     for record in (state.get("failed_keys") or {}).values():
         if isinstance(record, dict):
