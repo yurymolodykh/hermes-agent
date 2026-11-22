@@ -93,9 +93,18 @@ def has_live_connection(path: Path | str) -> bool:
     """Whether this process holds a connection to *path* (or to the database it is a sidecar of).
 
     Point-in-time answer: a raw open/close right after it returns ``False`` can still race a
-    new connection. Hold :func:`offline_file_access` across the I/O whenever possible."""
+    new connection. Hold :func:`offline_file_access` across the I/O whenever possible.
+
+    Idle READ-ONLY handles parked in the dashboard reuse pool are dropped first. They are
+    ``mode=ro``: they hold a descriptor but never a write lock, so no lock a raw read could
+    cancel. The question this function answers is "would raw I/O here cancel a POSIX lock?", and
+    spare idle readers never would — counting them made every backup/repair/doctor probe refuse
+    on a live gateway that simply had a warm read pool. A checked-out reader is still counted.
+    """
+    key = _key(path)
+    _drain_idle_read_only_handles(key)
     with _live_lock:
-        return _live_main_key(_key(path)) is not None
+        return _live_main_key(key) is not None
 
 
 class _TrackingMixin:
