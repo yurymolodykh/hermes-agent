@@ -73,48 +73,69 @@ def _board_card(conn) -> str:
     return tid
 
 
+def _child_runs_a_slow_split(db_path: str, announce_fd: int, done_fd: int) -> None:
+    """Child process: one PRODUCTION tick whose split phase is a slow decomposer.
+
+    On the pre-fix code the split phase runs inside ``_dispatch_once_locked``, so
+    this child holds ``<db>.dispatch.lock`` for the whole decomposer — which is
+    exactly the freeze the review measured. On the fixed code it holds only
+    ``<db>.split.lock``, so the board stays dispatchable.
+    """
+    parent_pid = os.getppid()
+    connection = kbc.connect()
+
+    def _slow_split(conn_, **_kwargs):
+        os.write(announce_fd, b"S")          # "I am inside the decomposer now"
+        time.sleep(SLOW_DECOMPOSE_SECONDS)   # 180 s x 3 attempts in production
+        return [], []
+
+    kbd._kac.run_split_phase = _slow_split
+    os.write(announce_fd, b"R")              # ready to tick
+    kbd.dispatch_once(connection, spawn_fn=lambda *a, **k: None)
+    os.write(done_fd, b"D")
+    connection.close()
+    os._exit(0)
+
+
 def test_a_slow_decomposer_does_not_freeze_the_board(conn, home):
-    """While ANOTHER PROCESS sits in a slow decomposer, this tick still spawns."""
-    tid = _board_card(conn)
-    db_path = kb.kanban_db_path(board="default")
+    """While ANOTHER PROCESS is inside a slow split, this tick still spawns."""
+    db_path = str(kb.kanban_db_path(board="default"))
+    announce_r, announce_w = os.pipe()
+    done_r, done_w = os.pipe()
     spawned: list[str] = []
 
-    def _spawn(task, workspace, board=None):
-        spawned.append(getattr(task, "id", str(task)))
-        return None
-
-    read_fd, write_fd = os.pipe()
     child = os.fork()
     if child == 0:  # pragma: no cover - child process
-        code = 1
-        try:
-            os.close(read_fd)
-            with kbc._dispatch_split_lock(db_path) as held:
-                os.write(write_fd, b"1" if held else b"0")
-                if held:
-                    # The decomposer: 180 s x 3 attempts in production.
-                    time.sleep(SLOW_DECOMPOSE_SECONDS)
-            code = 0
-        finally:
-            os._exit(code)
+        os.close(announce_r)
+        os.close(done_r)
+        _child_runs_a_slow_split(db_path, announce_w, done_w)
 
-    os.close(write_fd)
+    os.close(announce_w)
+    os.close(done_w)
     try:
-        assert os.read(read_fd, 1) == b"1", "the child could not take the split lock"
+        assert os.read(announce_r, 1) == b"R", "the child could not start its tick"
+        assert os.read(announce_r, 1) == b"S", "the child never reached its decomposer"
+
+        # The child is now blocked in the decomposer. Give the board real work and
+        # tick from this process: on the pre-fix code this returns skipped_locked.
+        tid = _board_card(conn)
         started = time.monotonic()
-        result = kbd.dispatch_once(conn, spawn_fn=_spawn)
+        result = kbd.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawned.append(task.id),
+        )
         elapsed = time.monotonic() - started
 
         assert result.skipped_locked is False, (
-            "the sibling process is splitting, not dispatching: this tick must not be "
-            "locked out of the board"
+            "another process is SPLITTING, not dispatching: this tick must not be locked "
+            "out of the board for the whole decomposer"
         )
         assert tid in spawned, "the tick must still spawn ready work during a split"
         assert elapsed < SLOW_DECOMPOSE_SECONDS / 2, (
-            f"the tick blocked {elapsed:.1f}s behind the sibling's decomposer"
+            f"the tick blocked {elapsed:.1f}s behind the sibling decomposer"
         )
     finally:
-        os.close(read_fd)
+        os.close(announce_r)
+        os.close(done_r)
         os.kill(child, signal.SIGKILL)
         os.waitpid(child, 0)
 
