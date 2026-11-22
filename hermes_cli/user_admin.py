@@ -23,6 +23,7 @@ Formats are taken from the code that owns them, never re-invented here:
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import stat
 import string
@@ -41,6 +42,8 @@ EXIT_REFUSED = 2
 PASSWORD_LENGTH = 24
 PASSWORD_PREFIX_CHARS = 7
 _PASSWORD_ALPHABET = string.ascii_letters + string.digits + "-_"
+
+logger = logging.getLogger(__name__)
 
 USERS_FILE_RELATIVE = "users.jsonl"
 CREDENTIALS_DIRNAME = "credentials"
@@ -406,16 +409,21 @@ def add_user(
         if source is None and not no_skills:
             try:
                 seed_profile_skills(get_profile_dir(profile))
-            except Exception as exc:  # pragma: no cover - skills are not the credential
-                _err(f"warning: skill seeding failed ({exc}); run `{profile} update` later")
+            except Exception:  # pragma: no cover - skills are not the credential
+                logger.exception("skill seeding failed for %s; the profile is usable without them",
+                                 profile)
+                _err(f"warning: skill seeding failed; run `{profile} update` later")
 
     except BaseException as exc:
         if created_profile:
             for step, action in reversed(undo):
                 try:
                     action()
-                except Exception as undo_exc:
-                    _err(f"rollback: {step} could not be undone ({undo_exc})")
+                except Exception:
+                    # A failed undo must be loud: it is the one case where a partial user can
+                    # survive, so the traceback says exactly which step stayed behind.
+                    logger.exception("rollback: %s could not be undone", step)
+                    _err(f"rollback: {step} could not be undone (see the log)")
         if isinstance(exc, (Refused, Failed)):
             raise
         raise Failed(str(exc)) from exc
@@ -449,8 +457,9 @@ def list_users() -> list[dict[str, Any]]:
     registry = None
     try:
         registry = bindings_store().read()
-    except Exception as exc:  # a broken registry must be visible, not crash the listing
-        _err(f"warning: bindings registry unreadable ({exc})")
+    except Exception:  # a broken registry must be visible, not crash the listing
+        logger.exception("bindings registry unreadable; listing users without it")
+        _err("warning: bindings registry unreadable (see the log)")
 
     path = users_file_path()
     records = []
@@ -660,6 +669,7 @@ def cmd_user_remove(args) -> int:
         _err(f"refused: {exc}")
         return EXIT_REFUSED
     except Exception as exc:
+        logger.exception("hermes user remove %s failed", args.login)
         _err(f"failed: {exc}")
         return EXIT_FAILED
     _out(f"✓ removed {result['login']}: " + ", ".join(result["removed"]))
