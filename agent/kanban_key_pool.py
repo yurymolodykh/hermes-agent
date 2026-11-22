@@ -58,6 +58,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from agent import kanban_key_pool_usage as _usage
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -619,16 +621,10 @@ def _read_state(path: Path) -> Dict[str, Any]:
         rr_cursor = None
     # ``usage`` (per-key busy time for the current Moscow day) is optional: a
     # state file written before the fairness change has none, and it must read
-    # exactly as before — no reservations lost, no bucket invented. Buckets
-    # from an earlier day are dropped here rather than at pick time, so every
-    # reader (status CLI included) sees one consistent window.
-    usage_raw = raw.get("usage")
-    today = _usage_today()
-    usage: Dict[str, Any] = {}
-    if isinstance(usage_raw, dict):
-        for key, record in usage_raw.items():
-            if isinstance(record, dict) and record.get("window") == today:
-                usage[str(key)] = dict(record)
+    # exactly as before — no reservations lost, no bucket invented. Buckets from
+    # an earlier day are dropped here rather than at pick time, so every reader
+    # (status CLI included) sees one consistent window.
+    usage = _usage.filter_today(raw.get("usage"))
     return {
         "version": 2,
         "reservations": reservations,
@@ -671,43 +667,21 @@ def _key_slots(entry: Any) -> List[Dict[str, Any]]:
 
 # ── usage accounting (fairness between keys) ───────────────────────────────
 #
-# Fairness is measured in **occupied time**, not in hand-outs. A key that served
-# three one-minute cards is not "more used" than a key that served one
-# three-hour card, and picking by hand-out count would keep punishing the key
-# that keeps getting the long jobs. ``usage[key] = {busy_seconds, cards,
-# window}`` accumulates the busy time of every slot as it is dropped, for the
-# current Moscow calendar day; the ``window`` stamp resets the bucket when the
-# day rolls over.
-
-#: Moscow is UTC+3 with no DST, so a fixed offset is exact rather than a
-#: shortcut. A local-time date would make the bucket boundary depend on where
-#: the dispatcher runs, which the owner asked not to happen.
-_USAGE_TZ = timezone(timedelta(hours=3))
-
+# Fairness is measured in **occupied time**, not in hand-outs: a key that
+# served three one-minute cards is not "more used" than one that served a
+# single three-hour card. The bookkeeping lives in ``agent.kanban_key_pool_usage``
+# (this facade is over its line ratchet); these three wrappers are the only
+# names the reservation paths use, and ``_account_usage`` binds the pool's own
+# TTL so a caller cannot charge more than a reservation could have lived.
 
 def _usage_today(now: Optional[float] = None) -> str:
     """The Moscow calendar date (``YYYY-MM-DD``) a usage bucket belongs to."""
-    stamp = time.time() if now is None else float(now)
-    return datetime.fromtimestamp(stamp, _USAGE_TZ).strftime("%Y-%m-%d")
+    return _usage.usage_today(now)
 
 
 def _usage_bucket(state: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
-    """Today's ``{key_id: {busy_seconds, cards, window}}``, rolling over in place.
-
-    Rollover is *reset*, not "carry yesterday forward": the owner's metric is
-    "how busy was each key today", so yesterday's imbalance must not keep
-    steering today's rotation.
-    """
-    today = _usage_today(now)
-    usage = state.get("usage")
-    if not isinstance(usage, dict):
-        usage = {}
-        state["usage"] = usage
-    for key in list(usage.keys()):
-        record = usage.get(key)
-        if not isinstance(record, dict) or record.get("window") != today:
-            usage.pop(key, None)
-    return usage
+    """Today's ``{key_id: {busy_seconds, cards, window}}``, rolling over in place."""
+    return _usage.usage_bucket(state, now)
 
 
 def _account_usage(
@@ -721,63 +695,20 @@ def _account_usage(
 
     Called from every place that removes a slot — sweep, task release, pid
     release — and only there, which is what makes double charging impossible: a
-    slot exists in exactly one list, and the caller removes it before/while
-    accounting. ``seconds`` is ``now - reserved_at`` clamped to
-    ``[0, _ttl_seconds()]`` so a clock jump or a corrupt ``reserved_at`` cannot
-    invent hours of usage.
+    slot exists in exactly one list, and the caller removes it in the same
+    branch that accounts for it.
     """
-    try:
-        kid = int(key_id)
-    except (TypeError, ValueError):
-        return
-    try:
-        reserved_at = float(slot.get("reserved_at") or 0)
-    except (TypeError, ValueError):
-        reserved_at = 0.0
-    seconds = 0.0
-    if reserved_at > 0:
-        seconds = min(max(float(now) - reserved_at, 0.0), _ttl_seconds())
-    bucket = _usage_bucket(state, now)
-    record = bucket.get(str(kid))
-    if not isinstance(record, dict):
-        record = {"busy_seconds": 0.0, "cards": 0, "window": _usage_today(now)}
-        bucket[str(kid)] = record
-    try:
-        record["busy_seconds"] = float(record.get("busy_seconds") or 0.0) + seconds
-    except (TypeError, ValueError):
-        record["busy_seconds"] = seconds
-    try:
-        record["cards"] = int(record.get("cards") or 0) + 1
-    except (TypeError, ValueError):
-        record["cards"] = 1
+    _usage.account_slot(state, key_id, slot, now=now, ttl_seconds=_ttl_seconds())
 
 
 def _usage_seconds(state: Dict[str, Any], key_id: int, now: Optional[float] = None) -> float:
     """Today's accumulated busy seconds for ``key_id`` (``0.0`` when it has none)."""
-    bucket = _usage_bucket(state, now)
-    record = bucket.get(str(int(key_id)))
-    if not isinstance(record, dict):
-        return 0.0
-    try:
-        return float(record.get("busy_seconds") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return _usage.busy_seconds(state, key_id, now)
 
 
 def _usage_lookup(usage: Dict[str, Any], key_id: int, today: str) -> float:
-    """Read-only busy seconds for ``key_id`` in an already-rolled-over bucket.
-
-    The read-only twin of :func:`_usage_seconds`: :func:`_pick_key` must not
-    mutate state while it is only *choosing* a key (the write happens under the
-    lock right after, with the reservation it picked).
-    """
-    record = usage.get(str(int(key_id)))
-    if not isinstance(record, dict) or record.get("window") != today:
-        return 0.0
-    try:
-        return float(record.get("busy_seconds") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    """Read-only busy seconds in an already-rolled-over bucket."""
+    return _usage.lookup(usage, key_id, today)
 
 
 def _serialize_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2171,19 +2102,7 @@ def pool_status() -> Dict[str, Any]:
     # Today's busy time per key: what the rotation actually balances on, so
     # `hermes kanban keypool status` shows the same number the picker uses
     # instead of leaving an even-looking `used` column as the only evidence.
-    for row in keys:
-        record = usage_today.get(str(row["key_id"]))
-        if not isinstance(record, dict):
-            record = {}
-        try:
-            row["busy_seconds"] = round(float(record.get("busy_seconds") or 0.0), 1)
-        except (TypeError, ValueError):
-            row["busy_seconds"] = 0.0
-        try:
-            row["cards"] = int(record.get("cards") or 0)
-        except (TypeError, ValueError):
-            row["cards"] = 0
-        row["usage_window"] = _usage_today(now)
+    _usage.decorate_status_rows(keys, usage_today, now)
     failed = []
     for record in (state.get("failed_keys") or {}).values():
         if isinstance(record, dict):
