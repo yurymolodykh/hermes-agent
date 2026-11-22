@@ -520,6 +520,13 @@ def remove_user(login: str, *, say: Callable[[str], None] = _out) -> dict[str, A
         if store.remove_record(login):
             removed.append(f"users-file record {login}")
 
+    from hermes_constants import get_hermes_home
+
+    password_path = get_hermes_home() / CREDENTIALS_DIRNAME / f"{login}.password"
+    if password_path.exists():
+        password_path.unlink()
+        removed.append(f"password file {password_path.name}")
+
     delete_profile(profile, yes=True)
     removed.append(f"profile {profile}")
     return {"login": login, "profile": profile, "removed": removed}

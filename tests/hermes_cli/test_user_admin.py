@@ -265,6 +265,7 @@ def test_remove_takes_the_route_binding_record_and_profile(home):
     registry = _registry()
     assert registry is None or registry.record("person/demo13") is None
     assert "demo13" not in (home / "users.jsonl").read_text(encoding="utf-8")
+    assert not (home / "credentials" / "demo13.password").exists()
 
 
 def test_remove_of_a_missing_user_is_refused(home):
