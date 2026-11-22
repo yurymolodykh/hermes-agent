@@ -176,7 +176,36 @@ def _dispatch_tick_lock(db_path: Path):
     lock is the defense-in-depth that prevents two dispatchers from ever writing concurrently *regardless of
     how the second one got there*.
     """
-    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    with _board_file_lock(db_path, "dispatch", noop_when_unopenable=True) as held:
+        yield held
+
+
+@contextlib.contextmanager
+def _dispatch_split_lock(db_path: Path):
+    """Non-blocking ``.split.lock``: ONE decomposer per board at a time.
+
+    Deliberately a different file from ``.dispatch.lock``: the auto-split phase
+    runs with the dispatch lock RELEASED (its decomposer is an aux LLM call of up
+    to 180 s × 3 attempts, and holding the single-writer guard across it froze
+    every board's reclaim/promote/spawn loop — measured 616.8 s with no spawn).
+    This lock only keeps two processes from paying for the same decomposition;
+    the writes it produces are applied later, under ``.dispatch.lock``. The
+    loser yields ``False`` and still runs its own tick.
+    """
+    with _board_file_lock(db_path, "split", noop_when_unopenable=False) as held:
+        yield held
+
+
+@contextlib.contextmanager
+def _board_file_lock(db_path: Path, kind: str, *, noop_when_unopenable: bool):
+    """Take ``<db>.{kind}.lock`` non-blockingly and yield whether we hold it.
+
+    ``noop_when_unopenable=True`` (the tick guard) degrades to ``True`` when the
+    lock file cannot even be opened, so a probe failure never blocks dispatch.
+    ``False`` (the split guard) yields ``False`` instead: a guard whose state is
+    unknown must not let a second decomposer start.
+    """
+    lock_path = db_path.with_name(f"{db_path.name}.{kind}.lock")
     handle = None
     acquired = False
     try:
@@ -187,9 +216,7 @@ def _dispatch_tick_lock(db_path: Path):
         except (OSError, AttributeError):
             acquired = False
     except OSError:
-        # Can't even open the lock file (permissions, read-only FS): degrade to
-        # a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        acquired = noop_when_unopenable
         handle = None
     try:
         yield acquired
