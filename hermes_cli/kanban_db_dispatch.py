@@ -2116,14 +2116,16 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
 
-    The auto-split phase runs AFTER the lock is released, guarded by its own
+    The auto-split phase runs BEFORE the lock is taken, under its own
     ``.split.lock``: it calls the decomposer (an aux LLM request, up to 180 s ×
     3 attempts) and holding the single-writer guard across that call froze the
     whole board — no reclaim, no promotion, no spawn for the duration (measured
-    616.8 s on a live board with ``dispatch_interval_seconds: 60``). Splitting
-    after the tick rather than before it means a card marked ``split_pending``
-    by this tick's failure accounting is split in the same tick, so the children
-    are spawned by the next one instead of waiting two intervals.
+    616.8 s on a live board with ``dispatch_interval_seconds: 60``). It stays
+    *before* the tick rather than after it because a split moves the burned card
+    to ``todo`` and its children to ``ready``, which is what this tick must then
+    spawn; running it afterwards left the card claimed by the spawn loop and
+    never split. ``.split.lock`` keeps two processes from paying for the same
+    decomposition; ``run_split_phase`` is called at most once per tick.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -2142,42 +2144,37 @@ def dispatch_once(
             keypool_exempt=keypool_exempt,
         )
 
-    def _split_outside_lock(result: DispatchResult) -> DispatchResult:
-        """Run the split phase with no dispatch lock held, at most once."""
-        if dry_run or result.skipped_locked:
-            return result
-        try:
-            split_db_path = _kb.kanban_db_path(board=board)
-        except Exception:
-            split_db_path = None
-        if split_db_path is None:
-            result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
-            return result
-        with _kbc._dispatch_split_lock(split_db_path) as split_held:
+    def _split_outside_lock(db_path: Optional[Path]) -> Optional[tuple[list[str], list[str]]]:
+        """Run the split phase with no dispatch lock held; None = not run."""
+        if dry_run:
+            return None
+        if db_path is None:
+            return _kac.run_split_phase(conn)
+        with _kbc._dispatch_split_lock(db_path) as split_held:
             if not split_held:
                 # Another process is already paying for this board's decomposer.
-                return result
-            result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
-        return result
+                return None
+            return _kac.run_split_phase(conn)
 
     try:
-        db_path = _kb.kanban_db_path(board=board)
+        db_path: Optional[Path] = _kb.kanban_db_path(board=board)
     except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _split_outside_lock(_locked_tick())
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
-        if not held:
-            result = DispatchResult(skipped_locked=True)
-        else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
-    # Lock released: the decomposer must never hold the board's write guard.
-    result = _split_outside_lock(result)
-    # Tick observer also runs strictly OUTSIDE the critical section: a slow
-    # subscriber must never stall a sibling dispatcher's tick.
+        db_path = None  # must not lose the tick; fall through to an unguarded dispatch
+    split_outcome = _split_outside_lock(db_path)
+    if db_path is None:
+        result = _locked_tick()
+    else:
+        with _kbc._dispatch_tick_lock(db_path) as held:
+            if not held:
+                result = DispatchResult(skipped_locked=True)
+            else:
+                result = _locked_tick()
+                # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
+                _kbc._maybe_checkpoint_wal(conn, db_path)
+    if split_outcome is not None:
+        result.auto_split, result.auto_split_failed = split_outcome
+    # Lock released. Fire the tick observer strictly OUTSIDE the critical
+    # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
