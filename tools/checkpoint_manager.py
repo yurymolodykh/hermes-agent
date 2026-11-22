@@ -62,9 +62,10 @@ from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import selected_git_env, windows_hide_flags
 from hermes_cli.gitlock import clear_stale_tmp_packs
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from utils import env_int, rmtree_readonly
+from tools.checkpoint_locks import LockHygiene, index_lock_contention
 
 logger = logging.getLogger(__name__)
 
@@ -292,29 +293,32 @@ def _unstage_store(store: Path, working_dir, index_file: Path) -> None:
         )
 
 
-def _unstage_excluded(store: Path, working_dir, index_file: Path) -> bool:
+def _unstage_excluded(store: Path, working_dir, index_file: Path) -> tuple[bool, str]:
     """Drop paths the store's excludes now cover from an index re-seeded from an older checkpoint.
 
     ``add -A`` honours ``info/exclude`` only for paths it is not already tracking, so a
     directory excluded after it was first captured (browser profiles) would otherwise stay in
     every later snapshot.
+
+    Returns ``(ok, error)``: a caller that only sees a bool cannot tell the human *why* the
+    checkpoint stopped, and this stage used to fail into ``agent.log`` alone.
     """
-    ok, out, _ = _run_git(
+    ok, out, err = _run_git(
         ["ls-files", "--cached", "--ignored", "-z", f"--exclude-from={store / 'info' / 'exclude'}"],
         store, working_dir, index_file=index_file,
     )
     if not ok:
-        return False
+        return False, err or "git ls-files --cached --ignored failed"
     paths = [p for p in out.split("\x00") if p]
     for i in range(0, len(paths), 200):
-        ok, _, _ = _run_git(
+        ok, _, err = _run_git(
             ["rm", "--cached", "-f", "-q", "--ignore-unmatch", "--", *paths[i:i + 200]],
             store, working_dir, index_file=index_file,
             extra_env={"GIT_LITERAL_PATHSPECS": "1"},
         )
         if not ok:
-            return False
-    return True
+            return False, err or "git rm --cached failed"
+    return True, ""
 
 
 def _ledger_path(store: Path, dir_hash: str) -> Path:
@@ -894,7 +898,7 @@ def _dir_size_bytes(path: Path) -> int:
 # CheckpointManager
 # ---------------------------------------------------------------------------
 
-class CheckpointManager:
+class CheckpointManager(LockHygiene):
     """Manages automatic filesystem checkpoints.
 
     Designed to be owned by AIAgent.  Call ``new_turn()`` at the start of
@@ -928,6 +932,15 @@ class CheckpointManager:
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
         self._checkpointed_dirs: set[str] = set()
+        # Visible-channel hook: a checkpoint that failed and could not be repaired must
+        # reach the human (card comment / turn warning), never only ``agent.log``.
+        # Wired by AIAgent init; left None in tests and standalone callers.
+        self.notice_callback: Optional[Callable[[str], None]] = None
+        self._last_failure: Optional[dict] = None
+        self._notified_failures: set[str] = set()
+        # Lock hygiene stats for this manager's lifetime (read by ``lock_report``).
+        self.released_locks: list[str] = []
+        self._store_swept = False
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -1070,13 +1083,20 @@ class CheckpointManager:
 
         self._checkpointed_dirs.add(abs_dir)
 
+        self._sweep_index_locks_once()
+
         try:
             from tools.checkpoint_pruning import store_lock
 
             with store_lock(_resolve_checkpoint_base()):
-                return self._take(abs_dir, reason)
+                taken = self._take(abs_dir, reason)
+                if not taken and self._last_failure:
+                    self._notify(self._failure_message())
+                return taken
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
+            self._record_failure(abs_dir, "store", f"{type(e).__name__}: {e}")
+            self._notify(self._failure_message())
             return False
 
     def list_checkpoints(self, working_dir: str) -> list[dict]:
@@ -1557,10 +1577,12 @@ class CheckpointManager:
     def _take(self, working_dir: str, reason: str, *, prune: bool = True) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path()
+        self._last_failure = None
 
         err = _init_store(store, working_dir)
         if err:
             logger.debug("Checkpoint store init failed: %s", err)
+            self._record_failure(working_dir, "store init", err or "unknown")
             return False
 
         _touch_project(store, working_dir)
@@ -1603,17 +1625,19 @@ class CheckpointManager:
         # Drop entries the old tree carries but this build excludes BEFORE staging: ``add -A``
         # re-reads every tracked path, and a locked browser-profile file would fail it each time.
         _unstage_store(store, working_dir, index_file)
-        if not _unstage_excluded(store, working_dir, index_file):
-            logger.debug("Checkpoint could not drop newly excluded paths from the index")
+        ok, err = _unstage_excluded(store, working_dir, index_file)
+        if not ok:
+            self._record_failure(working_dir, "unstage excluded", err)
             return False
         ok, err = self._stage_with_oversize_preflight(store, working_dir, index_file)
         if not ok:
-            logger.debug("Checkpoint git-add failed: %s", err)
+            self._record_stage_failure(working_dir, err)
             return False
 
         if self.max_file_size_mb > 0:
-            if not self._drop_oversize_from_index(store, working_dir, index_file):
-                logger.debug("Checkpoint oversize index cleanup failed")
+            ok, err = self._drop_oversize_from_index(store, working_dir, index_file)
+            if not ok:
+                self._record_failure(working_dir, "oversize cleanup", err)
                 return False
 
         # Compare against the current ref tip (not HEAD — HEAD points to a
@@ -1626,26 +1650,8 @@ class CheckpointManager:
         )
         has_ref = ok_ref and bool(ref_commit)
 
-        if has_ref:
-            ok_diff, _, _ = _run_git(
-                ["diff-index", "--cached", "--quiet", ref_commit],
-                store, working_dir,
-                allowed_returncodes={1},
-                index_file=index_file,
-            )
-            if ok_diff:
-                logger.debug("Checkpoint skipped: no changes in %s", working_dir)
-                return False
-        else:
-            # No ref yet — skip only if the index is empty.
-            ok_ls, ls_out, _ = _run_git(
-                ["ls-files", "--cached"],
-                store, working_dir,
-                index_file=index_file,
-            )
-            if ok_ls and not ls_out.strip():
-                logger.debug("Checkpoint skipped: empty tree in %s", working_dir)
-                return False
+        if self._nothing_to_snapshot(store, working_dir, index_file, ref_commit if has_ref else None):
+            return False
 
         # Write tree from per-project index.
         ok_tree, tree_sha, err = _run_git(
@@ -1653,7 +1659,7 @@ class CheckpointManager:
             index_file=index_file,
         )
         if not ok_tree or not tree_sha:
-            logger.debug("Checkpoint write-tree failed: %s", err)
+            self._record_failure(working_dir, "git write-tree", err or "write-tree failed")
             return False
 
         # A nested repository is stored as a gitlink, not its files: say so in
@@ -1681,7 +1687,7 @@ class CheckpointManager:
             index_file=index_file,
         )
         if not ok_commit or not new_sha:
-            logger.debug("Checkpoint commit-tree failed: %s", err)
+            self._record_failure(working_dir, "git commit-tree", err or "commit-tree failed")
             return False
 
         # Update the per-project ref.
@@ -1692,7 +1698,7 @@ class CheckpointManager:
             update_args, store, working_dir,
         )
         if not ok_update:
-            logger.debug("Checkpoint update-ref failed: %s", err)
+            self._record_failure(working_dir, "git update-ref", err or "update-ref failed")
             return False
 
         logger.debug("Checkpoint taken in %s: %s (%s)", working_dir, reason, new_sha[:8])
@@ -1740,11 +1746,7 @@ class CheckpointManager:
                     "--pathspec-file-nul",
                 ])
         try:
-            ok, _, err = _run_git(
-                add_args, store, working_dir,
-                timeout=_GIT_TIMEOUT * 2, index_file=index_file,
-            )
-            return ok, err
+            return self._stage_with_lock_retry(store, working_dir, index_file, add_args)
         finally:
             if oversize_pathspec is not None:
                 _unlink_quiet(oversize_pathspec)
@@ -1782,22 +1784,23 @@ class CheckpointManager:
 
     def _drop_oversize_from_index(
         self, store: Path, working_dir: str, index_file: Path,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """Remove any staged file larger than ``max_file_size_mb`` from the index.
 
         Lets the agent keep snapshotting source code while refusing to
         swallow generated assets (datasets, model weights, logs, videos).
+        Returns ``(ok, error)`` so the refusal reaches the visible channel.
         """
         if self.max_file_size_mb <= 0:
-            return True
-        ok, stdout, _ = _run_git(
+            return True, ""
+        ok, stdout, err = _run_git(
             ["ls-files", "--cached", "-z"],
             store, working_dir, index_file=index_file,
         )
         if not ok:
-            return False
+            return False, err or "git ls-files --cached failed"
         if not stdout:
-            return True
+            return True, ""
         # NUL separators preserve whitespace within each literal filename.
         paths = [p for p in stdout.split("\x00") if p]
         abs_workdir = _normalize_path(working_dir)
@@ -1809,7 +1812,7 @@ class CheckpointManager:
             rel for rel in paths if self._exceeds_size_cap(abs_workdir / rel)
         ]
         if not oversize:
-            return True
+            return True, ""
         logger.debug(
             "Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
             len(oversize), self.max_file_size_mb,
@@ -1819,13 +1822,13 @@ class CheckpointManager:
         BATCH = 200
         for i in range(0, len(oversize), BATCH):
             chunk = oversize[i:i + BATCH]
-            ok, _, _ = _run_git(
+            ok, _, err = _run_git(
                 ["update-index", "--force-remove", "--"] + chunk,
                 store, working_dir, index_file=index_file,
             )
             if not ok:
-                return False
-        return True
+                return False, err or "git update-index --force-remove failed"
+        return True, ""
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
         """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the

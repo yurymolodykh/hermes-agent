@@ -187,6 +187,57 @@ def cmd_clear_legacy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_locks(args: argparse.Namespace) -> int:
+    """Fleet-visible lock hygiene: report, and with ``--clean`` remove, dead index locks.
+
+    ``hermes checkpoints locks`` inspects one profile's checkpoint store (the
+    active ``HERMES_HOME``); ``--all-profiles`` walks every profile under the
+    Hermes root so one run can journal the whole fleet.  A lock is removed only
+    when it is zero bytes, older than the age gate and the platform proves no
+    live git holds it; every decision lands in ``lock-sweep.jsonl`` beside that
+    profile's store.
+    """
+    from tools.checkpoint_locks import journal_path, min_age_seconds, sweep_index_locks
+    from tools.checkpoint_manager import _resolve_checkpoint_base, _store_path
+
+    bases: list[Path] = []
+    if getattr(args, "all_profiles", False):
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+        bases = [p / "checkpoints" for p in sorted((root / "profiles").glob("*")) if p.is_dir()]
+        if (root / "checkpoints").is_dir():
+            bases.insert(0, root / "checkpoints")
+    else:
+        bases = [_resolve_checkpoint_base()]
+
+    clean = bool(getattr(args, "clean", False))
+    min_age = min_age_seconds()
+    total_removed = 0
+    total_kept = 0
+    print(f"Lock sweep: {'clean' if clean else 'report only'}; age gate {min_age // 60} min")
+    for base in bases:
+        store = _store_path(base)
+        if not (store / "indexes").is_dir():
+            print(f"  {base}: no store/indexes — skipped")
+            continue
+        result = sweep_index_locks(store, journal=clean, dry_run=not clean)
+        total_removed += len(result.removed)
+        total_kept += len(result.kept)
+        print(f"  {base}: scanned={result.scanned} removable={len(result.removed)} kept={len(result.kept)}")
+        for decision in result.removed:
+            verb = "would remove" if not clean else "removed"
+            print(f"    - {verb} {Path(decision.path).name} ({decision.age_seconds:.0f}s old)")
+        if clean and result.journal_path:
+            print(f"    journal: {result.journal_path}")
+        elif not clean and (result.removed or result.kept):
+            print(f"    journal would be: {journal_path(base)}")
+    print(f"Total: removable={total_removed} kept={total_kept}")
+    if not clean and total_removed:
+        print("Run with --clean to remove them (a live holder is always kept).")
+    return 0
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Wire subcommands onto the ``hermes checkpoints`` parser."""
     parser.set_defaults(func=cmd_status)  # bare `hermes checkpoints` → status
@@ -211,6 +262,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_prune.add_argument("-f", "--force", action="store_true",
                          help="Skip the orphan-deletion confirmation prompt")
     p_prune.set_defaults(func=cmd_prune)
+
+    p_locks = subs.add_parser(
+        "locks", help="Report (or with --clean remove) abandoned zero-byte index locks")
+    p_locks.add_argument("--clean", action="store_true",
+                         help="Remove every lock proven ownerless and older than the age gate")
+    p_locks.add_argument("--all-profiles", action="store_true",
+                         help="Walk every profile's checkpoint store, not just the active one")
+    p_locks.set_defaults(func=cmd_locks)
 
     for name, help_text, func in (
         ("clear", "Delete the entire checkpoint base (all /rollback history)", cmd_clear),
