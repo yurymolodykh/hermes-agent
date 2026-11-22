@@ -93,9 +93,18 @@ def has_live_connection(path: Path | str) -> bool:
     """Whether this process holds a connection to *path* (or to the database it is a sidecar of).
 
     Point-in-time answer: a raw open/close right after it returns ``False`` can still race a
-    new connection. Hold :func:`offline_file_access` across the I/O whenever possible."""
+    new connection. Hold :func:`offline_file_access` across the I/O whenever possible.
+
+    Idle READ-ONLY handles parked in the dashboard reuse pool are dropped first. They are
+    ``mode=ro``: they hold a descriptor but never a write lock, so no lock a raw read could
+    cancel. The question this function answers is "would raw I/O here cancel a POSIX lock?", and
+    spare idle readers never would — counting them made every backup/repair/doctor probe refuse
+    on a live gateway that simply had a warm read pool. A checked-out reader is still counted.
+    """
+    key = _key(path)
+    _drain_idle_read_only_handles(key)
     with _live_lock:
-        return _live_main_key(_key(path)) is not None
+        return _live_main_key(key) is not None
 
 
 class _TrackingMixin:
@@ -244,7 +253,15 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
 def offline_file_access(path: Path | str, *, what: str = "read"):
     """Hold the connection-lifecycle lock across a raw read of a database file: checking
     :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened
-    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O."""
+    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O.
+
+    Idle READ-ONLY handles parked in a reuse pool are drained first: they hold no lock the raw
+    access would break (a ``mode=ro`` connection never holds a write lock), but they do hold a
+    descriptor, and the check below is deliberately about ANY live connection. Dropping them is
+    the cheap, correct answer — the next read opens a fresh one, and a claim of exclusive access
+    to the file is exactly the moment this process must not be holding spare handles on it.
+    """
+    _drain_idle_read_only_handles(_key(path))
     with _live_lock:
         main = _live_main_key(_key(path))
         if main is not None:
@@ -255,3 +272,13 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
                 "connection's POSIX advisory locks. Close all database "
                 "handles (stop the gateway/dashboard) and retry.")
         yield
+
+
+def _drain_idle_read_only_handles(path_key: str) -> None:
+    """Close idle pooled read-only handles for ``path_key`` (best-effort; import is late so this
+    leaf module stays free of web-server imports)."""
+    try:
+        from hermes_cli.read_handle_pool import get_pool
+        get_pool().drop_path(path_key)
+    except Exception:  # pragma: no cover - a pool that cannot drain must not block raw access
+        logger.debug("could not drain idle read-only handles for %s", path_key, exc_info=True)

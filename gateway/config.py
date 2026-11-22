@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import threading
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
@@ -214,6 +215,65 @@ def _bundled_platform_manifest_name(plugin_dir: Path) -> Optional[str]:
         return None
 
 
+# Bundled-platform directory scan memo (#176). Keyed on a signature of the directory tree the scan
+# reads, so an install/removal/rename of a bundled plugin invalidates it on the next call: the scan
+# must never pin a stale platform list, but it also must not re-list + re-parse ~40 manifests on
+# every activation predicate and /api/status poll (measured: 64 ms per poll of 47 ms total).
+_bundled_platform_scan_lock = threading.Lock()
+_bundled_platform_scan_cache: dict[str, tuple[tuple, frozenset, dict]] = {}
+
+# A directory mtime moves on add/remove/rename of an entry; a manifest edit moves the manifest's own
+# mtime and leaves the directory's alone, so both go into the signature.
+def _bundled_platform_scan_signature(platforms_dir: Path) -> tuple:
+    """Filesystem fingerprint of the bundled-platform tree: directory mtime plus (name, mtime, size)
+    for every candidate child. Any edit, addition, removal or rename changes it."""
+    try:
+        entries = []
+        for child in sorted(platforms_dir.iterdir(), key=lambda c: c.name):
+            try:
+                if not child.is_dir():
+                    continue
+                init = child / "__init__.py"
+                manifest = next((child / m for m in ("plugin.yaml", "plugin.yml") if (child / m).is_file()), None)
+                if not init.is_file() or manifest is None:
+                    continue
+                stat = manifest.stat()
+                entries.append((child.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+        return (platforms_dir.stat().st_mtime_ns, tuple(entries))
+    except OSError:
+        return (None, ())
+
+
+def _bundled_platform_scan_cached(platforms_dir: Path) -> tuple[frozenset, dict]:
+    """``(names, aliases)`` for ``platforms_dir``, rescanned only when its signature moved.
+
+    Returns the SHARED cached objects; ``_scan_bundled_plugin_platforms`` hands callers copies.
+    """
+    key = str(platforms_dir)
+    signature = _bundled_platform_scan_signature(platforms_dir)
+    with _bundled_platform_scan_lock:
+        cached = _bundled_platform_scan_cache.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1], cached[2]
+    try:
+        dirs = [child for child in platforms_dir.iterdir()
+                if child.is_dir() and (child / "__init__.py").exists()
+                and ((child / "plugin.yaml").exists() or (child / "plugin.yml").exists())]
+        names = frozenset(child.name.lower() for child in dirs)
+        aliases: dict[str, str] = {}
+        for child in dirs:
+            manifest_name = _bundled_platform_manifest_name(child)
+            if manifest_name and manifest_name not in names and manifest_name not in aliases:
+                aliases[manifest_name] = child.name.lower()
+    except Exception:
+        return frozenset(), {}
+    with _bundled_platform_scan_lock:
+        _bundled_platform_scan_cache[key] = (signature, names, aliases)
+    return names, aliases
+
+
 class Platform(Enum):
     """Supported messaging platforms. Plugin platforms are dynamic members created on
     demand by ``_missing_`` and cached so ``Platform("irc") is Platform("irc")`` holds."""
@@ -278,23 +338,18 @@ class Platform(Enum):
     def _scan_bundled_plugin_platforms(cls) -> tuple[set, dict]:
         """Directory names of bundled platform plugins under ``plugins/platforms/``, plus a map of
         manifest ``name:`` keys that differ from their directory (alias -> directory name). Aliases
-        never shadow a directory name, so the directory stays the canonical platform value."""
-        try:
-            platforms_dir = Path(__file__).parent.parent / "plugins" / "platforms"
-            dirs = [
-                child for child in (platforms_dir.iterdir() if platforms_dir.is_dir() else ())
-                if child.is_dir() and (child / "__init__.py").exists()
-                and ((child / "plugin.yaml").exists() or (child / "plugin.yml").exists())
-            ]
-            names = {child.name.lower() for child in dirs}
-            aliases = {}
-            for child in dirs:
-                manifest_name = _bundled_platform_manifest_name(child)
-                if manifest_name and manifest_name not in names and manifest_name not in aliases:
-                    aliases[manifest_name] = child.name.lower()
-            return names, aliases
-        except Exception:
-            return set(), {}
+        never shadow a directory name, so the directory stays the canonical platform value.
+
+        Memoized per process on a filesystem signature (see ``_bundled_platform_scan_cached``):
+        this is on the per-request path (``Platform._missing_``, activation predicates, env rows)
+        and re-listing the directory plus re-parsing every manifest cost 64 ms of a 47 ms
+        /api/status poll — the scan read the same unchanged tree dozens of times per second. The
+        signature makes an install/removal/rename of a bundled plugin visible without a restart.
+        """
+        names, aliases = _bundled_platform_scan_cached(
+            Path(__file__).parent.parent / "plugins" / "platforms")
+        # Copies: callers subtract/update these freely and must not reach into the cache.
+        return set(names), dict(aliases)
 
 
 # Built-in values snapshotted before any dynamic _missing_ lookup.
