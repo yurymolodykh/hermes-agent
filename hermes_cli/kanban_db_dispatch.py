@@ -2113,31 +2113,14 @@ def dispatch_once(
     the tick because a split moves the burned card to ``todo`` and its children to
     ``ready`` — exactly what this tick must then spawn. Once per tick.
     """
-    try:
-        db_path: Optional[Path] = _kb.kanban_db_path(board=board)
-    except Exception:
-        db_path = None  # must not lose the tick: fall through unguarded
-    # Outside the board's single-writer lock: the decomposer is an aux LLM call.
-    split = _kbdsp.run_split_before_tick(conn, db_path, dry_run=dry_run)
-    tick = dict(
+    result = _kbdsp.run_tick(
+        conn, board,
         spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run, max_spawn=max_spawn,
         max_in_progress=max_in_progress, failure_limit=failure_limit,
-        stale_timeout_seconds=stale_timeout_seconds, board=board,
-        default_assignee=default_assignee,
+        stale_timeout_seconds=stale_timeout_seconds, default_assignee=default_assignee,
         max_in_progress_per_profile=max_in_progress_per_profile,
         reconcile_orphans=reconcile_orphans, keypool_exempt=keypool_exempt,
     )
-    if db_path is None:
-        result = _dispatch_once_locked(conn, **tick)
-    else:
-        with _kbc._dispatch_tick_lock(db_path) as held:
-            if not held:
-                result = DispatchResult(skipped_locked=True)
-            else:
-                result = _dispatch_once_locked(conn, **tick)
-                _kbc._maybe_checkpoint_wal(conn, db_path)  # still under the lock
-    if split is not None:
-        result.auto_split, result.auto_split_failed = split
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 

@@ -81,12 +81,13 @@ def _child_runs_a_slow_split(db_path: str, announce_fd: int, done_fd: int) -> No
     exactly the freeze the review measured. On the fixed code it holds only
     ``<db>.split.lock``, so the board stays dispatchable.
     """
-    parent_pid = os.getppid()
     connection = kbc.connect()
 
     def _slow_split(conn_, **_kwargs):
         os.write(announce_fd, b"S")          # "I am inside the decomposer now"
-        time.sleep(SLOW_DECOMPOSE_SECONDS)   # 180 s x 3 attempts in production
+        # The delay IS the behaviour under test (a slow decomposer); waiting on a
+        # condition instead would remove the very stall being measured.
+        time.sleep(SLOW_DECOMPOSE_SECONDS)   # health: allow HX013 -- this sleep IS the stall the test measures
         return [], []
 
     kbd._kac.run_split_phase = _slow_split
