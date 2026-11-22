@@ -391,7 +391,9 @@ def _enable_wal(conn: sqlite3.Connection, db_label: str, require_wal: bool, curr
     try:
         # ``PRAGMA journal_mode=WAL`` RETURNS the resulting mode: macOS NFS, SMB/CIFS and the AgentFS overlay
         # refuse WITHOUT raising. Trust the row, not the absence of an exception.
+        invalidate_journal_mode_memo(conn)
         mode = _mode_from_row(conn.execute("PRAGMA journal_mode=WAL").fetchone())
+        invalidate_journal_mode_memo(conn)
         if mode == "wal":
             return _wal_activated()
         silent_exc = WalUnsupportedError(f"journal_mode=WAL refused without raising (still {mode!r})")
@@ -419,7 +421,9 @@ def _enable_wal(conn: sqlite3.Connection, db_label: str, require_wal: bool, curr
             for _ in range(2):
                 time.sleep(0.05)
                 try:
+                    invalidate_journal_mode_memo(conn)
                     row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                    invalidate_journal_mode_memo(conn)
                 except sqlite3.OperationalError as retry_exc:
                     if "disk i/o error" not in str(retry_exc).lower():
                         raise
