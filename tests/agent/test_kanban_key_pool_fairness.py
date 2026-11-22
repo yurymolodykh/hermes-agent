@@ -80,6 +80,9 @@ def pool(tmp_path, monkeypatch):
 
     clock = Clock(msk(9, 0))
     monkeypatch.setattr(kp, "time", clock)
+    # The usage sibling has its own ``time`` import; drive it from the same clock
+    # so a state read filters buckets by the fake "today", not the real date.
+    monkeypatch.setattr(kp._usage, "time", clock)
     # The fake pids are not real processes; the sweep needs them to look dead.
     monkeypatch.setattr(kp, "_pid_alive", lambda pid: liveness_box["alive"])
 
