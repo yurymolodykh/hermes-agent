@@ -1,0 +1,7 @@
+kanban: scratch workspaces are ephemeral — they're deleted when the task completes. Use --workspace worktree: (git worktree) or --workspace dir:/abs/path (existing dir) to preserve worker output. (task t_97ed7493)
+slow decomposer           : 6.0s
+parent tick seconds       : 2.27
+parent skipped_locked     : False
+spawned during the split  : True ['t_97ed7493']
+split calls for 2 ticks   : 2
+child tick                : {'child_tick_seconds': 8.65, 'child_skipped_locked': False}

@@ -1,0 +1,13 @@
+{
+ "temp_root": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-split-xeojd4hn",
+ "slow_decomposer_seconds": 6.0,
+ "parent_tick_seconds": 3.04,
+ "parent_skipped_locked": true,
+ "parent_spawned": [],
+ "spawned_during_split": false,
+ "child": {
+  "child_tick_seconds": 9.29,
+  "child_skipped_locked": false
+ },
+ "split_calls_for_two_ticks": 2
+}

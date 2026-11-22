@@ -705,13 +705,16 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None,
+                        failure_limit: int = DEFAULT_FAILURE_LIMIT) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+    ``failure_limit`` is the threshold ``_run_reclaim_phase`` resolved from
+    ``kanban.failure_limit`` (it used to be ignored here, so a configured 3 ran as 2).
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -800,6 +803,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 conn, tid,
                 error=error,
                 outcome="timed_out",
+                failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
@@ -1364,14 +1368,16 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(conn: sqlite3.Connection, crash_details: list, *,
+                     failure_limit: int = DEFAULT_FAILURE_LIMIT) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
-    heal them) trip immediately.
+    heal them) trip immediately. ``failure_limit`` carries ``kanban.failure_limit``
+    here from ``_run_reclaim_phase``; without it the crash path booked the default.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -1431,6 +1437,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
+                failure_limit=failure_limit,
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
@@ -1446,7 +1453,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
@@ -1456,7 +1463,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
+def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None, *,
+                           failure_limit: int = DEFAULT_FAILURE_LIMIT) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -1470,7 +1478,10 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     for tid in (*sweep.crashed, *sweep.rate_limited):  # dead: no exit release
         _release_dead_card_key(tid)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(conn, sweep.crash_details, failure_limit=failure_limit)
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -2096,40 +2107,23 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
-    """
-    def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-            keypool_exempt=keypool_exempt,
-        )
 
-    try:
-        db_path = _kb.kanban_db_path(board=board)
-    except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
-        if not held:
-            result = DispatchResult(skipped_locked=True)
-        else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
-    # Lock released. Fire the tick observer strictly OUTSIDE the critical
-    # section: a slow subscriber must never stall a sibling dispatcher's tick.
+    The auto-split phase runs BEFORE the lock, under its own ``.split.lock``: its
+    decomposer is an aux LLM call (up to 180 s x 3) and holding the single-writer
+    guard across it froze the whole board (measured 616.8 s live). It stays before
+    the tick because a split moves the burned card to ``todo`` and its children to
+    ``ready`` — exactly what this tick must then spawn. Once per tick.
+    """
+    result = _kbdsp.run_tick(
+        conn, board,
+        locked_tick=_dispatch_once_locked,
+        skipped_result=DispatchResult,
+        spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run, max_spawn=max_spawn,
+        max_in_progress=max_in_progress, failure_limit=failure_limit,
+        stale_timeout_seconds=stale_timeout_seconds, default_assignee=default_assignee,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        reconcile_orphans=reconcile_orphans, keypool_exempt=keypool_exempt,
+    )
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
@@ -2394,12 +2388,12 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
+    result.crashed = detect_crashed_workers(conn, board=board, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     result.keypool_reaped = _kbkp.keypool_sweep()  # backstop: host-restart orphans
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -2592,13 +2586,10 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
-    # Cards whose retry counter burned twice in one generation wait for a split.
-    # OUTSIDE any write txn (the decomposer is an aux LLM call) and BEFORE the
-    # spawn budget is computed: a split moves the card to ``todo`` and its
-    # children to ``ready``, which changes what this tick can spawn. A dry run
-    # must not create child cards, so it skips the phase entirely.
-    if not dry_run:
-        result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
+    # The auto-split phase is deliberately NOT here: its decomposer is an aux
+    # LLM call (up to 180 s x 3 attempts) and this whole function runs under the
+    # board's single-writer lock. ``dispatch_once`` runs it BEFORE taking that
+    # lock, under its own non-blocking ``.split.lock``.
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -3166,5 +3157,6 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_dispatch_split as _kbdsp
 from hermes_cli import kanban_db_keypool as _kbkp
 from hermes_cli import kanban_db_workspace as _kbw

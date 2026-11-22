@@ -1,0 +1,6 @@
+config kanban.failure_limit = 2
+DEFAULT_FAILURE_LIMIT      = 2
+expected effective_limit   = 2
+  timeout  A: config only                           -> effective_limit=2 source=dispatcher failures=2
+  timeout  B: per-task max_retries=3                -> effective_limit=3 source=task failures=3
+  crash    A: config only                           -> effective_limit=2 source=dispatcher failures=2

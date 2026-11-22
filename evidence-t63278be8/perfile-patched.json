@@ -1,0 +1,13 @@
+{
+ "label": "patched",
+ "summary": "=== Summary: 99 files, 670 tests passed, 79 failed, 4 skipped; FAILED: 16 of 99 files (100% complete) in 219.0s (8 workers) ===",
+ "failing": {
+  "tests/hermes_cli/test_kanban_worker_admission_wait.py": 2,
+  "tests/hermes_cli/test_kanban_worker_owner_wait.py": 2,
+  "tests/hermes_cli/test_kanban_gateway_restart_handoff.py": 6,
+  "tests/hermes_cli/test_kanban_worker_restart_wait.py": 4,
+  "tests/hermes_cli/test_kanban_worker_socket_recovery.py": 25,
+  "tests/hermes_cli/test_kanban_worker_terminal_cwd.py": 1,
+  "tests/hermes_cli/test_kanban_resume_guard.py": 12
+ }
+}

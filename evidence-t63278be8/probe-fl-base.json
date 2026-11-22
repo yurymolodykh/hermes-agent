@@ -1,0 +1,42 @@
+{
+ "temp_root": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-fl-kbcmqtbd",
+ "config_failure_limit": 3,
+ "default_failure_limit": 2,
+ "results": [
+  {
+   "variant": "A: config only",
+   "path": "timeout",
+   "effective_limit": 2,
+   "limit_source": "dispatcher",
+   "failures": 2
+  },
+  {
+   "variant": "B: per-task max_retries=3",
+   "path": "timeout",
+   "effective_limit": 3,
+   "limit_source": "task",
+   "failures": 3
+  },
+  {
+   "variant": "C: dispatch_once(failure_limit=3)",
+   "path": "timeout",
+   "effective_limit": 2,
+   "limit_source": "dispatcher",
+   "failures": 2
+  },
+  {
+   "variant": "A: config only",
+   "path": "crash",
+   "effective_limit": 2,
+   "limit_source": "dispatcher",
+   "failures": 2
+  },
+  {
+   "variant": "C: dispatch_once(failure_limit=3)",
+   "path": "crash",
+   "effective_limit": 2,
+   "limit_source": "dispatcher",
+   "failures": 2
+  }
+ ]
+}
