@@ -22,7 +22,7 @@ import logging
 import sqlite3
 from typing import Optional
 
-_log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 # First line of the advisory; also the idempotency key (a card carries at most one).
 SIZING_COMMENT_TAG = "**card-sizing**"
 
@@ -101,8 +101,10 @@ def note_promotion(conn: sqlite3.Connection, task_id: str, *, author: str) -> bo
 
         add_comment(conn, task_id, author, body)
         return True
-    except Exception:  # advisory bookkeeping must never fail a promotion
-        _log.exception("card-sizing advisory failed for %s", task_id)
+    # Advisory bookkeeping must never veto a promotion: a broken estimate, an
+    # unreadable profile config or a comment write failure is logged, not raised.
+    except Exception:
+        logger.exception("card-sizing advisory failed for %s", task_id)
         return False
 
 
