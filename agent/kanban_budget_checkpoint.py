@@ -20,6 +20,7 @@ worker that has nothing to save must not get an empty commit.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -69,6 +70,20 @@ class WipCheckpoint:
         if self.mode == "archive" and self.archive:
             return f"архив {self.archive}"
         return "нет сохранения"
+
+
+@dataclass
+class WipPreservation:
+    """Outcome of a mid-run save: a git ref, a board-side archive, or nothing.
+
+    Separate from :class:`WipCheckpoint` because the reminder threshold does not
+    stop the run: it parks the tree without a commit, while the checkpoint is the
+    durable record a budget stop reports on.
+    """
+
+    mode: str = "none"            # "git" | "archive" | "none"
+    locator: Optional[str] = None  # ``refs/hermes-wip/<task>`` or the tarball path
+    detail: Optional[str] = None  # why nothing was saved, when mode == "none"
 
 
 def _git(cwd: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -177,8 +192,6 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
     # attachments-root override), so the archive lands where a human looks for it.
     from hermes_cli.kanban_db import task_attachments_dir
     out_dir = task_attachments_dir(task_id)
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
     target = out_dir / f"wip-{stamp}.tar.gz"
