@@ -183,8 +183,44 @@ def _commit_wip(root: Path, files: Iterable[str], subject: str) -> Optional[str]
     return sha.stdout.strip() if sha.returncode == 0 and sha.stdout.strip() else None
 
 
+def _tree_fingerprint(root: Path, files: Iterable[str]) -> str:
+    """Cheap identity of a workspace: relative paths plus each file's size and mtime.
+
+    A full content hash would read every byte of a card tree on each reminder; the
+    reminder only has to answer "did anything change since the last copy?", and an
+    edit that keeps both size and mtime is not a case archiving must catch.
+    """
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        try:
+            st = (root / rel).stat()
+        except OSError:
+            continue
+        digest.update(f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+_FINGERPRINT_FILE = ".wip-fingerprint"
+
+
+def _existing_archive(out_dir: Path, fingerprint: str) -> Optional[str]:
+    """The archive already holding this exact tree state, when one exists."""
+    try:
+        if (out_dir / _FINGERPRINT_FILE).read_text(encoding="utf-8").strip() != fingerprint:
+            return None
+        previous = sorted(out_dir.glob("wip-*.tar.gz"))
+    except OSError:
+        return None
+    return str(previous[-1]) if previous else None
+
+
 def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) -> Optional[str]:
-    """Fallback for a workspace with no git repository: a bounded tarball of its attachments."""
+    """Fallback for a workspace with no git repository: a bounded tarball of its attachments.
+
+    Repeating the call on an unchanged tree returns the archive already on disk
+    instead of writing a second one: the reminder threshold can fire more than once
+    per card, and a pile of identical tarballs is not more safety.
+    """
     paths = list(files)
     if not paths:
         return None
@@ -196,6 +232,10 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
+    fingerprint = _tree_fingerprint(root, paths)
+    unchanged = _existing_archive(out_dir, fingerprint)
+    if unchanged:
+        return unchanged
     target = out_dir / f"wip-{stamp}.tar.gz"
     total = 0
     try:
@@ -211,6 +251,10 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
     except (OSError, tarfile.TarError):
         target.unlink(missing_ok=True)
         return None
+    try:
+        (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
+    except OSError:
+        pass
     return str(target)
 
 
@@ -318,11 +362,47 @@ def preserve_wip_ref(*, task_id: Optional[str] = None, workspace: Optional[Path]
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def preserve_wip_tree(
+    *, task_id: Optional[str] = None, workspace: Optional[Path] = None
+) -> WipPreservation:
+    """Save the working tree mid-run, without committing and without stopping.
+
+    The reminder threshold exists so the worker still has budget left; a
+    ``workspace_kind=scratch`` card (no repository at all) has nothing to park,
+    so it gets the same board-side tarball the hard stop would have written.
+    Returns where the copy landed, for the reminder text.
+    """
+    root = workspace or card_workspace()
+    if root is None:
+        return WipPreservation(detail="нет каталога карточки")
+    if _repo_root(root) is not None:
+        ref = preserve_wip_ref(task_id=task_id, workspace=root)
+        if ref:
+            return WipPreservation(mode="git", locator=ref)
+        return WipPreservation(detail="ref не создан (индекс занят или git не ответил)")
+    try:
+        files = _changed_paths(root)
+    except (OSError, subprocess.SubprocessError) as exc:  # never break the turn loop
+        return WipPreservation(detail=f"не удалось прочитать дерево: {exc}")
+    if not files:
+        return WipPreservation(detail="нечего сохранять")
+
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    tid = (task_id or (os.environ.get("HERMES_KANBAN_TASK") or "task")).strip()
+    try:
+        archive = _archive_tree(root, files, tid, stamp)
+    except (OSError, tarfile.TarError) as exc:
+        return WipPreservation(detail=f"архив не создан: {exc}")
+    if archive:
+        return WipPreservation(mode="archive", locator=archive)
+    return WipPreservation(detail="архив не создан")
+
+
 def checkpoint_wip(
     *,
     reason: str,
     used: int,
-
+    max_total: int,
     workspace: Optional[Path] = None,
     task_id: Optional[str] = None,
 ) -> WipCheckpoint:
@@ -424,7 +504,10 @@ def describe_stop(
 __all__ = [
     "WIP_SUBJECT_PREFIX",
     "WipCheckpoint",
+    "WipPreservation",
     "card_workspace",
     "checkpoint_wip",
     "describe_stop",
+    "preserve_wip_ref",
+    "preserve_wip_tree",
 ]
