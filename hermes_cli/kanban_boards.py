@@ -96,8 +96,9 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     # subparser only; treat the alias as `rm --delete`.
     # See #23139.
     force_delete = getattr(args, "delete", False) or getattr(args, "boards_action", "") == "delete"
+    force = bool(getattr(args, "force", False))
     try:
-        res = kb.remove_board(args.slug, archive=not force_delete)
+        res = kb.remove_board(args.slug, archive=not force_delete, force=force)
     except ValueError as exc:
         return _err(f"kanban boards rm: {exc}")
     if res["action"] == "archived":
@@ -105,6 +106,11 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
               "Recover by moving the directory back to <root>/kanban/boards/<slug>/ "
               "and deleting the archived tombstone board.json left in its place.")
     else:
+        discarded = res.get("preserved") or []
+        if discarded:
+            print("Deleted scratch workspaces with unsaved work (--force):")
+            for path in discarded:
+                print(f"  {path}")
         print(f"Board {res['slug']!r} deleted.")
     return 0
 

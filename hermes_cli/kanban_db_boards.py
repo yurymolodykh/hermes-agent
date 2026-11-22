@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sqlite3
 import time
 from typing import Any
 from typing import Optional
@@ -187,9 +188,8 @@ def _preserved_board_workspaces(slug: str, d: Path) -> tuple[list[Path], list[Pa
     if not task_dirs:
         return preserved, unverified
     conn = None
-    db_path = _kb.kanban_db_path(board=slug)
+    db_path = d / "kanban.db"
     if db_path.exists():
-        import sqlite3
         try:
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
@@ -283,7 +283,7 @@ def remove_board(slug: str, *, archive: bool = True, force: bool = False) -> dic
             f"to delete the board anyway"
         )
     shutil.rmtree(d)
-    result = {"slug": normed, "action": "deleted", "new_path": ""}
+    result: dict[str, Any] = {"slug": normed, "action": "deleted", "new_path": ""}
     if preserved or unverified:
         result["preserved"] = [str(p) for p in [*preserved, *unverified]]
     return result
