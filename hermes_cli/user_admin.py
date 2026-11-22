@@ -335,7 +335,9 @@ def add_user(
             source = None
         profile_dir = create_profile(
             profile, clone_from=source, clone_config=source is not None, no_alias=True,
-            no_skills=no_skills,
+            # ``--no-skills`` is mutually exclusive with cloning: a clone copies the source's
+            # skills, so the flag only applies to a from-scratch profile.
+            no_skills=no_skills and source is None,
         )
         created_profile = True
         undo.append((f"profile {profile}", lambda: delete_profile(profile, yes=True)))

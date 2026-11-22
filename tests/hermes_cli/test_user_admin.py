@@ -18,12 +18,14 @@ reads or writes the operator's real profiles, config, or users file.
 
 from __future__ import annotations
 
+import io
 import json
 import stat
 
 import pytest
 
 import hermes_acl_bindings as hb
+from hermes_acl_soul import QUESTIONNAIRE_FILENAME
 from hermes_cli import user_admin as ua
 from hermes_cli.config import get_config_path
 from hermes_cli.config_backend import read_config_doc
@@ -54,8 +56,21 @@ def home(tmp_path, monkeypatch):
     return root
 
 
+def _args(login, *, telegram_id="", password=None, action="add", yes=True):
+    """The argparse namespace ``cmd_user_add``/``cmd_user_list`` receive."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        login=login, telegram_id=telegram_id, display_name="", role="user",
+        password_stdin=False, no_skills=True, json=False, user_action=action, yes=yes,
+    )
+
+
 def _routes() -> list[dict]:
-    document = read_config_doc(get_config_path()) or {}
+    try:
+        document = read_config_doc(get_config_path()) or {}
+    except FileNotFoundError:
+        return []
     gateway = document.get("gateway") if isinstance(document, dict) else None
     return list((gateway or {}).get("profile_routes") or [])
 
@@ -78,7 +93,7 @@ def test_add_creates_profile_soul_binding_password_and_route(home):
 
     soul = profile_dir / "SOUL.md"
     assert soul.is_file() and soul.read_text(encoding="utf-8").strip(), "SOUL must not be empty"
-    assert (profile_dir / ua.QUESTIONNAIRE_FILENAME).is_file()
+    assert (profile_dir / QUESTIONNAIRE_FILENAME).is_file()
 
     registry = _registry()
     record = registry.record("person/demo1")
@@ -115,9 +130,12 @@ def test_add_writes_the_password_to_an_owner_only_file(home):
     assert path.read_text(encoding="utf-8").strip() == "Pas$word-with-length"
 
 
-def test_add_never_prints_the_full_password(home, capsys):
+def test_add_never_prints_the_full_password(home, monkeypatch, capsys):
     secret = "Kx9-QwErTy-UiOpAsDfGh"
-    assert ua.cmd_user_add(ua._args_for_test("demo3", password=secret)) == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO(secret + "\n"))
+    args = _args("demo3")
+    args.password_stdin = True
+    assert ua.cmd_user_add(args) == 0
     captured = capsys.readouterr()
     assert secret not in captured.out
     assert secret not in captured.err
@@ -126,7 +144,7 @@ def test_add_never_prints_the_full_password(home, capsys):
 
 
 def test_add_without_telegram_id_warns_and_still_creates_the_user(home, capsys):
-    assert ua.cmd_user_add(ua._args_for_test("demo4", telegram_id="", password="x" * 20)) == 0
+    assert ua.cmd_user_add(_args("demo4")) == 0
     assert "no --telegram-id" in capsys.readouterr().err
     assert (home / "profiles" / "01-demo4").is_dir()
     assert _routes() == []
@@ -163,9 +181,9 @@ def test_duplicate_telegram_id_is_refused(home):
 
 
 def test_cli_returns_exit_code_2_on_a_duplicate(home, capsys):
-    assert ua.cmd_user_add(ua._args_for_test("demo8", password="one")) == 0
+    assert ua.cmd_user_add(_args("demo8")) == 0
     capsys.readouterr()
-    assert ua.cmd_user_add(ua._args_for_test("demo8", password="two")) == 2
+    assert ua.cmd_user_add(_args("demo8")) == 2
     assert "refused" in capsys.readouterr().err
 
 
@@ -214,7 +232,7 @@ def test_a_failure_while_binding_rolls_the_profile_back(home, monkeypatch):
 def test_cli_returns_non_zero_after_a_rollback(home, monkeypatch, capsys):
     monkeypatch.setattr(ua, "write_route_undoable",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
-    assert ua.cmd_user_add(ua._args_for_test("demo11", telegram_id="555", password="p")) == 1
+    assert ua.cmd_user_add(_args("demo11", telegram_id="555")) == 1
     assert "nothing was created" in capsys.readouterr().err
 
 
@@ -232,7 +250,7 @@ def test_list_reports_the_four_registries_and_never_a_hash(home, capsys):
     assert row["route"]["bot_profile"] is None
     assert row["subjects"] == ["tg:555123123"]
 
-    assert ua.cmd_user_list(ua._args_for_test(None, action="list")) == 0
+    assert ua.cmd_user_list(_args(None, action="list")) == 0
     printed = capsys.readouterr().out
     assert "demo12" in printed
     assert "scrypt$" not in printed, "a listing must never leak a password hash"
