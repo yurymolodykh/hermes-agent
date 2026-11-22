@@ -547,22 +547,60 @@ async def _webapp_caller_signed_out(request: Request) -> bool:
 #: exactly like the older per-seam caches it replaces for this endpoint.
 _STATUS_CACHE = TtlSingleFlightCache()
 
-#: Identity of every injected seam plus the gateway identity/runtime file stamps. A snapshot is only
-#: reused while this tuple is unchanged, so a gateway restart (new PID file), a runtime-state
-#: transition (gateway_state.json rewritten) or a test's monkeypatch drops the entry immediately
-#: instead of waiting out the TTL.
+#: Cheap inputs whose value decides part of the payload and must therefore never be served stale.
+def _status_liveness_digest(profile_dir: Optional[Path]) -> tuple:
+    """Everything cheap that changes the probe's verdict, read through the same seams.
+
+    The readiness answer — ``gateway_running`` / ``gateway_state``, the platform rollup and the
+    shared-profile warning — must flip on the *next* poll, not at the TTL. These inputs are cheap
+    (one JSON file read, the 1 s-cached PID probe), so the snapshot is keyed on their values rather
+    than on the clock alone: a gateway restart, a state transition, a live warning appearing or a
+    test's fake seam all change this tuple.
+    """
+    home = profile_dir if profile_dir is not None else get_process_hermes_home()
+    record = (read_runtime_status(path=home / "gateway_state.json") if profile_dir is not None
+              else read_runtime_status())
+    try:
+        runtime_digest = json.dumps(record, sort_keys=True, default=str) if isinstance(record, dict) else repr(record)
+    except (TypeError, ValueError):  # health: allow BLE001 -- an odd record just misses the cache
+        runtime_digest = repr(record)
+    try:
+        pid = (get_running_pid_cached(profile_dir / "gateway.pid") if profile_dir is not None
+               else get_running_pid_cached())
+    except Exception:  # health: allow BLE001 -- the probe's own ladder degrades the same way
+        pid = None
+    return (pid, runtime_digest)
+
+
 def _status_cache_signature(profile_dir: Optional[Path]) -> tuple:
+    """Cheap staleness key for one cached snapshot: liveness digest + seam/identity file stamps.
+
+    A snapshot is reused only while this tuple is unchanged, so a gateway restart (new PID file), a
+    runtime-state transition (``gateway_state.json`` rewritten), a live shared-profile warning
+    (spawn ledger), a config edit or a swapped test seam drops it immediately instead of waiting out
+    the TTL. Everything else — session counts, pressure rollups, the dashboard self-test — is
+    bounded by the TTL alone, which is what the probe's consumers budget for anyway.
+    """
     from gateway import status as gateway_status
 
     home = profile_dir if profile_dir is not None else get_process_hermes_home()
     stamps = []
-    for name in ("gateway.pid", "gateway.lock", "gateway_state.json"):
-        path = home / name
+    for path in (home / "gateway.pid", home / "gateway.lock", home / "gateway_state.json",
+                 get_config_path(), get_env_path()):
         try:
             stat = path.stat()
-            stamps.append((name, stat.st_mtime_ns, stat.st_size, stat.st_ino))
+            stamps.append((str(path), stat.st_mtime_ns, stat.st_size, stat.st_ino))
         except OSError:
-            stamps.append((name, None))
+            stamps.append((str(path), None))
+    # The spawn ledger is machine-rooted: an installation starting to share this profile must raise
+    # the warning on the next poll, not one TTL later.
+    try:
+        from hermes_cli.process_identity import _ledger_path
+        ledger = _ledger_path()
+        stat = ledger.stat()
+        stamps.append((str(ledger), stat.st_mtime_ns, stat.st_size, stat.st_ino))
+    except Exception:  # health: allow BLE001 -- absent/unreadable ledger means "no warning"
+        stamps.append(("spawn-ledger", None))
     seams = (
         id(gateway_status.get_running_pid_cached), id(gateway_status.read_runtime_status),
         id(_collect_profile_gateway_topology_cached), id(_load_configured_gateway_platforms),
@@ -570,7 +608,7 @@ def _status_cache_signature(profile_dir: Optional[Path]) -> tuple:
         bool(getattr(app.state, "auth_required", False)),
         bool(getattr(app.state, "bound_host", None) not in (None, "127.0.0.1", "localhost", "::1")),
     )
-    return (tuple(stamps), seams)
+    return (tuple(stamps), seams, _status_liveness_digest(profile_dir))
 
 
 async def _collect_status(profile_dir: Optional[Path], requested_profile: str,
