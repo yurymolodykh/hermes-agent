@@ -120,13 +120,14 @@ VERDICT: OK - the test's assertion catches a path-only cache and the real cache 
 
 `payload_dump.py` снимает набор ключей и типов `/api/status` на изолированном `HERMES_HOME` до и
 после правки: `diff payload_before.json payload_after.json` → **PAYLOAD SHAPE IDENTICAL**
-(33 ключа: `version`, `gateway_running`, `gateway_state`, `gateway_platforms`, `active_agents`,
+(37 ключей: `version`, `gateway_running`, `gateway_state`, `gateway_platforms`, `active_agents`,
 `gateway_busy`, `gateway_drainable`, `restart_drain_timeout`, `active_sessions`, `auth_required`,
-`nous_session_valid`, `install_id`, `components`, `overall`, `profiles`, `parked_profiles`,
-`gateway_mode`, `multiplex_standalone_reason`, `hermes_home`, `config_path`, `env_path`,
-`gateway_pid`, `gateway_health_url`, `gateways`, `disk`, `memory`, `shared_profile_warning`,
-`config_version`, `latest_config_version`, `can_update_hermes`, `release_date`,
-`gateway_heartbeat_stale_s`, `gateway_shared_with`).
+`auth_flows`, `auth_providers`, `nous_session_valid`, `install_id`, `components`, `overall`,
+`profiles`, `parked_profiles`, `gateway_mode`, `multiplex_standalone_reason`, `hermes_home`,
+`config_path`, `env_path`, `gateway_pid`, `gateway_health_url`, `gateways`, `disk`, `memory`,
+`shared_profile_warning`, `config_version`, `latest_config_version`, `can_update_hermes`,
+`release_date`, `gateway_heartbeat_stale_s`, `gateway_shared_with`, `gateway_exit_reason`,
+`gateway_updated_at`).
 
 ## 4. Линт и code health
 
@@ -144,14 +145,14 @@ fb213a5b10f  status cache: sort __all__ for ruff RUF022
 c31ddab668b  kanban: resolve leftover conflict markers from the foreign stash pop
 ```
 
-Диф карточки относительно базы `beeb9623539` — ровно 5 файлов, 773 вставки / 89 удалений:
+Диф карточки относительно базы `beeb9623539` — ровно 5 файлов, 776 вставок / 89 удалений:
 
 ```
 gateway/hosted_rooms.py                          |  59 ++++-
 hermes_cli/web_routers/status.py                 | 265 ++++++++++++++-------
 hermes_cli/web_status_cache.py                   | 111 +++++++++++
 tests/gateway/test_hosted_rooms_schema_cache.py  | 183 ++++++++++++++
-tests/hermes_cli/test_status_probe_cache.py      | 244 +++++++++++++++++++++
+tests/hermes_cli/test_status_probe_cache.py      | 247 +++++++++++++++++++++
 ```
 
 ## 6. Ограничения и что осталось вне рамок
