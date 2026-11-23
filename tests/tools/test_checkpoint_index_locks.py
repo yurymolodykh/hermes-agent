@@ -203,6 +203,73 @@ def test_plain_git_add_failure_is_recorded_under_git_add(base, project, manager,
 
 
 # =========================================================================
+# The contract: ensure_checkpoint never raises, whatever the probe or a
+# partial install throws at it
+# =========================================================================
+
+def test_a_probe_failure_that_is_not_an_oserror_still_never_raises(
+    base, project, manager, notices, monkeypatch,
+):
+    """``ensure_checkpoint`` promises "Never raises" — the sweep must not make that conditional.
+
+    The holder probe (``hermes_cli._early_recovery._held_open``) is platform machinery; nothing
+    in its contract limits it to ``OSError``.  A ``RuntimeError`` escaping the sweep used to fly
+    out of ``ensure_checkpoint`` past its ``try``, so the refusal was neither recorded nor shown
+    and the caller got an exception instead of ``False``/``True``.
+    """
+    store = _store(base)
+    indexes = store / "indexes"
+    indexes.mkdir(parents=True)
+    lock = indexes / "abcdef.lock"
+    lock.write_bytes(b"")
+    _aged(lock, 3600)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom from probe")
+
+    monkeypatch.setattr("hermes_cli._early_recovery._held_open", boom)
+
+    taken = manager.ensure_checkpoint(str(project), "probe blows up")
+
+    # The turn survives, and the checkpoint it could still take is still taken.
+    assert taken is True
+    assert lock.exists(), "a crashed probe must never authorise a delete"
+    report = manager.lock_report()
+    assert report["last_failure"] is not None, "the sweep refusal must be recorded"
+    assert report["last_failure"]["stage"] == "index lock sweep"
+    assert "RuntimeError" in report["last_failure"]["error"]
+    assert len(notices) == 1 and "index lock sweep" in notices[0]
+    # The checkpoint was taken, so the notice must not claim checkpoints are dead.
+    assert "NOT being taken" not in notices[0]
+    assert "still work" in notices[0]
+
+
+def test_a_missing_notice_symbol_does_not_break_the_failure_path(
+    base, project, manager, notices, monkeypatch,
+):
+    """A partial install has no ``post_worker_notice``; ``_notify`` must not die on that.
+
+    The import used to sit *above* the ``try`` in ``_notify``, so an ``ImportError`` there
+    propagated out of the error path itself: ``ensure_checkpoint`` caught it as the vague
+    ``store`` stage only to crash again on its own ``_notify`` call.
+    """
+    from tools import checkpoint_notice
+
+    monkeypatch.delattr(checkpoint_notice, "post_worker_notice")
+    monkeypatch.setattr(
+        checkpoints, "_run_git",
+        _fail_on(lambda args: args == ["write-tree"]),
+    )
+
+    assert manager.ensure_checkpoint(str(project), "no notice module") is False
+
+    failure = manager.lock_report()["last_failure"]
+    assert failure["stage"] == "git write-tree", "the real stage, not the vague 'store'"
+    # The in-process callback is a separate channel and must still fire.
+    assert len(notices) == 1
+
+
+# =========================================================================
 # The notice channel itself (card comment)
 # =========================================================================
 
