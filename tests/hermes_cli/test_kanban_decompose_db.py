@@ -90,5 +90,122 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_children_inherit_root_priority_exactly(kanban_home):
+    """A fan-out of a priority-190 card must not sink to the SQL default 0;
+    an explicit child priority wins over the root's."""
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="urgent")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET priority = 190 WHERE id = ?", (tid,))
+        child_ids = decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[
+                {"title": "inherits", "assignee": "default"},
+                {"title": "overrides", "assignee": "default", "priority": 5},
+                {"title": "explicit zero", "assignee": "default", "priority": 0},
+            ],
+        )
+    assert child_ids is not None
+    with kbc.connect() as conn:
+        inherited, overridden, explicit_zero = (kb.get_task(conn, c) for c in child_ids)
+    assert inherited.priority == 190
+    assert overridden.priority == 5
+    assert explicit_zero.priority == 0
+
+
+def test_children_inherit_root_dispatch_pins(kanban_home):
+    """skills / runtime cap / model+provider pins / reasoning effort follow the
+    root down the chain; a child's own values win."""
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="pinned")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = 900, skills = ?, "
+                "model_override = ?, provider_override = ?, reasoning_effort = ? "
+                "WHERE id = ?",
+                ('["codebase-inspection", "plan"]', "deepseek-v4-flash", "letovo", "high", tid),
+            )
+        child_ids = decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[
+                {"title": "inherits", "assignee": "default"},
+                {
+                    "title": "overrides", "assignee": "default",
+                    "skills": ["github-code-review"], "max_runtime_seconds": 60,
+                    "model_override": "gpt-5", "provider_override": "openai",
+                    "reasoning_effort": "low",
+                },
+            ],
+        )
+    assert child_ids is not None
+    with kbc.connect() as conn:
+        inherited = kb.get_task(conn, child_ids[0])
+        overridden = kb.get_task(conn, child_ids[1])
+    assert inherited.skills == ["codebase-inspection", "plan"]
+    assert inherited.max_runtime_seconds == 900
+    assert inherited.model_override == "deepseek-v4-flash"
+    assert inherited.provider_override == "letovo"
+    assert inherited.reasoning_effort == "high"
+    assert overridden.skills == ["github-code-review"]
+    assert overridden.max_runtime_seconds == 60
+    assert overridden.model_override == "gpt-5"
+    assert overridden.provider_override == "openai"
+    assert overridden.reasoning_effort == "low"
+
+
+def test_worktree_child_still_gets_no_workspace_path(kanban_home, tmp_path):
+    """Regression: inheriting pins must not resurrect workspace_path sharing for
+    worktrees — concurrent siblings would land in one checkout."""
+    worktree_dir = tmp_path / "wt"
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="tree card")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+                "priority = 7 WHERE id = ?",
+                (str(worktree_dir), tid),
+            )
+        child_ids = decompose_triage_task(
+            conn, tid, root_assignee="orch",
+            children=[{"title": "a", "assignee": "default"}, {"title": "b", "assignee": "default"}],
+        )
+    assert child_ids is not None
+    with kbc.connect() as conn:
+        for child_id in child_ids:
+            child = kb.get_task(conn, child_id)
+            assert child.workspace_kind == "worktree"
+            assert child.workspace_path is None
+            assert child.priority == 7
+
+
+def test_dir_child_inherits_root_workspace_path(kanban_home, tmp_path):
+    """Contrast case: a 'dir' child keeps sharing the root's directory (only
+    worktrees are excluded), and inherits its pins."""
+    shared = tmp_path / "shared"
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="dir card")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ?, "
+                "priority = 11 WHERE id = ?",
+                (str(shared), tid),
+            )
+        child_ids = decompose_triage_task(
+            conn, tid, root_assignee="orch",
+            children=[{"title": "a", "assignee": "default"}],
+        )
+    assert child_ids is not None
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child.workspace_kind == "dir"
+    assert child.workspace_path == str(shared)
+    assert child.priority == 11
+
+
+
 
 

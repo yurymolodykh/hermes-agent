@@ -1,6 +1,7 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from typing import Any, Optional
@@ -125,8 +126,14 @@ def decompose_triage_task(
     # (create_task, link_tasks, add_comment) must not be called in here.
     now = int(time.time())
     with write_txn(conn):
+        # The dispatch pins (priority, skills, runtime cap, model/provider,
+        # reasoning effort) are read here too: children inherit them, so a
+        # fan-out of a high-priority or model-pinned card does not sink to
+        # priority 0 on the profile default model.
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "priority, skills, max_runtime_seconds, model_override, "
+            "provider_override, reasoning_effort "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] not in allowed:
@@ -190,9 +197,17 @@ def _insert_decomposed_child(
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+
+    Dispatch pins (``priority``, ``skills``, ``max_runtime_seconds``,
+    ``model_override``/``provider_override``, ``reasoning_effort``) are
+    inherited from the root under the same per-child-wins rule: a fan-out of a
+    card at priority 190 must not sink its children to the SQL default 0, and
+    an explicit model/provider pick must survive the whole chain.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
+        _normalize_task_skills, _opt_int, _validate_model_override, _json_or,
+        normalize_reasoning_effort,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
@@ -207,15 +222,52 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+
+    # Per-child wins over the root's pins. ``in child`` (not ``.get(...) is
+    # not None``) keeps an explicit `priority: 0` and an explicit `skills: []`
+    # (none) meaningful rather than silently re-inheriting.
+    if "priority" in child and child["priority"] is not None:
+        priority = int(child["priority"])
+    else:
+        priority = int(root_row["priority"] or 0)
+    max_runtime_seconds = _opt_int(
+        child["max_runtime_seconds"] if child.get("max_runtime_seconds") is not None
+        else root_row["max_runtime_seconds"]
+    )
+    if "skills" in child and child["skills"] is not None:
+        skills_list = _normalize_task_skills(child["skills"])
+    else:
+        skills_list = _normalize_task_skills(_json_or(root_row["skills"]))
+    reasoning_effort = normalize_reasoning_effort(
+        child.get("reasoning_effort")
+        if child.get("reasoning_effort") is not None
+        else root_row["reasoning_effort"]
+    )
+    # Model and provider move as one pair: a child's bare model must not pick up
+    # the root's provider (and vice versa) — that is the mismatch the override
+    # exists to prevent.
+    if child.get("model_override") is not None or child.get("provider_override") is not None:
+        model_override, provider_override = _validate_model_override(
+            child.get("model_override"), child.get("provider_override"),
+        )
+    else:
+        model_override = root_row["model_override"]
+        provider_override = root_row["provider_override"]
+
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, priority, skills, max_runtime_seconds, "
+        " model_override, provider_override, reasoning_effort, "
+        " created_at, created_by) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], priority,
+            json.dumps(skills_list) if skills_list is not None else None,
+            max_runtime_seconds, model_override, provider_override, reasoning_effort,
+            now, (author or "decomposer"),
         ),
     )
     _append_event(
