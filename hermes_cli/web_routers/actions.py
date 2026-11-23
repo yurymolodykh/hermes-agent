@@ -22,6 +22,7 @@ from hermes_cli.version_info import get_version_info
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES
 from hermes_cli.web_routers._common import http_failure
+from hermes_cli.web_routers.handler_offload import off_loop
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -391,7 +392,9 @@ async def get_action_status(name: str, lines: int = 200):
 
     log_dir = _server_path("_ACTION_LOG_DIR")
     requested_lines = min(max(lines, 1), 2000)
-    tail = _tail_lines(log_dir / log_file_name, requested_lines)
+    # Tailing a rotated/multi-MB action log is disk I/O (p95 ≈ 96 ms at 64 MiB): run it on the
+    # offload seam so the request does not stall the loop that also serves the session socket.
+    tail = await off_loop(_tail_lines, log_dir / log_file_name, requested_lines)
 
     durable_update_action_id = None
     update_receipt_summary = action_receipt_summary = None
@@ -400,9 +403,15 @@ async def get_action_status(name: str, lines: int = 200):
         # dashboard's profile home: read it where it is written.
         from hermes_cli.logs import log_file_path
 
-        durable_update_action_id = _durable_completed_update_action_id(_tail_lines(log_file_path("update"), 2000))
-        spawned_action_id = (_latest_spawned_update_action_id(_tail_lines(log_dir / log_file_name, 2000))
-                             or _persisted_action_id(log_dir, name) or _ACTION_IDS.get(name))
+        durable_update_action_id = _durable_completed_update_action_id(
+            await off_loop(_tail_lines, log_file_path("update"), 2000)
+        )
+        spawned_action_id = (
+            _latest_spawned_update_action_id(
+                await off_loop(_tail_lines, log_dir / log_file_name, 2000)
+            )
+            or _persisted_action_id(log_dir, name) or _ACTION_IDS.get(name)
+        )
         if durable_update_action_id != spawned_action_id:
             # The root log is shared by every profile: another profile's (or an older) run's
             # completion never certifies the action this dashboard started.

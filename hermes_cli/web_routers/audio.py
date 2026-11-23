@@ -19,6 +19,7 @@ import urllib.request
 from fastapi import APIRouter
 from hermes_cli.dashboard_auth.native_http import grant_home_scope
 from hermes_cli.web_routers._common import http_failure
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
 from hermes_cli.web_server_gateway import _read_dashboard_json_response, _split_text_for_speak_stream
@@ -86,6 +87,34 @@ def _audio_extension_for_mime(mime_type: str) -> str:
     return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
 
 
+def _decode_and_stage(encoded: str, suffix: str) -> str:
+    """Decode a base64 audio payload and write it to a temp file; returns the staged path.
+
+    Blocking work (decode of up to 25 MiB + a disk write) — runs on the offload seam, never on
+    the event loop. Validation lives here so the decoded bytes are never copied back to the loop:
+    an invalid, empty or oversized payload raises ``HTTPException`` from the worker, and the seam
+    re-raises it unchanged (``handler_offload._bind`` / ``run_inline``).
+    """
+    try:
+        audio_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Audio payload is not valid base64")
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio recording is empty")
+    if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Audio recording is too large")
+    with tempfile.NamedTemporaryFile(
+        prefix="hermes-desktop-voice-", suffix=suffix, delete=False,
+    ) as tmp:
+        tmp.write(audio_bytes)
+        return tmp.name
+
+
+def _encode_b64(data: bytes) -> str:
+    """BASE64 text of already-read bytes — CPU-bound (≈70 ms per 25 MiB), so never on the loop."""
+    return base64.b64encode(data).decode("ascii")
+
+
 @router.post("/api/audio/transcribe")
 async def transcribe_audio_upload(
     payload: AudioTranscriptionRequest, profile: Optional[str] = None
@@ -103,25 +132,12 @@ async def transcribe_audio_upload(
     if not (normalized_mime_type.startswith("audio/") or normalized_mime_type == "video/webm"):
         raise HTTPException(status_code=400, detail="Payload must be an audio recording")
 
-    try:
-        audio_bytes = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Audio payload is not valid base64")
-
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Audio recording is empty")
-    if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Audio recording is too large")
-
     temp_path = ""
     try:
         with http_failure("Desktop voice transcription failed", 500, "Transcription failed"):
-            with tempfile.NamedTemporaryFile(
-                prefix="hermes-desktop-voice-", suffix=_audio_extension_for_mime(mime_type),
-                delete=False,
-            ) as tmp:
-                tmp.write(audio_bytes)
-                temp_path = tmp.name
+            temp_path = await off_loop(
+                _decode_and_stage, encoded, _audio_extension_for_mime(mime_type)
+            )
 
             # transcribe_recording (not raw transcribe_audio): filters Whisper
             # hallucinations and maps provider "empty transcript" errors to a
@@ -330,22 +346,22 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
 
     mime_type = _SPEAK_MIME_BY_EXT.get(os.path.splitext(file_path)[1].lower(), "audio/mpeg")
 
-    def _read_and_unlink() -> bytes:
-        # Off-loop: synthesized audio can be several MB; reading it inline
-        # blocks the uvicorn event loop. Unlink rides the same thread hop so
-        # the temp file cannot outlive an early return.
+    def _read_encoded_and_unlink() -> str:
+        # Off-loop: synthesized audio can be several MB; reading AND base64-encoding it inline
+        # blocks the uvicorn event loop. Encoding rides the same thread hop as the read so the
+        # bytes are touched once, and unlink rides it too so the temp file cannot outlive an
+        # early return.
         try:
             with open(file_path, "rb") as fh:
-                return fh.read()
+                return _encode_b64(fh.read())
         finally:
             _unlink_quietly(file_path)
 
     try:
-        audio_bytes = await asyncio.to_thread(_read_and_unlink)
+        encoded = await off_loop(_read_encoded_and_unlink)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not read audio: {exc}")
 
-    encoded = base64.b64encode(audio_bytes).decode("ascii")
     return {
         "ok": True, "data_url": f"data:{mime_type};base64,{encoded}", "mime_type": mime_type,
         "provider": result.get("provider"),

@@ -425,6 +425,16 @@ def _read_base64_file(path: Path) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _b64_text(data: bytes) -> str:
+    """BASE64 text of already-read bytes: pure CPU, off the loop for multi-MB payloads."""
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64_data_url(data: bytes, mime_type: str) -> str:
+    """One pass from bytes to a ``data:`` URL — encode and build the string in the worker."""
+    return f"data:{mime_type};base64,{_b64_text(data)}"
+
+
 @router.get("/api/media")
 async def get_media(path: str):
     """Return a gateway-local image as a base64 data URL for remote clients
@@ -517,8 +527,8 @@ async def proxy_remote_media(url: str, request: Request):
     if len(data) > _MEDIA_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
 
-    encoded = base64.b64encode(data).decode("ascii")
-    return {"data_url": f"data:{content_type};base64,{encoded}"}
+    data_url = await off_loop(_b64_data_url, data, content_type)
+    return {"data_url": data_url}
 
 
 def _decode_data_url(data_url: str) -> tuple[bytes, str]:
@@ -1239,10 +1249,11 @@ async def fs_read_data_url(
             data, _size, target = await asyncio.to_thread(
                 backend.read_bytes, path, max_bytes=_FS_DATA_URL_MAX_BYTES
             )
+            # Encoding the up-to-16-MiB payload rides the offload seam so the loop is free
+            # between the read and the host-file check below.
+            return {"dataUrl": await off_loop(_b64_data_url, data, _fs_mime_type(Path(target)))}
         except Exception as exc:
             _raise_fs_backend_error(exc)
-        encoded = base64.b64encode(data).decode("ascii")
-        return {"dataUrl": f"data:{_fs_mime_type(Path(target))};base64,{encoded}"}
     target = await _fs_download_path(path, profile, session_id, session=session)
     # A browser paste or pick reads back to be sent wherever a locked files root sits: the server
     # wrote it into the profile's own image cache or staged uploads, outside the managed tree.
