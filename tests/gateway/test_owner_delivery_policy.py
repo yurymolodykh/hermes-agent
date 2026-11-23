@@ -401,9 +401,10 @@ def test_commented_and_review_requested_are_suppressed(run_tick):
 # --- desktop / non-covered platforms keep the old behaviour ---------------------------
 
 
-def test_local_platform_completion_delivers_as_before(run_tick):
+@pytest.mark.parametrize("platform,enum", [("local", Platform.LOCAL), ("api_server", Platform.API_SERVER)])
+def test_local_platform_completion_delivers_as_before(run_tick, platform, enum):
     md = "/tmp/notes.md"
-    _completed_task(artifacts=[md], parent_open=True, platform="local")
+    _completed_task(artifacts=[md], parent_open=True, platform=platform)
     adapter = RecordingAdapter()
 
     delivered = {}
@@ -417,7 +418,7 @@ def test_local_platform_completion_delivers_as_before(run_tick):
 
     GatewayRunner._deliver_kanban_artifacts = spy
     try:
-        run_tick(adapter, _policy(), platform=Platform.LOCAL)
+        run_tick(adapter, _policy(), platform=enum)
     finally:
         GatewayRunner._deliver_kanban_artifacts = real
 
@@ -429,30 +430,32 @@ def test_local_platform_completion_delivers_as_before(run_tick):
 
 
 @pytest.mark.parametrize("kind", ["crashed", "commented", "review_requested"])
-def test_local_platform_service_events_still_deliver(run_tick, kind):
+@pytest.mark.parametrize("platform,enum", [("local", Platform.LOCAL), ("api_server", Platform.API_SERVER)])
+def test_local_platform_service_events_still_deliver(run_tick, kind, platform, enum):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="desktop card", assignee="worker")
-        _sub(tid, "local")
+        _sub(tid, platform)
         kb._append_event(conn, tid, kind, {"summary": "x", "author": "w", "preview": "p"})
     finally:
         conn.close()
     adapter = RecordingAdapter()
-    run_tick(adapter, _policy(), platform=Platform.LOCAL)
+    run_tick(adapter, _policy(), platform=enum)
     assert len(adapter.sent) == 1
     assert run_tick.rows() == []
 
 
-def test_local_platform_review_requested_still_wakes(run_tick):
+@pytest.mark.parametrize("platform,enum", [("local", Platform.LOCAL), ("api_server", Platform.API_SERVER)])
+def test_local_platform_review_requested_still_wakes(run_tick, platform, enum):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="desktop review", assignee="worker")
-        _sub(tid, "local")
+        _sub(tid, platform)
         kb._append_event(conn, tid, "review_requested", {"summary": "PR ready"})
     finally:
         conn.close()
     adapter = RecordingAdapter()
-    run_tick(adapter, _policy(), platform=Platform.LOCAL)
+    run_tick(adapter, _policy(), platform=enum)
     assert len(adapter.handled) == 1, "wake is not narrowed off Telegram"
 
 
@@ -494,4 +497,19 @@ def test_platforms_list_does_not_affect_other_platforms(run_tick):
     telegram_adapter = RecordingAdapter()
     run_tick(telegram_adapter, _policy())
     assert telegram_adapter.sent == [], "the telegram card is held back by the policy"
+    assert {r["platform"] for r in run_tick.rows()} == {"telegram"}
+
+
+def test_both_adapters_in_one_runner_are_scoped_by_subscription_platform(run_tick, monkeypatch):
+    """A runner serving every channel must still gate per subscription, not per process."""
+    _completed_task(artifacts=["/tmp/notes.md"], parent_open=True, platform="local")
+    _completed_task(artifacts=["/tmp/notes.md"], parent_open=True, platform="telegram")
+
+    local_adapter, telegram_adapter = RecordingAdapter(), RecordingAdapter()
+    runner = _make_runner(local_adapter, Platform.LOCAL)
+    runner.adapters[Platform.TELEGRAM] = telegram_adapter
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner, _policy()))
+
+    assert len(local_adapter.sent) == 1, "the desktop subscription keeps its ping"
+    assert telegram_adapter.sent == [], "the telegram subscription stays silent"
     assert {r["platform"] for r in run_tick.rows()} == {"telegram"}
