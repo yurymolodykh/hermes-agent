@@ -1,0 +1,26 @@
+▶ not activated — using HERMES_PYTHON: /home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 4 test files (~80 tests) under ['tests/hermes_cli/test_kanban_preserved_provenance.py', 'tests/hermes_cli/test_kanban_gc_retention.py', 'tests/hermes_cli/test_kanban_scratch_unsaved_work.py', 'tests/hermes_cli/test_kanban_db.py']; running with -j 8
+[  8.8% |     7/~80 | ✓10 | ✗ 0] ✓ tests/hermes_cli/test_kanban_gc_retention.py (10✓, 6.3s)
+[ 20.0% |    16/~80 | ✓19 | ✗ 0] ✓ tests/hermes_cli/test_kanban_preserved_provenance.py (9✓, 11.2s)
+[ 40.0% |    32/~80 | ✓35 | ✗ 0] ✓ tests/hermes_cli/test_kanban_scratch_unsaved_work.py (16✓, 16.5s)
+[100.0% |    80/~80 | ✓89 | ✗ 0] ✓ tests/hermes_cli/test_kanban_db.py (54✓ 1s, 24.3s)
+
+=== Summary: 4 files, 89 tests passed, 0 failed, 1 skipped (100% complete) in 24.3s (8 workers) ===
+
+  note: platforms('windows') tests (in 1 file) were SKIPPED on this host (linux); they run on the Windows Python-tests lane.
+  Durations cached to test_durations.json (4 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   4
+  Total subprocess CPU-wall: 58.2s  (runner wall: 24.3s, parallelism: 8x)
+  P50: 16.53s  P90: 24.27s  P95: 24.27s  P99: 24.27s  Max: 24.27s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     24.27s  tests/hermes_cli/test_kanban_db.py
+     16.53s  tests/hermes_cli/test_kanban_scratch_unsaved_work.py
+     11.16s  tests/hermes_cli/test_kanban_preserved_provenance.py
+      6.28s  tests/hermes_cli/test_kanban_gc_retention.py
