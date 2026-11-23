@@ -285,27 +285,28 @@ def test_reuse_of_an_existing_archive_clears_the_stale_loss_record(card_env, mon
     )
 
 
-def test_archive_retention_bounds_the_complete_pairs(card_env):
-    """Every distinct tree earns its own copy; the directory must not grow forever."""
+def test_archive_retention_bounds_the_complete_pairs(card_env, monkeypatch):
+    """Each run keeps its own window; past runs' copies do not accumulate."""
     from agent import kanban_budget_checkpoint as kbc
     from hermes_cli.kanban_db import task_attachments_dir
 
     workspace, _home = card_env
     written = []
     for i in range(6):
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", f"run-{i}")
         (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
         # A distinct mtime per generation: the fingerprint includes it by design.
         os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
         out = kbc.preserve_wip_tree(task_id="t_probe")
         assert out.mode == "archive"
-        written.append(str(out.locator))
+        written.append(Path(str(out.locator)).name)
 
     out_dir = task_attachments_dir("t_probe")
     tarballs = sorted(p.name for p in out_dir.glob("wip-*.tar.gz"))
     markers = sorted(p.name for p in out_dir.glob("wip-*.tar.gz.done"))
     assert len(tarballs) <= kbc._ARCHIVE_RETENTION, f"unbounded history: {tarballs}"
     assert len(markers) == len(tarballs), f"pairs must stay paired: {tarballs} / {markers}"
-    assert Path(written[-1]).name in tarballs, "the newest copy is always kept"
+    assert written[-1] in tarballs, "the newest copy is always kept"
     # No orphan markers left behind by the pruning.
     for marker in out_dir.glob("wip-*.tar.gz.done"):
         assert marker.with_name(marker.name[: -len(".done")]).exists()
@@ -336,34 +337,64 @@ def test_archive_retention_keeps_one_generation_of_unmarked_tarballs(card_env):
 
 
 def test_retention_never_deletes_the_copy_the_reminder_names(card_env):
-    """A copy this run's reminder named is never pruned, even past the window.
+    """A copy the current run's reminder points at survives past the window.
 
-    The reminder's text lives on in the conversation: pruning the path it names
-    would leave the model and the human reading about a copy that is gone.
+    The reminder's text lives on in the conversation, so pruning that path would
+    leave the model and the human reading about a copy that no longer exists.
     """
     from agent import kanban_budget_checkpoint as kbc
     from hermes_cli.kanban_db import task_attachments_dir
 
+    _workspace, _home = card_env
+    out_dir = task_attachments_dir("t_probe")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pairs = []
+    for i in range(6):
+        archive = out_dir / f"wip-2026010{i + 1}T000000.tar.gz"
+        archive.write_bytes(b"copy")
+        archive.with_name(archive.name + ".done").write_text("fp\n", encoding="utf-8")
+        os.utime(archive, ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
+        pairs.append(archive)
+
+    # The oldest copy is the one this run's reminder points at.
+    kbc._remember_named(str(pairs[0]))
+    removed = kbc._prune_archives(out_dir)
+
+    assert pairs[0].exists(), "the named copy was pruned"
+    assert pairs[0].with_name(pairs[0].name + ".done").exists()
+    survivors = sorted(p.name for p in out_dir.glob("wip-*.tar.gz"))
+    assert len(survivors) == kbc._ARCHIVE_RETENTION + 1, survivors
+    assert pairs[0].name in survivors
+    assert str(pairs[0]) not in removed
+    # Unnamed copies past the window are gone — the exemption is not a hole.
+    assert not pairs[1].exists() and not pairs[2].exists()
+
+
+def test_a_new_run_does_not_inherit_the_previous_runs_pinned_copies(card_env, monkeypatch):
+    """The exemption is per run: a successor's first save prunes the old names."""
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
     workspace, _home = card_env
-    (workspace / "a.txt").write_text("gen-0\n", encoding="utf-8")
-    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
-    first = kbc.preserve_wip_tree(task_id="t_probe")
-    assert first.mode == "archive"
-    named = Path(first.locator)
-
-    # More generations than the retention window can hold.
-    for i in range(1, 6):
-        (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
+    pinned = []
+    for i in range(5):
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-old")
+        (workspace / "a.txt").write_text(f"old-{i}\n", encoding="utf-8")
         os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
-        assert kbc.preserve_wip_tree(task_id="t_probe").mode == "archive"
+        out = kbc.preserve_wip_tree(task_id="t_probe")
+        assert out.mode == "archive"
+        pinned.append(Path(str(out.locator)))
 
-    assert named.exists(), "the copy the reminder named was pruned"
-    assert named.with_name(named.name + ".done").exists()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-new")
+    (workspace / "a.txt").write_text("new\n", encoding="utf-8")
+    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + 99 * 10**9,) * 2)
+    fresh = kbc.preserve_wip_tree(task_id="t_probe")
+    assert fresh.mode == "archive"
+
     out_dir = task_attachments_dir("t_probe")
     kept = len(list(out_dir.glob("wip-*.tar.gz")))
-    assert kept <= kbc._ARCHIVE_RETENTION + len(kbc._named_in_run()), f"unbounded: {kept}"
-    # Everything else outside the window is gone: the exemption is not a hole.
-    assert kept < 6
+    assert kept <= kbc._ARCHIVE_RETENTION, f"stale run's pins survived: {kept}"
+    assert Path(str(fresh.locator)).exists()
 
 
 def test_a_legacy_tarball_without_a_done_marker_is_not_reused(card_env):
