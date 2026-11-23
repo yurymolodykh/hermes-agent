@@ -318,6 +318,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("terminal_provider", code)
     if code == _kb.KANBAN_OWNER_LOST_EXIT_CODE:
         return ("owner_lost", code)
+    if code == _kb.KANBAN_WORKER_LOST_EXIT_CODE:
+        return ("worker_lost", code)
     return ("nonzero_exit", code)
 
 
@@ -1124,6 +1126,10 @@ class _DeadWorker:
     owner_lost: bool = False
     """``KANBAN_OWNER_LOST_EXIT_CODE``: the submitter outlived its owner's silence budget. The
     owner was absent, not the work wrong — requeued WITHOUT counting a failure (OPS-15)."""
+    worker_lost: bool = False
+    """``KANBAN_WORKER_LOST_EXIT_CODE``: the owner lost the execution it admitted and no
+    ``worker_result`` exists (a host watchdog kill, an OOM, a manual kill). A platform loss, not
+    the card's fault — requeued WITHOUT counting a failure, run outcome ``interrupted`` (OPS-16)."""
 
     @property
     def run_outcome(self) -> str:
@@ -1135,7 +1141,9 @@ class _DeadWorker:
         if self.owner_lost:
             return "owner_lost"
         # A restart/shutdown interruption is an infrastructure requeue, not a card failure.
-        return "interrupted" if self.host_interrupted else "crashed"
+        # So is a lost execution: the platform dropped the attempt, the card did nothing wrong —
+        # the same ``interrupted`` a gateway restart books, so the card is not read as broken.
+        return "interrupted" if (self.host_interrupted or self.worker_lost) else "crashed"
 
 
 # The stop causes a gateway records on a turn it ended itself (``gateway.run``'s
@@ -1253,6 +1261,19 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
             owner_lost=True,
         )
+    if kind == "worker_lost":
+        # The owner lost the execution it admitted and no worker_result exists (OPS-16): a host
+        # watchdog kill, an OOM or a manual kill dropped the attempt mid-flight. The platform lost
+        # it — the card's work did not fail — so requeue without charging, and book the run as
+        # ``interrupted`` so the board reads a platform condition, not a broken card.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} lost its execution on the owner (exit {code}) — the platform dropped this "
+            "attempt with no recorded result; requeued without counting a failure",
+            "interrupted",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            worker_lost=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1344,7 +1365,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation or dead.host_interrupted or dead.owner_lost:
+            if dead.rate_limited or dead.protocol_violation or dead.host_interrupted or dead.owner_lost \
+                    or dead.worker_lost:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1376,7 +1398,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
-        if dead.host_interrupted or dead.owner_lost:
+        if dead.host_interrupted or dead.owner_lost or dead.worker_lost:
             continue  # a host-caused requeue is not evidence of a systemic card fault
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
@@ -1391,6 +1413,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         if dead.owner_lost:
             # The owner was silent past the submitter's budget (OPS-15): already requeued with
             # no failure counted, and an absent host is not evidence of a card fault.
+            continue
+        if dead.worker_lost:
+            # The platform lost the attempt's execution (OPS-16): already requeued with no failure
+            # counted. A dropped execution is an infrastructure condition, never a card fault.
             continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
