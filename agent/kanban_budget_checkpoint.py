@@ -316,8 +316,11 @@ def _archive_tree(
     if unchanged:
         return _ArchiveOutcome(unchanged, complete=True)
 
-    sizes = {rel: (root / rel).stat().st_size for rel in paths if (root / rel).is_file()}
-    total = sum(sizes.values())
+    try:
+        total = sum((root / rel).stat().st_size for rel in paths if (root / rel).is_file())
+    except OSError:
+        # A file vanished mid-walk: try again next turn rather than guessing the size.
+        return None
     if total > _ARCHIVE_MAX_BYTES:
         # Decided before opening a tarball: an unfinished write is what used to
         # land here, and its remains were indistinguishable from a real copy.
