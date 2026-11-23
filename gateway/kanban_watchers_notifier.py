@@ -564,11 +564,7 @@ class _Collector:
         if not self.owner_policy.covers(platform):
             return events, {}
         task_id = sub["task_id"]
-        artifacts = []
-        for ev in events:
-            raw = (getattr(ev, "payload", None) or {}).get("artifacts")
-            if isinstance(raw, (list, tuple)):
-                artifacts.extend(item for item in raw if isinstance(item, str))
+        task = self.kb.get_task(conn, task_id)
         open_ancestor = has_open_ancestor(conn, task_id)
         categories: dict = {}
         kept: list = []
@@ -576,9 +572,8 @@ class _Collector:
             category, reason = classify_kanban_event(
                 kind=ev.kind,
                 payload=getattr(ev, "payload", None),
-                task=self.kb.get_task(conn, task_id),
+                task=task,
                 has_open_ancestor=open_ancestor,
-                artifacts=artifacts,
                 extensions=self.owner_policy.artifact_extensions,
             )
             if category is None:
