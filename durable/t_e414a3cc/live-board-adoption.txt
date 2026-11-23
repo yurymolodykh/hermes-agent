@@ -1,0 +1,4 @@
+legacy events adopted: 2
+registry entries: 2
+   t_2c42e5ad /home/hermes/.hermes/kanban/workspaces/t_2c42e5ad | commits unreachable from any remote branch
+   t_af262aaf /home/hermes/.hermes/kanban/workspaces/t_af262aaf | commits unreachable from any remote branch

@@ -1,6 +1,25 @@
 # PROGRESS — t_e414a3cc: провенанс сохранённых scratch-каталогов (Д3)
 
-## Состояние: реализация + тесты готовы, широкий набор `tests/hermes_cli/` идёт.
+## Состояние: РАУНД 2 — оба дефекта ревью исправлены, доказательства сняты, коммит впереди.
+
+### Раунд 2 (после request_changes от 06:48)
+
+* **Д3.1** `kanban_preserved_workspaces.directory_is_gone()` — «нет каталога»
+  только при достоверном отрицании (`lstat`→ENOENT + листингуемый родитель);
+  `EACCES`/`EIO`/`ENOTDIR` на предке = «не знаю» → запись И событие живут.
+  Используется в `prune_gone()` и `adopt()`. Заголовок `gc` →
+  «Registered preserved scratch workspaces».
+* **Д3.2** `adopt(conn, task_id=None)` переносит legacy preserved-события в реестр;
+  вызывается из `kanban_db._register_preserved_workspaces()` перед
+  `delete_archived_task`/`delete_task` и из `_reap_preserved_workspaces()` в `gc`.
+* 3 новых теста (всего 9): нечитаемый родитель, hard-delete legacy-карточки,
+  adopt на первом `gc`.
+* Доказательства: `red-before-round2.txt` (3 failed на b2f959e8ffe),
+  `green-round2.txt` (89 passed), `live-smoke-round2.txt` (S1–S4),
+  `live-board-adoption.txt` (копия живой доски: adopted=2),
+  `wide-suite-round2.txt` (759 passed, 29 failed — те же 13 файлов, что на базе).
+
+### Раунд 1
 
 * Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc`
 * Ветка: `wt/t_e414a3cc`; база `c22f1fdcad3`; code-health база `3e1895729437`

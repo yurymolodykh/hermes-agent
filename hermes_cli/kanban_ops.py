@@ -438,7 +438,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
 
 def _reap_preserved_workspaces() -> list[dict]:
-    """Prune gone registry entries and return the ones still on disk (Д3/Д7)."""
+    """Adopt legacy events, prune reliably-gone entries, return the rest (Д3/Д7)."""
     from hermes_cli import kanban_preserved_workspaces as kpw
 
     try:

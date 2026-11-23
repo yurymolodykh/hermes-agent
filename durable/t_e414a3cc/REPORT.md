@@ -145,3 +145,87 @@ PY=/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933
 HERMES_PYTHON=$PY scripts/run_tests.sh tests/hermes_cli/test_kanban_preserved_provenance.py
 $PY -m scripts.code_health --base 3e1895729437
 ```
+
+---
+
+# Раунд 2 — исправление двух дефектов ревью round 1
+
+Ревьюер (комментарий 643, вложение `review-round1-t_e414a3cc.md`) принял
+четыре заявленных сценария, но нашёл два материальных дефекта в ядре
+требования «провенанс переживает и retention, и hard-delete». Оба исправлены.
+
+## Д3.1 — временный отказ stat больше не читается как «каталога нет»
+
+`prune_gone()` считал каталог исчезшим по `not Path(path).is_dir()`, а `is_dir()`
+даёт `False` и при недоступном родителе (отмонтированный том, `EACCES`, сбой
+NFS). Тогда удалялись запись реестра **и** освобождённое от ретенции событие —
+при живом каталоге на диске.
+
+Новый предикат `kanban_preserved_workspaces.directory_is_gone()` (источник
+истины один, используется и в `prune_gone`, и в `adopt`):
+
+* `os.lstat` → `FileNotFoundError` = кандидат на «нет»;
+* любой другой `OSError` (`EACCES`/`EIO`/`ENOTDIR` на предке) = «не знаю»,
+  запись и событие живут;
+* `lstat` успешен (каталог, файл, висячий симлинк) = «на месте»;
+* дополнительно листингуется родитель: путь, которого нет в нечитаемом
+  родителе, — тоже «не знаю».
+
+Это то же правило, что уже принято в Д1+Д2: нечитаемое = «не знаю», а не «чисто».
+Заголовок вывода `gc` сменён на «Registered preserved scratch workspaces» —
+запись с нечитаемым родителем печатается, и утверждать «на диске» было бы догадкой.
+
+## Д3.2 — каталоги, сохранённые до обновления, переживают hard-delete
+
+`record()` вызывался только из `_preserve_scratch_workspace`, поэтому у карточек,
+сохранённых до реестра, единственный указатель — событие, а `delete_archived_task`
+его стирал.
+
+Новый `kanban_preserved_workspaces.adopt(conn, task_id=None)` переносит
+preserved-события в реестр (переиспользует `record()`, идемпотентно по
+`(task, path)`) и вызывается в двух точках:
+
+* `_register_preserved_workspaces()` в `delete_archived_task` **и** `delete_task` —
+  до удаления строк задачи, чтобы hard-delete физически не мог стереть указатель;
+  ошибка bookkeeping'а не блокирует удаление (каталог на диске, событие ещё есть);
+* `kanban_ops._reap_preserved_workspaces()` — первым шагом `gc`, чтобы
+  существующая доска мигрировала на первом прогоне, не дожидаясь удаления.
+
+## Проверено на живой доске (read-only копия)
+
+`live-board-adoption.txt` — копия `/home/hermes/.hermes/kanban.db` (backup API,
+10.6 МБ), прогон только шага adopt: `adopted=2`, реестр создан с обеими
+записями — ровно те две карточки (`t_af262aaf` archived, `t_2c42e5ad` done),
+которые ревьюер нашёл вручную. Сам `gc` на копии не запускался: он делает
+`rmtree` по путям в `/home/hermes/.hermes/kanban/workspaces/`, то есть удалял
+бы реальные каталоги живой установки.
+
+## Доказательства раунда 2
+
+* `red-before-round2.txt` — **3 failed, 6 passed** на чистом `git archive
+  b2f959e8ffe` + новый тест-файл (каждый новый тест красный по своему дефекту).
+* `green-round2.txt` — 4 файла (`preserved_provenance`, `gc_retention`,
+  `scratch_unsaved_work`, `db`): **89 passed, 0 failed, 1 skipped**.
+* `live-smoke-round2.txt` — живой прогон на изолированном `HERMES_HOME`:
+  * S1 legacy-событие → hard-delete → `registry entries: 1`, событий 0,
+    каталог на диске, `gc` печатает путь;
+  * S2 legacy-событие на done-карточке → `gc` записал его в реестр;
+  * S3 нечитаемый родитель → `entries=3 events=1` до и после, файл цел;
+    родитель снова читаем → запись жива, не зачищена;
+  * S4 оператор удалил каталог → `entries=2 events=0` (запись и событие забыты).
+* `wide-suite-round2.txt` — 104 файла, 759 passed, 29 failed, 4 skipped;
+  13 файлов с падениями — **тот же самый набор**, что на базе (`new in round2: []`,
+  сравнение списком файлов, а не на глаз). Причина — `tests/home_io_guard.py`
+  на путях `<worktree>/.git/worktrees/...` и отсутствие user-D-Bus; сохраняется
+  как `manual_review`.
+* ruff — `All checks passed!`; `code_health --base 3e1895729437` — 0 blocking / 0 advisory.
+
+## Новые тесты (раунд 2, 3 шт.)
+
+* `test_unreadable_parent_keeps_registry_entry_and_event` — `chmod 0o000` на
+  родителе: прогон `gc` не теряет ни запись, ни событие; после возврата прав
+  запись снова «живая».
+* `test_hard_delete_adopts_a_pre_registry_preserved_event` — legacy-событие,
+  `delete_archived_task`, затем `gc` называет путь.
+* `test_gc_adopts_a_pre_registry_preserved_event` — существующая доска
+  мигрирует на первом же `gc`.
