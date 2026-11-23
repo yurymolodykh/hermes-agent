@@ -332,7 +332,7 @@ def test_concurrent_acquire_release_never_raises_and_leaks_no_descriptors(seeded
                     continue
                 hits["n"] += 1
                 pool.release(key, db, identity)
-        except BaseException as exc:  # noqa: BLE001 - the assertion below reports it
+        except BaseException as exc:  # reported by the assertion below
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(keys[i % len(keys)],), daemon=True)
