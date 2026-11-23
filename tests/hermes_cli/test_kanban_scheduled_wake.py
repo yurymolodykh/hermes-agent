@@ -305,3 +305,76 @@ def test_dispatch_tick_wakes_and_spawns_in_the_same_pass(kanban_home, monkeypatc
     assert _row(conn, tid)["status"] in ("ready", "running")
     # Spawn may be refused by an environment guard; the WAKE itself must have landed.
     assert _row(conn, tid)["scheduled_until"] is None
+
+
+# ---------------------------------------------------------------------------
+# Migration: an old board gains the column without losing or changing a row
+# ---------------------------------------------------------------------------
+
+
+def _rows_digest(conn, table: str, columns: list[str]) -> str:
+    """sha256 over every row of ``table`` projected onto ``columns`` (ordered by id)."""
+    import hashlib
+    import json as _json
+
+    rows = conn.execute(
+        f"SELECT {', '.join(columns)} FROM {table} ORDER BY id"
+    ).fetchall()
+    payload = _json.dumps([tuple(r) for r in rows], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_migration_adds_scheduled_until_without_touching_rows(kanban_home):
+    """Criterion 1(е): migrating a pre-column board is loss-free (sha256 before/after)."""
+    from hermes_cli import kanban_db_connect as kbc2
+
+    path = kb.kanban_db_path()
+    with kbc.connect() as conn:
+        ids = [
+            kb.create_task(conn, title=f"legacy {i}", assignee="a", created_by="test")
+            for i in range(3)
+        ]
+        kb.schedule_task(conn, ids[0], reason="parked long ago")  # no deadline at all
+        kb.add_comment(conn, ids[0], "operator", "SCHEDULED_UNTIL=2027-01-15T09:00:00+03:00")
+        other = kb.create_task(conn, title="todo card", assignee="b", created_by="test")
+
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)") if r["name"] != "scheduled_until"]
+        before = _rows_digest(conn, "tasks", cols)
+        statuses_before = {
+            r["id"]: r["status"] for r in conn.execute("SELECT id, status FROM tasks")
+        }
+        events_before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+        comments_before = conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0]
+
+    # Simulate a board created before the column existed: drop it, and drop the
+    # process cache so the next connect() runs the ALTER pass instead of the fast path.
+    conn = kbc2.connect(path)
+    try:
+        conn.execute("ALTER TABLE tasks DROP COLUMN scheduled_until")
+        conn.commit()
+        assert "scheduled_until" not in {
+            r["name"] for r in conn.execute("PRAGMA table_info(tasks)")
+        }, "the fixture board must really look pre-migration"
+    finally:
+        conn.close()
+    kbc2._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with kbc.connect() as conn:
+        names = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert "scheduled_until" in names, "the migration must add the column"
+        assert _rows_digest(conn, "tasks", cols) == before, "existing rows must not change"
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events_before
+        assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == comments_before
+        # No card gains a deadline from the migration alone.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE scheduled_until IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert kb.get_task(conn, ids[0]).scheduled_until is None
+        assert kb.get_task(conn, other).status == statuses_before[other]
+        # The legacy marker still resolves, so the parked legacy card keeps its date.
+        epoch = kbsch.resolve_deadline(conn, ids[0])
+        assert epoch is not None and kbsch.format_local(epoch).startswith("2027-01-15 09:00")
+
+    # Second connect must be a no-op (idempotent migration).
+    with kbc.connect() as conn:
+        assert _rows_digest(conn, "tasks", cols) == before
