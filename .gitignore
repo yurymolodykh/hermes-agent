@@ -344,3 +344,5 @@ apps/desktop/.dist-build*
 /evidence-*/
 /PROGRESS-*.md
 /REPORT-*.md
+
+/PROGRESS.md
