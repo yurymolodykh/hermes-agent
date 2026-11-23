@@ -56,13 +56,14 @@ def home(tmp_path, monkeypatch):
     return root
 
 
-def _args(login, *, telegram_id="", password=None, action="add", yes=True):
+def _args(login, *, telegram_id="", password=None, action="add", yes=True, adopt=False):
     """The argparse namespace ``cmd_user_add``/``cmd_user_list`` receive."""
     from types import SimpleNamespace
 
     return SimpleNamespace(
         login=login, telegram_id=telegram_id, display_name="", role="user",
         password_stdin=False, no_skills=True, json=False, user_action=action, yes=yes,
+        adopt_existing_account=adopt,
     )
 
 
@@ -271,3 +272,64 @@ def test_remove_takes_the_route_binding_record_and_profile(home):
 def test_remove_of_a_missing_user_is_refused(home):
     with pytest.raises(ua.Refused):
         ua.remove_user("nobody-here")
+
+
+# ---------------------------------------------------------------------------
+# adopting an account that already signs in
+# ---------------------------------------------------------------------------
+
+
+def _write_existing_account(home, login, *, password="old-password", telegram_id="", gen=7):
+    """A dashboard account that predates its profile — the usual state after a rollout."""
+    from hermes_cli import dashboard_users as du
+
+    store = du.UserStore(home / "users.jsonl")
+    store.upsert_record(du.UserRecord(
+        login=login,
+        password_hash=du.hash_password(password),
+        display_name=login,
+        telegram_id=telegram_id,
+        gen=gen,
+        created_at="2026-01-01T00:00:00+00:00",
+    ))
+    return store
+
+
+def test_adoption_creates_the_profile_and_keeps_the_sign_in_credential(home, capsys):
+    from hermes_cli import dashboard_users as du
+
+    store = _write_existing_account(home, "demo9", password="old-password", gen=7)
+    before = store.get("demo9")
+    assert before is not None
+
+    assert ua.cmd_user_add(_args("demo9", telegram_id="555900111", adopt=True,
+                                 password=None)) == 0
+
+    after = du.UserStore(home / "users.jsonl").get("demo9")
+    assert after is not None
+    assert after.password_hash == before.password_hash, "the password people sign in with must not change"
+    assert after.gen == before.gen, "a new generation would invalidate their live session"
+    assert after.telegram_id == "555900111", "the Telegram stamp is what the route is written from"
+    assert after.created_at == before.created_at
+    assert (home / "profiles" / "01-demo9" / "SOUL.md").is_file()
+    assert (home / "acl" / "profile-bindings.json").is_file()
+    assert _routes()[0]["user_id"] == "555900111"
+    captured = capsys.readouterr()
+    assert "unchanged" in captured.out, "the owner must see that no new password was made"
+    assert "kept the existing credential" in captured.err
+
+
+def test_adoption_without_the_flag_is_still_a_refusal(home):
+    _write_existing_account(home, "demo10")
+    with pytest.raises(ua.Refused) as excinfo:
+        ua.add_user("demo10", adopt=False)
+    assert "already exists" in str(excinfo.value)
+    assert "already exists" in str(excinfo.value)
+    assert not (home / "profiles" / "01-demo10").exists()
+
+
+def test_adoption_still_refuses_an_unknown_account(home):
+    """Adoption fills in a missing profile; it does not invent people."""
+    result = ua.add_user("demo11", password="fresh-password", adopt=True)
+    assert result["password_file"] is not None
+    assert (home / "profiles" / "01-demo11" / "SOUL.md").is_file()

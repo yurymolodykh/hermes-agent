@@ -28,6 +28,7 @@ import secrets
 import stat
 import string
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -319,6 +320,7 @@ def add_user(
     role: str = "user",
     password: Optional[str] = None,
     no_skills: bool = False,
+    adopt: bool = False,
     say: Callable[[str], None] = _out,
 ) -> dict[str, Any]:
     """Provision one user completely. Raises :class:`Refused` or :class:`Failed`."""
@@ -328,7 +330,7 @@ def add_user(
     telegram_id = str(telegram_id or "").strip()
     display = (display_name or "").strip() or login
 
-    profile = _preflight(login, telegram_id)  # Refused → nothing written yet
+    profile = _preflight(login, telegram_id, adopt=adopt)  # Refused → nothing written yet
 
     undo: list[tuple[str, Callable[[], Any]]] = []
     created_profile = False
@@ -395,27 +397,29 @@ def add_user(
         # refused in the preflight) there is nothing to keep.
         existing = None
         if adopt:
-            load = du.load_users_file(users_path) if users_path else None
-            if load is not None and load.ok:
+            load = du.load_users_file(users_path)
+            if load.ok:
                 existing = du.lookup(load.users, login)
 
+        secret: Optional[str] = None
+        password_path: Optional[Path] = None
         if existing is not None and password is None:
-            secret = None
-            password_path = None
             _err(f"kept the existing credential for {login} (generation {existing.gen})")
         else:
             secret = password if password is not None else generate_password()
-            password_path, undo_password = write_password_file(login, secret)
-            undo.append((f"password file {password_path.name}", undo_password))
+            written, undo_password = write_password_file(login, secret)
+            password_path = written
+            undo.append((f"password file {written.name}", undo_password))
 
         users_store = du.UserStore(users_path)
         if existing is not None:
-            record = replace(  # type: ignore[type-var]  # dataclasses.replace on a frozen record
+            record = replace(
                 existing,
                 display_name=display or existing.display_name,
                 telegram_id=existing.telegram_id or telegram_id,
             )
         else:
+            assert secret is not None  # set above whenever there was no record to keep
             record = du.UserRecord(
                 login=login,
                 password_hash=du.hash_password(secret),
@@ -469,8 +473,10 @@ def add_user(
         "subjects": subjects,
         "telegram_id": telegram_id,
         "users_file": str(users_path),
-        "password_file": str(password_path),
-        "password_prefix": secret[:PASSWORD_PREFIX_CHARS],
+        "password_file": str(password_path) if password_path else None,
+        # None when an adopted account kept the password it already had: there is no
+        # new secret to print a prefix of.
+        "password_prefix": secret[:PASSWORD_PREFIX_CHARS] if secret else None,
         "route": _route_for_profile(login),
     }
 
@@ -607,6 +613,10 @@ def build_user_parser(subparsers) -> None:
                        help="Read the password from stdin instead of generating one")
     p_add.add_argument("--no-skills", action="store_true",
                        help="Do not seed bundled skills into the new profile")
+    p_add.add_argument("--adopt-existing-account", action="store_true",
+                       help="The sign-in record already exists (e.g. people who already use the "
+                            "dashboard): create the profile and keep their password and generation "
+                            "exactly as they are, instead of refusing the duplicate login")
     p_add.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     p_add.set_defaults(func=cmd_user_add)
 
@@ -642,6 +652,7 @@ def cmd_user_add(args) -> int:
             role=args.role,
             password=password,
             no_skills=getattr(args, "no_skills", False),
+            adopt=getattr(args, "adopt_existing_account", False),
         )
     except Refused as exc:
         _err(f"refused: {exc}")
@@ -658,9 +669,12 @@ def cmd_user_add(args) -> int:
     _out(f"  binding:        {result['slug']}"
          + (f"  subjects={', '.join(result['subjects'])}" if result["subjects"] else ""))
     _out(f"  users file:     {result['users_file']}")
-    _out(f"  password file:  {result['password_file']}  (mode 0600)")
-    _out(f"  password:       {result['password_prefix']}…  (first {PASSWORD_PREFIX_CHARS} "
-         "characters; the full password is in the file above)")
+    if result["password_file"]:
+        _out(f"  password file:  {result['password_file']}  (mode 0600)")
+        _out(f"  password:       {result['password_prefix']}…  (first {PASSWORD_PREFIX_CHARS} "
+             "characters; the full password is in the file above)")
+    else:
+        _out("  password:       unchanged — the existing sign-in credential was kept")
     route = result["route"]
     if route:
         _out(f"  telegram route: platform={route['platform']} user_id={route['user_id']} "
