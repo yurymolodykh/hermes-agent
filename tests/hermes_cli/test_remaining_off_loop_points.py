@@ -301,3 +301,65 @@ def test_action_status_tails_inline_when_the_switch_is_off(monkeypatch, tmp_path
 
     _run(actions_router.get_action_status("gateway-restart"))
     assert seen == [loop_thread], "switch off must tail inline, as before the change"
+
+
+# ── observability: every one of the five points lands in the /api/status counters ──
+
+
+@pytest.mark.parametrize(
+    "point", ["transcribe", "speak", "proxy_media", "fs_read_data_url", "action_status"]
+)
+def test_each_point_is_counted_by_the_seam(monkeypatch, tmp_path, point):
+    """§2.4: the switch's ``submitted`` counter must grow for every new call site."""
+    from hermes_cli.web_routers import actions as actions_router
+    from hermes_cli.web_routers import audio as audio_router
+    from hermes_cli.web_routers import files as files_router
+
+    _arm(monkeypatch, True)
+    before = ho.HANDLER_OFFLOAD.snapshot()["submitted"]
+
+    async def _fake_scoped(profile, fn):
+        if point == "transcribe":
+            return {"success": True, "transcript": "hi", "provider": "p"}
+        clip = tmp_path / "clip.mp3"
+        clip.write_bytes(b"\x00" * 16)
+        return json.dumps({"success": True, "file_path": str(clip), "provider": "p"})
+
+    monkeypatch.setattr(audio_router, "_run_config_scoped", _fake_scoped)
+
+    if point == "transcribe":
+        audio_router_mod = audio_router
+
+        def _stage(encoded, suffix):
+            staged = tmp_path / "voice.webm"
+            staged.write_bytes(b"x")
+            return str(staged)
+
+        monkeypatch.setattr(audio_router_mod, "_decode_and_stage", _stage)
+        payload = audio_router_mod.AudioTranscriptionRequest(
+            data_url="data:audio/webm;base64,AAAA", mime_type="audio/webm"
+        )
+        _run(audio_router_mod.transcribe_audio_upload(payload))
+    elif point == "speak":
+        _run(audio_router.speak_text(audio_router.TTSSpeakRequest(text="hi")))
+    elif point == "proxy_media":
+        monkeypatch.setattr(files_router, "_require_token", lambda request: None, raising=False)
+        _fake_http_client(monkeypatch, b"\x89PNG\r\n\x1a\n" + b"0" * 8, "image/png")
+        _run(files_router.proxy_remote_media("https://v3.fal.media/media/abc123", None))
+    elif point == "fs_read_data_url":
+        class _Backend:
+            def read_bytes(self, path, max_bytes=None):
+                return b"remote-bytes", 12, "/srv/ssh/chart.png"
+
+        async def _no_session(session_id, profile):
+            return None
+
+        monkeypatch.setattr(files_router, "_fs_owned_session", _no_session)
+        monkeypatch.setattr(files_router, "_remote_fs_backend", lambda path, profile: _Backend())
+        _run(files_router.fs_read_data_url("/srv/ssh/chart.png", None))
+    else:
+        monkeypatch.setattr(actions_router, "_server_path", lambda name: tmp_path)
+        monkeypatch.setattr(actions_router, "_tail_lines", lambda path, n: ["line"])
+        _run(actions_router.get_action_status("gateway-restart"))
+
+    assert ho.HANDLER_OFFLOAD.snapshot()["submitted"] > before, f"{point} bypassed the seam"
