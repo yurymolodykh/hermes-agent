@@ -441,6 +441,11 @@ def _reap_preserved_workspaces() -> list[dict]:
 
     try:
         with kbc.connect_closing() as conn:
+            # Cards preserved before the registry existed keep their pointer in
+            # `task_events` only; adopt first so a sweep never reports a
+            # half-migrated board (and so retention's retained event has a
+            # registry twin).
+            kpw.adopt(conn)
             kpw.prune_gone(conn)
             return kpw.entries(conn)
     except (sqlite3.Error, OSError, ValueError, KeyError) as exc:

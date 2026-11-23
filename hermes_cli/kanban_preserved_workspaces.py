@@ -226,6 +226,73 @@ def _forget_events(conn: sqlite3.Connection, task_id: str, path: str) -> None:
     )
 
 
+def directory_is_gone(path: str) -> bool:
+    """True only on a *reliable* negative: the path is absent and its parent lists.
+
+    ``Path.is_dir()`` is also ``False`` for a transient stat failure — an
+    unmounted volume, ``EACCES`` on an ancestor, an NFS hiccup — so reading it
+    as "gone" deletes the registry line AND the retained event while the
+    directory is still on disk. That is the one outcome the registry exists to
+    prevent, so the rule here is the same one the unsaved-work scan already
+    uses: unreadable means "cannot tell", never "clean".
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False  # EACCES / EIO / ENOTDIR on an ancestor: cannot tell
+    else:
+        return False  # present as a dir, a file, or even a dangling symlink
+    parent = os.path.dirname(path.rstrip("/\\")) or "."
+    try:
+        with os.scandir(parent):
+            return True
+    except OSError:
+        return False  # absent from a parent we cannot list is still "cannot tell"
+
+
+def adopt(conn: sqlite3.Connection, task_id: Optional[str] = None) -> int:
+    """Copy preserved *events* into the registry; returns how many were seen.
+
+    Cards preserved before the registry existed carry their provenance only in
+    ``task_events``, and a hard delete wipes exactly that. Calling this before
+    the task rows go means ``delete_archived_task`` can never be the step that
+    erases the last pointer to a directory still on disk; ``gc`` calls it too,
+    so an existing board migrates on the next sweep. Idempotent: ``record``
+    upserts per (task, path) and appends no duplicate event.
+    """
+    sql = "SELECT task_id, payload FROM task_events WHERE kind = ?"
+    params: list[object] = [PRESERVED_KIND]
+    if task_id is not None:
+        sql += " AND task_id = ?"
+        params.append(task_id)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        return 0
+    adopted = 0
+    for row in rows:
+        try:
+            payload = json.loads(row[1] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not payload.get("path"):
+            continue
+        path = str(payload["path"])
+        if directory_is_gone(path):
+            continue
+        record(
+            conn,
+            str(row[0]),
+            path,
+            payload.get("repo") or path,
+            payload.get("reason") or "preserved scratch workspace",
+        )
+        adopted += 1
+    return adopted
+
+
 def _payload_path(payload) -> str:
     try:
         parsed = json.loads(payload or "{}")
@@ -235,22 +302,25 @@ def _payload_path(payload) -> str:
 
 
 def prune_gone(conn: sqlite3.Connection) -> list[dict]:
-    """Drop entries whose directory no longer exists; returns what went.
+    """Drop entries whose directory is *reliably* gone; returns what went.
 
     The directory is the only thing worth keeping a line for, so an entry the
     operator already removed (recovered by hand, exactly what the docs ask)
-    disappears together with the event retention now has to spare.
+    disappears together with the event retention now has to spare. "Gone" is
+    :func:`directory_is_gone` — a path we merely cannot stat (unmounted volume,
+    unreadable ancestor) keeps its line and its event, because deleting them
+    would strand a live directory with no provenance at all.
     """
     registry = registry_path(conn)
     if registry is None:
         return []
     with _registry_lock(registry) as locked:
         current = _read(registry)
-        gone = [e for e in current if not Path(e["path"]).is_dir()]
+        gone = [e for e in current if directory_is_gone(e["path"])]
         if not gone:
             return []
         if locked:
-            keep = [e for e in current if Path(e["path"]).is_dir()]
+            keep = [e for e in current if not directory_is_gone(e["path"])]
             with contextlib.suppress(OSError):
                 _write(registry, keep)
         elif not registry.exists():

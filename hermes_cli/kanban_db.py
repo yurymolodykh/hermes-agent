@@ -3973,9 +3973,32 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
+def _register_preserved_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
+    """Move this task's preserved events into the durable registry before a delete.
+
+    A hard delete wipes ``task_events``; for a card preserved before the
+    registry existed that row is the ONLY pointer to a directory that stays on
+    disk. Registering first means the delete can never be the step that erases
+    the last provenance (verdict t_896b6548, Д3). Idempotent and a no-op for a
+    task with no preserved event.
+    """
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    try:
+        kpw.adopt(conn, task_id)
+    except (sqlite3.Error, OSError) as exc:
+        # Never block a delete on the bookkeeping: the directory is still on
+        # disk and the next ``gc`` re-adopts from the (still present) event.
+        _log.warning(
+            "Could not register preserved workspaces for task %s before delete: %s",
+            task_id, exc,
+        )
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
+    _register_preserved_workspaces(conn, task_id)
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
@@ -3986,6 +4009,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
+    _register_preserved_workspaces(conn, task_id)
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:

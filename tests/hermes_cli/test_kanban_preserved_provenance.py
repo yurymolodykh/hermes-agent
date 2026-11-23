@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -229,3 +230,130 @@ def test_registry_survives_a_board_scoped_round_trip(kanban_home):
     assert [entry["path"] for entry in payload] == [str(ws)]
     assert ws.is_dir()
     assert time.time() > 0  # keep the module's clock import honest
+
+
+# ---------------------------------------------------------------------------
+# Д3.1 — an unreadable path is "cannot tell", never "gone"
+# ---------------------------------------------------------------------------
+
+_not_root = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root can read a 0o000 directory"
+)
+
+
+@_not_root
+def test_unreadable_parent_keeps_registry_entry_and_event(kanban_home, capsys):
+    """A stat we cannot complete must not delete the only pointer.
+
+    ``Path.is_dir()`` is False for an unmounted volume or an unreadable
+    ancestor just as it is for a deleted directory. Reaping on that reading
+    drops the registry line AND the retention-exempt event while the directory
+    is still on disk — the guard would strand exactly what it preserved.
+    """
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    with kbc.connect_closing() as conn:
+        task_id, ws = _ws_with_unpushed_repo(conn)
+        assert kb.complete_task(conn, task_id, result="done")
+        assert kb.archive_task(conn, task_id)
+        registry = kpw.registry_path(conn)
+        assert [e["path"] for e in kpw.entries(conn)] == [str(ws)]
+
+    parent = ws.parent
+    parent.chmod(0o000)
+    try:
+        assert _gc() == 0
+        out = capsys.readouterr().out
+        assert str(ws) not in out, "cannot be reported as live either — it is unknown"
+    finally:
+        parent.chmod(0o755)
+
+    with kbc.connect_closing() as conn:
+        assert [e["path"] for e in kpw.entries(conn)] == [str(ws)], (
+            "an unreadable parent was read as a deleted directory"
+        )
+        assert _events(conn, task_id), "the retained event was reaped with it"
+    assert registry is not None and registry.exists()
+    assert (ws / "clone" / "work.txt").exists()
+
+    # And once it is readable again the entry is live, not reaped.
+    assert _gc() == 0
+    assert str(ws) in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Д3.2 — a card preserved BEFORE the registry existed still survives a delete
+# ---------------------------------------------------------------------------
+
+
+def _legacy_preserved_event(conn, task_id: str, path: Path) -> None:
+    """Exactly what the pre-registry code wrote: one event, no registry row."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+            " VALUES (?, NULL, ?, ?, 0)",
+            (task_id, PRESERVED_EVENT,
+             json.dumps({"path": str(path), "repo": str(path), "reason": "pre-upgrade"})),
+        )
+
+
+def test_hard_delete_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
+    """A legacy card's event is the only pointer — the delete must migrate it first."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="legacy preserved")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        ws = Path(kbw.resolve_workspace(task))
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "only-copy.txt").write_text("the only copy\n", encoding="utf-8")
+        _legacy_preserved_event(conn, task_id, ws)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (task_id,))
+        reg = kpw_registry(conn)
+        assert reg is not None and not reg.exists(), "precondition: no registry row yet"
+
+        assert kb.delete_archived_task(conn, task_id) is True
+
+        assert kb.get_task(conn, task_id) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 0, "precondition: the event itself is gone"
+        assert ws.is_dir()
+
+    assert _gc() == 0
+    out = capsys.readouterr().out
+    assert str(ws) in out, (
+        "a card preserved before the registry lost its last pointer on delete: "
+        f"{out}"
+    )
+
+
+def test_gc_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
+    """An existing board migrates on the first sweep, without waiting for a delete."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="legacy done")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        ws = Path(kbw.resolve_workspace(task))
+        ws.mkdir(parents=True, exist_ok=True)
+        _legacy_preserved_event(conn, task_id, ws)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+
+    assert _gc() == 0
+    out = capsys.readouterr().out
+    assert str(ws) in out, f"gc never adopted the legacy event:\n{out}"
+    with kbc.connect_closing() as conn:
+        assert [e["path"] for e in kpw_entries(conn)] == [str(ws)]
+
+
+def kpw_registry(conn):
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    return kpw.registry_path(conn)
+
+
+def kpw_entries(conn):
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    return kpw.entries(conn)
