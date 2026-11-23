@@ -196,6 +196,27 @@ def main() -> int:
                  "verdict": "оффлоад" if unlink8_stats["p50_ms"] >= P50_MS else "в цикле", **unlink8_stats})
     add("Path.unlink(missing_ok) нет файла", "ops.py:685, files.py:1142/1145",
         "уборка после ошибки", lambda: (work / "nope").unlink(missing_ok=True), 200)
+    # local_models.py:803 — файл модели может быть сотни МиБ; верхняя граница 1 ГиБ.
+    # Отдельный замер: unlink свежезаписанного файла ждёт грязных страниц, это и есть худший случай.
+    def unlink_1gib() -> None:
+        with open(work / "big.gguf", "wb") as fh:
+            for _ in range(16):
+                fh.write(chunk64)
+        t0 = time.perf_counter()
+        (work / "big.gguf").unlink()
+        big_samples.append((time.perf_counter() - t0) * 1000.0)
+
+    chunk64 = b"x" * (64 << 20)
+    big_samples: list[float] = []
+    for _ in range(3):
+        unlink_1gib()
+    big_sorted = sorted(big_samples)
+    big_stats = {"p50_ms": round(statistics.median(big_sorted), 4),
+                 "p95_ms": round(big_sorted[-1], 4), "max_ms": round(big_sorted[-1], 4),
+                 "n": len(big_sorted)}
+    rows.append({"op": "Path.unlink 1 ГиБ (свежие данные)", "locator": "local_models.py:803",
+                 "note": "верхняя граница файла модели", "size_driven": True,
+                 "verdict": "оффлоад (размер)", **big_stats})
     # local_models.py:1041 local_models_sideload
     add("os.link", "local_models.py:1052", "хардлинк модели",
         lambda: (os.link(gguf, work / "l.gguf") or (work / "l.gguf").unlink()), 50)
