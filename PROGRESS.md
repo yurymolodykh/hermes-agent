@@ -1,101 +1,99 @@
-# PROGRESS — t_77d98767 (кэши пер-запросной обвязки)
+# PROGRESS — t_6c16a6cb (вынос блокирующих обработчиков из цикла событий)
 
-**Состояние: ФАЗА 1 (замеры и разбор) закрыта. Правок продуктового кода НЕТ.** Прогон остановлен
-по бюджету времени до первой правки. Дальше — только шаги 1–4 ниже, они расписаны до строчки.
+**Состояние: исполнение сделано, дефекты выноса найдены и закрыты, тесты прогнаны, REPORT.md
+написан. Осталось: повтор прогона `probe_sqlite_threads.py` и `scripts/iso-certify.py`
+(не поместились в бюджет), публикация — гейт оркестратора.**
 
-## Что уже сделано и где лежит
+Отчёт с таблицами до/после, списком тестов и процедурой отката:
+`durable/t_a61becbc/REPORT.md`.
 
-Дерево карточки: `/home/hermes/.hermes/hermes-agent/.worktrees/t_77d98767` (ветка `wt/t_77d98767`).
-База сравнения (merge-base, `1456950ab7d`), распакована из `git archive` — **git-каталога нет**,
-поэтому `BASE_TREE`-стенды заводятся этим путём:
+## Шов
 
+`hermes_cli/web_routers/handler_offload.py` — `HANDLER_OFFLOAD.install(app, workers=None)` /
+`.shutdown()` / `.reset()` / `.resolve()`, `off_loop()`, `offload_status()`.
+Приватный `ThreadPoolExecutor` (2×CPU, floor 8, cap 32), `contextvars.copy_context()` в воркер.
+Выключатель: `dashboard.handler_offload: false` **или** `HERMES_HANDLER_OFFLOAD=0` → inline
+на цикле (прежнее поведение, без правки файлов). Режим логируется однократно при старте и
+отдаётся в `/api/status` → `handler_offload: {mode, enabled, workers, submitted, inline,
+in_flight, queue_depth, max_queue_depth, avg_wait_ms}`.
+
+## Переведено off-loop (29 из 37 аудита; 8 остальных — осознанно)
+
+files.py (`fs_write_text`, `upload_managed_file_stream`, `fs_git_root`, `get_media`),
+ops.py (backup / download-backup / import), local_models.py (delete / sideload),
+profiles.py (open-terminal, import, is_file), status.py (`get_logs`), dashboard_ui.py
+(`serve_plugin_asset`), chat_ws.py (`_pty_channel_marker_state`).
+
+Не переведён `messaging.py:start_whatsapp_onboarding` — перевод ломал 21 тест
+`test_whatsapp_dashboard_repair` (парный поток создаётся в контексте запроса); путь разовый (QR),
+причина записана комментарием в файле. Остальные 5 — не блокировки (`sleep` в ожидающих петлях,
+`await asyncio.sleep(0)`, `wait` на сокете, и ложное срабатывание AST-аудита `str.replace`).
+
+## Дефекты, которые породил сам вынос (исправлены, доказаны красными)
+
+1. **Гонка стейджа в `files.py:_fs_write_text_blocking`.** Имя `.<name>.hermes-tmp-<pid>`
+   постоянно для процесса; в пуле два сейва одного файла берут ОДИН путь → второй падает ENOENT
+   и в `except` удаляет файл победителя. Замер: 8 одновременных 8-МиБ сейвов — **6 из 8 по 500**;
+   доказательство `.probe-tmp/proof_concurrent_save.py` (`ok=2 failed=6`). Фикс: `token_hex(6)`.
+   Тест `tests/hermes_cli/test_fs_write_text_offload.py`.
+2. **Счётчики пула отдавались из TTL-кэша `/api/status`** (TTL 1,5 с) — при всплеске 64
+   запросов отдавалось `max_queue_depth: 0`, хотя очередь была. Фикс: поле подмешивается после
+   кэша. Тест `tests/hermes_cli/test_status_offload_live.py`; красное доказательство
+   `.probe-tmp/proof_status_cache.py` (`2 failed`).
+
+## Тесты
+
+Раннер: `HERMES_PYTHON=/home/hermes/.hermes/hermes-agent/.venv/bin/python HOME=/tmp/t6c
+scripts/run_tests.sh …` (иначе `run-in-hermes-env` ищет bootstrap-Python и падает).
+
+- 19 файлов: **351 passed, 1 failed, 11 skipped**. Провал — `test_status_probe_off_loop`
+  («async def functions are not natively supported»), **тот же провал на базе** `dde0f0befbc`.
+- Пред-существующие провалы подтверждены прогоном в `.probe-tmp/base-tree` (detached
+  `dde0f0befbc`): `test_serve_handler_ledger` 1 failed, `test_webapp_uploads` 1 failed,
+  `test_webapp_upload_security` 2 errors — ровно те же на базе.
+- Новые этой карточкой: `test_handler_offload.py` (11), `test_fs_write_text_offload.py` (1),
+  `test_status_offload_live.py` (2).
+
+## Замеры (файлы в `durable/t_a61becbc/`)
+
+- `probe_handler_lag.py` — прямой замер предмета: max разрыв цикла inline **110,9 / 795,7 мс**
+  против threaded **78,8 / 38,6 мс**; в inline тикер просыпается ОДИН раз за всплеск.
+- `probe_pool.py` — 64 запроса на пул из 16: 64×200, `max_queue_depth=24`, очередь работает,
+  таймаутов нет.
+- `probe_blocking_write.py` — A/B 8 МиБ×8: threaded 8×200, inline 8×200; остаток лага ~140 мс —
+  разбор JSON-тела на цикле, не вынесенное тело.
+- `ab_offload.py` + `ab-curve.json` / `ab-loop.json` — A/B с переключением выключателя, 2 повтора.
+  **Выигрыша в латентности на sessions/search нет** (разброс повторов больше разницы режимов):
+  эти маршруты уже читают БД через `to_thread`. Лаг цикла был мал и до правки (0 превышений
+  50 мс в обоих режимах).
+- `curve-after.json` / `after.json` сняты, но с `curve-before.json` **несравнимы**: разное время,
+  разная посторонняя нагрузка (load average 3,2–4,6 на 8 ядрах). Сравнивать надо по `ab-*.json`.
+
+## Осталось (не выполнено, честно)
+
+1. Сценарий (в) `scripts/iso-certify.py --duration-s 120` не прогонялся — бюджет исчерпан.
+   Вместо него: `probe_handler_lag.py` (прямой замер удержания цикла) и `bench_loop` с монитором
+   лага в процессе сервера.
+2. Публикация — гейт оркестратора; выкатка/рестарт — за оркестратором.
+
+## Проверено (было в списке остатков, закрыто)
+
+- `probe_sqlite_threads.py` прогнан: SQLite не пересекает потоки. 200 сессий × 12 сообщений, по 8
+  одновременных на `sessions`/`messages`/`search` через воркеры — **все 200, ни одного 5xx**
+  (`ProgrammingError: created in a thread` дал бы 500). Оговорка: сервер поднят с
+  `log_config=None`, поэтому скан маркеров по логу (`sqlite_thread_error: false`, `log_lines: 1`)
+  сам по себе пуст; вывод держится на кодах ответов.
+- `probe_pool.py` прогнан: 64 запроса на пул из 16 → 64×200, `max_queue_depth=24`, очередь
+  работает, таймаутов нет.
+
+## Процедура аварийного отката (одна команда, без правки файлов)
+
+```yaml
+dashboard:
+  handler_offload: false      # ~/.hermes/config.yaml
 ```
-/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/base_tree
+```bash
+hermes serve --restart        # либо: systemctl --user restart hermes-gateway
+# эквивалент без правки конфига: Environment=HERMES_HANDLER_OFFLOAD=0 в юните
 ```
-
-### Стенды (в корне дерева, коммитятся)
-
-1. `bench_obv.py <tree> [out.json] [window]` — приёмочный стенд: py-spy 15 с + 8 одновременных
-   `/api/status` на реальном uvicorn-приложении, считает долю кадров-точек, CPU процесса и
-   латентность. **Важно:** attach к чужому процессу запрещён (`/proc/sys/kernel/yama/ptrace_scope
-   = 1`, py-spy → `Permission Denied`), поэтому py-spy **запускает** сервер сам
-   (`py-spy record -d N -f raw -o prof -- python server.py`), а бенч только гоняет нагрузку.
-   `-d` должен быть целым числом (строка `15` роняет py-spy: `ParseIntError`).
-2. `probe_hotpaths.py <tree> [iters]` — прямая стоимость трёх точек по путям, которые реально
-   исполняет запрос (`build_profile_secret_scope`, `find_all_skills`, `SessionDB.get_session`),
-   с числом вызовов нижнего уровня.
-
-### Замеры «до» (база `1456950ab7d`)
-
-`bench_obv.py`: 1663 сэмпла, окно 12,1 с, 3295 запросов, CPU процесса 11,17 с → **92 % одного
-ядра** под нагрузкой 8×`, латентность `/api/status` median 27,3 мс, p95 33,8 мс, max 447 мс.
-**Три целевые рамки на этом стенде НИЖЕ разрешения сэмплирования** (0 зафиксированных сэмплов на
-`load_env_file`, `_dir_tree_signature`, `_open_fd_count`): задача, которая ждёт от py-spy падения
-доли этих трёх точек, на тестовом стенде цифру не даст — доля видна только на живом шлюзе
-(там она была 5,4 / 2,7 / 3,0 % при 148 потоках и 790 МБ). Это ограничение приёмки, его надо
-писать в отчёт, а не обходить.
-
-`probe_hotpaths.py` (300 итераций) — вот где стоимость видна и её надо снимать:
-
-| точка | база, µs/оп | нижний уровень на 300 итераций |
-|---|---|---|
-| `build_profile_secret_scope` | **76,5** (p95 89,5) | `_parse_env_text` — 0 вызовов (мемо уже есть), файл всё равно читается на каждый вызов |
-| `find_all_skills` | **3775** (p95 4000) | `_dir_tree_signature` — **65 016 вызовов** (217 на один листинг: полный обход ~170 каталогов каждый раз) |
-| `SessionDB.get_session` | 66,3 | `_open_fd_count` — 1 листинг (мемо 0,25 с уже есть) |
-
-## Что выяснилось про «уже сделано» (это меняет объём)
-
-Кэши из постановки **частично существуют в базе**, и их надо не «написать», а доделать:
-
-1. `.env` — мемо уже есть (`_ENV_FILE_CACHE`, LRU 64, ключ = точные байты файла, каждый вызов
-   **читает файл** и только пропускает разбор; `invalidate_env_file_cache()` — ручка сброса).
-   Остаток работы: убрать чтение файла с горячего пути по `file_signature()` (mtime, size, inode,
-   ctime — `utils.py:42`) с обязательной сверкой байтов, когда сигнатура изменилась, и с
-   сохранением комментария-обоснования из `agent/secret_scope.py:317-336` (там записан инцидент
-   CI 39146191939: coarse-clock перезапись того же размера внутри одного тика). Готовый тест
-   контракта — `tests/agent/test_secret_scope_env_cache.py` (5 тестов, включая оба сценария
-   свежести) — его нельзя ломать.
-2. Навыки — кэш каталога есть (`_SKILLS_CACHE`, TTL 30 с), но **подпись считается полным обходом
-   дерева на каждый вызов** (217 `_dir_tree_signature` = 3,7 мс чистой стоимости листинга).
-   Остаток работы: посчитать подпись по mtime только тех каталогов, что реально меняются, с
-   коротким TTL (0,2–0,5 с) — свежесть установки навыка обязана остаться «сразу».
-3. Дескрипторы — мемо уже есть (`_FD_USAGE_CACHE_SECONDS = 0.25`, проверяется в
-   `_fd_headroom_ok`), поведение при исчерпании (`_read_open_denied_fd_headroom`, отказ → откат на
-   писательское соединение) покрыто тестами `test_fd_headroom_guard_*`. Остаток работы: вынести
-   замер в фоновый таймер (или увеличить TTL с сохранением семантики «fail closed только по
-   факту»), не меняя ни один из этих тестов.
-
-## Следующий шаг (по порядку)
-
-1. `agent/secret_scope.py::load_env_file` — сигнатура `file_signature(os.stat())` → попадание без
-   `open()`; промах → прежний путь «прочитать байты → сверить → разобрать». Тест: существующий
-   файл `test_secret_scope_env_cache.py` зелёный + новый тест «попадание не открывает файл»
-   (monkeypatch на `builtins.open`/счётчик) и «правка видна в следующем вызове».
-2. `tools/skills_tool.py::_skills_scan_signature` — кэш подписи по (корни, disabled) с TTL
-   `_SKILLS_SIGNATURE_TTL_SECONDS = 0.25` и сбросом из `clear_skills_cache()`. Тесты:
-   `tests/tools/test_skills_tool_discovery_cache.py`, `tests/agent/test_skill_commands_freshness.py`
-   (там же сценарии «навык установлен/удалён — видно сразу»; TTL ≤0,25 с их не ломает).
-3. `hermes_state_readpool.py` — таймер (threading.Timer/фоновый поток, остановка по weakref) или
-   TTL 1–2 с; тесты `tests/hermes_state/test_session_db_read_conn_pool.py` (строки 575–620
-   monkeypatch-ят `_fd_usage_cache` и `_open_fd_count` — контракт сохранить дословно).
-4. Прогон: `HOME=/tmp/t77 ../../.venv/bin/python -m pytest tests/agent/test_secret_scope_env_cache.py
-   tests/tools/test_skills_tool_discovery_cache.py tests/agent/test_skill_commands_freshness.py
-   tests/hermes_state/test_session_db_read_conn_pool.py tests/hermes_cli/test_read_handle_pool_wiring.py -q`
-   (`HOME` обязателен — иначе `tests/home_io_guard.py`), затем `probe_hotpaths.py` по своему дереву
-   и `bench_obv.py` по базе и по своему дереву той же методикой.
-5. Коммит в `wt/t_77d98767` → публикация `ops-card-merge.py --task t_77d98767` (гейт публикации
-   унаследован из `t_f8450188`; порядок и запреты — в теле той карточки) → `kanban_request_review`
-   (09).
-
-## Локаторы
-
-- Бенч-база: `/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/base_tree`
-- Замер «до» (JSON): `/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/bench_before.json`
-- Живой профиль для сверки: `/home/hermes/.hermes/profiles/*/.env` (~27 КБ), дерево навыков ~170
-  каталогов — `probe_hotpaths.py` воспроизводит этот масштаб.
-
-## Ограничения, которые нельзя терять из вида
-
-- Кэш не имеет права отдать устаревшие секреты или устаревший список навыков (границы карточки).
-- `state.db` общий для всех профилей: транзакционную семантику не трогать.
-- Checkpoint-снапшоты в этом прогоне не снимались (store busy) — откат только через git.
+В журнале: `handler offload mode=inline (single-process)`; `/api/status` → `mode = "inline"`.

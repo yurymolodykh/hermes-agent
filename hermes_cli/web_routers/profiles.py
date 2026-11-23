@@ -38,6 +38,7 @@ from hermes_cli.web_server_config import (
 )
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, config_scoped_to_thread
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
 )
@@ -1124,23 +1125,31 @@ def _linux_terminal_commands(command: str) -> list:
 async def open_profile_terminal_endpoint(name: str, request: Request):
     acl_profiles.require_visible(request, name)
     with _profile_errors("POST /api/profiles/%s/open-terminal failed", name):
-        command = _profile_setup_command(name)
-
-        if sys.platform.startswith("win"):
-            subprocess.Popen(["cmd.exe", "/c", "start", "", command])  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
-        elif sys.platform == "darwin":
-            escaped = command.replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.Popen(["osascript", "-e",  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
-                              f'tell application "Terminal"\nactivate\ndo script "{escaped}"\nend tell'])
-        else:
-            for executable, popen_args in _linux_terminal_commands(command):
-                if await asyncio.to_thread(subprocess.call, ["which", executable], stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL) == 0:
-                    subprocess.Popen(popen_args)  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
-                    break
-            else:
-                raise HTTPException(status_code=400, detail="No supported terminal emulator found")
+        # Resolution stats the profile directory and the spawn probes PATH with `which`: both
+        # are synchronous and belong on the offload pool, one hop for the whole decision.
+        command = await off_loop(_open_terminal_for_profile, name)
     return {"ok": True, "command": command}
+
+
+def _open_terminal_for_profile(name: str) -> str:
+    """Resolve the profile's setup command and spawn a terminal for it (runs off the loop)."""
+    command = _profile_setup_command(name)
+
+    if sys.platform.startswith("win"):
+        subprocess.Popen(["cmd.exe", "/c", "start", "", command])
+    elif sys.platform == "darwin":
+        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.Popen(["osascript", "-e",
+                          f'tell application "Terminal"\nactivate\ndo script "{escaped}"\nend tell'])
+    else:
+        for executable, popen_args in _linux_terminal_commands(command):
+            if subprocess.call(["which", executable], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0:
+                subprocess.Popen(popen_args)
+                break
+        else:
+            raise HTTPException(status_code=400, detail="No supported terminal emulator found")
+    return command
 
 
 @router.patch("/api/profiles/{name}")
@@ -1416,7 +1425,7 @@ async def import_profile_endpoint(body: ProfileImport, request: Request):
     # Bundled desktop appearance overlay, so the desktop needn't make another round-trip.
     desktop_overlay = None
     overlay_path = profile_dir / "desktop.json"
-    if overlay_path.is_file():
+    if await off_loop(overlay_path.is_file):
         desktop_overlay = _best_effort(
             "Reading desktop.json from imported profile %s failed", imported,
             fn=lambda: _read_desktop_overlay(profile_dir))

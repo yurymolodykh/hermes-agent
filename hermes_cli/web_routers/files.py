@@ -35,6 +35,7 @@ from hermes_cli.staged_uploads import (
     ensure_profile_subdir, is_staged_upload, removed_on_failure, resolve_upload_home,
 )
 from hermes_cli.web_deps import late
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_server_remote_media import remote_media_response
 from hermes_cli.web_upload_limit import CHAT_IMAGE_MAX_BYTES
 from hermes_cli.web_server_surface import route_on
@@ -439,13 +440,23 @@ async def get_media(path: str):
     roots = _media_serve_roots()
     if not any(target == root or root in target.parents for root in roots):
         raise HTTPException(status_code=403, detail="Path outside media roots")
-    if not target.is_file():
+    size, exists = await off_loop(_media_stat, target)
+    if not exists:
         raise HTTPException(status_code=404, detail="File not found")
-    if target.stat().st_size > _MEDIA_MAX_BYTES:
+    if size > _MEDIA_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
 
     encoded = await asyncio.to_thread(_read_base64_file, target)
     return {"data_url": f"data:{_MEDIA_CONTENT_TYPES[target.suffix.lower()]};base64,{encoded}"}
+
+
+def _media_stat(target: Path) -> tuple[int, bool]:
+    """``(size, is_regular_file)`` for a media path; a missing/unstattable path is ``(0, False)``."""
+    try:
+        st = target.stat()
+    except OSError:
+        return 0, False
+    return st.st_size, stat.S_ISREG(st.st_mode)
 
 
 # Remote image URLs an authenticated proxy may fetch for a client that cannot
@@ -927,7 +938,7 @@ async def stream_upload_to_path(
         raise HTTPException(status_code=500, detail=f"{write_failed}: {exc}")
     finally:
         if not renamed:
-            tmp_path.unlink(missing_ok=True)
+            await off_loop(tmp_path.unlink, missing_ok=True)
         await file.close()
     return total
 
@@ -942,8 +953,10 @@ async def upload_managed_file_stream(
     """Chunked multipart upload: constant memory and no base64 inflation, unlike
     the JSON data-URL endpoint that trips proxy body-size limits on large archives."""
     policy, target, display_path = _managed_write_target(path, request, overwrite)
+    # The chunk COPY already runs on a worker; this one mkdir is the remaining blocking call
+    # on the request path (a deep tree on a mounted share is not free).
     with _io_errors("File is not writable", "Could not create parent directory"):
-        target.parent.mkdir(parents=True, exist_ok=True)
+        await off_loop(target.parent.mkdir, parents=True, exist_ok=True)
     await stream_upload_to_path(
         file, target,
         too_large="File is too large",
@@ -1118,6 +1131,15 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
+    # stat + is_dir + write_text + replace + unlink are all synchronous filesystem calls on a
+    # path the caller chose: on a slow/spinning volume or a mounted share they park the whole
+    # event loop (and with it every other request in this process). One worker hop covers the
+    # whole decision so the checks stay atomic against the same staging file.
+    return await off_loop(_fs_write_text_blocking, target, text)
+
+
+def _fs_write_text_blocking(target: Path, text: str) -> dict[str, Any]:
+    """The synchronous body of ``fs_write_text`` (runs on the offload pool)."""
     try:
         st: Optional[os.stat_result] = target.stat()
     except FileNotFoundError:
@@ -1134,7 +1156,13 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
     if not target.parent.is_dir():
         raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
-    tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
+    # A per-call unique staging name, not ``.<name>.hermes-tmp-<pid>``: this body now runs on a
+    # worker pool, so two concurrent saves of the same file would otherwise stage to the SAME temp
+    # path — one replaces it, the other's ``os.replace`` then fails with ENOENT while its
+    # ``except`` branch unlinks the surviving writer's file. Uniqueness per call keeps the
+    # write-then-replace pair atomic for each saver (last replace wins, which is the same
+    # outcome two sequential saves have).
+    tmp = target.with_name(f".{target.name}.hermes-tmp-{secrets.token_hex(6)}")
     try:
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, target)
@@ -1397,15 +1425,20 @@ async def fs_git_root(path: str, request: Request, profile: Optional[str] = None
     # The walk below climbs to the repository root, which may sit ABOVE the named folder: the
     # start point is the caller's to name, so it carries the same boundary as every other read.
     _hosted_fs_read_guard(target, request)
-    try:
-        st = target.stat()
-        start = target if stat.S_ISDIR(st.st_mode) else target.parent
-    except OSError:
-        start = target
-    root = _fs_find_git_root(start)
+    start = await off_loop(_fs_git_root_start, target)
+    root = await off_loop(_fs_find_git_root, start)
     if root:
         _hosted_fs_read_guard(Path(root), request)
     return {"root": root}
+
+
+def _fs_git_root_start(target: Path) -> Path:
+    """``target`` if it is a directory, else its parent — the git walk's start point."""
+    try:
+        st = target.stat()
+        return target if stat.S_ISDIR(st.st_mode) else target.parent
+    except OSError:
+        return target
 
 
 @router.get("/api/fs/default-cwd")

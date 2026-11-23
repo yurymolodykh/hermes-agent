@@ -34,6 +34,7 @@ from hermes_cli.web_routers._common import (
     require_results_write, results_profile, spawn_profile_action,
 )
 from hermes_cli.web_routers.files import stream_upload_to_path
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_acl_results import memory_dirs_for
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -605,7 +606,7 @@ async def run_backup(body: BackupRequest, profile: Optional[str] = None):
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         archive = _dashboard_backup_dir(profile) / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
         try:
-            archive.parent.mkdir(parents=True, exist_ok=True)
+            await off_loop(archive.parent.mkdir, parents=True, exist_ok=True)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not create backup directory: {exc}")
         output = str(archive)
@@ -618,9 +619,11 @@ async def run_backup(body: BackupRequest, profile: Optional[str] = None):
 
 @router.get("/api/ops/backup/download")
 async def download_dashboard_backup(archive: str, profile: Optional[str] = None):
+    # resolve(strict=True) hits the filesystem (and raises FileNotFoundError); so does is_file.
+    # Both run off the loop, then FileResponse streams the already-validated path.
     try:
-        backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
-        target = Path(archive).expanduser().resolve(strict=True)
+        backup_dir, target = await off_loop(
+            _resolve_backup_targets, _dashboard_backup_dir(profile), archive)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Backup not found")
     except (OSError, RuntimeError):
@@ -628,11 +631,18 @@ async def download_dashboard_backup(archive: str, profile: Optional[str] = None)
 
     if not _path_is_under(backup_dir, target):
         raise HTTPException(status_code=403, detail="Backup is outside the dashboard backup directory")
-    if not target.is_file():
+    if not await off_loop(target.is_file):
         raise HTTPException(status_code=404, detail="Backup not found")
     return FileResponse(
         path=str(target), media_type="application/zip", filename=target.name, content_disposition_type="attachment",
     )
+
+
+def _resolve_backup_targets(backup_dir: Path, archive: str) -> tuple[Path, Path]:
+    """Resolve the backup dir and the requested archive; raises FileNotFoundError when absent."""
+    resolved_dir = backup_dir.expanduser().resolve(strict=False)
+    target = Path(archive).expanduser().resolve(strict=True)
+    return resolved_dir, target
 
 
 def _spawn_import(archive: str, force: bool, profile: Optional[str] = None) -> dict:
@@ -649,7 +659,7 @@ async def run_import(body: ImportRequest, profile: Optional[str] = None):
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
-    if not os.path.isfile(archive):
+    if not await off_loop(os.path.isfile, archive):
         raise HTTPException(status_code=404, detail=f"Archive not found: {archive}")
     return _spawn_import(archive, body.force, profile)
 
@@ -671,7 +681,7 @@ async def run_import_upload(
     profile = destructive_profile(profile, "POST /api/ops/import-upload")
     staging_dir = _dashboard_backup_dir(profile)
     try:
-        staging_dir.mkdir(parents=True, exist_ok=True)
+        await off_loop(staging_dir.mkdir, parents=True, exist_ok=True)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not create import staging directory: {exc}")
 
@@ -681,8 +691,8 @@ async def run_import_upload(
         file, target, too_large="Archive is too large",
         not_writable="Import staging directory is not writable", write_failed="Could not write uploaded archive",
     )
-    if not zipfile.is_zipfile(target):
-        target.unlink(missing_ok=True)
+    if not await off_loop(zipfile.is_zipfile, target):
+        await off_loop(target.unlink, missing_ok=True)
         raise HTTPException(status_code=400, detail="Uploaded archive is not a valid zip file")
     return {**_spawn_import(str(target), force, profile), "archive": str(target), "uploaded_bytes": total}
 

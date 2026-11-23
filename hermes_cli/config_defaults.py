@@ -987,6 +987,14 @@ DEFAULT_CONFIG = {
         # Process-isolation rollout controls. Read via the raw config loader, so tui_gateway.server
         # also owns explicit defaults.
         "turn_isolation": False,
+        # Kill switch for the dashboard routers' blocking-work offload
+        # (hermes_cli/web_routers/handler_offload.py). true = file/archive/local-model work runs
+        # on a bounded worker pool instead of the event loop; false = the pre-change inline
+        # behaviour. Env HERMES_HANDLER_OFFLOAD=0 forces inline for an emergency rollback.
+        # Settled once at boot: changing it needs a restart of the `hermes serve` backend.
+        "handler_offload": True,
+        # Size of that pool (1-128). Unset/0 = 2 x CPU, floored at 8 and capped at 32.
+        "handler_offload_workers": 0,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         # Token/cost analytics surfaces are hidden by default: the numbers are a local LOWER-BOUND

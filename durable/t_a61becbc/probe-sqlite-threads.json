@@ -1,0 +1,35 @@
+{
+  "parallel": 8,
+  "routes": {
+    "sessions": {
+      "codes": [
+        200
+      ],
+      "p50_ms": 239.3,
+      "max_ms": 270.9
+    },
+    "messages": {
+      "codes": [
+        200
+      ],
+      "p50_ms": 68.2,
+      "max_ms": 80.6
+    },
+    "search": {
+      "codes": [
+        200
+      ],
+      "p50_ms": 638.8,
+      "max_ms": 666.2
+    }
+  },
+  "log_markers": {
+    "SQLite objects created in a thread": 0,
+    "ProgrammingError": 0,
+    "check_same_thread": 0,
+    "Operation on closed database": 0,
+    "database is locked": 0
+  },
+  "log_lines": 1,
+  "sqlite_thread_error": false
+}

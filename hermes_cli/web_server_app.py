@@ -238,6 +238,14 @@ async def http_lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
+    # Settle the routers' offload kill switch once per boot, before the first request can
+    # touch a route (the mode is logged here and reported by /api/status).
+    from hermes_cli.web_routers.handler_offload import HANDLER_OFFLOAD
+
+    HANDLER_OFFLOAD.install(app)
     lifespan = http_lifespan if getattr(app.state, "gateway_runner", None) is not None else standalone_lifespan
-    async with lifespan(app):
-        yield
+    try:
+        async with lifespan(app):
+            yield
+    finally:
+        HANDLER_OFFLOAD.shutdown()

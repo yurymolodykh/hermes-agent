@@ -38,6 +38,10 @@ from hermes_cli.web_routers._common import (
     REDACTED_CREDENTIAL_WRITE_DETAIL, http_failure, is_redacted_credential_preview,
     redacted_credential_preview,
 )
+# NOTE: whatsapp onboarding/start intentionally stays on the event loop. It is a human-paced,
+# once-per-setup path (QR pairing) and it spawns the pairing subprocess/thread from the request
+# context, which the handler's own tests pin; moving it off the loop broke that contract and buys
+# nothing on the hot path.
 from hermes_cli.web_models import (
     MessagingPlatformUpdate, TelegramOnboardingApply, TelegramOnboardingStart,
     WhatsAppOnboardingApply, WhatsAppOnboardingStart,

@@ -1,0 +1,564 @@
+{
+  "kind": "loop",
+  "reps": 2,
+  "per_mode": {
+    "inline": {
+      "status": {
+        "loop_p99_ms": [
+          10.9,
+          24.66
+        ],
+        "loop_max_ms": [
+          10.9,
+          24.66
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          35.0,
+          60.2
+        ],
+        "loop_p99_median": 17.78,
+        "loop_max_median": 17.78
+      },
+      "sessions": {
+        "loop_p99_ms": [
+          12.21,
+          47.67
+        ],
+        "loop_max_ms": [
+          12.21,
+          47.67
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          283.3,
+          268.1
+        ],
+        "loop_p99_median": 29.94,
+        "loop_max_median": 29.94
+      },
+      "messages": {
+        "loop_p99_ms": [
+          5.79,
+          9.57
+        ],
+        "loop_max_ms": [
+          5.79,
+          9.57
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          85.4,
+          131.0
+        ],
+        "loop_p99_median": 7.68,
+        "loop_max_median": 7.68
+      },
+      "search": {
+        "loop_p99_ms": [
+          8.18,
+          14.41
+        ],
+        "loop_max_ms": [
+          8.18,
+          15.94
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          937.1,
+          1187.8
+        ],
+        "loop_p99_median": 11.29,
+        "loop_max_median": 12.06
+      },
+      "skills": {
+        "loop_p99_ms": [
+          9.41,
+          8.52
+        ],
+        "loop_max_ms": [
+          9.41,
+          8.52
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          45.8,
+          77.4
+        ],
+        "loop_p99_median": 8.96,
+        "loop_max_median": 8.96
+      },
+      "checkpoints": {
+        "loop_p99_ms": [
+          3.52,
+          0.63
+        ],
+        "loop_max_ms": [
+          3.52,
+          0.63
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          31.0,
+          26.2
+        ],
+        "loop_p99_median": 2.08,
+        "loop_max_median": 2.08
+      }
+    },
+    "threaded": {
+      "status": {
+        "loop_p99_ms": [
+          6.85,
+          6.0
+        ],
+        "loop_max_ms": [
+          6.85,
+          6.0
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          29.5,
+          37.9
+        ],
+        "loop_p99_median": 6.42,
+        "loop_max_median": 6.42
+      },
+      "sessions": {
+        "loop_p99_ms": [
+          13.99,
+          14.87
+        ],
+        "loop_max_ms": [
+          13.99,
+          14.87
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          292.1,
+          258.4
+        ],
+        "loop_p99_median": 14.43,
+        "loop_max_median": 14.43
+      },
+      "messages": {
+        "loop_p99_ms": [
+          8.1,
+          16.42
+        ],
+        "loop_max_ms": [
+          8.1,
+          16.42
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          102.9,
+          103.2
+        ],
+        "loop_p99_median": 12.26,
+        "loop_max_median": 12.26
+      },
+      "search": {
+        "loop_p99_ms": [
+          5.81,
+          10.52
+        ],
+        "loop_max_ms": [
+          10.74,
+          10.52
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          1146.2,
+          1025.1
+        ],
+        "loop_p99_median": 8.16,
+        "loop_max_median": 10.63
+      },
+      "skills": {
+        "loop_p99_ms": [
+          9.09,
+          4.0
+        ],
+        "loop_max_ms": [
+          9.09,
+          4.0
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          65.5,
+          52.3
+        ],
+        "loop_p99_median": 6.54,
+        "loop_max_median": 6.54
+      },
+      "checkpoints": {
+        "loop_p99_ms": [
+          2.03,
+          2.28
+        ],
+        "loop_max_ms": [
+          2.03,
+          2.28
+        ],
+        "over_50ms": [
+          0,
+          0
+        ],
+        "lat_p50_ms": [
+          28.8,
+          24.9
+        ],
+        "loop_p99_median": 2.15,
+        "loop_max_median": 2.15
+      }
+    }
+  },
+  "per_rep": [
+    {
+      "rep": 0,
+      "mode": "inline",
+      "routes": {
+        "status": {
+          "lat_p50_ms": 35.0,
+          "lat_max_ms": 36.8,
+          "loop_lag": {
+            "samples": 2,
+            "p50_ms": 10.9,
+            "p99_ms": 10.9,
+            "max_ms": 10.9,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "sessions": {
+          "lat_p50_ms": 283.3,
+          "lat_max_ms": 312.6,
+          "loop_lag": {
+            "samples": 25,
+            "p50_ms": 0.34,
+            "p99_ms": 12.21,
+            "max_ms": 12.21,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "messages": {
+          "lat_p50_ms": 85.4,
+          "lat_max_ms": 97.2,
+          "loop_lag": {
+            "samples": 8,
+            "p50_ms": 1.38,
+            "p99_ms": 5.79,
+            "max_ms": 5.79,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "search": {
+          "lat_p50_ms": 937.1,
+          "lat_max_ms": 948.0,
+          "loop_lag": {
+            "samples": 91,
+            "p50_ms": 0.24,
+            "p99_ms": 8.18,
+            "max_ms": 8.18,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "skills": {
+          "lat_p50_ms": 45.8,
+          "lat_max_ms": 62.9,
+          "loop_lag": {
+            "samples": 5,
+            "p50_ms": 0.65,
+            "p99_ms": 9.41,
+            "max_ms": 9.41,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "checkpoints": {
+          "lat_p50_ms": 31.0,
+          "lat_max_ms": 36.2,
+          "loop_lag": {
+            "samples": 3,
+            "p50_ms": 1.5,
+            "p99_ms": 3.52,
+            "max_ms": 3.52,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        }
+      }
+    },
+    {
+      "rep": 0,
+      "mode": "threaded",
+      "routes": {
+        "status": {
+          "lat_p50_ms": 29.5,
+          "lat_max_ms": 30.0,
+          "loop_lag": {
+            "samples": 3,
+            "p50_ms": 1.53,
+            "p99_ms": 6.85,
+            "max_ms": 6.85,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "sessions": {
+          "lat_p50_ms": 292.1,
+          "lat_max_ms": 338.8,
+          "loop_lag": {
+            "samples": 27,
+            "p50_ms": 0.81,
+            "p99_ms": 13.99,
+            "max_ms": 13.99,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "messages": {
+          "lat_p50_ms": 102.9,
+          "lat_max_ms": 116.1,
+          "loop_lag": {
+            "samples": 10,
+            "p50_ms": 0.59,
+            "p99_ms": 8.1,
+            "max_ms": 8.1,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "search": {
+          "lat_p50_ms": 1146.2,
+          "lat_max_ms": 1169.5,
+          "loop_lag": {
+            "samples": 109,
+            "p50_ms": 0.53,
+            "p99_ms": 5.81,
+            "max_ms": 10.74,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "skills": {
+          "lat_p50_ms": 65.5,
+          "lat_max_ms": 79.4,
+          "loop_lag": {
+            "samples": 6,
+            "p50_ms": 2.07,
+            "p99_ms": 9.09,
+            "max_ms": 9.09,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "checkpoints": {
+          "lat_p50_ms": 28.8,
+          "lat_max_ms": 33.2,
+          "loop_lag": {
+            "samples": 4,
+            "p50_ms": 0.19,
+            "p99_ms": 2.03,
+            "max_ms": 2.03,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        }
+      }
+    },
+    {
+      "rep": 1,
+      "mode": "inline",
+      "routes": {
+        "status": {
+          "lat_p50_ms": 60.2,
+          "lat_max_ms": 62.0,
+          "loop_lag": {
+            "samples": 4,
+            "p50_ms": 1.89,
+            "p99_ms": 24.66,
+            "max_ms": 24.66,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "sessions": {
+          "lat_p50_ms": 268.1,
+          "lat_max_ms": 376.6,
+          "loop_lag": {
+            "samples": 16,
+            "p50_ms": 11.5,
+            "p99_ms": 47.67,
+            "max_ms": 47.67,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "messages": {
+          "lat_p50_ms": 131.0,
+          "lat_max_ms": 152.7,
+          "loop_lag": {
+            "samples": 12,
+            "p50_ms": 1.44,
+            "p99_ms": 9.57,
+            "max_ms": 9.57,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "search": {
+          "lat_p50_ms": 1187.8,
+          "lat_max_ms": 1242.1,
+          "loop_lag": {
+            "samples": 106,
+            "p50_ms": 0.71,
+            "p99_ms": 14.41,
+            "max_ms": 15.94,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "skills": {
+          "lat_p50_ms": 77.4,
+          "lat_max_ms": 90.4,
+          "loop_lag": {
+            "samples": 7,
+            "p50_ms": 4.49,
+            "p99_ms": 8.52,
+            "max_ms": 8.52,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "checkpoints": {
+          "lat_p50_ms": 26.2,
+          "lat_max_ms": 29.6,
+          "loop_lag": {
+            "samples": 3,
+            "p50_ms": 0.49,
+            "p99_ms": 0.63,
+            "max_ms": 0.63,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        }
+      }
+    },
+    {
+      "rep": 1,
+      "mode": "threaded",
+      "routes": {
+        "status": {
+          "lat_p50_ms": 37.9,
+          "lat_max_ms": 40.7,
+          "loop_lag": {
+            "samples": 4,
+            "p50_ms": 0.25,
+            "p99_ms": 6.0,
+            "max_ms": 6.0,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "sessions": {
+          "lat_p50_ms": 258.4,
+          "lat_max_ms": 305.1,
+          "loop_lag": {
+            "samples": 22,
+            "p50_ms": 2.56,
+            "p99_ms": 14.87,
+            "max_ms": 14.87,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "messages": {
+          "lat_p50_ms": 103.2,
+          "lat_max_ms": 121.7,
+          "loop_lag": {
+            "samples": 10,
+            "p50_ms": 0.36,
+            "p99_ms": 16.42,
+            "max_ms": 16.42,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "search": {
+          "lat_p50_ms": 1025.1,
+          "lat_max_ms": 1038.1,
+          "loop_lag": {
+            "samples": 99,
+            "p50_ms": 0.32,
+            "p99_ms": 10.52,
+            "max_ms": 10.52,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "skills": {
+          "lat_p50_ms": 52.3,
+          "lat_max_ms": 66.5,
+          "loop_lag": {
+            "samples": 6,
+            "p50_ms": 1.76,
+            "p99_ms": 4.0,
+            "max_ms": 4.0,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        },
+        "checkpoints": {
+          "lat_p50_ms": 24.9,
+          "lat_max_ms": 27.8,
+          "loop_lag": {
+            "samples": 3,
+            "p50_ms": -0.03,
+            "p99_ms": 2.28,
+            "max_ms": 2.28,
+            "over_50ms": 0,
+            "over_200ms": 0
+          }
+        }
+      }
+    }
+  ]
+}
