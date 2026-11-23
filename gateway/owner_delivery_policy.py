@@ -44,7 +44,7 @@ class OwnerDeliveryConfig:
     artifact_extensions: tuple[str, ...] = DEFAULT_ARTIFACT_EXTENSIONS
 
     @classmethod
-    def from_config(cls, kanban_cfg: Optional[Mapping[str, Any]]) -> "OwnerDeliveryConfig":
+    def from_config(cls, kanban_cfg: Optional[Mapping[str, Any]]) -> OwnerDeliveryConfig:
         """Read the policy block; anything malformed degrades to the shipped defaults."""
         raw = (kanban_cfg or {}).get("owner_delivery_policy")
         if not isinstance(raw, Mapping):
