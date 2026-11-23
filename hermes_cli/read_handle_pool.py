@@ -24,9 +24,10 @@ Correctness rules, in order of what would break without them:
   are used by whichever thread reads next), so a handle is checked out to exactly one caller at
   a time and returned only when that caller is done.
 * **Bounds.** Idle handles are capped per path and process-wide (the descriptor ceilings the
-  read pool already respects, ``_READ_POOL_MAX`` / ``_READ_POOL_PROCESS_MAX``), with TTL
-  eviction so a quiet profile does not hold descriptors forever. A pool miss is not an error:
-  the caller opens as before.
+  read pool already respects, ``_READ_POOL_MAX`` / ``_READ_POOL_PROCESS_MAX``) and evicted LRU —
+  the longest-idle handle goes first, so a busy profile is not starved by a stale one elsewhere.
+  TTL eviction keeps a quiet profile from holding descriptors forever. A pool miss is not an
+  error: the caller opens as before.
 * **Failure.** A handle that fails its probe is closed and never pooled; if the pool itself is
   unusable, callers fall back to the previous open-per-request path.
 """
@@ -59,6 +60,23 @@ class _PooledEntry:
         self.db = db
         self.identity = identity
         self.idle_since = idle_since
+
+
+def _handle_is_reusable(db) -> bool:
+    """Whether a pooled read-only handle can serve another read right now.
+
+    A handle parked in the pool can be killed while idle: ``SessionDB.close()`` (the test
+    leak sweep, a shutdown sweep, an explicit close of a handle someone else wrapped) sets
+    ``_conn = None``, and a structural-corruption read quarantines it with ``_db_corrupt``.
+    Pooling either one hands the next request a read that fails on its first statement, so
+    both are checked at BOTH ends — before returning a handle to the pool and before handing
+    one out (it can die in between, while idle).
+    """
+    if db is None:
+        return False
+    if getattr(db, "_db_corrupt", False):
+        return False
+    return getattr(db, "_conn", None) is not None
 
 
 class _ReadOnlyHandlePool:

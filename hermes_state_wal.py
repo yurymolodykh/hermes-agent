@@ -104,6 +104,14 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     if memo is not _JOURNAL_PROBE_UNSET:
         return memo
     mode = _probe_journal_mode(conn)
+    if mode is None:
+        # A failed probe is NOT an answer: ``None`` means "could not read" (locked/busy, a
+        # transient EIO) and callers take their fail-closed branch on it. Memoizing it would
+        # pin that branch for the life of the connection — one unlucky probe during a writer
+        # open would disable the lock-free read pool and the OFD WAL-generation guard until the
+        # connection closed, silently degrading the very path this memo exists to speed up.
+        # Leave the unknown un-memoized so the next call probes again.
+        return None
     try:
         conn._journal_mode_memo = mode
     except AttributeError:  # a connection subclass without __dict__: just skip the memo

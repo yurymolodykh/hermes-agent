@@ -604,6 +604,15 @@ def _close_leaked_session_dbs():
     wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
     if wait is not None:
         wait()
+    # Dashboard read-only handles parked in the reuse pool are SessionDB instances too: they are
+    # in the registry below (so the sweep closes them), and a closed handle left in the pool would
+    # be handed to the NEXT test's read as a dead connection. Drain the pool first — close() is
+    # idempotent, so the registry sweep that follows is harmless.
+    try:
+        from hermes_cli.read_handle_pool import get_pool
+        get_pool().clear()
+    except Exception:
+        pass
     try:
         from hermes_state_guard import _test_instance_registry as registry
     except Exception:
