@@ -41,6 +41,25 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _legacy_kanban_notifier_delivery(monkeypatch):
+    """Run pre-policy notifier tests against ``owner_delivery_policy.enabled: false``.
+
+    The shipped default narrows Telegram to decisions and final deliverables, which is
+    exactly the behaviour those modules must NOT assume: they assert the generic
+    subscription mechanics (kinds, retries, wake routing, ordering) that the policy now
+    short-circuits. The policy-off path is the documented rollback and is identical to
+    the old code, so testing mechanics there is testing the mechanism itself.
+    ``tests/gateway/test_owner_delivery_policy.py`` opts back in per tick.
+    """
+    from gateway import kanban_watchers_notifier as notifier
+    from gateway.owner_delivery_policy import OwnerDeliveryConfig
+
+    monkeypatch.setattr(
+        notifier, "_owner_delivery_config", lambda: OwnerDeliveryConfig(enabled=False), raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _join_api_turn_workers():
     """Join the API turn workers a test left running, as its loop's teardown used to.
 
