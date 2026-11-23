@@ -343,4 +343,5 @@ apps/desktop/.dist-build*
 # артефакты карточек: доказательства, отчёты и журналы прогресса живут в доске
 /evidence-*/
 /PROGRESS-*.md
+/PROGRESS.md
 /REPORT-*.md
