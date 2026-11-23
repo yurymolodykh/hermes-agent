@@ -143,21 +143,45 @@ def test_speak_text_encodes_off_the_loop(monkeypatch, tmp_path):
     assert not clip.exists(), "the temp clip must still be unlinked"
 
 
+def test_speak_text_encodes_inline_when_the_switch_is_off(monkeypatch, tmp_path):
+    from hermes_cli.web_routers import audio as audio_router
+
+    _arm(monkeypatch, False)
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    clip = tmp_path / "clip.mp3"
+    clip.write_bytes(b"\x00" * 1024)
+
+    async def _fake_scoped(profile, fn):
+        return json.dumps({"success": True, "file_path": str(clip), "provider": "p"})
+
+    monkeypatch.setattr(audio_router, "_run_config_scoped", _fake_scoped)
+
+    real_encode = audio_router._encode_b64
+
+    def _spy(data):
+        seen.append(threading.get_ident())
+        return real_encode(data)
+
+    monkeypatch.setattr(audio_router, "_encode_b64", _spy)
+
+    _run(audio_router.speak_text(audio_router.TTSSpeakRequest(text="hi")))
+    assert seen == [loop_thread], "switch off must encode inline, as before the change"
+    assert not clip.exists(), "the temp clip must still be unlinked"
+
+
 # ── №4 files.py proxy_remote_media: base64 encode ────────────────────────────────
 
 
-def test_proxy_remote_media_encodes_off_the_loop(monkeypatch):
-    from hermes_cli.web_routers import files as files_router
+def _fake_http_client(monkeypatch, content: bytes, content_type: str) -> None:
     import httpx
-
-    _arm(monkeypatch, True)
-    loop_thread = threading.get_ident()
-    seen: list[int] = []
 
     class _Resp:
         status_code = 200
-        headers = {"content-type": "image/png"}
-        content = b"\x89PNG\r\n\x1a\n" + b"0" * 8
+
+        def __init__(self, body: bytes, ctype: str):
+            self.content = body
+            self.headers = {"content-type": ctype}
 
     class _Client:
         def __init__(self, *a, **k):
@@ -170,7 +194,18 @@ def test_proxy_remote_media_encodes_off_the_loop(monkeypatch):
             return False
 
         async def get(self, url):
-            return _Resp()
+            return _Resp(content, content_type)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client, raising=False)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_proxy_remote_media_encodes_on_the_seam(monkeypatch, enabled):
+    from hermes_cli.web_routers import files as files_router
+
+    _arm(monkeypatch, enabled)
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
 
     real = files_router._b64_data_url
 
@@ -180,20 +215,24 @@ def test_proxy_remote_media_encodes_off_the_loop(monkeypatch):
 
     monkeypatch.setattr(files_router, "_require_token", lambda request: None, raising=False)
     monkeypatch.setattr(files_router, "_b64_data_url", _spy)
-    monkeypatch.setattr(httpx, "AsyncClient", _Client, raising=False)
+    _fake_http_client(monkeypatch, b"\x89PNG\r\n\x1a\n" + b"0" * 8, "image/png")
 
     result = _run(files_router.proxy_remote_media("https://v3.fal.media/media/abc123", None))
     assert result["data_url"].startswith("data:image/png;base64,")
-    assert seen and seen[0] != loop_thread, "base64 encode ran on the event loop"
+    if enabled:
+        assert seen and seen[0] != loop_thread, "base64 encode ran on the event loop"
+    else:
+        assert seen == [loop_thread], "switch off must encode inline, as before the change"
 
 
 # ── №6 files.py fs_read_data_url, remote branch: base64 encode ───────────────────
 
 
-def test_fs_read_data_url_remote_branch_encodes_off_the_loop(monkeypatch):
+@pytest.mark.parametrize("enabled", [True, False])
+def test_fs_read_data_url_remote_branch_encodes_on_the_seam(monkeypatch, enabled):
     from hermes_cli.web_routers import files as files_router
 
-    _arm(monkeypatch, True)
+    _arm(monkeypatch, enabled)
     loop_thread = threading.get_ident()
     seen: list[int] = []
 
@@ -216,7 +255,10 @@ def test_fs_read_data_url_remote_branch_encodes_off_the_loop(monkeypatch):
 
     result = _run(files_router.fs_read_data_url("/srv/ssh/chart.png", None))
     assert result["dataUrl"].startswith("data:image/png;base64,")
-    assert seen and seen[0] != loop_thread, "base64 encode ran on the event loop"
+    if enabled:
+        assert seen and seen[0] != loop_thread, "base64 encode ran on the event loop"
+    else:
+        assert seen == [loop_thread], "switch off must encode inline, as before the change"
 
 
 # ── №7 actions.py get_action_status: _tail_lines ─────────────────────────────────
