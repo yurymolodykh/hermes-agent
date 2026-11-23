@@ -1156,7 +1156,13 @@ def _fs_write_text_blocking(target: Path, text: str) -> dict[str, Any]:
     if not target.parent.is_dir():
         raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
-    tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
+    # A per-call unique staging name, not ``.<name>.hermes-tmp-<pid>``: this body now runs on a
+    # worker pool, so two concurrent saves of the same file would otherwise stage to the SAME temp
+    # path — one replaces it, the other's ``os.replace`` then fails with ENOENT while its
+    # ``except`` branch unlinks the surviving writer's file. Uniqueness per call keeps the
+    # write-then-replace pair atomic for each saver (last replace wins, which is the same
+    # outcome two sequential saves have).
+    tmp = target.with_name(f".{target.name}.hermes-tmp-{secrets.token_hex(6)}")
     try:
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, target)
