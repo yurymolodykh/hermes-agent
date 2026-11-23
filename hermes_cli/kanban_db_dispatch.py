@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from hermes_cli import kanban_db_capacity as _kbcap
 from hermes_cli import kanban_auto_continue as _kac
 from hermes_cli import kanban_db_day_window as _kbday
+from hermes_cli import kanban_db_schedule as _kbschedule
 from hermes_cli import kanban_db_worker_env as _kbenv
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -106,6 +107,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    woken_by_timer: list[str] = field(default_factory=list)
+    """Parked (``scheduled``) cards whose ``scheduled_until`` deadline had passed
+    and were woken this tick (event ``woken_by_timer``). Woken cards are promoted
+    in the same tick, so they usually also appear in ``spawned``. NOT a failure
+    signal: a late catch-up shows up here once, not as a storm."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2428,7 +2434,7 @@ def _run_reclaim_phase(
     try:
         result.woken_by_timer = _kbschedule.wake_due_tasks(conn)
     except Exception:  # noqa: BLE001 - a wake failure must never stop the tick
-        _log.exception("dispatcher: timed wake phase failed")
+        _kb._log.exception("dispatcher: timed wake phase failed")
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
