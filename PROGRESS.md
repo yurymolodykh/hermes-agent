@@ -83,6 +83,12 @@
   конфликтные маркеры в `hermes_cli/kanban_ops.py` / `hermes_cli/kanban_db_dispatch.py`
   (файлы вне правки); восстановлены `git checkout HEAD --`, дерево чистое, стэши не тронуты.
 * Модель запроса: `letovo/deepseek-v4-flash` (не подменялась).
+* ⚠️ Менеджер чекпоинтов профиля не работает: `PruneError: checkpoint store is busy:
+  /home/hermes/.hermes/profiles/03-software-engineer/checkpoints` — откат этого прогона
+  невозможен. Страховка: коммит `f683da1597e` в `wt/t_754f37fe` + файлы
+  `evidence-t_754f37fe/` и `REPORT-t_754f37fe.md` на диске (оба каталога/файлы в
+  `.gitignore`, поэтому отчёт приложен к карточке вложениями).
+
 
 ---
 
