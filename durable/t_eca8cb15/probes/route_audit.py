@@ -92,7 +92,16 @@ BLOCKING_CALLS = {"time.sleep", "threading.Event.wait", "threading.Lock.acquire"
                   "threading.RLock.acquire", "concurrent.futures.wait",
                   "select.select", "selectors.DefaultSelector"}
 
-OFFLOAD_CALLS = {"to_thread", "run_in_executor", "run_sync"}
+OFFLOAD_CALLS = {
+    # stdlib / anyio / starlette
+    "to_thread", "run_in_executor", "run_sync", "run_in_threadpool",
+    # проектные обёртки: все они сводятся к asyncio.to_thread/run_in_threadpool
+    # (`hermes_cli/web_routers/_common.py`: scoped_to_thread,
+    # config_scoped_to_thread; profiles.py: _read_off_loop; skills.py: _hub_lookup;
+    # audio.py: _run_config_scoped).
+    "config_scoped_to_thread", "scoped_to_thread", "_read_off_loop",
+    "_hub_lookup", "_run_config_scoped",
+}
 
 # Получатель «похож на путь» — см. пункт 3 докстринга.
 RECEIVER_HINTS = ("path", "file", "dir", "root", "target", "tmp", "dest", "src",
@@ -143,6 +152,8 @@ def classify(call: ast.Call) -> tuple[str, str] | None:
     # Не блокирующее: разбор URL, чтение os.environ, идентификаторы процесса.
     if root == "urllib" and full.split(".")[1:2] == ["parse"]:
         return None
+    if full in {"urllib.request.Request", "urllib.request.build_opener"}:
+        return None
     if root == "os" and full.split(".")[1:2] == ["environ"]:
         return None
     if full in {"os.getpid", "os.getcwd", "os.cpu_count", "os.urandom", "os.fspath"}:
@@ -181,33 +192,71 @@ def classify(call: ast.Call) -> tuple[str, str] | None:
     if last in PATH_META:
         return ("meta", full)
     # Ожидание процесса/потока/будущего: ждёт, пока получатель «похож» на них.
-    if last in {"wait", "poll", "communicate", "join"} and _receiver_ok(call):
+    if last in {"wait", "communicate", "join"} and _receiver_ok(call):
         return ("blocking", full)
     return None
 
 
 class Finder(ast.NodeVisitor):
+    """Обход тела async-обработчика.
+
+    Тело вложенной функции (`def _run(): ...`) исполняется НЕ в момент
+    объявления: она уходит в пул целиком (`asyncio.to_thread(_run)`), поэтому её
+    вызовы считаются отдельно и в основной список не попадают. Если её имя
+    передано в обёртку оффлоада, она помечается `offloaded_by_name`.
+    Обратная сторона того же решения названа в докстринге модуля: блокирующий
+    вызов в вложенной функции, которую никто не оффлоадит, виден только в
+    `nested_helpers` и требует ручного решения.
+    """
+
     def __init__(self) -> None:
         self.blocking: list[tuple[int, str]] = []
         self.meta: list[tuple[int, str]] = []
         self.offload_wrappers = 0
+        self.offloaded_names: set[str] = set()
+        self.nested_helpers: list[dict] = []
+        self._nested: Finder | None = None
 
-    # Вложенные функции/лямбды исполняются не в момент объявления: их тело
-    # блокирующим не считается (иначе `def _run(): shutil.rmtree(...)` в
-    # scan_skill_hub попал бы в список, хотя `_run` уходит в to_thread через
-    # _hub_lookup). Обратная сторона названа в докстринге.
+    # --- вложенные функции -------------------------------------------------
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
-        return
+        self._scan_nested(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
-        return
+        self._scan_nested(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
-        return
+        inner = Finder()
+        inner._nested = self if self._nested is None else self._nested
+        outer = self._nested or self
+        for stmt in [node.body]:
+            inner.visit(stmt)
+        outer.nested_helpers.append({
+            "helper": "<lambda>", "line": node.lineno,
+            "calls": inner.blocking + inner.meta, "offloaded": False,
+        })
 
+    def _scan_nested(self, node) -> None:  # node: ast.FunctionDef|ast.AsyncFunctionDef
+        owner = self._nested or self
+        inner = Finder()
+        inner._nested = owner
+        for stmt in node.body:
+            inner.visit(stmt)
+        owner.nested_helpers.append({
+            "helper": node.name, "line": node.lineno,
+            "calls": inner.blocking + inner.meta, "offloaded": False,
+        })
+
+    # --- вызовы ------------------------------------------------------------
     def visit_Call(self, node: ast.Call) -> None:
         if is_offloaded(node):
             self.offload_wrappers += 1
+            # Имя функции, переданной в пул, трекаем, чтобы пометить вложенную.
+            # Обёртки проекта передают её не первым аргументом
+            # (`config_scoped_to_thread(profile, _run)`), поэтому смотрим все.
+            for arg in node.args:
+                target = dotted(arg)
+                if target:
+                    (self._nested or self).offloaded_names.add(target.split(".")[-1])
             # Первый аргумент исполняется в пуле — внутрь не спускаемся.
             for arg in node.args[1:]:
                 self.visit(arg)
@@ -217,8 +266,7 @@ class Finder(ast.NodeVisitor):
         kind = classify(node)
         if kind:
             (self.blocking if kind[0] == "blocking" else self.meta).append(
-                (node.lineno, kind[1])
-            )
+                (node.lineno, kind[1]))
         self.generic_visit(node)
 
 
@@ -264,7 +312,7 @@ def collect(modules: list[Path]) -> tuple[list[dict], dict]:
 
 
 def audit(handlers: list[dict]) -> dict:
-    blocking_rows, meta_only_rows = [], []
+    blocking_rows, meta_only_rows, nested_rows = [], [], []
     offload_handlers = 0
     for h in handlers:
         if not h["is_async"]:
@@ -279,7 +327,21 @@ def audit(handlers: list[dict]) -> dict:
             blocking_rows.append({**base, "calls": f.blocking})
         elif f.meta:
             meta_only_rows.append({**base, "calls": f.meta})
-    return {"blocking_handlers": blocking_rows, "meta_only_handlers": meta_only_rows,
+        # Вложенные помощники с блокирующими вызовами: оффлоадятся по имени?
+        for nh in f.nested_helpers:
+            if not nh["calls"]:
+                continue
+            offloaded = nh["helper"] in f.offloaded_names
+            nested_rows.append({**base, **nh, "offloaded": offloaded})
+            if offloaded and not f.blocking:
+                # Этот обработчик оффлоадит вложенного помощника — уже правильный.
+                if not any(r["handler"] == h["handler"] and r["file"] == h["file"]
+                           for r in blocking_rows):
+                    blocking_rows = [r for r in blocking_rows if not (
+                        r["handler"] == h["handler"] and r["file"] == h["file"])]
+    return {"blocking_handlers": blocking_rows,
+            "meta_only_handlers": meta_only_rows,
+            "nested_helpers": nested_rows,
             "async_with_offload": offload_handlers}
 
 
