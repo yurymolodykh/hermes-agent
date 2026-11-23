@@ -229,3 +229,18 @@ preserved-события в реестр (переиспользует `record()
   `delete_archived_task`, затем `gc` называет путь.
 * `test_gc_adopts_a_pre_registry_preserved_event` — существующая доска
   мигрирует на первом же `gc`.
+
+## Финальные проверки раунда 2 (после коммита `e10451c1965`)
+
+* `tests/hermes_cli/test_kanban_preserved_provenance.py` — **9 passed** (1 файл).
+  `preserved_provenance` + `gc_retention` + `scratch_unsaved_work` — **35 passed, 0 failed**.
+* `ruff check --config ruff.pre-commit.toml` по 6 изменённым файлам — `All checks passed!`
+* `python -m scripts.code_health --base 3e1895729437` — 9 files, **0 blocking, 0 advisory**.
+* `git status` чистый, HEAD = `origin/wt/t_e414a3cc` = `e10451c1965`.
+
+## Изменение интерфейса `gc` (осознанное)
+
+Заголовок блока путей: «Preserved scratch workspaces still on disk (N)» →
+«Registered preserved scratch workspaces (N)». Причина: при нечитаемом родителе
+запись печатается (оператор должен знать о каталоге), но утверждать, что он
+«на диске», было бы догадкой — ровно тот класс ошибки, который закрывает Д3.1.
