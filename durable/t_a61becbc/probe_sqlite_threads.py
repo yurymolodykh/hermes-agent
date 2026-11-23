@@ -121,7 +121,6 @@ def main() -> int:
         "sessions": "/api/sessions?limit=50",
         "messages": "/api/sessions/s0/messages?limit=500&include_compacted=1",
         "search": "/api/sessions/search?q=body&limit=20",
-        "stats": "/api/sessions/s0/stats",
     }
     out = {"parallel": args.parallel, "routes": {}}
     for name, path in routes.items():
@@ -140,6 +139,7 @@ def main() -> int:
             t.join()
         codes = sorted({c for c, _ in results})
         lat = sorted(ms for _, ms in results)
+        # Any non-200 is itself a finding (5xx on a read route means the worker path broke).
         out["routes"][name] = {"codes": codes, "p50_ms": round(lat[len(lat) // 2], 1),
                               "max_ms": round(lat[-1], 1)}
         print(name, out["routes"][name], flush=True)

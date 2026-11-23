@@ -12,9 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path("/home/hermes/.hermes/hermes-agent/.worktrees/t_6c16a6cb")
+ROOT = Path(__file__).resolve().parents[2]
 TARGET = ROOT / "hermes_cli/web_routers/status.py"
-BACKUP = ROOT / ".probe-tmp/status-fixed.py"
 
 FIXED = '''    if signed_out:
         full = {key_: value for key_, value in full.items() if key_ in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
@@ -32,7 +31,7 @@ BROKEN = '''    if signed_out:
 def main() -> int:
     src = TARGET.read_text(encoding="utf-8")
     assert FIXED in src, "fixed block not found — did the file change?"
-    shutil.copy2(TARGET, BACKUP)
+    backup = src  # in-memory restore: no copy on disk to leave behind
     try:
         TARGET.write_text(src.replace(FIXED, BROKEN), encoding="utf-8")
         proc = subprocess.run(
@@ -45,7 +44,7 @@ def main() -> int:
               if proc.returncode != 0 else "GREEN — the test does NOT pin the defect")
         return 0 if proc.returncode != 0 else 1
     finally:
-        shutil.copy2(BACKUP, TARGET)
+        TARGET.write_text(backup, encoding="utf-8")
         print("restored", TARGET)
 
 
