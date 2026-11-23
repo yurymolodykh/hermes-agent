@@ -19,27 +19,26 @@ already names: its acceptance criteria.
 
 Measured on the shared board (``task_runs`` joined to ``tasks``, duration =
 ``ended_at − started_at``, runs with a usable duration, 17–23.11.2026: 763 runs,
-percentiles by linear interpolation on the sorted durations):
+percentiles by nearest rank on the sorted durations):
 
 ===========  =======  ======  ======  ==========
 acceptance   runs     p50     p80     share > 60
 items       (n)       min     min     min
 ===========  =======  ======  ======  ==========
 0            223      23      61      21 %
-3            52       41      79      29 %
+3            52       40      81      29 %
 4            233      42      79      30 %
 5            170      46      90      36 %
-6            54       55      88      48 %
-7            9        48      96      44 %
+6            54       52      91      48 %
 ===========  =======  ======  ======  ==========
 
-Two- and eight-plus-item buckets exist but are not tabulated: 2 items has only four
-runs, and 8+ (18 runs, p50 21 min) is dominated by fan-out cards whose wall clock is
-mostly orchestration, not work. The last tabulated point (7) is thin too, so the
-figure above it is held, not extrapolated.
+Above six items the figure is held at the six-item point. The 7+ bucket (27 runs)
+measures *lower* — p50 38, p80 75 — because those cards are mostly fan-out parents
+whose wall clock is orchestration, not work; letting that dip through would predict a
+bigger card as faster. Two items has four runs and is interpolated, not tabulated.
 
-The whole sample: median 38 min, 30 % of runs longer than 60 min, 40 % longer than
-50 min. The old ``12 + 6 × items`` line put four items at 36 min — a 2.2×
+The whole sample: median 38 min, p80 76 min, 30 % of runs longer than 60 min, 40 %
+longer than 50 min. The old ``12 + 6 × items`` line put four items at 36 min — a 2.2×
 under-estimate against the measured p80 for that bucket (79 min), which is why the
 minute axis never fired.
 
@@ -75,11 +74,11 @@ SAFETY_MARGIN = 1.0
 #
 # Source: ``task_runs`` JOIN ``tasks`` on the shared board, ``ended_at − started_at``
 # in seconds, runs with a usable duration, 17–23.11.2026 (763 runs), acceptance items
-# counted by ``count_acceptance_items`` on the task body, percentiles by linear
-# interpolation. Recheck with ``tests/agent/test_kanban_card_sizing.py``'s
-# ``CALIBRATION_*`` round-trip; the docstring table is the same measurement.
-CALIBRATION_P50_MINUTES = {0: 23, 3: 41, 4: 42, 5: 46, 6: 55, 7: 48}
-CALIBRATION_P80_MINUTES = {0: 61, 3: 79, 4: 79, 5: 90, 6: 88, 7: 96}
+# counted by ``count_acceptance_items`` on the task body, percentiles by nearest rank.
+# Recheck with ``tests/agent/test_kanban_card_sizing.py``'s ``CALIBRATION_*``
+# round-trip; the docstring table is the same measurement.
+CALIBRATION_P50_MINUTES = {0: 23, 3: 40, 4: 42, 5: 46, 6: 52}
+CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 91}
 # The owner's target for one run: a card is authored to close in 30–50 minutes.
 CARD_MINUTE_TARGET = 50
 # Wall-clock cap written into a card that names none (``hermes_cli.kanban_db``'s own
@@ -100,8 +99,9 @@ def _interpolate_minutes(table: "dict[int, int]", acceptance_items: int) -> int:
     if items <= points[0]:
         return table[points[0]]
     if items >= points[-1]:
-        # Above the last measured point the figure is held, not extrapolated: the
-        # bucket with 7+ items is thin (n=9) and a fitted slope would invent the rest.
+        # Above the last measured point the figure is held, not extrapolated: the larger
+        # buckets are fan-out parents whose wall clock falls back (7+ measures *lower*),
+        # so a fitted slope would predict a bigger card as faster.
         return table[points[-1]]
     for lower, upper in zip(points, points[1:]):
         if lower <= items <= upper:

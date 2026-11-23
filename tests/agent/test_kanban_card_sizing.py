@@ -94,7 +94,7 @@ def test_assignee_budget_treats_an_unlimited_profile_as_no_budget(tmp_path, monk
 
 def test_estimate_minutes_is_calibrated_on_acceptance_items():
     """The minute figure is the measured p80 of its acceptance-item bucket, not a line:
-    0 → 61, 4 → 79, 6 → 88 min on the shared board (see the module docstring). Four
+    0 → 61, 4 → 79, 6 → 91 min on the shared board (see the module docstring). Four
     items is the bucket the report named — the old 36-minute guess was 2.2× under it."""
     from agent.kanban_card_sizing import (
         CARD_MINUTE_TARGET, CALIBRATION_P80_MINUTES, estimate_minutes,
@@ -104,15 +104,17 @@ def test_estimate_minutes_is_calibrated_on_acceptance_items():
     assert CALIBRATION_P80_MINUTES[4] == 79
     assert estimate_minutes(0) == 61
     assert estimate_minutes(4) == 79
-    assert estimate_minutes(6) == 88
+    assert estimate_minutes(6) == 91
     # Every measured bucket round-trips exactly, so a drift in a constant is caught.
     for items, minutes in CALIBRATION_P80_MINUTES.items():
         assert estimate_minutes(items) == minutes
     # Between measured points the figure is interpolated linearly, never extrapolated
     # (61 → 81 over 0 → 3 items: 1 item → 68, 2 → 74).
     assert estimate_minutes(1) == 68 and estimate_minutes(2) == 74
-    # Above the last measured point (7, n=9) the figure is held at that point.
-    assert estimate_minutes(12) == CALIBRATION_P80_MINUTES[7]
+    # Above the last measured point (6) the figure is held: the 7+ bucket measures
+    # LOWER (p80 75) because those cards are fan-out parents, so extrapolating its
+    # dip would predict a bigger card as faster.
+    assert estimate_minutes(12) == CALIBRATION_P80_MINUTES[6] == 91
     assert estimate_minutes(3) >= CARD_MINUTE_TARGET
 
 
@@ -132,7 +134,7 @@ def test_estimate_minutes_survives_a_card_with_no_criteria():
     # A hand-built estimate derives the same figure instead of disagreeing.
     assert CardSizeEstimate(
         acceptance_items=6, body_bytes=10, estimated_iterations=220, budget=300,
-    ).estimated_minutes == 88
+    ).estimated_minutes == 91
 
 
 def test_sizing_warning_carries_the_minute_estimate():
@@ -146,7 +148,7 @@ def test_sizing_warning_carries_the_minute_estimate():
     )
 
     assert warning is not None
-    assert "96 мин" in warning and "48" in warning   # p80 and median for 9 items
+    assert "91 мин" in warning and "52" in warning   # p80 and median for 9 items
     assert "30–50" in warning
     assert "310 iterations" in warning  # the iteration part is unchanged
 
@@ -215,13 +217,13 @@ def test_both_axes_are_named_together_and_a_generous_wall_clears_the_advisory():
         estimate_card(body, budget=120, max_runtime_seconds=3600), assignee="x",
     )
     assert both is not None
-    assert "310 iterations vs 120" in both and "96 мин" in both
+    assert "310 iterations vs 120" in both and "91 мин" in both
 
     naive_wall = sizing_warning(
         estimate_card(body, budget=120, max_runtime_seconds=2400), assignee="x",
     )
     assert naive_wall is not None
-    assert "40 мин" in naive_wall and "96 мин" in naive_wall
+    assert "40 мин" in naive_wall and "91 мин" in naive_wall
 
     generous_wall = sizing_warning(
         estimate_card(body, budget=120, max_runtime_seconds=86_400), assignee="x",
