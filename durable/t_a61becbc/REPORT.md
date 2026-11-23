@@ -248,22 +248,26 @@ scripts/run_tests.sh …` (иначе `run-in-hermes-env` ищет bootstrap-Pyt
 
 ## 6. Список изменённых файлов
 
+`git diff --stat dde0f0befbc HEAD -- hermes_cli tests` (14 файлов, +721 −52):
+
 ```
- hermes_cli/config_defaults.py              |   8 +
- hermes_cli/web_routers/handler_offload.py  | 244 ++++++++++++++++++++
- hermes_cli/web_server_app.py               |  12 +-
- hermes_cli/web_routers/files.py            |  53 +++--
- hermes_cli/web_routers/ops.py              |  26 ++-
- hermes_cli/web_routers/local_models.py     |  32 ++-
- hermes_cli/web_routers/profiles.py         |  43 +++--
- hermes_cli/web_routers/status.py           |  21 ++-
- hermes_cli/web_routers/dashboard_ui.py     |   4 +-
- hermes_cli/web_routers/chat_ws.py          |   3 +-
- hermes_cli/web_routers/messaging.py        |   4 +   (комментарий-обоснование отказа)
- tests/hermes_cli/test_handler_offload.py   | 196 +++++++++++++++
- tests/hermes_cli/test_fs_write_text_offload.py |  61 +++++
- tests/hermes_cli/test_status_offload_live.py  |  81 +++++
+ hermes_cli/config_defaults.py                  |   8 +
+ hermes_cli/web_routers/handler_offload.py      | 244 ++++++++++++++++++++
+ hermes_cli/web_server_app.py                   |  12 +-
+ hermes_cli/web_routers/files.py                |  55 +++--
+ hermes_cli/web_routers/ops.py                  |  26 ++-
+ hermes_cli/web_routers/local_models.py         |  32 ++-
+ hermes_cli/web_routers/profiles.py             |  43 +++--
+ hermes_cli/web_routers/status.py               |  25 ++-
+ hermes_cli/web_routers/dashboard_ui.py         |   4 +-
+ hermes_cli/web_routers/chat_ws.py              |   3 +-
+ hermes_cli/web_routers/messaging.py            |   4 +   (комментарий-обоснование отказа)
+ tests/hermes_cli/test_handler_offload.py       | 196 ++++++++++++++
+ tests/hermes_cli/test_fs_write_text_offload.py |  52 +++++
+ tests/hermes_cli/test_status_offload_live.py   |  69 +++++
 ```
+
+Коммит в ветке `wt/t_6c16a6cb`: `5d80caa598bf` (над базой `dde0f0befbc`).
 
 ## 7. Стенды (в `durable/t_a61becbc/`)
 
@@ -274,8 +278,11 @@ scripts/run_tests.sh …` (иначе `run-in-hermes-env` ищет bootstrap-Pyt
 | `probe_handler_lag.py` | лаг цикла от самого тела, без HTTP |
 | `probe_blocking_write.py` | HTTP A/B 8 МиБ × 8 на `write-text`, живой пул vs inline |
 | `probe_pool.py` | всплеск 64 на пул из 16: очередь, коды ответов, счётчики |
-| `probe_sqlite_threads.py` | сквозная проверка «SQLite не пересекает потоки» — **не поднялся**, см. §5 |
+| `probe_sqlite_threads.py` | 8 одновременных чтений на sessions/messages/search через воркеры — все 200, ни одного 5xx (SQLite не пересекает потоки) |
+| `proof_concurrent_save.py` | красное доказательство гонки стейджа на до-фиксовом коде (`ok=2 failed=6`) |
+| `proof_status_cache.py` | красное доказательство «счётчики из TTL-кэша» на до-фиксовом коде (`2 failed`) |
 
 Данные: `curve-before.json`, `loop-before.json`, `before.json` (до, из `t_a61becbc`);
 `curve-after.json`, `after.json`, `ab-curve.json`, `ab-loop.json`, `probe-handler-lag.json`,
-`probe-write-on.json`, `probe-write-off.json`, `probe-pool.json` (эта карточка).
+`probe-write-on.json`, `probe-write-off.json`, `probe-pool.json`, `probe-sqlite-threads.json`
+(эта карточка).
