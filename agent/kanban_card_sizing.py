@@ -1,29 +1,49 @@
-"""Card-sizing rule: does a card's declared volume fit the assignee's iteration budget?
+"""Card-sizing rule: does a card's declared volume fit the assignee's *two* budgets?
 
-An iteration budget belongs to the *assignee profile* (``agent.max_turns``), not to
-the card, and a card that cannot fit does not fail loudly — it burns its last
-iteration mid-edit and stops (``t_f3d28e37``: 1459 verified lines, uncommitted).
-Raising every profile's cap is not the fix: the same 31 budget stops in the board
-history ran from 0.5 h to 2.8 h, so the cap is not the variable — the card's size
-against it is.
+Two independent limits stop a run, and they are not the same axis:
 
-The rule is deliberately coarse and stated in work items the card already names:
-its acceptance criteria. Measured on 383 finished runs of the shared board (31 of
-them budget stops, 352 not): the median budget stop carried 5 acceptance items and
-the median completed run 4. Applied as written, the estimator flags 6 of the 31
-stops (19 %) and 18 of the 352 other runs (5 %) — a 3.5x lift over the 8 % base
-rate. That is the right asymmetry for an advisory warning: a false alarm costs a
-re-read of the card, a missed one costs the run, and the WIP checkpoint (see
-``agent.kanban_budget_checkpoint``) is the guarantee underneath for the stops this
-rule does not see.
+* the assignee profile's iteration budget (``agent.max_turns``) — the rule's original
+  axis. An iteration budget belongs to the *assignee profile*, not to the card, and a
+  card that cannot fit does not fail loudly — it burns its last iteration mid-edit and
+  stops (``t_f3d28e37``: 1459 verified lines, uncommitted);
+* the card's own wall-clock cap (``task_runs.max_runtime_seconds``, written from
+  ``hermes_cli.kanban_db.DEFAULT_MAX_RUNTIME_SECONDS`` = 3600 s at creation). This is
+  what actually kills runs on this board: on 23.11.2026 two cards went ``timed_out``
+  at that wall while the sizing rule stayed silent — four acceptance items estimated
+  at 160 iterations against a 240 budget ("fits") and 36 minutes against a 60-minute
+  wall ("fits"), and the run died at the wall it had been told it would fit.
 
-Budget stops are NOT mostly a size problem: 25 of 31 carried a normal-looking card.
-The cap is not the variable and neither is the item count alone — which is why the
-rule warns rather than blocks, and why the checkpoint, not the split, is what keeps
-the work.
+The iteration axis is deliberately coarse; the minute axis is calibrated on the board's
+own history rather than on a linear guess. Both are stated in work items the card
+already names: its acceptance criteria.
 
-The rule is advisory by construction: it never blocks ``kanban_create``. A card
-may legitimately be bigger than the profile and be split by its creator.
+Measured on the shared board (``task_runs`` joined to ``tasks``, duration =
+``ended_at − started_at``, runs with a usable duration, 17–23.11.2026: 754 runs):
+
+===========  =======  ======  ======  ==========
+acceptance   runs     p50     p80     share > 60
+items       (n)       min     min     min
+===========  =======  ======  ======  ==========
+0            224      23      61      21 %
+3            49       42      81      31 %
+4            231      42      79      30 %
+5            165      45      90      35 %
+6            54       55      88      48 %
+7            9        48      96      44 %
+===========  =======  ======  ======  ==========
+
+The whole sample: median 38 min, 30 % of runs longer than 60 min, 40 % longer than
+50 min. The old ``12 + 6 × items`` line put four items at 36 min — a 2.2×
+under-estimate against the measured p80 for that bucket (79 min), which is why the
+minute axis never fired.
+
+Budget stops are NOT mostly a size problem: 25 of the 31 original budget stops carried
+a normal-looking card. Neither axis alone is the variable — which is why the rule warns
+rather than blocks, and why the WIP checkpoint (``agent.kanban_budget_checkpoint``), not
+the split, is what keeps the work.
+
+The rule is advisory by construction: it never blocks ``kanban_create``. A card may
+legitimately be bigger than the profile and be split by its creator.
 """
 
 from __future__ import annotations
@@ -41,16 +61,22 @@ BASE_ITERATIONS = 40
 # Head-room for the model's own bookkeeping turns (comments, heartbeats, greps).
 SAFETY_MARGIN = 1.0
 
-# Minutes are a second, independent axis: a card can fit its iteration budget and
-# still run for two hours. Measured on the shared board (672 runs, 17–23.11.2026,
-# successful runs only, duration = task_runs.ended_at − started_at): 65 % of runs
-# landed under 50 min with 0–4 acceptance items, 43 % with 5–6. Text features (body
-# length, file/line counts) separate duration poorly (AUC 0.58–0.60), so minutes are
-# allotted from the one feature that does: the acceptance-item count.
-BASE_MINUTES = 12
-MINUTES_PER_ITEM = 6
+# Wall-clock calibration: minutes per acceptance-item count, measured on the shared
+# board (see the module docstring for the query shape and the sample). Keys are item
+# counts that the board actually has enough runs for; values are the measured
+# percentiles, rounded to whole minutes. Interpolated linearly between points and
+# clamped to the last point above it — no point is extrapolated from a formula.
+#
+# Source: ``task_runs`` JOIN ``tasks`` on the shared board, ``ended_at − started_at``
+# in seconds, runs with a usable duration, 17–23.11.2026 (754 runs), acceptance items
+# counted by ``count_acceptance_items`` on the task body.
+CALIBRATION_P50_MINUTES = {0: 23, 3: 42, 4: 42, 5: 45, 6: 55, 7: 48}
+CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 88, 7: 96}
 # The owner's target for one run: a card is authored to close in 30–50 minutes.
 CARD_MINUTE_TARGET = 50
+# Wall-clock cap written into a card that names none (``hermes_cli.kanban_db``'s own
+# default). Read lazily so this module keeps importing without the CLI package.
+FALLBACK_MAX_RUNTIME_SECONDS = 3600
 
 _ACCEPTANCE_HEADING = re.compile(
     r"(?im)^\s*(?:#+\s*)?(?:\*\*)?\s*(?:приёмка|приемка|acceptance|критерии|"
@@ -59,15 +85,46 @@ _ACCEPTANCE_HEADING = re.compile(
 _ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+\S")
 
 
-def estimate_minutes(acceptance_items: int) -> int:
-    """Minutes the rule allots to a card with this many acceptance items.
+def _interpolate_minutes(table: "dict[int, int]", acceptance_items: int) -> int:
+    """The table's figure for this item count: linear between points, clamped at both ends."""
+    items = max(0, acceptance_items)
+    points = sorted(table)
+    if items <= points[0]:
+        return table[points[0]]
+    if items >= points[-1]:
+        # Above the last measured point the figure is held, not extrapolated: the
+        # bucket with 7+ items is thin (n=9) and a fitted slope would invent the rest.
+        return table[points[-1]]
+    for lower, upper in zip(points, points[1:]):
+        if lower <= items <= upper:
+            span = upper - lower
+            frac = (items - lower) / span
+            return int(round(table[lower] + (table[upper] - table[lower]) * frac))
+    return table[points[-1]]
 
-    ``12 + 6 × items``: the fixed overhead of orienting and handing off plus six
-    minutes per acceptance criterion. Fitted on the shared board's successful runs
-    (see ``BASE_MINUTES``), so 3 items ≈ 30 min and 6 ≈ 48 min — the second lands
-    just under ``CARD_MINUTE_TARGET`` and a 7th item pushes the card over it.
+
+def estimate_minutes(acceptance_items: int) -> int:
+    """Planning minutes for a card with this many acceptance items: the measured p80.
+
+    p80 and not the median: the wall axis exists to warn before a run is killed, so the
+    figure that matters is the pessimistic-but-plausible one — 4 items ≈ 79 min, which
+    is 2.2× the old linear guess and over the 60-minute default wall. ``3 items ≈ 81``
+    is likewise over ``CARD_MINUTE_TARGET``; see ``estimate_minutes_median`` for the
+    p50 that the advisory also reports.
     """
-    return BASE_MINUTES + MINUTES_PER_ITEM * max(0, acceptance_items)
+    return _interpolate_minutes(CALIBRATION_P80_MINUTES, acceptance_items)
+
+
+def estimate_minutes_median(acceptance_items: int) -> int:
+    """Median minutes for a card with this many acceptance items (the measured p50)."""
+    return _interpolate_minutes(CALIBRATION_P50_MINUTES, acceptance_items)
+
+
+def wall_minutes(max_runtime_seconds: Optional[int]) -> Optional[int]:
+    """The wall expressed in whole minutes (rounded up), or None when the card has none."""
+    if max_runtime_seconds is None:
+        return None
+    return int(math.ceil(max(0, max_runtime_seconds) / 60))
 
 
 @dataclass(frozen=True)
@@ -77,15 +134,23 @@ class CardSizeEstimate:
     body_bytes: int
     estimated_iterations: int
     budget: Optional[int]
-    estimated_minutes: Optional[int] = None
+    # The card's own wall-clock cap (``tasks.max_runtime_seconds``); None = uncapped
+    # (a row created before the default existed), which the rule reads as silence.
+    max_runtime_seconds: Optional[int] = None
 
-    def __post_init__(self) -> None:
-        # Derived rather than required: every caller that sizes a card gets the minute
-        # figure for free, and a hand-built estimate cannot disagree with the formula.
-        if self.estimated_minutes is None:
-            object.__setattr__(
-                self, "estimated_minutes", estimate_minutes(self.acceptance_items)
-            )
+    @property
+    def estimated_minutes(self) -> int:
+        # Derived rather than stored: a hand-built estimate cannot disagree with the
+        # calibration table the warning and the tool response both report.
+        return estimate_minutes(self.acceptance_items)
+
+    @property
+    def median_minutes(self) -> int:
+        return estimate_minutes_median(self.acceptance_items)
+
+    @property
+    def wall_minutes(self) -> Optional[int]:
+        return wall_minutes(self.max_runtime_seconds)
 
     @property
     def fits(self) -> bool:
@@ -97,6 +162,19 @@ class CardSizeEstimate:
         if self.budget is None:
             return 0
         return max(0, self.estimated_iterations - self.budget)
+
+    @property
+    def fits_minutes(self) -> bool:
+        """True when no wall was given, the card names no criteria, or the p80 fits it."""
+        if self.wall_minutes is None or not self.acceptance_items:
+            return True
+        return self.estimated_minutes <= self.wall_minutes
+
+    @property
+    def minutes_overrun(self) -> int:
+        if self.wall_minutes is None or not self.acceptance_items:
+            return 0
+        return max(0, self.estimated_minutes - self.wall_minutes)
 
 
 def count_acceptance_items(body: Optional[str]) -> int:
@@ -124,34 +202,73 @@ def estimate_iterations(acceptance_items: int) -> int:
     )
 
 
-def estimate_card(body: Optional[str], budget: Optional[int]) -> CardSizeEstimate:
-    """Size a card body against a profile's iteration budget (``None`` = unlimited)."""
+def estimate_card(
+    body: Optional[str],
+    budget: Optional[int],
+    *,
+    max_runtime_seconds: Optional[int] = None,
+) -> CardSizeEstimate:
+    """Size a card body against a profile's iteration budget and the card's wall.
+
+    ``budget=None`` means unlimited (nothing to judge); ``max_runtime_seconds=None``
+    means the card carries no wall (an uncapped row), *not* the dispatcher default —
+    the caller that knows the default (``kanban_create``, because ``create_task`` is
+    about to write it) resolves it before calling here.
+    """
     items = count_acceptance_items(body)
     return CardSizeEstimate(
         acceptance_items=items,
         body_bytes=len((body or "").encode("utf-8")),
         estimated_iterations=estimate_iterations(items),
         budget=budget,
+        max_runtime_seconds=max_runtime_seconds,
     )
 
 
 def sizing_warning(estimate: CardSizeEstimate, *, assignee: str) -> Optional[str]:
-    """A one-line advisory for ``kanban_create``; None when the card fits.
+    """A one-line advisory for ``kanban_create``; None when the card fits both axes.
 
-    Advisory, never fatal: the creator decides to split or to raise the profile's
-    cap, and both are legitimate answers.
+    Two limits are reported because they are different ways to lose the run: the
+    assignee's iteration budget and the card's own wall clock. Advisory, never fatal:
+    the creator decides to split, to raise the profile's cap or to raise the wall, and
+    all three are legitimate answers.
     """
-    if estimate.fits or estimate.budget is None:
-        return None
     if not estimate.acceptance_items:
+        # Nothing was declared, so there is nothing to size — including the minutes,
+        # whose zero-item bucket is mostly cards that never named a criterion.
         return None
+    iteration_over = estimate.budget is not None and not estimate.fits
+    minute_over = not estimate.fits_minutes
+    if not iteration_over and not minute_over:
+        return None
+
+    parts: list[str] = []
+    if iteration_over:
+        parts.append(
+            f"{estimate.acceptance_items} acceptance items ≈ "
+            f"{estimate.estimated_iterations} iterations vs {estimate.budget} for "
+            f"'{assignee}'"
+        )
+    if minute_over:
+        parts.append(
+            f"{estimate.acceptance_items} acceptance items ≈ "
+            f"{estimate.estimated_minutes} мин (медиана {estimate.median_minutes}) "
+            f"vs предел прогона карточки {estimate.max_runtime_seconds} с "
+            f"({estimate.wall_minutes} мин)"
+        )
+    if not parts:  # defensive: no axis over, nothing to say
+        return None
+    split = " or ".join(
+        item for item, used in (
+            ("raise `agent.max_turns` for that profile", iteration_over),
+            ("raise `max_runtime_seconds` of the card", minute_over),
+        ) if used
+    )
     return (
-        f"card volume may exceed the assignee's iteration budget: "
-        f"{estimate.acceptance_items} acceptance items ≈ "
-        f"{estimate.estimated_iterations} iterations vs {estimate.budget} for "
-        f"'{assignee}', ≈ {estimate.estimated_minutes} мин при цели 30–{CARD_MINUTE_TARGET}. "
-        f"Split the card, or raise `agent.max_turns` for that profile, "
-        f"or accept that it may stop mid-work (the WIP checkpoint keeps the tree)."
+        "card volume may exceed its budget: " + "; ".join(parts)
+        + f". Цель — 30–{CARD_MINUTE_TARGET} мин на прогон. "
+        f"Split the card, or {split}, or accept that it may stop mid-work "
+        f"(the WIP checkpoint keeps the tree)."
     )
 
 
@@ -191,17 +308,34 @@ def assignee_iteration_budget(assignee: str) -> Optional[int]:
     return None if resolved == TURN_LIMIT_UNLIMITED else resolved
 
 
+def default_wall_seconds() -> Optional[int]:
+    """The wall ``create_task`` writes into a card that names none; None if unreadable.
+
+    Read from ``hermes_cli.kanban_db`` (one source of truth for the number) and never
+    cached: the value is a board-level decision, not a constant of this rule.
+    """
+    try:
+        from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
+    except (ImportError, AttributeError):
+        return FALLBACK_MAX_RUNTIME_SECONDS
+    return DEFAULT_MAX_RUNTIME_SECONDS
+
+
 __all__ = [
     "BASE_ITERATIONS",
-    "BASE_MINUTES",
+    "CALIBRATION_P50_MINUTES",
+    "CALIBRATION_P80_MINUTES",
     "CARD_MINUTE_TARGET",
+    "FALLBACK_MAX_RUNTIME_SECONDS",
     "ITERATIONS_PER_CRITERION",
-    "MINUTES_PER_ITEM",
     "CardSizeEstimate",
     "assignee_iteration_budget",
     "count_acceptance_items",
+    "default_wall_seconds",
     "estimate_card",
     "estimate_iterations",
     "estimate_minutes",
+    "estimate_minutes_median",
     "sizing_warning",
+    "wall_minutes",
 ]
