@@ -1,3 +1,55 @@
+# PROGRESS — t_e414a3cc: провенанс сохранённых scratch-каталогов (Д3)
+
+## Состояние: реализация + тесты готовы, широкий набор `tests/hermes_cli/` идёт.
+
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc`
+* Ветка: `wt/t_e414a3cc`; база `c22f1fdcad3`; code-health база `3e1895729437`
+* Checkpoints недоступны (store busy) → откат только через git-коммиты.
+
+## Выбранный вариант (обоснование)
+
+(а) + durable-реестр + учёт в `gc` — гибрид: ретенция исключает вид события
+`workspace_cleanup_preserved_unsaved_work`, а рядом с БД доски лежит
+`kanban-preserved-workspaces.json`, который переживает и ретенцию, и hard-delete.
+Исключение из ретенции ограничено: `gc` удаляет запись реестра И событие, как
+только каталога на диске нет (тест `test_gc_forgets_a_preserved_dir_the_operator_removed`).
+Вариант (в) отклонён: отказ `delete_archived_task` ломает штатный жизненный цикл
+карточки ради побочного артефакта.
+
+## Изменения
+
+1. `hermes_cli/kanban_preserved_workspaces.py` (новый) — реестр: `record()`
+   (идемпотентно по (task, path): событие не дублируется — Д7, запись upsert),
+   `entries()`, `prune_gone()` (удаляет записи без каталога + их события),
+   `registry_path(conn)` (по файлу БД **этого** соединения, не по ambient-пину),
+   flock/msvcrt-лок с таймаутом 5с, атомарная запись через `os.replace`.
+2. `hermes_cli/kanban_db_workspace.py::_preserve_scratch_workspace` — вместо
+   прямой `_append_event` зовёт `kpw.record(...)`.
+3. `hermes_cli/kanban_db_retention.py` (новый) — `gc_events`/`gc_worker_logs`/
+   `_retention_seconds` вынесены из фасада; в DELETE добавлено
+   `kind != PRESERVED_KIND`. Вынос нужен и по code-health: фасад был 4372 строк.
+4. `hermes_cli/kanban_db.py` — блок ретенции удалён, имена ре-экспортируются
+   tail-import'ом (как остальные sibling'и).
+5. `hermes_cli/kanban_ops.py::_cmd_gc` — после сводки печатает пути сохранённых
+   каталогов (путь + task id + причина) через `_reap_preserved_workspaces()`.
+6. `website/docs/user-guide/features/kanban.md` — документирован реестр и команда поиска.
+7. `tests/hermes_cli/test_kanban_preserved_provenance.py` (новый) — 6 тестов.
+
+## Доказательства
+
+* Красная база (до реализации): 6 failed — `evidence-t_e414a3cc/red-before.txt`
+* Зелёный после: 6 passed — `evidence-t_e414a3cc/green-after.txt`
+* ruff + code_health — `evidence-t_e414a3cc/checks.txt`
+
+## Проверки
+
+* `tests/hermes_cli/test_kanban_preserved_provenance.py` → 6 passed
+* `python -m scripts.code_health --base 3e1895729437` → 0 blocking, 0 advisory
+* `ruff check --config ruff.pre-commit.toml` → All checks passed
+* Широкий `tests/hermes_cli/` → см. `evidence-t_e414a3cc/wide-suite.txt`
+
+---
+
 # PROGRESS — t_9bddc422: убрать упоминание диска из `owner_unavailable`
 
 ## Состояние: ГОТОВО. Коммит `9c058a57bab` в ветке `wt/t_9bddc422`, дерево чистое.
