@@ -756,6 +756,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    scheduled_until: Optional[int] = None    # epoch deadline of a parked card; NULL = none
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -782,7 +783,10 @@ _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by",
     "workspace_kind", "workspace_path", "claim_lock",
 )
-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+_TASK_EPOCH_COLUMNS = (
+    "created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at",
+    "scheduled_until",  # absent on a pre-migration row -> ``_row_get`` yields None
+)
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
@@ -992,7 +996,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Epoch deadline of a ``scheduled`` (parked) card; NULL = parked with no
+    -- deadline, which the dispatcher never wakes. Set by
+    -- ``hermes_cli.kanban_db_schedule`` through ``hermes kanban schedule --until``
+    -- and cleared by the wake itself (``woken_by_timer``), by ``unblock`` and on
+    -- completion — so one deadline produces exactly one wake.
+    scheduled_until      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3739,7 +3749,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, scheduled_until = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -4045,18 +4055,24 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, until: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable).
+
+    ``until`` (epoch, see :func:`kanban_db_schedule.parse_until`) records WHEN the
+    card should come back: the dispatcher tick wakes it then (``woken_by_timer``).
+    Without ``until`` the card is parked with no deadline — it waits for a human,
+    which the board flags as an anomaly rather than silently forgetting it.
+    """
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [int(until) if until else None, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   scheduled_until = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -4099,46 +4115,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-# --- Stats + SLA helpers ---
-
-def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
-    by_status: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
-    ):
-        by_status[row["status"]] = int(row["n"])
-
-    by_assignee = _counts_by_assignee(conn)
-
-    oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
-    ).fetchone()
-    now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
-
-    return {
-        "by_status": by_status,
-        "by_assignee": by_assignee,
-        "oldest_ready_age_seconds": oldest_ready_age,
-        "now": now,
-    }
-
-
-def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
-    """``{assignee: {status: n}}`` over non-archived tasks."""
-    counts: dict[str, dict[str, int]] = {}
-    for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
-    ):
-        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
-    return counts
+# --- Stats + SLA helpers (moved to ``kanban_db_stats``; re-exported at the tail) ---
 
 
 def _to_epoch(val) -> Optional[int]:
@@ -4163,15 +4140,14 @@ def _to_epoch(val) -> Optional[int]:
         return None
 
 
+def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """``{assignee: {status: n}}`` over non-archived tasks (see ``kanban_db_stats``)."""
+    return kanban_db_stats.counts_by_assignee(conn)
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
-    now = int(time.time())
-    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
-    return {
-        "created_age_seconds": now - _c if _c is not None else None,
-        "started_age_seconds": now - _s if _s is not None else None,
-        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
-    }
+    return kanban_db_stats.task_age(task)
 
 
 # --- Retention + garbage collection (see kanban_db_retention) ---
@@ -4334,6 +4310,9 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli import kanban_db_sizing
+from hermes_cli import kanban_db_schedule
+from hermes_cli import kanban_db_stats
+from hermes_cli.kanban_db_stats import board_stats
 from hermes_cli.kanban_db_promotion import (
     _has_sticky_block,
     _latest_event,

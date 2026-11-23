@@ -18,6 +18,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_schedule as kbschedule
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
@@ -654,6 +655,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    if task.status == "scheduled":
+        # Observability: when will it come back, or is it parked for a human?
+        if task.scheduled_until:
+            field("wakes", f"{kbschedule.format_local(task.scheduled_until)} (timer)")
+        else:
+            field("wakes", "no deadline — a human must unblock it (schedule <id> --until …)")
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -1162,11 +1169,30 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     ids = _bulk_ids(args)
+    raw_until = _stripped_or_none(getattr(args, "until", None))
+    until = None
+    if raw_until is not None:
+        until = kbschedule.parse_until(raw_until)
+        if until is None:
+            return _err(
+                f"cannot read --until {raw_until!r}: pass ISO-8601 "
+                f"(2026-11-25T04:40) or epoch seconds; a value without an offset is "
+                f"read in {kbschedule.timezone_name()} "
+            )
+    note = reason
+    when = ""
+    if until is not None:
+        when = kbschedule.format_local(until)
+        note = f"{reason} SCHEDULED_UNTIL={when}" if reason else f"SCHEDULED_UNTIL={when}"
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, note, author, "SCHEDULED", lambda tid: kb.schedule_task(
+            conn, tid, reason=note, expected_run_id=_worker_run_id_for(tid), until=until))
+        label = (
+            (lambda tid: f"Scheduled {tid}{suffix} — wakes {when}")
+            if until is not None else (lambda tid: f"Scheduled {tid}{suffix}")
+        )
+        return _bulk_apply(ids, op, label, lambda tid: f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1301,6 +1327,11 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    sched_line = kbschedule.describe_schedule(stats)
+    if sched_line:
+        print(f"\n{sched_line}")
+        for card in stats.get("next_wakeups") or []:
+            print(f"  {card['id']}  {card['scheduled_until_local']}  {card['title']}")
     return 0
 
 
