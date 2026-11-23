@@ -142,11 +142,23 @@ class _ReadOnlyHandlePool:
                     break
                 if not entries:
                     self._idle.pop(key, None)
+            # Counted INSIDE the lock: _idle is mutated under it by release()/_pop_oldest_locked()/
+            # clear(), so walking it from a logging argument after the lock is a data race that
+            # would raise between the pop above and the return below (losing the handle).
+            idle_count = sum(len(group) for group in self._idle.values())
         for entry in stale:
             self._close_entry(entry)
         logger.debug("read-only handle pool %s for %s (idle=%d)",
-                     "HIT" if picked is not None else "MISS", key, self._total_idle_locked())
-        return picked.db if picked is not None else None
+                     "HIT" if picked is not None else "MISS", key, idle_count)
+        if picked is None:
+            return None
+        try:
+            return picked.db
+        except BaseException:
+            # Never strand a checked-out handle: whatever fails between the pop and the handoff,
+            # the caller gets nothing and the pool must not keep (or leak) the entry.
+            self._close_entry(picked)
+            raise
 
     def release(self, key: str, db, identity) -> bool:
         """Return ``db`` to the pool; False when the handle is not reusable (caller closes it).
