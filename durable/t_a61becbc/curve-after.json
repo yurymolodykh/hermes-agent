@@ -1,0 +1,99 @@
+{
+  "repo": "/home/hermes/.hermes/hermes-agent/.worktrees/t_6c16a6cb",
+  "sessions": 200,
+  "messages": 12,
+  "routes": {
+    "status": {
+      "1": {
+        "p50_ms": 3.7,
+        "max_ms": 3.7,
+        "wall_ms": 3.7
+      },
+      "2": {
+        "p50_ms": 7.3,
+        "max_ms": 7.3,
+        "wall_ms": 7.1
+      },
+      "4": {
+        "p50_ms": 15.7,
+        "max_ms": 16.0,
+        "wall_ms": 15.7
+      },
+      "8": {
+        "p50_ms": 30.4,
+        "max_ms": 31.9,
+        "wall_ms": 30.2
+      },
+      "slowdown_8x": 8.62
+    },
+    "sessions": {
+      "1": {
+        "p50_ms": 19.3,
+        "max_ms": 19.3,
+        "wall_ms": 19.3
+      },
+      "2": {
+        "p50_ms": 40.7,
+        "max_ms": 40.7,
+        "wall_ms": 31.7
+      },
+      "4": {
+        "p50_ms": 87.8,
+        "max_ms": 96.8,
+        "wall_ms": 68.2
+      },
+      "8": {
+        "p50_ms": 204.2,
+        "max_ms": 252.5,
+        "wall_ms": 182.0
+      },
+      "slowdown_8x": 13.08
+    },
+    "messages": {
+      "1": {
+        "p50_ms": 9.2,
+        "max_ms": 9.2,
+        "wall_ms": 9.2
+      },
+      "2": {
+        "p50_ms": 16.6,
+        "max_ms": 16.6,
+        "wall_ms": 13.4
+      },
+      "4": {
+        "p50_ms": 35.5,
+        "max_ms": 39.0,
+        "wall_ms": 33.5
+      },
+      "8": {
+        "p50_ms": 84.4,
+        "max_ms": 96.7,
+        "wall_ms": 74.5
+      },
+      "slowdown_8x": 10.51
+    },
+    "search": {
+      "1": {
+        "p50_ms": 40.9,
+        "max_ms": 40.9,
+        "wall_ms": 40.9
+      },
+      "2": {
+        "p50_ms": 97.9,
+        "max_ms": 97.9,
+        "wall_ms": 88.3
+      },
+      "4": {
+        "p50_ms": 307.2,
+        "max_ms": 309.6,
+        "wall_ms": 299.1
+      },
+      "8": {
+        "p50_ms": 836.1,
+        "max_ms": 854.4,
+        "wall_ms": 781.5
+      },
+      "slowdown_8x": 20.89
+    }
+  }
+}
