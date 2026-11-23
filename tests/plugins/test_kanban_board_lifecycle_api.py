@@ -86,6 +86,55 @@ def test_delete_board_hard_leaves_nothing(client):
     assert not kb.board_dir("widget").exists()
 
 
+def _git(repo: Path, *args: str) -> str:
+    """Run git inside ``repo`` only: no command may inherit pytest's cwd or HOME config."""
+    proc = subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, timeout=60,
+                          encoding="utf-8", errors="replace")
+    return proc.stdout.strip()
+
+
+def _seed_scratch_clone(repo: Path) -> None:
+    """A scratch clone holding one commit that exists nowhere else."""
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "work.txt").write_text("only copy\n", encoding="utf-8")
+    _git(repo, "add", "work.txt")
+    _git(repo, "commit", "-m", "never pushed")
+
+
+def _local_identity(repo: Path) -> str:
+    """``user.*`` as recorded in this repository's own ``.git/config`` (empty when unset)."""
+    proc = subprocess.run(["git", "config", "--local", "--get-regexp", r"^user\."], cwd=repo,
+                          check=False, capture_output=True, timeout=60,
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode in (0, 1), proc.stderr  # 1 is git's "nothing matched"
+    return proc.stdout.strip()
+
+
+def test_seeding_the_scratch_clone_never_writes_into_the_enclosing_repository(tmp_path, monkeypatch):
+    """pytest's cwd is whatever tree the run started in: the seed must not configure that tree."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _git(outer, "init", "-b", "main")
+    _git(outer, "config", "user.email", "honest-dev@example.org")
+    _git(outer, "config", "user.name", "Honest Dev")
+    before = _local_identity(outer)
+
+    monkeypatch.chdir(outer)  # exactly the cwd the leaky version inherited
+    _seed_scratch_clone(tmp_path / "scratch" / "clone")
+    assert _local_identity(outer) == before
+
+    # Same helper from a directory with no repository at all (an archive/snapshot run).
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    _seed_scratch_clone(tmp_path / "scratch2" / "clone")
+    assert _local_identity(tmp_path / "scratch2" / "clone") == (
+        "user.email t@example.com\nuser.name t")
+
+
 def test_hard_delete_is_refused_while_a_workspace_holds_unsaved_work(client):
     """The dashboard delete is the same backend path, so the guard has to answer there too."""
     client.post("/api/plugins/kanban/boards", json={"slug": "widget"})
@@ -93,15 +142,7 @@ def test_hard_delete_is_refused_while_a_workspace_holds_unsaved_work(client):
         task_id = kb.create_task(conn, title="scratch task")
     ws = kb.workspaces_root(board="widget") / task_id
     repo = ws / "clone"
-    repo.mkdir(parents=True)
-    for args in (("init", "-b", "main", str(repo)), ("config", "user.email", "t@example.com"),
-                 ("config", "user.name", "t")):
-        subprocess.run(["git", *args], check=True, capture_output=True, timeout=60,
-                       encoding="utf-8", errors="replace")
-    (repo / "work.txt").write_text("only copy\n", encoding="utf-8")
-    for args in (("add", "work.txt"), ("commit", "-m", "never pushed")):
-        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, timeout=60,
-                       encoding="utf-8", errors="replace")
+    _seed_scratch_clone(repo)
     with connect_closing(board="widget") as conn:
         conn.execute(
             "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? WHERE id = ?",
