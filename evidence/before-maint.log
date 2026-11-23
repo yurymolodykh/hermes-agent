@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/hermes/.hermes/kanban/workspaces/t_9f42e621/evidence/repro_manager.py", line 73, in <module>
+    project.mkdir(parents=True, exist_ok=True)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py", line 1011, in mkdir
+    os.mkdir(self, mode)
+    ~~~~~~~~^^^^^^^^^^^^
+FileExistsError: [Errno 17] File exists: '/tmp/x'
