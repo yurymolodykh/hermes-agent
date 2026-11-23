@@ -84,7 +84,11 @@ def personal_profile_name(login: str) -> str:
     slug = normalize_login(login)
     if not slug or not person_slug(slug):
         return ""
-    return f"{PERSONAL_ROOT_PREFIX}{slug}"
+    # A login carries dots (``maria.safronova``); a profile name may not — the platform's
+    # rule is lowercase letters, digits, '-' and '_'. The login stays the sign-in name and the
+    # registry subject; only the directory name is folded, so one person keeps one identity
+    # in every registry that matters.
+    return f"{PERSONAL_ROOT_PREFIX}{slug.replace('.', '-')}"
 
 
 def telegram_subject(telegram_id: str) -> str:
@@ -287,7 +291,7 @@ def _preflight(login: str, telegram_id: str, *, adopt: bool = False) -> str:
     registry = store().read()
     subject = telegram_subject(telegram_id)
     if registry is not None:
-        slug = f"person/{profile[len(PERSONAL_ROOT_PREFIX):]}"
+        slug = f"person/{login}"  # the login, not the folded directory name
         if registry.record(slug) is not None:
             raise Refused(f"binding record {slug} already exists")
         if registry.person_of(slug) is not None:
@@ -299,14 +303,17 @@ def _preflight(login: str, telegram_id: str, *, adopt: bool = False) -> str:
             raise Refused(f"profile {profile} is already listed in {registry.profile_owner(profile)}")
 
     # Users file: no record, and no route already aiming at this profile.
-    path = users_file_path()
-    if path is not None:
-        result = du.load_users_file(path)
-        if not result.ok:
-            raise Refused(f"users file {path} is unusable: "
-                          + "; ".join(str(problem) for problem in result.problems))
-        if du.lookup(result.users, login) is not None:
-            raise Refused(f"login {login!r} already exists in {path}")
+    from pathlib import Path as _Path
+
+    from hermes_constants import get_hermes_home
+
+    path = users_file_path() or _Path(get_hermes_home()) / "users.jsonl"
+    result = du.load_users_file(path)
+    if not result.ok:
+        raise Refused(f"users file {path} is unusable: "
+                      + "; ".join(str(problem) for problem in result.problems))
+    if du.lookup(result.users, login) is not None:
+        raise Refused(f"login {login!r} already exists in {path}")
     if _route_for_profile(login) is not None:
         raise Refused(f"gateway.profile_routes already routes Telegram traffic to {profile}")
     return profile
@@ -374,7 +381,7 @@ def add_user(
         # 3. Bindings: one person, their profile, their Telegram stamp.
         from hermes_acl_bindings import store as bindings_store
 
-        slug = f"person/{profile[len(PERSONAL_ROOT_PREFIX):]}"
+        slug = f"person/{login}"  # the login, not the folded directory name
         subjects = [telegram_subject(telegram_id)] if telegram_id else []
         bindings_store().bind(
             slug, profiles=[profile], subjects=subjects, display_name=display,
@@ -556,7 +563,7 @@ def remove_user(login: str, *, say: Callable[[str], None] = _out) -> dict[str, A
             write_config_document(path, document)
         removed.append(f"gateway.profile_routes: {len(routes) - len(kept)} entry")
 
-    slug = f"person/{profile[len(PERSONAL_ROOT_PREFIX):]}"
+    slug = f"person/{login}"  # the login, not the folded directory name
     registry = bindings_store().read()
     if registry is not None and registry.record(slug) is not None:
         bindings_store().unbind(slug, written_by="hermes user remove")
