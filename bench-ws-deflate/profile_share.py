@@ -59,18 +59,23 @@ def analyse(raw: str) -> dict:
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--deflate", choices=("on", "off"), required=True)
+    ap.add_argument("--variant", default="on",
+                    help="server_app.py variant name: on|off|level1|level4|memlevel1|notakeover")
+    ap.add_argument("--extra", default="",
+                    help="extra server_app.py flags, space-separated (e.g. '--level 1')")
     ap.add_argument("--mode", default="delta-coalesced")
     ap.add_argument("--seconds", type=int, default=15)
     ap.add_argument("--clients", type=int, default=8)
     ap.add_argument("--rate", type=int, default=100)
     args = ap.parse_args()
 
-    port = 18401 if args.deflate == "on" else 18402
+    index = ("on", "off", "level1", "level4", "memlevel1", "notakeover").index(args.variant)
+    port = 18401 + index
+    extra = args.extra.split() if args.extra else []
     srv = subprocess.Popen([sys.executable, f"{HERE}/server_app.py", "--port", str(port),
-                            "--deflate", args.deflate],
+                            *extra],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    raw = f"/tmp/bench-{args.deflate}-{os.getpid()}.raw"
+    raw = f"/tmp/bench-{args.variant}-{os.getpid()}.raw"
     try:
         for _ in range(120):
             try:
@@ -102,7 +107,8 @@ async def main() -> None:
             await load
         except (asyncio.CancelledError, websockets.ConnectionClosed):
             pass
-        result = {"deflate": args.deflate, "mode": args.mode, "clients": args.clients,
+        result = {"variant": args.variant, "extra": extra, "mode": args.mode,
+                  "clients": args.clients,
                   "profile_seconds": round(wall, 2), **analyse(raw)}
         print(json.dumps(result))
     finally:

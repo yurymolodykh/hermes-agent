@@ -1,62 +1,36 @@
-# PROGRESS — t_0650ebf8: мягкий бюджет сохраняет работу и в не-git каталоге
+# PROGRESS — t_5bb8406e: замер сжатия WebSocket и решение по объёму
 
-## Состояние: реализовано, проверено, закоммичено (`60626efab961`). Передано на ревью 15-sre-qa.
+## Состояние: измерение готово, решение принято, правка production не требуется. Идёт финальный прогон профилей + отчёт.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_0650ebf8`, ветка `wt/t_0650ebf8`
-* Базовая ревизия: `aed44879299`
-* Правка = `git diff aed44879299` (два файла кода, один тестовый файл, `evidence-t0650ebf8/`)
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_5bb8406e`, ветка `wt/t_5bb8406e`
+* Гейт публикации: `ops-card-merge.py --task t_5bb8406e` (не выполнен)
 
-## Что сделано
+## Установлено (проверено по коду и живой системе)
 
-1. `agent/kanban_budget_checkpoint.py`
-   * `WipPreservation` — результат мягкого сохранения: `mode` в `git|archive|none`, `locator`, `detail`.
-   * `preserve_wip_tree()` — на пороге напоминания: git-дерево → прежний ref (`preserve_wip_ref`),
-     каталог без репозитория → тот же tar-фолбэк (`_archive_tree`), что на жёстком пределе;
-     формат имени `wip-<stamp>.tar.gz` и каталог `task_attachments_dir(task_id)` не менялись.
-   * `_tree_fingerprint` + `_existing_archive` + `.wip-fingerprint` рядом с архивами — повторный
-     вызов на неизменённом дереве возвращает существующий архив, второй файл не пишется.
-     Сравнение по пути/size/mtime набора файлов (полный хеш не считается).
-   * Существующие архивы сортируются по `st_mtime_ns`, не по имени: суффикс `-2` одного тика
-     сортируется раньше «чистой» метки.
-   * Усечённый по `_ARCHIVE_MAX_BYTES` архив не записывает fingerprint — иначе следующий
-     неизменённый вызов переиспользовал бы неполный архив.
-2. `agent/turn_iteration_prep.py` — `_maybe_inject_iteration_budget_warning` зовёт
-   `preserve_wip_tree()` вместо `preserve_wip_ref()`; в текст напоминания попадает либо ref,
-   либо путь архива. Проверка «последняя строка — tool-результат, не персистентная» перенесена
-   ДО сохранения: без неё ref/tar создавался бы на ходе, где напоминание не вставится.
-3. `tests/agent/test_kanban_budget_reminder_wip.py` — 3 теста: scratch → архив с содержимым +
-   путь в тексте; git-worktree → ref и НЕТ архива; повтор на неизменённом дереве → второй архив
-   не появляется, напоминание называет существующий.
+1. Production УЖЕ гейтит deflate: `hermes_cli/web_server_lifecycle.py:588`
+   `per_message_deflate = auth_required or host not in _LOOPBACK_HOST_VALUES`;
+   `hermes_cli/web_server.py:1091` — то же для dashboard. Введено коммитом
+   `1ae92cf59f2` (py-spy: 48 % цикла на WS-отправке, половина — deflate).
+2. Живой шлюз слушает `127.0.0.1:9120`, но `dashboard.public_url=https://molodykh.su`
+   + `basic_auth` → `listener_auth_required(...)` = True → **deflate включён**.
+   Именно поэтому py-spy видит `PerMessageDeflate.encode` в живом профиле.
+3. nginx (мастер pid 1243) терминирует TLS на 127.0.0.1:80/443 и проксирует на
+   loopback → все удалённые пиры приходят с 127.0.0.1. **Гейт по пиру невозможен**:
+   отличить локального клиента от проксированного нельзя (uvicorn решает на
+   `connection_made`, до TLS/Host/заголовков).
 
-## Проверки
+## Замеры
 
-* `tests/agent/test_kanban_budget_reminder_wip.py` → 3 passed.
-* Красная база: файлы кода из `aed44879299` (изолированный export дерева + новый тест) →
-  2 failed, 1 passed (`evidence-t0650ebf8/baseline-red.md`).
-* Наборы падающих тестов «база vs правка» на 7 файлах бюджета: база 58 / правка 56;
-  «только с правкой» — пусто, «только на базе» — ровно два новых теста в их базовых версиях.
-  Остальные падения предсуществующие (страж `home_io_guard.py` ругается на путь worktree
-  `<worktree>/hermes-update-pull`), наборы совпадают.
-* `ruff check --config ruff.pre-commit.toml` — All checks passed.
-* `python -m scripts.code_health --base aed44879299` → 0 blocking, 0 advisory.
-* Живой прогон на учебной scratch-карточке (`evidence-t0650ebf8/live-scratch.txt`):
-  108/180 → архив 942 Б за 57 мс, верхние записи `PROGRESS.md, report.md, nested/notes.txt`,
-  повтор на неизменённом дереве — архивов до=1 после=1, после правки — 2.
-* Git-карточка (`live-git-and-cost.txt`): ref `refs/hermes-wip/t_probe_git`, HEAD не сдвинут,
-  tar нет. Стоимость на больших деревьях — там же (5 тыс. файлов ≈ 1 с; 1 ГБ несжимаемых ≈ 12 с).
+* py-spy, 15 с, 8 клиентов, `delta-coalesced`: **доля срезов в deflate 43,9 %**
+  (152 из 346 срезов); deflate off — 0 % и втрое меньше занятых срезов (75).
+* Матрица (matrix-v2.json), контроль (те же настройки через override-фабрику)
+  совпадает с базой в пределах 0,8 % — путь подмены фабрики достоверен.
+* Ужатие опровергнуто: level 1/4 и memLevel 1 дают +2…+174 % трафика без выигрыша
+  CPU; `no_context_takeover` +75…+712 % трафика и +20…+50 % CPU.
+* Отключение: трафик ×2,1…×56 (медиана ~×7), CPU на кадр −22…−60 %.
 
-## Передача
+## Следующий шаг
 
-Ревизия `60626efab961` в ветке `wt/t_0650ebf8` (не влита в общую ветку).
-Независимое ревью точной ревизии, тесты и выкат — карточка профиля `15-sre-qa`.
-
----
-
-# (архив) PROGRESS — t_4cb8f83b: точечный перенос двух апстрим-фиксов
-
-## Состояние: ГОТОВО (обе правки внесены, тесты и проверки сняты). Остались финальный коммит и передача.
-
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_4cb8f83b`, ветка `wt/t_4cb8f83b`
-* База для сравнения: `beeb9623539`
-* Содержимое правки = `git diff beeb9623539`
-* Отчёт: `REPORT-patches.md`; доказательства: `evidence-t4cb8f83b/`
+1. Дождаться `bench-ws-deflate/profile-shares.jsonl` (12 прогонов py-spy).
+2. `bench-ws-deflate/REPORT.md` — цифры до/после, решение, обоснование.
+3. Коммит → `ops-card-merge.py` → `kanban_request_review` (09-independent-reviewer).
