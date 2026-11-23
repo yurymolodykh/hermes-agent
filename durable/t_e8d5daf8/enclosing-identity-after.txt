@@ -1,0 +1,2 @@
+$ git --git-dir=<platform>/.git config --local --get-regexp ^user\.   # after ALL runs, commit 60ce34fd362
+exit=1

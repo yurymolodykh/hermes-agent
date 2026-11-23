@@ -1,0 +1,6 @@
+warning: Selection `FURB192` has no effect because preview is not enabled.
+warning: Selection `PLE0304` has no effect because preview is not enabled.
+warning: Selection `PLR1708` has no effect because preview is not enabled.
+warning: Selection `RUF063` has no effect because preview is not enabled.
+warning: Selection `RUF068` has no effect because preview is not enabled.
+All checks passed!

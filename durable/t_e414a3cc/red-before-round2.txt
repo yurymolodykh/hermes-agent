@@ -1,0 +1,221 @@
+▶ not activated — using HERMES_PYTHON: /home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+fatal: не найден git репозиторий (или один из родительских каталогов): .git
+▶ launching test runner
+Discovered 1 test files (~9 tests) under ['tests/hermes_cli/test_kanban_preserved_provenance.py']; running with -j 8
+[100.0% |     9/~9 | ✓6 | ✗3] ✗ tests/hermes_cli/test_kanban_preserved_provenance.py (6✓ 3✗, 13.1s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_preserved_provenance.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes')
+  ║ capsys = <_pytest.capture.CaptureFixture object at 0x75ae28efe8b0>
+  ║ 
+  ║     def test_gc_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
+  ║         """An existing board migrates on the first sweep, without waiting for a delete."""
+  ║         with kbc.connect_closing() as conn:
+  ║             task_id = kb.create_task(conn, title="legacy done")
+  ║             task = kb.get_task(conn, task_id)
+  ║             assert task is not None
+  ║             ws = Path(kbw.resolve_workspace(task))
+  ║             ws.mkdir(parents=True, exist_ok=True)
+  ║             _legacy_preserved_event(conn, task_id, ws)
+  ║             with kb.write_txn(conn):
+  ║                 conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+  ║     
+  ║         assert _gc() == 0
+  ║         out = capsys.readouterr().out
+  ║ >       assert str(ws) in out, f"gc never adopted the legacy event:\n{out}"
+  ║ E       AssertionError: gc never adopted the legacy event:
+  ║ E         GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+  ║ E         
+  ║ E       assert '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c' in 'GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed\n'
+  ║ E        +  where '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c' = str(PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c'))
+  ║ 
+  ║ tests/hermes_cli/test_kanban_preserved_provenance.py:345: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_unreadable_parent_keeps_registry_entry_and_event
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_hard_delete_adopts_a_pre_registry_preserved_event
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_adopts_a_pre_registry_preserved_event
+  ║ ========================= 3 failed, 6 passed in 5.78s ==========================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_preserved_provenance.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 6 tests passed, 3 failed; FAILED: 1 of 1 file (100% complete) in 13.1s (8 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 13.1s  (runner wall: 13.1s, parallelism: 8x)
+  P50: 13.06s  P90: 13.06s  P95: 13.06s  P99: 13.06s  Max: 13.06s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     13.06s  tests/hermes_cli/test_kanban_preserved_provenance.py
+
+=== Failure output ===
+
+--- tests/hermes_cli/test_kanban_preserved_provenance.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.14.9, pytest-9.1.1, pluggy-1.7.0
+rootdir: /var/tmp/red-t_e414a3cc
+configfile: pyproject.toml
+plugins: asyncio-1.4.0, anyio-4.15.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 9 items
+
+tests/hermes_cli/test_kanban_preserved_provenance.py ......FFF           [100%]
+
+=================================== FAILURES ===================================
+____________ test_unreadable_parent_keeps_registry_entry_and_event _____________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x75ae28f9a8b0>
+
+    @_not_root
+    def test_unreadable_parent_keeps_registry_entry_and_event(kanban_home, capsys):
+        """A stat we cannot complete must not delete the only pointer.
+    
+        ``Path.is_dir()`` is False for an unmounted volume or an unreadable
+        ancestor just as it is for a deleted directory. Reaping on that reading
+        drops the registry line AND the retention-exempt event while the directory
+        is still on disk — the guard would strand exactly what it preserved.
+        """
+        from hermes_cli import kanban_preserved_workspaces as kpw
+    
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+            registry = kpw.registry_path(conn)
+            assert [e["path"] for e in kpw.entries(conn)] == [str(ws)]
+    
+        parent = ws.parent
+        parent.chmod(0o000)
+        try:
+            assert _gc() == 0
+            # Reporting it is the safe side of "unknown": the operator gets the
+            # path, and nothing is reaped on a stat we could not complete.
+        finally:
+            parent.chmod(0o755)
+    
+        with kbc.connect_closing() as conn:
+>           assert [e["path"] for e in kpw.entries(conn)] == [str(ws)], (
+                "an unreadable parent was read as a deleted directory"
+            )
+E           AssertionError: an unreadable parent was read as a deleted directory
+E           assert [] == ['/var/tmp/he...s/t_c66c28b0']
+E             
+E             Right contains one more item: '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes/kanban/workspaces/t_c66c28b0'
+E             Use -v to get more diff
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:272: AssertionError
+----------------------------- Captured stdout call -----------------------------
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_c66c28b0: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes/kanban/workspaces/t_c66c28b0/clone — /var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes/kanban/workspaces/t_c66c28b0 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'default' registered delegation provider: default
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'openrouter' registered video_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-openai-native' registered web provider: openai-native
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins_context.py:180 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:542 Plugin discovery complete: 62 found, 58 enabled
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_c66c28b0: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes/kanban/workspaces/t_c66c28b0/clone — /var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_unreadable_parent_keeps_r0/.hermes/kanban/workspaces/t_c66c28b0 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+____________ test_hard_delete_adopts_a_pre_registry_preserved_event ____________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_hard_delete_adopts_a_pre_0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x75ae28ecd250>
+
+    def test_hard_delete_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
+        """A legacy card's event is the only pointer — the delete must migrate it first."""
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="legacy preserved")
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            ws = Path(kbw.resolve_workspace(task))
+            ws.mkdir(parents=True, exist_ok=True)
+            (ws / "only-copy.txt").write_text("the only copy\n", encoding="utf-8")
+            _legacy_preserved_event(conn, task_id, ws)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (task_id,))
+            reg = kpw_registry(conn)
+            assert reg is not None and not reg.exists(), "precondition: no registry row yet"
+    
+            assert kb.delete_archived_task(conn, task_id) is True
+    
+            assert kb.get_task(conn, task_id) is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+            ).fetchone()[0] == 0, "precondition: the event itself is gone"
+            assert ws.is_dir()
+    
+        assert _gc() == 0
+        out = capsys.readouterr().out
+>       assert str(ws) in out, (
+            "a card preserved before the registry lost its last pointer on delete: "
+            f"{out}"
+        )
+E       AssertionError: a card preserved before the registry lost its last pointer on delete: GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+E         
+E       assert '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_hard_delete_adopts_a_pre_0/.hermes/kanban/workspaces/t_5fb9707e' in 'GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed\n'
+E        +  where '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_hard_delete_adopts_a_pre_0/.hermes/kanban/workspaces/t_5fb9707e' = str(PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_hard_delete_adopts_a_pre_0/.hermes/kanban/workspaces/t_5fb9707e'))
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:325: AssertionError
+________________ test_gc_adopts_a_pre_registry_preserved_event _________________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x75ae28efe8b0>
+
+    def test_gc_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
+        """An existing board migrates on the first sweep, without waiting for a delete."""
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="legacy done")
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            ws = Path(kbw.resolve_workspace(task))
+            ws.mkdir(parents=True, exist_ok=True)
+            _legacy_preserved_event(conn, task_id, ws)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+    
+        assert _gc() == 0
+        out = capsys.readouterr().out
+>       assert str(ws) in out, f"gc never adopted the legacy event:\n{out}"
+E       AssertionError: gc never adopted the legacy event:
+E         GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+E         
+E       assert '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c' in 'GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed\n'
+E        +  where '/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c' = str(PosixPath('/var/tmp/hermes-pytest-1001/r-phc5c7e0/pytest-of-hermes/pytest-0/test_gc_adopts_a_pre_registry_0/.hermes/kanban/workspaces/t_f9cef11c'))
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:345: AssertionError
+=========================== short test summary info ============================
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_unreadable_parent_keeps_registry_entry_and_event
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_hard_delete_adopts_a_pre_registry_preserved_event
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_adopts_a_pre_registry_preserved_event
+========================= 3 failed, 6 passed in 5.78s ==========================
+
+=== 1 file with test failures ===
+  tests/hermes_cli/test_kanban_preserved_provenance.py  (3 tests failed)

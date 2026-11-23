@@ -1,0 +1,196 @@
+{
+  "kind": "curve",
+  "reps": 2,
+  "per_mode": {
+    "inline": {
+      "status": {
+        "n8_p50_ms": [
+          55.2,
+          42.6
+        ],
+        "n8_max_ms": [
+          56.7,
+          44.2
+        ],
+        "n8_p50_median": 48.9,
+        "n8_max_median": 50.5
+      },
+      "sessions": {
+        "n8_p50_ms": [
+          250.6,
+          297.7
+        ],
+        "n8_max_ms": [
+          337.8,
+          382.4
+        ],
+        "n8_p50_median": 274.1,
+        "n8_max_median": 360.1
+      },
+      "messages": {
+        "n8_p50_ms": [
+          89.6,
+          97.9
+        ],
+        "n8_max_ms": [
+          109.8,
+          121.9
+        ],
+        "n8_p50_median": 93.8,
+        "n8_max_median": 115.8
+      },
+      "search": {
+        "n8_p50_ms": [
+          707.8,
+          1035.5
+        ],
+        "n8_max_ms": [
+          765.4,
+          1050.3
+        ],
+        "n8_p50_median": 871.6,
+        "n8_max_median": 907.8
+      }
+    },
+    "threaded": {
+      "status": {
+        "n8_p50_ms": [
+          44.2,
+          44.8
+        ],
+        "n8_max_ms": [
+          45.0,
+          45.6
+        ],
+        "n8_p50_median": 44.5,
+        "n8_max_median": 45.3
+      },
+      "sessions": {
+        "n8_p50_ms": [
+          290.7,
+          220.2
+        ],
+        "n8_max_ms": [
+          329.0,
+          257.3
+        ],
+        "n8_p50_median": 255.4,
+        "n8_max_median": 293.1
+      },
+      "messages": {
+        "n8_p50_ms": [
+          93.2,
+          85.3
+        ],
+        "n8_max_ms": [
+          108.4,
+          102.2
+        ],
+        "n8_p50_median": 89.2,
+        "n8_max_median": 105.3
+      },
+      "search": {
+        "n8_p50_ms": [
+          948.5,
+          950.8
+        ],
+        "n8_max_ms": [
+          983.7,
+          972.4
+        ],
+        "n8_p50_median": 949.6,
+        "n8_max_median": 978.0
+      }
+    }
+  },
+  "per_rep": [
+    {
+      "rep": 0,
+      "mode": "inline",
+      "routes": {
+        "status": {
+          "p50": 55.2,
+          "max": 56.7
+        },
+        "sessions": {
+          "p50": 250.6,
+          "max": 337.8
+        },
+        "messages": {
+          "p50": 89.6,
+          "max": 109.8
+        },
+        "search": {
+          "p50": 707.8,
+          "max": 765.4
+        }
+      }
+    },
+    {
+      "rep": 0,
+      "mode": "threaded",
+      "routes": {
+        "status": {
+          "p50": 44.2,
+          "max": 45.0
+        },
+        "sessions": {
+          "p50": 290.7,
+          "max": 329.0
+        },
+        "messages": {
+          "p50": 93.2,
+          "max": 108.4
+        },
+        "search": {
+          "p50": 948.5,
+          "max": 983.7
+        }
+      }
+    },
+    {
+      "rep": 1,
+      "mode": "inline",
+      "routes": {
+        "status": {
+          "p50": 42.6,
+          "max": 44.2
+        },
+        "sessions": {
+          "p50": 297.7,
+          "max": 382.4
+        },
+        "messages": {
+          "p50": 97.9,
+          "max": 121.9
+        },
+        "search": {
+          "p50": 1035.5,
+          "max": 1050.3
+        }
+      }
+    },
+    {
+      "rep": 1,
+      "mode": "threaded",
+      "routes": {
+        "status": {
+          "p50": 44.8,
+          "max": 45.6
+        },
+        "sessions": {
+          "p50": 220.2,
+          "max": 257.3
+        },
+        "messages": {
+          "p50": 85.3,
+          "max": 102.2
+        },
+        "search": {
+          "p50": 950.8,
+          "max": 972.4
+        }
+      }
+    }
+  ]
+}
