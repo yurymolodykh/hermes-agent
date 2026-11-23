@@ -748,6 +748,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    scheduled_until: Optional[int] = None    # epoch deadline of a parked card; NULL = none
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -774,7 +775,10 @@ _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by",
     "workspace_kind", "workspace_path", "claim_lock",
 )
-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+_TASK_EPOCH_COLUMNS = (
+    "created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at",
+    "scheduled_until",  # absent on a pre-migration row -> ``_row_get`` yields None
+)
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
@@ -984,7 +988,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Epoch deadline of a ``scheduled`` (parked) card; NULL = parked with no
+    -- deadline, which the dispatcher never wakes. Set by
+    -- ``hermes_cli.kanban_db_schedule`` through ``hermes kanban schedule --until``
+    -- and cleared by the wake itself (``woken_by_timer``), by ``unblock`` and on
+    -- completion — so one deadline produces exactly one wake.
+    scheduled_until      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3726,7 +3736,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, scheduled_until = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -4008,18 +4018,24 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, until: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable).
+
+    ``until`` (epoch, see :func:`kanban_db_schedule.parse_until`) records WHEN the
+    card should come back: the dispatcher tick wakes it then (``woken_by_timer``).
+    Without ``until`` the card is parked with no deadline — it waits for a human,
+    which the board flags as an anomaly rather than silently forgetting it.
+    """
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [int(until) if until else None, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   scheduled_until = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """

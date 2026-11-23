@@ -2421,6 +2421,14 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     result.keypool_reaped = _kbkp.keypool_sweep()  # backstop: host-restart orphans
+    # Wake parked cards whose deadline passed BEFORE promotion, so a woken card is
+    # promoted and spawned in the SAME tick it comes due. Catch-up is free: the
+    # predicate is ``scheduled_until <= now`` and the wake clears the column, so a
+    # tick that arrives hours late wakes each card once instead of replaying.
+    try:
+        result.woken_by_timer = _kbschedule.wake_due_tasks(conn)
+    except Exception:  # noqa: BLE001 - a wake failure must never stop the tick
+        _log.exception("dispatcher: timed wake phase failed")
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
