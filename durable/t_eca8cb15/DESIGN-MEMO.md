@@ -95,10 +95,12 @@ python3 durable/t_eca8cb15/probes/probe_body_ops.py   # -> body_ops.json / body_
 `route_audit.py` берёт ревизию из `git rev-parse HEAD` и печатает её в отчёте; `probe_body_ops.py`
 печатает только измеренные числа. Оба — обычный `python3`, без зависимостей проекта.
 
-**Перепись на ревизии `47d3ac2b449b`** — вывод скрипта, ключ `stats` в
+**Перепись на ревизии `c68e627db05e`** (верхушка ветки на момент круга 3; идентична переписи на
+`47d3ac2b449b` — перегенерированный `route_audit.json` отличается от прежнего **только** полем
+`git_rev`, все `stats` совпадают байт-в-байт) — вывод скрипта, ключ `stats` в
 `probes/route_audit.json` (ревизия печатается самим скриптом в `git_rev` и в первой строке
-`route_audit.md`; числа относятся к коду `hermes_cli/web_routers`, и он между этой ревизией и
-верхушкой ветки не менялся — проверяется `git diff --stat 47d3ac2b449b..HEAD -- hermes_cli/`,
+`route_audit.md`; числа относятся к коду `hermes_cli/web_routers`, и он между этими ревизиями
+не менялся — проверяется `git diff --stat 47d3ac2b449b..HEAD -- hermes_cli/`,
 вывод пуст): регистраций в `hermes_cli/web_routers/*.py` (38 модулей) — **336** =
 HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (уникальных 299), `def` 35
 (уникальных 35). Разбивка по слоям: HTTP-глаголы 325 (`async` 290, `def` 35), `api_route` 1
@@ -161,26 +163,32 @@ HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (ун�
    лимита, а не по типичному файлу.
 
 Иначе вызов остаётся в цикле. Порог не теоретический: `probes/body_ops.json` меряет ровно те
-операции, что стоят в телах (`mkdir` на существующем каталоге — 0,007 мс, `exists` — 0,004 мс,
-а `write_text` 8 МиБ + `os.replace` — p50 114 мс, p95 1061 мс; `base64.b64decode` 25 МиБ —
-p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данными — p50 1584 мс).
+операции, что стоят в телах (`mkdir` на существующем каталоге — 0,006 мс, `exists` — 0,003 мс,
+а `write_text` 8 МиБ + `os.replace` — p50 41,7 мс, p95 120,6 мс; `base64.b64decode` 25 МиБ —
+p50 109,8 мс; `Path.unlink` файла 1 ГиБ с реальными данными — p50 81,8 мс, p95 1041,2 мс при n=3).
+
+> **Таблица цен — снимок одного прогона** (`body_ops.json` этой ревизии), разброс между прогонами
+> до 3×, число зависит от размера тела и файловой системы. Независимый прогон ревьюера на том же
+> скрипте дал `write_text` 33,8/215,1 мс и `unlink` 1 ГиБ 164,9/1500,8 мс — тот же порядок, другие
+> абсолютные значения. Порог §1.3 от разброса не зависит: решения «оффлоад/в цикле» не меняются
+> ни на одном из прогонов, потому что разрыв между дорогими и дешёвыми операциями — два порядка.
 
 #### Обработчики с блокирующим вызовом без оффлоада — 12 (`blocking_handlers`)
 
 | Локатор | Вызов (строка) | Цена по `body_ops.json` | Решение |
 |---|---|---|---|
-| `files.py:1083` `fs_write_text` | `tmp.write_text` 1139, `os.replace` 1140, `tmp.unlink` 1142/1145 (в петле же `target.stat` 1122 и `parent.is_dir` 1134 — метаданные, 0,006 мс, остаются) | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 1061 мс | **оффлоад** (размер) |
-| `audio.py:90` `transcribe_audio_upload` | `base64.b64decode` 107, `tmp.write` 123 | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс | **оффлоад** (размер) |
-| `audio.py:299` `speak_text` | `base64.b64encode` 348 | 25 МиБ p50 103 мс; 1 МиБ p50 2,6 мс | **оффлоад** (размер) |
-| `files.py:472` `proxy_remote_media` | `base64.b64encode` 509 | ≤25 МиБ (`_MEDIA_MAX_BYTES`) p50 103 мс | **оффлоад** (только кодирование) |
-| `files.py:1203` `fs_read_data_url` | `base64.b64encode` 1216 (ветка удалённого backend) | 16 МиБ p50 59 мс | **оффлоад** (перенести в уже существующий `_render` 1233–1238) |
-| `local_models.py:796` `local_models_delete` | `path.unlink` 803 | 8 МиБ p50 0,7 мс, но файлы модели до 100+ МиБ: 1 ГиБ реальных данных p50 1584 мс | **оффлоад** (размер файла задаёт пользователь) |
-| `actions.py:386` `get_action_status` | `_tail_lines` 394, 403, 404 (до 4 чтений) | лог 64 МиБ: p50 2,6 мс, max 3,0 мс | **оффлоад** (p50 > 1 мс) |
-| `files.py:936` `upload_managed_file_stream` | `target.parent.mkdir` 946 | 0,007 мс; сама запись уже `to_thread` по чанкам (`stream_upload_to_path`) | **остаётся** — порог не превышен |
-| `ops.py:601` `run_backup` | `archive.parent.mkdir` 608 | 0,007 мс | **остаётся** |
-| `ops.py:666` `run_import_upload` | `staging_dir.mkdir` 674, `zipfile.is_zipfile` 684, `target.unlink` 685 | `mkdir` 0,007 мс; `is_zipfile` 50 МиБ p50 0,025 мс (читает только хвост); `unlink` свежего файла 0,011 мс | **остаётся** |
-| `local_models.py:1041` `local_models_sideload` | `dest.parent.mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,007 / 0,029 / 0,062 мс | **остаётся** |
-| `profiles.py:1124` `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | Popen 0,41 мс (fire-and-forget; `which` уже в `to_thread`) | **остаётся** |
+| `files.py:1083` `fs_write_text` | `text.encode` 1118/1147, `tmp.write_text` 1139, `os.replace` 1140, `tmp.unlink` 1142/1145 (в петле же `target.stat` 1122 и `parent.is_dir` 1134 — метаданные, 0,006 мс, остаются) | `write_text` 8 МиБ + `replace`: p50 41,7 мс, p95 120,6 мс; `str.encode` тех же 8 МиБ: p50 1,0 мс, p95 7,0 мс (n=10) | **оффлоад** (размер) |
+| `audio.py:90` `transcribe_audio_upload` | `base64.b64decode` 107, `tmp.write` 123 | `b64decode` 25 МиБ p50 109,8 мс; запись 25 МиБ p50 100,9 мс, p95 565,7 мс | **оффлоад** (размер) |
+| `audio.py:299` `speak_text` | `base64.b64encode` 348 | 25 МиБ p50 70,9 мс; 1 МиБ p50 2,0 мс | **оффлоад** (размер) |
+| `files.py:472` `proxy_remote_media` | `base64.b64encode` 509 | ≤25 МиБ (`_MEDIA_MAX_BYTES`) p50 70,9 мс | **оффлоад** (только кодирование) |
+| `files.py:1203` `fs_read_data_url` | `base64.b64encode` 1216 (ветка удалённого backend) | 16 МиБ p50 47,9 мс | **оффлоад** (перенести в уже существующий `_render` 1233–1238) |
+| `local_models.py:796` `local_models_delete` | `path.unlink` 803 | 8 МиБ p50 0,5 мс, но файлы модели до 100+ МиБ: 1 ГиБ свежих данных p50 81,8 мс, p95 1041,2 мс (n=3; у ревьюера 164,9/1500,8) | **оффлоад** (размер файла задаёт пользователь) |
+| `actions.py:386` `get_action_status` | `_tail_lines` 394, 403, 404 (до 4 чтений) | лог 64 МиБ: p50 2,2 мс, p95 3,4 мс, max 95,8 мс (n=20) | **оффлоад** (p50 > 1 мс) |
+| `files.py:936` `upload_managed_file_stream` | `target.parent.mkdir` 946 | 0,006 мс; сама запись уже `to_thread` по чанкам (`stream_upload_to_path`) | **остаётся** — порог не превышен |
+| `ops.py:601` `run_backup` | `archive.parent.mkdir` 608 | 0,006 мс | **остаётся** |
+| `ops.py:666` `run_import_upload` | `staging_dir.mkdir` 674, `zipfile.is_zipfile` 684, `target.unlink` 685 | `mkdir` 0,006 мс; `is_zipfile` 50 МиБ p50 0,018 мс (читает только хвост); `unlink` свежего файла 0,009 мс | **остаётся** |
+| `local_models.py:1041` `local_models_sideload` | `dest.parent.mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,006 / 0,021 / 0,046 мс | **остаётся** |
+| `profiles.py:1124` `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | Popen 0,27 мс (fire-and-forget; `which` уже в `to_thread`) | **остаётся** |
 
 Итог: **7 обработчиков уходят в пул, 5 остаются по порогу** — и остаются они не «потому что
 мелкие», а потому что цена измерена и она на два порядка ниже порога.
@@ -191,8 +199,8 @@ p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данны
   (`exists`/`is_file` 439), `files.py:428` `get_media` (442/444), `files.py:1389` `fs_git_root`
   (`stat` 1401), `ops.py:620` `download_dashboard_backup` (631), `ops.py:647` `run_import`
   (`os.path.isfile` 652), `profiles.py:1395` `import_profile_endpoint` (1419), `status.py:998`
-  `get_logs` (`exists` 1008). Цена каждого — 0,003–0,004 мс; обход вверх до `.git`
-  (`files.py:1405`, 50 каталогов) — 0,14 мс. На 8 одновременных запросах это доли миллисекунды,
+  `get_logs` (`exists` 1008). Цена каждого — 0,003 мс; обход вверх до `.git`
+  (`files.py:1405`, 50 каталогов) — 0,10 мс. На 8 одновременных запросах это доли миллисекунды,
   тогда как сам `to_thread` стоит дороже (переключение + копирование контекста).
   **Решение: остаются.**
 - **WebSocket-петли**: `audio.py:522` `transcribe_stream_ws` (`sleep`), `webapp_relay_proxy.py:294`
@@ -208,12 +216,12 @@ p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данны
 .replace("+00:00", "Z")` (строка 714), цена 0,0003 мс; файловых замен в теле нет вообще.
 Что действительно стоит денег и что делает этот обработчик особенным:
 
-- `(session_path / "creds.json").exists()` (717) — 0,011 мс, порог не превышен;
+- `(session_path / "creds.json").exists()` (717) — 0,008 мс, порог не превышен;
 - `_whatsapp_session_path()` (708), `_prune_whatsapp_onboarding_sessions()` (707),
   `_whatsapp_linked_account_from_session(session_path)` (719) — чтение каталога и `creds.json`,
   суммарно микросекунды, порог не превышен;
 - `_backup_whatsapp_session(session_path)` (730 → `web_whatsapp_session.py:48-52`) — `exists` +
-  `rename` сессии в `mkdtemp` + `mkdir(mode=0o700)`: 0,22 мс, порог не превышен.
+  `rename` сессии в `mkdtemp` + `mkdir(mode=0o700)`: 0,16 мс, порог не превышен.
 
 **Настоящая проблема здесь другая, и она не про дисковый ввод-вывод:** тело исполняется под
 `_whatsapp_onboarding_lock` (706) — это `threading.RLock` (`messaging.py:373`), взятый в
@@ -316,7 +324,7 @@ HTTP.
 | WS/PTY без новой шины | нет | нет | **да** |
 | Стоимость правки | очень высокая | высокая | **низкая (7 локаторов)** |
 | Откат | средний | низкий, но с рестартом | **одна настройка** |
-| Доказанный выигрыш по замеру | не показан | только CPU | устраняет 7 подтверждённых блокировок цикла (p50 до 1584 мс, p95 до 1061 мс) |
+| Доказанный выигрыш по замеру | не показан | только CPU | устраняет 7 подтверждённых блокировок цикла (худшие в артефактах: `unlink` 1 ГиБ p95 1041 мс, `write_text` 8 МиБ p95 121 мс, `b64decode` 25 МиБ p50 110 мс; хвост `write_text` в других прогонах достигал 215–1061 мс) |
 
 ---
 
@@ -364,23 +372,23 @@ dashboard:
 
 | № | Файл:строка | Функция | Что уходит в поток | Цена по `body_ops.json` |
 |---|---|---|---|---|
-| 1 | `hermes_cli/web_routers/files.py:1083` | `fs_write_text` | `tmp.write_text` (1139), `os.replace` (1140) + два `tmp.unlink` (1142/1145) — одним `to_thread`, чтобы порядок «временный → атомарная замена» не разъехался. `target.stat()` (1122) и `target.parent.is_dir()` (1134) остаются в цикле: 0,006 мс, порог §1.3 не превышен | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 **1061** мс |
-| 2 | `hermes_cli/web_routers/audio.py:90` | `transcribe_audio_upload` | `base64.b64decode` (107) и запись временного файла (123) | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс |
-| 3 | `hermes_cli/web_routers/audio.py:299` | `speak_text` | `base64.b64encode` (348) — рядом с уже существующим `_read_and_unlink` (344) | 25 МиБ p50 103 мс |
-| 4 | `hermes_cli/web_routers/files.py:472` | `proxy_remote_media` | `base64.b64encode` (509), кодирование ответа | ≤25 МиБ p50 103 мс |
-| 5 | `hermes_cli/web_routers/local_models.py:796` | `local_models_delete` | `path.unlink` (803) — размер файла задаёт пользователь | 8 МиБ 0,7 мс, но 1 ГиБ реальных данных p50 **1584** мс |
-| 6 | `hermes_cli/web_routers/files.py:1203` | `fs_read_data_url` | `base64.b64encode` в удалённой ветке (1216) — перенести в существующий `_render` (1233–1238), который уже в `to_thread` (1238) | 16 МиБ p50 59 мс |
-| 7 | `hermes_cli/web_routers/actions.py:386` | `get_action_status` | `_tail_lines` ×4 (394, 403, 404) — одним `to_thread` с таймаутом ожидания действия (436 остаётся прямым: `Popen.wait` на завершённом процессе 0,0004 мс) | лог 64 МиБ p50 2,6 мс |
+| 1 | `hermes_cli/web_routers/files.py:1083` | `fs_write_text` | `tmp.write_text` (1139), `os.replace` (1140) + два `tmp.unlink` (1142/1145) — одним `to_thread`, чтобы порядок «временный → атомарная замена» не разъехался. Туда же `text.encode` (1118 — подсчёт размера, 1147 — `byteSize` ответа): p95 7,0 мс, а на 8 МиБ это второй по величине вызов в теле. `target.stat()` (1122) и `target.parent.is_dir()` (1134) остаются в цикле: 0,006 мс, порог §1.3 не превышен | `write_text` 8 МиБ + `replace`: p50 41,7 мс, p95 **120,6** мс (загруженный прогон — до 1061 мс); `str.encode` 8 МиБ: p50 1,0 мс, p95 7,0 мс |
+| 2 | `hermes_cli/web_routers/audio.py:90` | `transcribe_audio_upload` | `base64.b64decode` (107) и запись временного файла (123) | `b64decode` 25 МиБ p50 109,8 мс; запись 25 МиБ p50 100,9 мс, p95 565,7 мс |
+| 3 | `hermes_cli/web_routers/audio.py:299` | `speak_text` | `base64.b64encode` (348) — рядом с уже существующим `_read_and_unlink` (344) | 25 МиБ p50 70,9 мс |
+| 4 | `hermes_cli/web_routers/files.py:472` | `proxy_remote_media` | `base64.b64encode` (509), кодирование ответа | ≤25 МиБ p50 70,9 мс |
+| 5 | `hermes_cli/web_routers/local_models.py:796` | `local_models_delete` | `path.unlink` (803) — размер файла задаёт пользователь | 8 МиБ 0,5 мс, но 1 ГиБ свежих данных p50 81,8 мс, p95 **1041,2** мс (n=3) |
+| 6 | `hermes_cli/web_routers/files.py:1203` | `fs_read_data_url` | `base64.b64encode` в удалённой ветке (1216) — перенести в существующий `_render` (1233–1238), который уже в `to_thread` (1238) | 16 МиБ p50 47,9 мс |
+| 7 | `hermes_cli/web_routers/actions.py:386` | `get_action_status` | `_tail_lines` ×4 (394, 403, 404) — одним `to_thread` с таймаутом ожидания действия (436 остаётся прямым: `Popen.wait` на завершённом процессе 0,0003 мс) | лог 64 МиБ p50 2,2 мс, max 95,8 мс |
 
 Локаторы **вне списка правок** (порог §1.3 не превышен, цена измерена):
 
 | Файл:строка | Функция | Заявленный блокирующий вызов | Измеренная цена | Почему остаётся |
 |---|---|---|---|---|
-| `hermes_cli/web_routers/files.py:936` | `upload_managed_file_stream` | `target.parent.mkdir` (946) | 0,007 мс | сама запись уже `to_thread` по чанкам в `stream_upload_to_path` |
-| `hermes_cli/web_routers/ops.py:601` | `run_backup` | `archive.parent.mkdir` (608) | 0,007 мс | каталог подготовки |
-| `hermes_cli/web_routers/ops.py:666` | `run_import_upload` | `mkdir` 674, `is_zipfile` 684, `unlink` 685 | 0,007 / 0,025 / 0,011 мс | `is_zipfile` читает только хвост архива |
-| `hermes_cli/web_routers/local_models.py:1041` | `local_models_sideload` | `mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,007 / 0,029 / 0,062 мс | метаданные, копирование уже вне цикла |
-| `hermes_cli/web_routers/profiles.py:1124` | `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | 0,41 мс | fire-and-forget; `which` уже в `to_thread` |
+| `hermes_cli/web_routers/files.py:936` | `upload_managed_file_stream` | `target.parent.mkdir` (946) | 0,006 мс | сама запись уже `to_thread` по чанкам в `stream_upload_to_path` |
+| `hermes_cli/web_routers/ops.py:601` | `run_backup` | `archive.parent.mkdir` (608) | 0,006 мс | каталог подготовки |
+| `hermes_cli/web_routers/ops.py:666` | `run_import_upload` | `mkdir` 674, `is_zipfile` 684, `unlink` 685 | 0,006 / 0,018 / 0,009 мс | `is_zipfile` читает только хвост архива |
+| `hermes_cli/web_routers/local_models.py:1041` | `local_models_sideload` | `mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,006 / 0,021 / 0,046 мс | метаданные, копирование уже вне цикла |
+| `hermes_cli/web_routers/profiles.py:1124` | `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | 0,27 мс | fire-and-forget; `which` уже в `to_thread` |
 
 **`profiles.py:1195` `get_profile_soul` из старого списка убран:** `read_text` там уже вызывается
 через `_read_off_loop` (1203) — это не долг, а образец. **`messaging.py:701` из списка правок
@@ -390,15 +398,24 @@ dashboard:
 **WebSocket-петли — не трогать:** `audio.py:522` `transcribe_stream_ws`, `webapp_relay_proxy.py:294`
 `relay_ws`. WS обязан жить в цикле событий; это не HTTP-параллельность.
 
-**Порядок приоритета и почему он такой:** №1 отделён от остальных не сложностью, а тем, что его
-p95 в 1000 раз выше медианы (`write_text` под нагрузкой ждёт грязной страницы), а лимит 8 МиБ
-делает его худший случай единственным, который заметен пользователю как «панель замерла на
-секунду». №5 стоит выше №6/№7 только потому, что размер файла там задаёт не сервер, а
-пользователь (модели до сотен МиБ) — измеренный `unlink` 1 ГиБ = 1584 мс.
+**Порядок приоритета и почему он такой:** №1 отделён от остальных не сложностью, а размером
+хвоста: `write_text` под нагрузкой ждёт грязной страницы, и его p95 в трёх прогонах (наш 120,6 мс,
+независимый 215,1 мс, загруженная ФС 1061 мс) выше медианы в 3–25 раз — единственная операция в
+списке, чей хвост измерялся в секундах. №5 стоит выше №6/№7 потому, что размер файла там задаёт не
+сервер, а пользователь (модели до сотен МиБ): `unlink` 1 ГиБ — p95 1041 мс, при медиане 82 мс.
+
+> **Состояние на 23.11.2026:** правки №1–№7 (кроме `messaging.py`, см. ниже) уже реализованы и
+> влиты в `feature/multiuser-access` @ `bfd5c5ef51ed` (32 файла, шов
+> `hermes_cli/web_routers/handler_offload.py`, выключатель `dashboard.handler_offload` /
+> `HERMES_HANDLER_OFFLOAD=0`) — таблица выше остаётся спецификацией того, что закрыто, а остаток
+> аудита назван в `durable/t_a61becbc/REPORT.md`: 8 точек из 37 находок. Имя выключателя в дереве —
+> `dashboard.handler_offload`; `dashboard.parallelism` из §5.2 — тот же ключ, если реализация
+> выберет его вместо уже влитого.
 
 ### 5.2 Новые/изменяемые модули
 
-- `hermes_cli/config_defaults.py` — секция `dashboard.parallelism` (`enabled`, `max_threads`).
+- `hermes_cli/config_defaults.py` — секция `dashboard.parallelism` (`enabled`, `max_threads`)
+  (в дереве уже есть `dashboard.handler_offload` — см. строку состояния выше).
 - `hermes_cli/web_server_app.py` — при старте создать `anyio.CapacityLimiter(max_threads)`,
   положить в `app.state.parallelism`; лог режима.
 - `hermes_cli/web_routers/status.py` — добавить в ответ блок `parallelism` (число busy/limit).
@@ -422,11 +439,14 @@ p95 в 1000 раз выше медианы (`write_text` под нагрузко
 
 ### Шаг 1. Программный откат (секунды, без пересборки)
 
-- **Файл:** `~/.hermes/config.yaml`, секция `dashboard.parallelism`.
+- **Файл:** `~/.hermes/config.yaml`, секция `dashboard.parallelism` (в уже влитом `bfd5c5ef51ed`
+  ключ называется `dashboard.handler_offload`; `HERMES_HANDLER_OFFLOAD=0` — то же из окружения).
 - **Команда:** `hermes config set dashboard.parallelism.enabled false` (или правка строки вручную).
 - **Ожидаемо:** `GET /api/status` → `"parallelism": {"enabled": false, ...}`; в журнале при
   следующем старте строка режима `enabled=false`.
 - **Проверка вторым человеком:** `curl -s localhost:9120/api/status | python3 -m json.tool | grep -A4 parallelism`.
+  Порт **9120** — живой шлюз этого хоста (`ss -ltnp | grep 9120`); **42971** из
+  `probes/twoproc_current.json` — эфемерный порт измерительного стенда, к нему обращаться не нужно.
 
 > Замечание: режим применяется при старте сервера (создание лимитера), поэтому после смены
 > значения — рестарт шлюза тем же способом, каким он запущен. Это осознанно: менять размер пула
@@ -442,10 +462,16 @@ p95 в 1000 раз выше медианы (`write_text` под нагрузко
 
 ### Шаг 3. Проверка, что состояние не пострадало
 
-- **Команда:** `sqlite3 ~/.hermes/state.db "PRAGMA integrity_check; PRAGMA journal_mode;"`.
-- **Ожидаемо:** `ok` и `wal`.
-- **Проверка вторым человеком:** до и после отката — одинаковый вывод; число сессий
-  `SELECT COUNT(*) FROM sessions;` не изменилось.
+- **Команда** (бинаря `sqlite3` на хосте нет — проверено `command -v sqlite3` → не найдено;
+  используется штатный модуль `python3`):
+  ```bash
+  python3 -c "import sqlite3,os;c=sqlite3.connect('file:'+os.path.expanduser('~/.hermes/state.db')+'?mode=ro',uri=True);print(c.execute('PRAGMA journal_mode').fetchone(),c.execute('PRAGMA integrity_check').fetchone(),c.execute('SELECT COUNT(*) FROM sessions').fetchone())"
+  ```
+- **Ожидаемо** (фактический вывод, снятый на этом хосте):
+  `('wal',) ('ok',) (51,)` — то есть `journal_mode = wal`, `integrity_check = ok`, 51 сессия.
+  Соединение открывается `mode=ro`, поэтому команда безопасна и на живом шлюзе.
+- **Проверка вторым человеком:** до и после отката — одинаковый вывод, кроме третьего элемента
+  (число сессий может вырасти, если в это время шёл чат; уменьшиться не должно).
 
 ### Шаг 4. Проверка панели
 
@@ -461,7 +487,8 @@ p95 в 1000 раз выше медианы (`write_text` под нагрузко
    (n=16 → 1,46 с). Это отдельная задача (FTS/индексация), не параллельность HTTP.
 2. **Замеры сняты на временном `HERMES_HOME`** с 200 сессиями — на реальном профиле числа будут
    другими; базовая линия для сравнения — эта записка, а не абсолютные значения.
-3. **Живой шлюз не рестартовался** (граница карточки): контрольный замер на порту 9120 —
+3. **Живой шлюз не рестартовался** (граница карточки): контрольный замер на порту **9120**
+   (живой шлюз; не путать с 42971 — это стенд) —
    `manual_review` для потребителя.
 4. **Multi-process запись в один `state.db` (вариант B) измерена частично**: проба
    `probes/probe_store.py` подготовлена, но полный прогон не снят — при выборе B это блокирующее
