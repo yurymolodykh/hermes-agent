@@ -174,6 +174,40 @@ PYTHONPATH="$PWD:/home/hermes/.hermes/hermes-agent/.venv/lib/python3.14/site-pac
 
 ---
 
+## Состояние ветки на момент handoff
+
+| | |
+|---|---|
+| Ветка | `wt/t_96d65020` (база `b55cbeb3c64`) |
+| Верхушка | `5daedf19c1e` |
+| Push | `ours` → `5daedf19c1eff074ac31c7bed4f7ba9b6a44183c` (совпадает с локальной) |
+| Дерево | чистое (`git status --porcelain` пуст) |
+| Коммиты карточки | `79ef7c11c19` (Д1+Д2) → `aee1af815a1` (чекпойнт) → `c245075f1c3` (раунд 2) → `5daedf19c1e` (финальный прогон) |
+
+### Финальный прогон на закоммиченном дереве
+
+`evidence/green-final-committed.txt`:
+
+* 4 целевых файла (`test_kanban_scratch_unsaved_work`, `test_kanban_board_delete_guard`,
+  `test_kanban_gc_retention`, `plugins/test_kanban_board_lifecycle_api`) — **42 passed**
+* они же + `test_kanban_dashboard_plugin`, `test_kanban_cli`, `test_kanban_board_path_priority`,
+  `test_kanban_board_project`, `test_kanban_db_init` — **114 passed**
+
+### Замечание по pre-commit
+
+Штатный `lefthook` → `scripts/hermes-python` в этом worktree падает на окружении
+(`no bootstrap Python found; run setup-hermes.sh`), не на диффе. Проверка выполнена тем же
+`ruff_runner` с тем же `ruff.pre-commit.toml` напрямую:
+
+```
+python -m scripts.code_health.ruff_runner check --config ruff.pre-commit.toml <changed files>
+→ All checks passed!
+```
+
+Коммит `c245075f1c3` затем прошёл через настоящий hook с `HERMES_PYTHON` — тот же результат.
+
+---
+
 ## Раунд 2 — правки по ревью
 
 | Замечание ревью | Что сделано | Локатор |
