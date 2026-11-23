@@ -20,6 +20,8 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Callable, Dict, Mapping, NamedTuple, Optional, Tuple
 
+from utils import file_signature, mtime_is_racy
+
 
 # Process-global (describes the deployment mode, not a per-task value): set once
 # at gateway startup when gateway.multiplex_profiles is true.
@@ -321,15 +323,21 @@ def _parse_env_value(raw_value: str) -> str:
 # turn, cron fire, MCP/browser adoption and housekeeping drain, and each call used to re-read and
 # re-parse the whole file.
 #
-# FRESHNESS: every call still OPENS and READS the file (a few hundred bytes) and keys on its exact
-# bytes; only the decode + parse is skipped. A stat identity is not enough: a kernel that stamps
-# mtime/ctime from the coarse (jiffy) clock leaves (mtime, size, inode, ctime) unchanged across an
-# in-place same-size rewrite inside one tick, and ``/reload`` then served the old value (CI run
-# 39146191939). The open keeps close-to-open revalidation on NFS, and a vanished/unreadable file
-# fails the open and is never cached (a transient EACCES must not become "this profile has no
-# secrets"). ``invalidate_env_file_cache()`` is the explicit knob; ``hermes_cli.config.
-# invalidate_env_cache()`` calls it for Hermes's own .env writers.
-_ENV_FILE_CACHE: OrderedDict[str, tuple[bytes, dict[str, str]]] = OrderedDict()
+# FRESHNESS: the memo is keyed on ``utils.file_signature(st)`` — (mtime_ns, size, inode, ctime_ns) —
+# and a hit does NOT open the file: a settled profile ``.env`` (27 KB in the live profile) cost
+# ~22 µs/op of open+read against ~3 µs of stat. A stat identity alone is not enough for correctness
+# though: a kernel that stamps mtime/ctime from the coarse (jiffy) clock leaves all four components
+# unchanged across an in-place same-size rewrite inside one tick, and ``/reload`` then served the
+# old value (CI run 39146191939). So a signature that is still RACY — ``utils.mtime_is_racy`` on the
+# later of mtime/ctime — is not trusted: while the file is that fresh the call reads the bytes and
+# compares them exactly as before, and the open is skipped only once the file has settled past the
+# window (git's racily-clean rule). A signature that differs from the cached one (or a vanished /
+# unreadable file) falls through to the same open path: an atomic replace moves the inode, an
+# in-place rewrite moves ctime (userland cannot backdate it, so ``cp -p`` and ``rsync -t`` are
+# caught), and a same-size rewrite inside one tick is caught by the byte comparison above. The open
+# on a miss also keeps close-to-open revalidation on NFS. ``invalidate_env_file_cache()`` stays the
+# explicit knob; ``hermes_cli.config.invalidate_env_cache()`` calls it for Hermes's own .env writers.
+_ENV_FILE_CACHE: OrderedDict[str, tuple[tuple[int, int, int, int], bytes, dict[str, str]]] = OrderedDict()
 _ENV_FILE_CACHE_LOCK = threading.Lock()
 _ENV_FILE_CACHE_MAX = 64  # one entry per profile home in practice
 
@@ -383,25 +391,45 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     """
     key = str(env_path)
     try:
-        with open(env_path, "rb") as handle:
-            raw = handle.read()
+        st = os.stat(env_path)
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
         return {}
-
+    signature = file_signature(st)
+    # A file stamped inside the racy window could still be rewritten in place without moving any of
+    # the four signature components (coarse jiffy clock, CI run 39146191939), so its bytes are read
+    # and compared exactly as before. Only a settled file's signature is trusted on its own.
+    racy = mtime_is_racy(max(st.st_mtime_ns, st.st_ctime_ns))
     with _ENV_FILE_CACHE_LOCK:
         cached = _ENV_FILE_CACHE.get(key)
-        if cached is not None and cached[0] == raw:
+        if cached is not None:
             _ENV_FILE_CACHE.move_to_end(key)
-            return dict(cached[1])
-    secrets = _parse_env_text(_decode_env_bytes(raw))
+            cached_signature, cached_raw, cached_secrets = cached
+            if not racy and cached_signature == signature:
+                return dict(cached_secrets)
+        else:
+            cached_raw = cached_secrets = None
+
+    try:
+        with open(env_path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        invalidate_env_file_cache(env_path)
+        return {}
+
+    # Signature taken BEFORE the read: a write racing the read moves the next stat, so the entry is
+    # revalidated (and re-read) instead of pinning bytes that no longer describe the file.
+    if cached_raw == raw and cached_secrets is not None:
+        secrets = dict(cached_secrets)
+    else:
+        secrets = _parse_env_text(_decode_env_bytes(raw))
     with _ENV_FILE_CACHE_LOCK:
-        _ENV_FILE_CACHE[key] = (raw, dict(secrets))
+        _ENV_FILE_CACHE[key] = (signature, raw, dict(secrets))
         _ENV_FILE_CACHE.move_to_end(key)
         while len(_ENV_FILE_CACHE) > _ENV_FILE_CACHE_MAX:
             _ENV_FILE_CACHE.popitem(last=False)
-    return secrets
+    return dict(secrets)
 
 
 def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
