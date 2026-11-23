@@ -78,23 +78,30 @@ class _ReadOnlyHandlePool:
         except Exception:  # pragma: no cover - defensive: close() is best-effort by contract
             logger.debug("pooled read-only handle close failed", exc_info=True)
 
-    def _evict_locked(self, key: str) -> None:
-        """Drop the oldest idle handle for ``key`` (caller holds the lock)."""
-        entries = self._idle.get(key)
-        if not entries:
-            return
+    def _pop_oldest_locked(self, exclude_key: Optional[str] = None) -> Optional[_PooledEntry]:
+        """Remove and return the longest-idle entry process-wide (caller holds the lock)."""
+        victim_key = None
+        victim_since = None
+        for candidate_key, entries in self._idle.items():
+            if candidate_key == exclude_key or not entries:
+                continue
+            if victim_since is None or entries[0].idle_since < victim_since:
+                victim_key, victim_since = candidate_key, entries[0].idle_since
+        if victim_key is None:
+            return None
+        entries = self._idle[victim_key]
         entry = entries.pop(0)
         if not entries:
-            self._idle.pop(key, None)
-        # Closed outside the lock in acquire(); closing under the lock would serialize readers
-        # behind a checkpoint. Callers pass the entry to _close_entry after releasing.
-        threading.Thread(target=self._close_entry, args=(entry,), daemon=True).start()
+            self._idle.pop(victim_key, None)
+        return entry
 
     def acquire(self, key: str, identity) -> Optional[object]:
         """A live idle handle for ``key`` with a matching file identity, or None.
 
         Expired handles are closed; a handle whose file identity moved is discarded (the path
-        names a different file now, and a read must not answer from the old one).
+        names a different file now, and a read must not answer from the old one). A handle that
+        died while idle (its owner closed the SessionDB, or a read quarantined it as corrupt) is
+        discarded too — handing it out would fail the caller's very first read.
         """
         now = time.monotonic()
         stale: list[_PooledEntry] = []
@@ -110,24 +117,47 @@ class _ReadOnlyHandlePool:
                     if entry.identity != identity:
                         stale.append(entry)
                         continue
+                    if not _handle_is_reusable(entry.db):
+                        stale.append(entry)
+                        continue
                     picked = entry
                     break
                 if not entries:
                     self._idle.pop(key, None)
         for entry in stale:
             self._close_entry(entry)
+        logger.debug("read-only handle pool %s for %s (idle=%d)",
+                     "HIT" if picked is not None else "MISS", key, self._total_idle_locked())
         return picked.db if picked is not None else None
 
     def release(self, key: str, db, identity) -> bool:
-        """Return ``db`` to the pool; False when the pool is full (caller closes it)."""
+        """Return ``db`` to the pool; False when the handle is not reusable (caller closes it).
+
+        At the per-path or process-wide ceiling the LONGEST-IDLE entry is evicted (LRU) to make
+        room, so a busy profile is not starved of its own handles by a stale one elsewhere.
+        Evicted handles are closed outside the lock: closing under it would serialize readers
+        behind a checkpoint.
+        """
+        if not _handle_is_reusable(db):
+            logger.debug("not pooling %s: handle is closed or quarantined", key)
+            return False
         entry = _PooledEntry(db, identity, time.monotonic())
+        evicted: list[_PooledEntry] = []
         with self._lock:
             entries = self._idle.setdefault(key, [])
-            if len(entries) >= _POOL_PER_PATH or self._total_idle_locked() >= _POOL_PROCESS_MAX:
-                if not entries:
-                    self._idle.pop(key, None)
-                return False
+            overflow = len(entries) >= _POOL_PER_PATH
+            if overflow:
+                evicted.append(entries.pop(0))
+            elif self._total_idle_locked() >= _POOL_PROCESS_MAX:
+                victim = self._pop_oldest_locked(exclude_key=key) or (entries.pop(0) if entries else None)
+                if victim is None:
+                    if not entries:
+                        self._idle.pop(key, None)
+                    return False
+                evicted.append(victim)
             entries.append(entry)
+        for old in evicted:
+            self._close_entry(old)
         return True
 
     def discard(self, db) -> None:
