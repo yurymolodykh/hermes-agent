@@ -5,9 +5,9 @@
   "codes": {
     "200": 64
   },
-  "lat_p50_ms": 797.0,
-  "lat_max_ms": 1118.4,
-  "burst_wall_ms": 1169.3,
+  "lat_p50_ms": 760.0,
+  "lat_max_ms": 1127.0,
+  "burst_wall_ms": 1148.5,
   "offload_before": {
     "mode": "threaded",
     "enabled": true,
@@ -23,14 +23,14 @@
     "mode": "threaded",
     "enabled": true,
     "workers": 16,
-    "submitted": 0,
+    "submitted": 64,
     "inline": 0,
     "in_flight": 0,
     "queue_depth": 0,
-    "max_queue_depth": 0,
-    "avg_wait_ms": 0.0
+    "max_queue_depth": 24,
+    "avg_wait_ms": 65.49
   },
-  "queued": false,
+  "queued": true,
   "all_ok": true,
   "target_ok": true
 }

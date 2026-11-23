@@ -747,8 +747,12 @@ async def get_status(profile: Optional[str] = None,
         key, _collect, signature=lambda: _status_cache_signature(profile_dir))
 
     if signed_out:
-        return {key_: value for key_, value in full.items() if key_ in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
-    return full
+        full = {key_: value for key_, value in full.items() if key_ in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
+    # The offload counters are LIVE by definition — they describe the pool that is serving right
+    # now. Adding them to the cached snapshot would report the state at the last TTL refresh, so a
+    # burst shorter than the TTL would read ``queue_depth: 0`` while requests were queued. Merged
+    # after the cache instead; nothing else in the payload depends on them.
+    return {**full, "handler_offload": _handler_offload_view()}
 
 
 @router.get("/api/system/stats")
