@@ -367,6 +367,24 @@ dashboard:
 - `GET /api/status` отдаёт поле `handler_offload: {mode, enabled, workers, submitted, inline,
   in_flight, queue_depth, max_queue_depth, avg_wait_ms}` — именно `handler_offload`, не `parallelism`.
 
+Положения выключателя сняты прогой `probes/probe_offload_switch.py` → `probes/offload_switch.json`
+(модуль берётся из `feature/multiuser-access`, каждая комбинация — во временном `HERMES_HOME`):
+
+| Комбинация | `mode` | `enabled` | `workers` |
+|---|---|---|---|
+| ни ключа, ни env (заводское) | `threaded` | `true` | 16 |
+| `HERMES_HANDLER_OFFLOAD=0` | `inline` | `false` | 0 |
+| `HERMES_HANDLER_OFFLOAD=1` | `threaded` | `true` | 16 |
+| `dashboard.handler_offload: false` | `inline` | `false` | 0 |
+| `dashboard.handler_offload: true` | `threaded` | `true` | 16 |
+| `…: true` + `handler_offload_workers: 3` | `threaded` | `true` | 3 |
+| `dashboard.parallelism.enabled: false` (**не читаемое имя**) | `threaded` | `true` | 16 |
+| `handler_offload: false` + env `=1` (env сильнее) | `threaded` | `true` | 16 |
+
+Последняя строка — то, ради чего таблица: старое имя ключа режим **не выключает**, а env
+переопределяет конфиг в обе стороны. Откат поэтому — либо `handler_offload: false`, либо
+`HERMES_HANDLER_OFFLOAD=0`.
+
 Именно поэтому C безопасен: **нет второго режима жизни состояния**, есть только то, где
 исполняется работа.
 
@@ -551,6 +569,9 @@ dashboard:
   рядом — `probes/body_ops_run2.json` (`write_text` 51,4/175,2 мс, `unlink` 1 ГиБ 38,3/454,2 мс);
   независимый прогон ревьюера — `write_text` 33,8/215,1 мс, `unlink` 1 ГиБ 164,9/1500,8 мс.
   Решения «оффлоад / в цикле» от разброса не зависят: разрыв дорогих и дешёвых операций — два порядка.
+- `probes/probe_offload_switch.py` → `offload_switch.json` — положения выключателя (§4): 8 комбинаций
+  env/config, включая не читаемое имя `dashboard.parallelism.enabled`; модуль берётся из
+  `feature/multiuser-access` через `git show`, чужой профиль не трогается.
 - `probes/probe_client.py` — двухпроцессный стенд (сервер в своём процессе).
 - `probes/server_main.py` — серверная часть стенда (реальный `web_server.app`).
 - `probes/probe_store.py` — замер потолка хранилища (чтения/записи/процессы).
@@ -570,6 +591,8 @@ python3 durable/t_eca8cb15/probes/route_audit.py --live   # сверка пер�
 python3 durable/t_eca8cb15/probes/probe_body_ops.py
 python3 durable/t_eca8cb15/probes/probe_fs_cost.py
 python3 durable/t_eca8cb15/probes/probe_messaging_block.py
+python3 durable/t_eca8cb15/probes/probe_offload_switch.py --json durable/t_eca8cb15/probes/offload_switch.json
 ```
 
-Все четыре — обычный `python3`, без зависимостей проекта, без сети, во временном каталоге.
+Все шесть — обычный `python3`, без зависимостей проекта, без сети, во временном каталоге
+(последней нужен `git` — модуль выключателя читается из `feature/multiuser-access`).
