@@ -79,7 +79,6 @@ class HandlerOffload:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._executor: Optional[ThreadPoolExecutor] = None
-        self._semaphore: Optional[asyncio.Semaphore] = None
         self._enabled = DEFAULT_ENABLED
         self._workers = DEFAULT_WORKERS
         self._settled = False
@@ -125,23 +124,35 @@ class HandlerOffload:
                 self._workers if self._enabled else 0,
             )
 
-    def install(self, app: Any = None) -> "HandlerOffload":
-        """Settle the switch and, when enabled, arm the pool on ``app.state``."""
+    def install(self, app: Any = None, workers: Optional[int] = None) -> "HandlerOffload":
+        """Settle the switch and, when enabled, arm the pool on ``app.state``.
+
+        ``workers`` is for tests and for a deliberate one-off size override; the shipped size
+        comes from config/``DEFAULT_WORKERS`` so a restart reproduces it.
+        """
         if not self._settled:
             self.resolve()
+        if workers is not None:
+            self._workers = max(1, int(workers))
         if self._enabled:
             self._arm()
         if app is not None:
             app.state.handler_offload = self
         return self
 
+    def reset(self) -> None:
+        """Forget the settled switch (tests, and a boot that re-reads config)."""
+        self.shutdown()
+        with self._lock:
+            self._enabled = DEFAULT_ENABLED
+            self._workers = DEFAULT_WORKERS
+            self._settled = False
+
     def _arm(self) -> None:
         with self._lock:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=self._workers, thread_name_prefix="web-offload")
-            if self._semaphore is None:
-                self._semaphore = asyncio.Semaphore(self._workers)
 
     @property
     def enabled(self) -> bool:
@@ -153,6 +164,7 @@ class HandlerOffload:
 
     def snapshot(self) -> Dict[str, Any]:
         return {
+            "mode": "threaded" if self._enabled else "inline",
             "enabled": self._enabled,
             "workers": self._workers if self._enabled else 0,
             "submitted": self.submitted,
@@ -170,7 +182,13 @@ class HandlerOffload:
         return fn(*args, **kwargs)
 
     async def run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Await ``fn`` off the loop, or inline when the switch is off."""
+        """Await ``fn`` off the loop, or inline when the switch is off.
+
+        Concurrency is left to the executor's own bounded queue: an ``asyncio.Semaphore`` created
+        on one loop cannot be awaited from another (uvicorn reload, test teardown), and the
+        executor already refuses to run more than ``max_workers`` at a time. The counters below
+        are what make that queue visible in ``/api/status``.
+        """
         if not self._enabled:
             return self.run_inline(fn, *args, **kwargs)
         self._arm()
@@ -181,18 +199,13 @@ class HandlerOffload:
             self.queue_depth += 1
             if self.queue_depth > self.max_queue_depth:
                 self.max_queue_depth = self.queue_depth
-        assert self._semaphore is not None and self._executor is not None
-        async with self._semaphore:
-            waited = (loop.time() - started) * 1000.0
+        try:
+            return await loop.run_in_executor(self._executor, _bind(fn, args, kwargs))
+        finally:
             with self._lock:
                 self.queue_depth -= 1
-                self.in_flight += 1
-                self.wait_ms_total += waited
-            try:
-                return await loop.run_in_executor(self._executor, _bind(fn, args, kwargs))
-            finally:
-                with self._lock:
-                    self.in_flight -= 1
+                self.in_flight = self.queue_depth
+                self.wait_ms_total += (loop.time() - started) * 1000.0
 
     def shutdown(self) -> None:
         with self._lock:

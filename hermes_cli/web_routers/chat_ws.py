@@ -19,6 +19,7 @@ from agent.interrupt_scope import InterruptScope, bind_interrupt_scope
 from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_registry_snapshot
 from hermes_cli.pty_session import RegistryFull
 from hermes_cli.web_deps import LateState, late
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_server_chat import (
     _build_sidecar_url, _close_stalled_pty_input, _get_console_executor, _legacy_pump, _pty_fail, _ws_auth_ok,
     _ws_close_reason, _ws_gate, _ws_request_is_allowed,
@@ -463,7 +464,7 @@ async def _pty_channel_marker_state(
     if force_fresh:
         resume = None
         try:
-            active_session_file.unlink(missing_ok=True)
+            await off_loop(active_session_file.unlink, missing_ok=True)
         except OSError:
             pass
         marker_preexisting = False
