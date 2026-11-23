@@ -175,7 +175,8 @@ p50 109,8 мс; `Path.unlink` файла 1 ГиБ с реальными данн
 > **Таблица цен — снимок одного прогона** (`body_ops.json` этой ревизии), разброс между прогонами
 > заметный: медиана до 4×, хвост до 5× — число зависит от размера тела, файловой системы и
 > состояния page cache. Независимый прогон ревьюера на том же скрипте дал `write_text` 33,8/215,1 мс
-> и `unlink` 1 ГиБ 164,9/1500,8 мс; повторный прогон здесь — 11,7/526,4 и 864,7/889,1 мс. Порядок
+> и `unlink` 1 ГиБ 164,9/1500,8 мс; второй прогон здесь (закоммичен как
+> `probes/body_ops_run2.json`) — `write_text` 51,4/175,2 мс и `unlink` 1 ГиБ 38,3/454,2 мс. Порядок
 > величины и выводы от разброса не зависят: решения «оффлоад/в цикле» одинаковы на всех прогонах,
 > потому что разрыв между дорогими и дешёвыми операциями — два порядка.
 
@@ -315,7 +316,7 @@ WS/PTY, которые нельзя разнести без новой шины.
 | **Цена** | Правка 7 локаторов из §1.3/§5.1 на `asyncio.to_thread` (образец — 173 async-обработчика, которые уже так делают). Пять локаторов остаются по измеренному порогу, это обосновано в §1.3. |
 | **Риск** | Наименьший: нет новых процессов, нет новой сериализации состояния, WS/PTY остаются в том же процессе, единственный писатель не трогается. |
 | **Сложность откатa** | **Наименьшая**: одна настройка конфига; правки аддитивные, каждый `to_thread` откатывается независимо; поведение до/после отличается только тем, что цикл не блокируется. |
-| **Потолок** | Ограничен GIL и CPU: `search` n=16 всё равно ~1,4 с. Семафор (`anyio.CapacityLimiter`) не даёт пулу потоков съесть память. |
+| **Потолок** | Ограничен GIL и CPU: `search` n=16 всё равно ~1,4 с. Ограничитель параллелизма — сам `ThreadPoolExecutor` с фиксированным числом воркеров (`handler_offload_workers`): его очередь и есть лимитер, память пула не растёт неограниченно. |
 
 **Вердикт: выбран (C).** Плюс честная фиксация потолка: **этот вариант не ускоряет CPU-тяжёлый
 поиск**; если он станет проблемой, это отдельная задача про индексацию/FTS, а не про параллельность
@@ -339,7 +340,7 @@ HTTP.
 | Что падает | Что теряется | Как восстанавливается |
 |---|---|---|
 | Один обработчик (исключение в `to_thread`) | только этот запрос | HTTP 500; остальные запросы цикла живы — **в этом и выигрыш C** |
-| Пул потоков переполнен | новые запросы ждут в очереди лимитера | семафор ограничивает; ожидание в цикле не блокирует другие корутины |
+| Пул потоков переполнен | новые запросы ждут в очереди исполнителя | число воркеров фиксировано (`handler_offload_workers`), очередь видна в `/api/status` (`queue_depth`, `max_queue_depth`); ожидание в цикле не блокирует другие корутины |
 | Процесс шлюза | PTY-сессии, WS-подписки, кэш статуса (in-memory) | перезапуск: `state.db` не тронут (WAL), кэш прогревается первым запросом, PTY поднимаются заново |
 | Писатель (`state.db`) | ничего подтверждённого: receipt-транзакция либо коммитит, либо нет | незавершённая транзакция откатывается WAL; следующий запрос читает `runtime_revision` заново |
 | Чужой процесс держит аренду | запись отвечает `409/503 owner_unavailable` (замерено) | штатное поведение, не деградация; чтение продолжает работать |
@@ -350,18 +351,39 @@ HTTP.
 блокирующая работа снова идёт в цикле**:
 
 ```yaml
-# ~/.hermes/config.yaml
+# ~/.hermes/config.yaml  — ключи, которые ДЕЙСТВИТЕЛЬНО читаются (см. строку состояния §5.1)
 dashboard:
-  parallelism:
-    enabled: false          # true = оффлоад блокирующих обработчиков в пул потоков
-    max_threads: 16         # предел пула (anyio.CapacityLimiter), не больше 2× ядер
+  handler_offload: false        # true = оффлоад блокирующих обработчиков в пул потоков
+  handler_offload_workers: 16   # предел пула (1–128); 0/не задан = 2×CPU, ≥8 и ≤32
 ```
 
-- `enabled: false` (и отсутствие ключа) → **ровно текущее поведение**: `to_thread` не вызывается,
-  обработчик исполняется в цикле как сегодня.
-- `enabled: true` → оффлоад по §1.3.
-- При старте в журнал пишется одна строка: какой режим поднят, предел пула и pid/порт.
-- `GET /api/status` дополнительно отдаёт `parallelism: {enabled, mode, max_threads, busy}`.
+- `handler_offload: false` → **ровно текущее поведение**: `to_thread` не вызывается, обработчик
+  исполняется в цикле как сегодня.
+- `handler_offload: true` (и отсутствие ключа — таково заводское значение) → оффлоад по §1.3.
+- Имя `dashboard.parallelism` из первой редакции этой записки в дереве **не читается**:
+  `hermes config set dashboard.parallelism.enabled false` пишет значение молча, но с предупреждением
+  «not a recognized config key», и режим не меняет — проверено (§6, шаг 1).
+- При старте в журнал пишется одна строка режима (`handler offload mode=… source=… workers=…`).
+- `GET /api/status` отдаёт поле `handler_offload: {mode, enabled, workers, submitted, inline,
+  in_flight, queue_depth, max_queue_depth, avg_wait_ms}` — именно `handler_offload`, не `parallelism`.
+
+Положения выключателя сняты прогой `probes/probe_offload_switch.py` → `probes/offload_switch.json`
+(модуль берётся из `feature/multiuser-access`, каждая комбинация — во временном `HERMES_HOME`):
+
+| Комбинация | `mode` | `enabled` | `workers` |
+|---|---|---|---|
+| ни ключа, ни env (заводское) | `threaded` | `true` | 16 |
+| `HERMES_HANDLER_OFFLOAD=0` | `inline` | `false` | 0 |
+| `HERMES_HANDLER_OFFLOAD=1` | `threaded` | `true` | 16 |
+| `dashboard.handler_offload: false` | `inline` | `false` | 0 |
+| `dashboard.handler_offload: true` | `threaded` | `true` | 16 |
+| `…: true` + `handler_offload_workers: 3` | `threaded` | `true` | 3 |
+| `dashboard.parallelism.enabled: false` (**не читаемое имя**) | `threaded` | `true` | 16 |
+| `handler_offload: false` + env `=1` (env сильнее) | `threaded` | `true` | 16 |
+
+Последняя строка — то, ради чего таблица: старое имя ключа режим **не выключает**, а env
+переопределяет конфиг в обе стороны. Откат поэтому — либо `handler_offload: false`, либо
+`HERMES_HANDLER_OFFLOAD=0`.
 
 Именно поэтому C безопасен: **нет второго режима жизни состояния**, есть только то, где
 исполняется работа.
@@ -410,31 +432,59 @@ dashboard:
 сравним с секундой ожидания в панели. №5 стоит выше №6/№7 потому, что размер файла там задаёт не
 сервер, а пользователь (модели до сотен МиБ): `unlink` 1 ГиБ — p95 1041 мс, при медиане 82 мс.
 
-> **Состояние на 23.11.2026:** правки №1–№7 (кроме `messaging.py`, см. ниже) уже реализованы и
-> влиты в `feature/multiuser-access` @ `bfd5c5ef51ed` (32 файла, шов
+> **Состояние на 23.11.2026 (проверено мной построчно в `feature/multiuser-access`, не по отчёту):**
+> вынос блокирующей работы влит в `bfd5c5ef51ed` (32 файла, шов
 > `hermes_cli/web_routers/handler_offload.py`, выключатель `dashboard.handler_offload` /
-> `HERMES_HANDLER_OFFLOAD=0`) — таблица выше остаётся спецификацией того, что закрыто, а остаток
-> аудита назван в `durable/t_a61becbc/REPORT.md`: 8 точек из 37 находок. Имя выключателя в дереве —
-> `dashboard.handler_offload`; `dashboard.parallelism` из §5.2 — тот же ключ, если реализация
-> выберет его вместо уже влитого.
+> `HERMES_HANDLER_OFFLOAD=0`), но **таблица выше закрыта не вся**. Фактическое состояние по
+> целевому дереву:
+>
+> | № | Точка (целевая ветка) | Состояние в `feature/multiuser-access` |
+> |---|---|---|
+> | 1 | `files.py:1096 fs_write_text` | **оффлоадднут** — `off_loop(_fs_write_text_blocking, …)` (1138), внутри `write_text` 1167 + `os.replace` 1168 + `unlink` в `finally` |
+> | 2 | `audio.py:90 transcribe_audio_upload` | **НЕ оффлоадднут**: `base64.b64decode` (107) и `tmp.write` (123) остались в цикле |
+> | 3 | `audio.py:299 speak_text` | **частично**: в потоке только чтение+unlink (`_read_and_unlink`, 344); `base64.b64encode` (348) остался в цикле |
+> | 4 | `files.py:483 proxy_remote_media` | **НЕ оффлоадднут**: `base64.b64encode` (520) в цикле |
+> | 5 | `local_models.py:803 local_models_delete` | **оффлоадднут** — `off_loop(_variant_files_on_disk)` (808), `off_loop(_unlink_all)` (811) |
+> | 6 | `files.py:1231 fs_read_data_url` | **оффлоадднут** — `to_thread` (1236/1239/1249/1266) |
+> | 7 | `actions.py:386 get_action_status` | **НЕ оффлоадднут**: `_tail_lines` (394/403/404) в цикле |
+>
+> Итого закрыто 3 из 7 (№1, 5, 6), №3 — наполовину, №2/4/7 — остаток для `t_f238ce77`.
+> Номера строк §5.1 — на ревизии аудита `47d3ac2b449b`; в целевой ветке они сдвинуты:
+> `files.py` 1083→**1096**, 472→**483**, 1203→**1231**, `local_models.py` 796→**803**
+> (`audio.py:90/299` и `actions.py:386` не сдвинулись). Остаток полного аудита назван в
+> `durable/t_a61becbc/REPORT.md`: 8 находок из 37, из них 4 — осознанно неблокирующие
+> (`oauth.py:514/916`, `webapp_access.py:156`, `audio.py:593`, `display.py:125`, плюс ложное
+> срабатывание `ops.py:207`) и `messaging.py:start_whatsapp_onboarding` (контракт 21 теста).
+> **Имя выключателя в дереве — `dashboard.handler_offload`, и это единственное читаемое имя**;
+> `dashboard.parallelism` из первой редакции записки Hermes не читает (проверено: предупреждение
+> «not a recognized config key»), поэтому §4/§6/§5.2 приведены к `handler_offload`.
 
-### 5.2 Новые/изменяемые модули
+### 5.2 Новые/изменяемые модули (приведено к тому, что уже в дереве)
 
-- `hermes_cli/config_defaults.py` — секция `dashboard.parallelism` (`enabled`, `max_threads`)
-  (в дереве уже есть `dashboard.handler_offload` — см. строку состояния выше).
-- `hermes_cli/web_server_app.py` — при старте создать `anyio.CapacityLimiter(max_threads)`,
-  положить в `app.state.parallelism`; лог режима.
-- `hermes_cli/web_routers/status.py` — добавить в ответ блок `parallelism` (число busy/limit).
-- Общий хелпер (новый sibling, напр. `hermes_cli/web_routers/_offload.py`): `run_blocking(fn, *a)`
-  — при `enabled: false` вызывает `fn()` напрямую, при `true` — `await asyncio.to_thread(fn, *a)`
-  под лимитером. **Единственная точка, где живёт выключатель.**
+- `hermes_cli/config_defaults.py` — секция `dashboard`: `handler_offload: True` (строка 995 на
+  `feature/multiuser-access`) и `handler_offload_workers: 0` (строка 997; `0` = 2×CPU, ≥8 и ≤32).
+- `hermes_cli/web_routers/handler_offload.py` — `HandlerOffload.resolve()` решает режим один раз
+  при старте (`env → config → default`) и пишет строку журнала; `install(app)` кладёт объект в
+  `app.state.handler_offload` и при `enabled` поднимает `ThreadPoolExecutor(workers)`.
+- `hermes_cli/web_routers/status.py` — `_handler_offload_view()` (529) отдаёт в `/api/status` поле
+  `handler_offload` со счётчиками пула (`submitted/inline/in_flight/queue_depth/max_queue_depth/avg_wait_ms`).
+- **Выключатель живёт ровно в одном месте** — `HandlerOffload.run()`: при `enabled: false`
+  вызывает `fn()` прямо в цикле (`run_inline`), при `true` — `loop.run_in_executor` с копией
+  `contextvars` (`_bind`), чтобы профиль запроса дошёл до воркера.
+
+> Историческая справка: первая редакция §5.2 предлагала свой `_offload.py` и
+> `anyio.CapacityLimiter` под именем `parallelism`. В дереве это не понадобилось: ограничение
+> параллелизма даёт сам `ThreadPoolExecutor` (его очередь и есть лимитер), а имя ключа —
+> `handler_offload`. Ниже §5.3 остаётся критериями для `t_f238ce77`.
 
 ### 5.3 Где нужен замер (критерии приёмки t_f238ce77)
 
 1. Тот же двухпроцессный стенд (`probes/probe_client.py`) до/после: ожидание — `health-проба`
    при n=16 на `/api/sessions` не хуже 15,2 мс (базовая линия этой записки) и **не растёт**;
-2. `/api/status` режим и `busy` видны в ответе;
-3. при `enabled: false` числа совпадают с базовой линией §1.2 в пределах шума;
+2. `/api/status` отдаёт `handler_offload.mode` / `.enabled` / `.workers` и живые счётчики
+   (`submitted`, `queue_depth`, `max_queue_depth`, `avg_wait_ms`) — они и есть наблюдение режима;
+3. при `handler_offload: false` (или `HERMES_HANDLER_OFFLOAD=0`) числа совпадают с базовой
+   линией §1.2 в пределах шума, а `handler_offload.mode == "inline"`;
 4. WS-события чата: тот же набор событий (сравнение с записью на базе).
 
 ---
@@ -445,14 +495,30 @@ dashboard:
 
 ### Шаг 1. Программный откат (секунды, без пересборки)
 
-- **Файл:** `~/.hermes/config.yaml`, секция `dashboard.parallelism` (в уже влитом `bfd5c5ef51ed`
-  ключ называется `dashboard.handler_offload`; `HERMES_HANDLER_OFFLOAD=0` — то же из окружения).
-- **Команда:** `hermes config set dashboard.parallelism.enabled false` (или правка строки вручную).
-- **Ожидаемо:** `GET /api/status` → `"parallelism": {"enabled": false, ...}`; в журнале при
-  следующем старте строка режима `enabled=false`.
-- **Проверка вторым человеком:** `curl -s localhost:9120/api/status | python3 -m json.tool | grep -A4 parallelism`.
-  Порт **9120** — живой шлюз этого хоста (`ss -ltnp | grep 9120`); **42971** из
-  `probes/twoproc_current.json` — эфемерный порт измерительного стенда, к нему обращаться не нужно.
+- **Файл:** `~/.hermes/config.yaml`, секция `dashboard` — ключи `handler_offload` и
+  `handler_offload_workers` (именно они читаются деревом; `dashboard.parallelism` **не читается** —
+  см. ниже). Эквивалент из окружения: `HERMES_HANDLER_OFFLOAD=0` (переопределяет конфиг).
+- **Команда (проверенная, снята на этом хосте):**
+  ```bash
+  hermes config set dashboard.handler_offload false
+  # без правки конфига вообще — переменной окружения на процесс шлюза:
+  HERMES_HANDLER_OFFLOAD=0 <команда запуска шлюза>
+  ```
+- **Ожидаемо** (фактический вывод, снятый здесь на временном `HERMES_HOME`):
+  - `hermes config set dashboard.handler_offload false` → `✓ Set dashboard.handler_offload = False in …/config.yaml`,
+    в файле `dashboard:\n  handler_offload: false`; `hermes config get dashboard.handler_offload` → `false`;
+  - `HandlerOffload().install().snapshot()` → `{"mode": "inline", "enabled": false, "workers": 0, …}`;
+  - после рестарта шлюза в журнале `handler offload mode=inline (single-process) source=config dashboard.handler_offload workers=0`.
+- **Почему не `dashboard.parallelism.enabled`:** проверено на этом хосте —
+  `hermes config set dashboard.parallelism.enabled false` печатает
+  `⚠ 'dashboard.parallelism.enabled' is not a recognized config key — it was saved anyway, but Hermes
+  may not read it`. Значение ложится в YAML, но режим не меняет: читается только `handler_offload`.
+  Первая редакция этой записки предлагала `parallelism` — это было ошибкой, исправлено.
+- **Проверка вторым человеком:** `curl -s localhost:9120/api/status | python3 -c "import json,sys;print(json.load(sys.stdin)['handler_offload'])"`.
+  Живой шлюз этого хоста на момент проверки отдал `{"mode": "threaded", "enabled": true, "workers": 16, …}`
+  (проверено здесь же); после `handler_offload: false` и рестарта ожидается `"mode": "inline", "enabled": false, "workers": 0`.
+  Порт **9120** — живой шлюз этого хоста (`ss -ltnp | grep 9120` → `127.0.0.1:9120`, pid шлюза);
+  **42971** из `probes/twoproc_current.json` — эфемерный порт измерительного стенда, к нему обращаться не нужно.
 
 > Замечание: режим применяется при старте сервера (создание лимитера), поэтому после смены
 > значения — рестарт шлюза тем же способом, каким он запущен. Это осознанно: менять размер пула
@@ -493,9 +559,11 @@ dashboard:
    (n=16 → 1,46 с). Это отдельная задача (FTS/индексация), не параллельность HTTP.
 2. **Замеры сняты на временном `HERMES_HOME`** с 200 сессиями — на реальном профиле числа будут
    другими; базовая линия для сравнения — эта записка, а не абсолютные значения.
-3. **Живой шлюз не рестартовался** (граница карточки): контрольный замер на порту **9120**
-   (живой шлюз; не путать с 42971 — это стенд) —
-   `manual_review` для потребителя.
+3. **Живой шлюз не рестартовался** (граница карточки). Read-only снимок сделан: на порту **9120**
+   (живой шлюз этого хоста) `/api/status` отдаёт `handler_offload = {"mode": "threaded", "enabled": true,
+   "workers": 16, …}`; управляемый перезапуск с `handler_offload: false` и контрольный замер после
+   выкатки `t_f238ce77` — `manual_review` для потребителя. Порт 42971 из `probes/twoproc_current.json` —
+   стенд, не живой шлюз.
 4. **Multi-process запись в один `state.db` (вариант B) измерена частично**: проба
    `probes/probe_store.py` подготовлена, но полный прогон не снят — при выборе B это блокирующее
    требование, при выборе C не требуется.
@@ -513,9 +581,13 @@ dashboard:
   на этих числах стоит порог §1.3 и порядок §5.1. Закоммиченный `body_ops.json` — **26 операций**,
   включая `Path.unlink 1 ГиБ (свежие данные)` (строки 199–217 скрипта). Таблица цен — снимок одного
   прогона: разброс между прогонами заметный (медиана до 4×, хвост до 5×), число зависит от размера
-  тела, файловой системы и page cache
-  (в независимом прогоне ревьюера `write_text` 8 МиБ — 33,8/215,1 мс, `unlink` 1 ГиБ — 164,9/1500,8 мс;
-  здесь — 41,7/120,6 и 81,8/1041,2). Решения «оффлоад / в цикле» от разброса не зависят.
+  тела, файловой системы и page cache. Второй прогон того же скрипта на том же хосте закоммичен
+  рядом — `probes/body_ops_run2.json` (`write_text` 51,4/175,2 мс, `unlink` 1 ГиБ 38,3/454,2 мс);
+  независимый прогон ревьюера — `write_text` 33,8/215,1 мс, `unlink` 1 ГиБ 164,9/1500,8 мс.
+  Решения «оффлоад / в цикле» от разброса не зависят: разрыв дорогих и дешёвых операций — два порядка.
+- `probes/probe_offload_switch.py` → `offload_switch.json` — положения выключателя (§4): 8 комбинаций
+  env/config, включая не читаемое имя `dashboard.parallelism.enabled`; модуль берётся из
+  `feature/multiuser-access` через `git show`, чужой профиль не трогается.
 - `probes/probe_client.py` — двухпроцессный стенд (сервер в своём процессе).
 - `probes/server_main.py` — серверная часть стенда (реальный `web_server.app`).
 - `probes/probe_store.py` — замер потолка хранилища (чтения/записи/процессы).
@@ -535,6 +607,8 @@ python3 durable/t_eca8cb15/probes/route_audit.py --live   # сверка пер�
 python3 durable/t_eca8cb15/probes/probe_body_ops.py
 python3 durable/t_eca8cb15/probes/probe_fs_cost.py
 python3 durable/t_eca8cb15/probes/probe_messaging_block.py
+python3 durable/t_eca8cb15/probes/probe_offload_switch.py --json durable/t_eca8cb15/probes/offload_switch.json
 ```
 
-Все четыре — обычный `python3`, без зависимостей проекта, без сети, во временном каталоге.
+Все шесть — обычный `python3`, без зависимостей проекта, без сети, во временном каталоге
+(последней нужен `git` — модуль выключателя читается из `feature/multiuser-access`).
