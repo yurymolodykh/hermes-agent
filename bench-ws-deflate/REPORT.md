@@ -202,6 +202,11 @@ bash run_profiles.sh                                                      # 12 �
 `cpu-precise*.json` (точный CPU), `noise-floor.json`, `profile-shares.jsonl` (py-spy),
 `noise-floor.py`, `cpu_precise.py`, `profile_share.py`, `server_app.py`, `drive.py`.
 
+Проверка воспроизводимости после рефакторинга стенда: прогон `matrix_v2.py --rounds 2 --clients 4`
+даёт **побайтово те же** размеры для варианта `off` во всех сценариях; сжатые варианты
+отличаются на единицы байт, потому что каждый кадр несёт свой nonce (это защита от context
+takeover, см. комментарий в `server_app.py`) — проценты трафика совпадают в пределах 0,8 %.
+
 ## 7. Ограничения этого замера
 
 * Стенд синтезирует поток кадров из реальных тел `state.db`; живой агентский ход

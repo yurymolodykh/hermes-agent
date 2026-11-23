@@ -43,6 +43,17 @@ def _write_json(path: str, data: dict) -> None:
         json.dump(data, fh, indent=2, ensure_ascii=False)
 
 
+async def _spawn(*argv, **kw):
+    """subprocess.Popen blocks the event loop while the kernel forks; hand it to a thread."""
+    return await asyncio.to_thread(subprocess.Popen, list(argv), **kw)
+
+
+async def _run(*argv, **kw):
+    """subprocess.run waits for the child; on the loop that stalls every other connection."""
+    kw.setdefault("check", False)
+    return await asyncio.to_thread(subprocess.run, list(argv), **kw)
+
+
 async def wait_ready(port: int) -> None:
     for _ in range(160):
         try:
@@ -90,10 +101,11 @@ async def main() -> None:
     args = ap.parse_args()
 
     ports = {v: 18700 + i for i, v in enumerate(args.variants)}
-    servers = {v: subprocess.Popen([sys.executable, f"{HERE}/server_app.py",
-                                    "--port", str(ports[v]), *ARGV[v]],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-               for v in args.variants}
+    servers = {}
+    for v in args.variants:
+        servers[v] = await _spawn(sys.executable, f"{HERE}/server_app.py",
+                                  "--port", str(ports[v]), *ARGV[v],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     result: dict = {"mode": args.mode, "repeat": args.repeat, "clients": args.clients,
                     "variants": {}}
     try:

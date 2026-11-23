@@ -36,6 +36,17 @@ def _write_json(path: str, data: dict) -> None:
         json.dump(data, fh, indent=2, ensure_ascii=False)
 
 
+async def _spawn(*argv, **kw):
+    """subprocess.Popen blocks the event loop while the kernel forks; hand it to a thread."""
+    return await asyncio.to_thread(subprocess.Popen, list(argv), **kw)
+
+
+async def _run(*argv, **kw):
+    """subprocess.run waits for the child; on the loop that stalls every other connection."""
+    kw.setdefault("check", False)
+    return await asyncio.to_thread(subprocess.run, list(argv), **kw)
+
+
 async def wait_ready(port: int) -> None:
     for _ in range(160):
         try:
@@ -80,10 +91,11 @@ async def main() -> None:
     ap.add_argument("--out", default="noise-floor.json")
     args = ap.parse_args()
 
-    servers = {d: subprocess.Popen([sys.executable, f"{HERE}/server_app.py",
-                                    "--port", str(PORTS[d]), *a],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-               for d, a in ARGV.items()}
+    servers = {}
+    for d, a in ARGV.items():
+        servers[d] = await _spawn(sys.executable, f"{HERE}/server_app.py",
+                                  "--port", str(PORTS[d]), *a,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     samples: dict[str, list[float]] = {d: [] for d in servers}
     walls: dict[str, list[float]] = {d: [] for d in servers}
     try:

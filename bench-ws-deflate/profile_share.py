@@ -25,6 +25,17 @@ HERE = "/home/hermes/.hermes/hermes-agent/.worktrees/t_5bb8406e/bench-ws-deflate
 PY_SPY = "/home/hermes/.local/bin/py-spy"
 
 
+async def _spawn(*argv, **kw):
+    """subprocess.Popen blocks the event loop while the kernel forks; hand it to a thread."""
+    return await asyncio.to_thread(subprocess.Popen, list(argv), **kw)
+
+
+async def _run(*argv, **kw):
+    """subprocess.run waits for the child; on the loop that stalls every other connection."""
+    kw.setdefault("check", False)
+    return await asyncio.to_thread(subprocess.run, list(argv), **kw)
+
+
 async def client(port: int, mode: str) -> None:
     async with websockets.connect(f"ws://127.0.0.1:{port}/bench?mode={mode}&repeat=100000",
                                  compression="deflate", max_size=None) as ws:
@@ -72,9 +83,8 @@ async def main() -> None:
     index = ("on", "off", "level1", "level4", "memlevel1", "notakeover").index(args.variant)
     port = 18401 + index
     extra = args.extra.split() if args.extra else []
-    srv = subprocess.Popen([sys.executable, f"{HERE}/server_app.py", "--port", str(port),
-                            *extra],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    srv = await _spawn(sys.executable, f"{HERE}/server_app.py", "--port", str(port), *extra,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     raw = f"/tmp/bench-{args.variant}-{os.getpid()}.raw"
     try:
         for _ in range(120):
@@ -95,11 +105,11 @@ async def main() -> None:
         t0 = time.perf_counter()
         # ptrace_scope=1 lets only a parent attach, and py-spy here is a sibling of the server, so
         # the attach runs under sudo (py-spy then writes the file as root, hence the chmod below).
-        proc = subprocess.run(
-            ["sudo", "-n", PY_SPY, "record", "-d", str(args.seconds), "-r", str(args.rate),
-             "-f", "raw", "-o", raw, "--pid", str(srv.pid), "--nonblocking", "--threads"],
+        proc = await _run(
+            "sudo", "-n", PY_SPY, "record", "-d", str(args.seconds), "-r", str(args.rate),
+            "-f", "raw", "-o", raw, "--pid", str(srv.pid), "--nonblocking", "--threads",
             capture_output=True, text=True, timeout=args.seconds + 120)
-        subprocess.run(["sudo", "-n", "chmod", "644", raw], capture_output=True, timeout=60)
+        await _run("sudo", "-n", "chmod", "644", raw, capture_output=True, timeout=60)
         wall = time.perf_counter() - t0
         sys.stderr.write((proc.stdout + proc.stderr)[-600:] + "\n")
         load.cancel()

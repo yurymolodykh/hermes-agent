@@ -28,6 +28,17 @@ def cpu_seconds(pid: int) -> float:
     return (int(parts[13]) + int(parts[14])) / 100.0  # utime+stime in clock ticks
 
 
+async def _spawn(*argv, **kw):
+    """subprocess.Popen blocks the event loop while the kernel forks; hand it to a thread."""
+    return await asyncio.to_thread(subprocess.Popen, list(argv), **kw)
+
+
+async def _run(*argv, **kw):
+    """subprocess.run waits for the child; on the loop that stalls every other connection."""
+    kw.setdefault("check", False)
+    return await asyncio.to_thread(subprocess.run, list(argv), **kw)
+
+
 async def one_client(port: int, mode: str, repeat: int) -> tuple[int, int]:
     frames = app = 0
     async with websockets.connect(f"ws://127.0.0.1:{port}/bench?mode={mode}&repeat={repeat}",
@@ -59,9 +70,9 @@ async def main() -> None:
     args = ap.parse_args()
 
     port = 18201 if args.deflate == "on" else 18202
-    srv = subprocess.Popen([sys.executable, f"{HERE}/server_app.py", "--port", str(port),
-                            "--deflate", args.deflate],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    srv = await _spawn(sys.executable, f"{HERE}/server_app.py", "--port", str(port),
+                       "--deflate", args.deflate,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(80):
             try:
@@ -74,7 +85,7 @@ async def main() -> None:
                             break
                 break
             except OSError:
-                time.sleep(0.25)
+                await asyncio.sleep(0.25)
         rows = []
         for _ in range(args.rounds):
             # warm the code paths once, then measure (avoids one-off import/JIT noise)

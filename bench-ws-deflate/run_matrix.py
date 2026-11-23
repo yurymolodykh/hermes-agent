@@ -36,6 +36,17 @@ def _write_json(path: str, data: dict) -> None:
         json.dump(data, fh, indent=2, ensure_ascii=False)
 
 
+async def _spawn(*argv, **kw):
+    """subprocess.Popen blocks the event loop while the kernel forks; hand it to a thread."""
+    return await asyncio.to_thread(subprocess.Popen, list(argv), **kw)
+
+
+async def _run(*argv, **kw):
+    """subprocess.run waits for the child; on the loop that stalls every other connection."""
+    kw.setdefault("check", False)
+    return await asyncio.to_thread(subprocess.run, list(argv), **kw)
+
+
 async def wait_ready(port: int) -> None:
     for _ in range(120):
         try:
@@ -88,9 +99,11 @@ async def main() -> None:
         "off": ["--deflate", "off"],
         "tuned": ["--deflate", "on", "--window", str(args.window), "--memlevel", str(args.memlevel)],
     }
-    servers = {d: subprocess.Popen(
-        [sys.executable, f"{HERE}/server_app.py", "--port", str(PORTS[d]), *a],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for d, a in argv.items()}
+    servers = {}
+    for d, a in argv.items():
+        servers[d] = await _spawn(sys.executable, f"{HERE}/server_app.py",
+                                  "--port", str(PORTS[d]), *a,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     report: dict = {"clients": args.clients, "rounds": args.rounds, "scenarios": {}}
     try:
         for d in servers:
@@ -101,8 +114,8 @@ async def main() -> None:
             for d in ("on", "off", "tuned"):
                 pid, port = servers[d].pid, PORTS[d]
                 # wire bytes: one client, relay-counted (drive.py prints its own JSON)
-                out = subprocess.run(
-                    [sys.executable, f"{HERE}/drive.py", "--port", str(port), "--mode", mode],
+                out = await _run(
+                    sys.executable, f"{HERE}/drive.py", "--port", str(port), "--mode", mode,
                     capture_output=True, text=True, check=True, timeout=120)
                 wire = json.loads(out.stdout.strip().splitlines()[-1])
                 # sender CPU: warm once, then measure `rounds` bursts of N concurrent clients
