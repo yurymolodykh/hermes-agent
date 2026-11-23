@@ -201,29 +201,103 @@ def _tree_fingerprint(root: Path, files: Iterable[str]) -> str:
 
 
 _FINGERPRINT_FILE = ".wip-fingerprint"
+# A complete tarball is only ever handed back when this marker, carrying the tree
+# fingerprint, sits beside it. An archive without one is not proof of anything:
+# the previous implementation left cut-off tarballs in this directory, and they
+# looked exactly like real copies.
+_DONE_SUFFIX = ".done"
+# The single, overwritten record of a tree that cannot be archived whole. No
+# tarball is written for that case, so nothing truncated can be handed back.
+_PARTIAL_FILE = "wip-partial.json"
+
+
+@dataclass
+class _ArchiveOutcome:
+    """Where an archive attempt landed, and whether it holds the whole tree."""
+
+    path: str
+    complete: bool
 
 
 def _existing_archive(out_dir: Path, fingerprint: str) -> Optional[str]:
-    """The archive already holding this exact tree state, when one exists.
+    """The complete archive already holding this exact tree state, when one exists.
+
+    Only ``*.tar.gz.done`` markers are candidates, and the marker itself must
+    carry *fingerprint*: a tarball without a matching completeness marker is
+    either truncated or from an older tree, and naming it would point the model
+    at a copy that is not this workspace.
 
     Newest by mtime, not by name: two saves inside one second get a ``-N`` suffix
     that sorts *before* the bare stamp, so a name sort would return the older copy.
     """
     try:
-        if (out_dir / _FINGERPRINT_FILE).read_text(encoding="utf-8").strip() != fingerprint:
-            return None
-        previous = sorted(out_dir.glob("wip-*.tar.gz"), key=lambda p: p.stat().st_mtime_ns)
+        markers = [
+            p for p in out_dir.glob(f"wip-*.tar.gz{_DONE_SUFFIX}")
+            if p.read_text(encoding="utf-8").strip() == fingerprint
+        ]
+        newest = max(markers, key=lambda p: p.stat().st_mtime_ns) if markers else None
     except OSError:
         return None
-    return str(previous[-1]) if previous else None
+    if newest is None:
+        return None
+    archive = newest.with_suffix("")
+    return str(archive) if archive.is_file() else None
 
 
-def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) -> Optional[str]:
+def _existing_partial(out_dir: Path, fingerprint: str) -> Optional[str]:
+    """The partial record already describing this exact over-cap tree, if written."""
+    target = out_dir / _PARTIAL_FILE
+    try:
+        recorded = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return str(target) if recorded.get("fingerprint") == fingerprint else None
+
+
+def _record_partial(
+    out_dir: Path, paths: list[str], fingerprint: str, total: int,
+) -> Optional[_ArchiveOutcome]:
+    """Overwrite the one partial record for an over-cap tree; write no tarball.
+
+    The card's files are too large to copy, so the honest artefact is the fact of
+    the loss plus enough detail to act on it — never a tarball cut in half that a
+    successor could mistake for the workspace. One file, rewritten in place, so a
+    threshold that fires on every turn does not leave a pile behind.
+    """
+    target = out_dir / _PARTIAL_FILE
+    payload = {
+        "kind": "partial",
+        "reason": "дерево больше потолка архива",
+        "fingerprint": fingerprint,
+        "cap_bytes": _ARCHIVE_MAX_BYTES,
+        "tree_bytes": total,
+        "file_count": len(paths),
+        "example": paths[:10],
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return None
+    return _ArchiveOutcome(str(target), complete=False)
+
+
+def _archive_tree(
+    root: Path, files: Iterable[str], task_id: str, stamp: str,
+) -> Optional[_ArchiveOutcome]:
     """Fallback for a workspace with no git repository: a bounded tarball of its attachments.
 
-    Repeating the call on an unchanged tree returns the archive already on disk
-    instead of writing a second one: the reminder threshold can fire more than once
-    per card, and a pile of identical tarballs is not more safety.
+    Three outcomes, none of them dishonest:
+
+    * this exact tree was already copied whole → that archive is returned;
+    * the tree fits under ``_ARCHIVE_MAX_BYTES`` → a ``wip-<stamp>.tar.gz`` plus a
+      ``.done`` marker holding the fingerprint, which is what makes it reusable;
+    * the tree does not fit → **no tarball at all**, and one overwritten
+      ``wip-partial.json`` recording the loss. A truncated file can never be
+      handed back, and a threshold that fires every turn leaves one file, not four.
     """
     paths = list(files)
     if not paths:
@@ -239,38 +313,44 @@ def _archive_tree(root: Path, files: Iterable[str], task_id: str, stamp: str) ->
     fingerprint = _tree_fingerprint(root, paths)
     unchanged = _existing_archive(out_dir, fingerprint)
     if unchanged:
-        return unchanged
+        return _ArchiveOutcome(unchanged, complete=True)
+
+    sizes = {rel: (root / rel).stat().st_size for rel in paths if (root / rel).is_file()}
+    total = sum(sizes.values())
+    if total > _ARCHIVE_MAX_BYTES:
+        # Decided before opening a tarball: an unfinished write is what used to
+        # land here, and its remains were indistinguishable from a real copy.
+        recorded = _existing_partial(out_dir, fingerprint)
+        if recorded:
+            return _ArchiveOutcome(recorded, complete=False)
+        partial = _record_partial(out_dir, paths, fingerprint, total)
+        return partial
+
     target = out_dir / f"wip-{stamp}.tar.gz"
     # Two saves inside one second must not overwrite each other: a changed tree
     # in the same tick still deserves its own file.
     serial = 1
-    while target.exists():
+    while target.exists() or target.with_name(target.name + _DONE_SUFFIX).exists():
         serial += 1
         target = out_dir / f"wip-{stamp}-{serial}.tar.gz"
-    total = 0
-    complete = True
     try:
         with tarfile.open(target, "w:gz") as tar:
             for rel in paths:
                 src = root / rel
                 if not src.is_file():
                     continue
-                total += src.stat().st_size
-                if total > _ARCHIVE_MAX_BYTES:
-                    complete = False
-                    break
                 tar.add(src, arcname=rel, recursive=False)
     except (OSError, tarfile.TarError):
         target.unlink(missing_ok=True)
         return None
-    if complete:
-        # A truncated archive is not this tree's copy: recording its fingerprint
-        # would make the next unchanged call reuse it and drop the rest forever.
-        try:
-            (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
-        except OSError:
-            pass
-    return str(target)
+    # The marker is written last and carries the fingerprint: a tarball is only
+    # ever called this tree's copy once it is known to be whole.
+    try:
+        (out_dir / f"{target.name}{_DONE_SUFFIX}").write_text(fingerprint + "\n", encoding="utf-8")
+        (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return _ArchiveOutcome(str(target), complete=True)
 
 
 def card_workspace() -> Optional[Path]:

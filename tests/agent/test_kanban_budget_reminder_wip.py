@@ -10,6 +10,7 @@ the reminder to saving *something* on both shapes, and to not piling up copies.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tarfile
 
@@ -136,3 +137,80 @@ def test_repeat_reminder_on_an_unchanged_workspace_writes_no_second_archive(card
     (workspace / "report.md").write_text("# done\n" * 3, encoding="utf-8")
     _remind(_Agent(used=130, max_total=180), _tool_turn())
     assert len(_archives(home)) == 2
+
+
+def test_a_truncated_archive_is_never_the_one_the_notice_names(card_env, monkeypatch):
+    """A copy cut off at the size cap must never stand in for the real tree.
+
+    A truncated tarball sits in the same directory as the complete ones. Once the
+    tree returns to an already-copied state, the newest file by mtime is the
+    truncated one, so without a completeness marker the reminder points the model
+    at an archive holding zero entries.
+    """
+    from agent import kanban_budget_checkpoint as kbc
+
+    workspace, home = card_env
+    (workspace / "a.txt").write_text("A" * 100, encoding="utf-8")
+    (workspace / "b.txt").write_text("B" * 100, encoding="utf-8")
+    before = {n: (workspace / n).stat() for n in ("a.txt", "b.txt")}
+
+    first = kbc.preserve_wip_tree(task_id="t_probe")
+    assert first.mode == "archive" and first.locator
+
+    # monkeypatch.undo() would also drop the fixture's env; restore just this knob.
+    cap = kbc._ARCHIVE_MAX_BYTES
+    monkeypatch.setattr(kbc, "_ARCHIVE_MAX_BYTES", 1024)
+    try:
+        (workspace / "a.txt").write_text("A" * 5000, encoding="utf-8")
+        over_cap = kbc.preserve_wip_tree(task_id="t_probe")
+    finally:
+        kbc._ARCHIVE_MAX_BYTES = cap
+    # Nothing the model is shown may present the cut-off copy as the tree.
+    assert over_cap.mode != "archive"
+    assert over_cap.locator != first.locator
+
+    # Back to exactly the copied state: same bytes, same sizes, same mtimes.
+    (workspace / "a.txt").write_text("A" * 100, encoding="utf-8")
+    for name, st in before.items():
+        os.utime(workspace / name, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    again = kbc.preserve_wip_tree(task_id="t_probe")
+    assert again.mode == "archive"
+    assert str(again.locator) == str(first.locator)
+    with tarfile.open(again.locator) as tar:
+        assert sorted(tar.getnames()) == ["a.txt", "b.txt"]
+
+
+def test_over_cap_repeats_write_one_partial_copy_and_say_so(card_env, monkeypatch):
+    """Over the cap the threshold fires every turn; four copies is not more safety.
+
+    The copy that is written is partial by construction, so the reminder must say
+    so instead of promising that "that archive survives the budget stop".
+    """
+    from agent import kanban_budget_checkpoint as kbc
+
+    workspace, home = card_env
+    for i in range(4):
+        (workspace / f"part{i}.bin").write_bytes(b"P" * (256 * 1024))
+    monkeypatch.setattr(kbc, "_ARCHIVE_MAX_BYTES", 300 * 1024)
+
+    outcomes = [kbc.preserve_wip_tree(task_id="t_probe") for _ in range(4)]
+
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    on_disk = sorted(task_attachments_dir("t_probe").glob("*"))
+    assert len(on_disk) <= 2, f"the cap path must not pile up copies: {on_disk}"
+    assert all(o.mode != "archive" for o in outcomes), [
+        (o.mode, o.locator) for o in outcomes
+    ]
+    written = [o for o in outcomes if o.mode == "partial"]
+    assert written, [o.detail for o in outcomes]
+    for out in written:
+        assert out.locator and os.path.exists(out.locator)
+        assert out.detail and "част" in out.detail.lower()
+
+    messages = _tool_turn()
+    assert _remind(_Agent(used=108, max_total=180), messages) is True
+    notice = messages[-1]["content"]
+    assert "partial" in notice.lower()
+    assert "survives the budget stop" not in notice
