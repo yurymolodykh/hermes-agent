@@ -20,7 +20,7 @@ import time
 import websockets
 
 HERE = "/home/hermes/.hermes/hermes-agent/.worktrees/t_5bb8406e/bench-ws-deflate"
-PORTS = {"on": 18301, "off": 18302}
+PORTS = {"on": 18301, "off": 18302, "tuned": 18303}
 MODES = ("delta-coalesced", "delta", "card", "models", "panel")
 
 
@@ -73,19 +73,26 @@ async def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--clients", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--window", type=int, default=9)
+    ap.add_argument("--memlevel", type=int, default=4)
     args = ap.parse_args()
 
+    argv = {
+        "on": ["--deflate", "on"],
+        "off": ["--deflate", "off"],
+        "tuned": ["--deflate", "on", "--window", str(args.window), "--memlevel", str(args.memlevel)],
+    }
     servers = {d: subprocess.Popen(
-        [sys.executable, f"{HERE}/server_app.py", "--port", str(PORTS[d]), "--deflate", d],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for d in ("on", "off")}
+        [sys.executable, f"{HERE}/server_app.py", "--port", str(PORTS[d]), *a],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for d, a in argv.items()}
     report: dict = {"clients": args.clients, "rounds": args.rounds, "scenarios": {}}
     try:
-        for d, p in servers.items():
+        for d in servers:
             await wait_ready(PORTS[d])
 
         for mode in MODES:
             entry: dict = {}
-            for d in ("on", "off"):
+            for d in ("on", "off", "tuned"):
                 pid, port = servers[d].pid, PORTS[d]
                 # wire bytes: one client, relay-counted (drive.py prints its own JSON)
                 out = subprocess.run(
@@ -102,7 +109,7 @@ async def main() -> None:
                     samples.append({"cpu_s": round(after - before, 4), **b,
                                     "cpu_ms_per_frame": round((after - before) * 1000 / b["frames"], 4)})
                 entry[d] = {"wire": wire, "cpu": samples}
-            on, off = entry["on"], entry["off"]
+            on, off, tuned = entry["on"], entry["off"], entry["tuned"]
             wire_on, wire_off = on["wire"]["wire_s2c"], off["wire"]["wire_s2c"]
             entry["summary"] = {
                 "wire_s2c_deflate_on": wire_on,
@@ -115,6 +122,15 @@ async def main() -> None:
                 "cpu_wall_median_off": sorted(s["wall_s"] for s in off["cpu"])[len(off["cpu"]) // 2],
                 "app_bytes": on["wire"]["app_bytes"],
                 "frames": on["wire"]["frames"],
+                "tuned_window": args.window,
+                "tuned_memlevel": args.memlevel,
+                "wire_s2c_tuned": tuned["wire"]["wire_s2c"],
+                "traffic_vs_on_tuned_pct": round(
+                    (tuned["wire"]["wire_s2c"] - wire_on) / wire_on * 100, 1),
+                "cpu_ms_per_frame_tuned_median": sorted(
+                    s["cpu_ms_per_frame"] for s in tuned["cpu"])[len(tuned["cpu"]) // 2],
+                "cpu_wall_median_tuned": sorted(
+                    s["wall_s"] for s in tuned["cpu"])[len(tuned["cpu"]) // 2],
             }
             report["scenarios"][mode] = entry
             print(json.dumps({"mode": mode, **entry["summary"]}, ensure_ascii=False))

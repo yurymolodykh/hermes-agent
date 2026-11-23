@@ -123,22 +123,33 @@ def main() -> None:
     ap.add_argument("--deflate", choices=("on", "off"), default="on")
     ap.add_argument("--window", type=int, default=None, help="server_max_window_bits")
     ap.add_argument("--memlevel", type=int, default=None, help="zlib memLevel")
+    ap.add_argument("--level", type=int, default=None, help="zlib compress level (1..9)")
     args = ap.parse_args()
-    if args.deflate == "on" and (args.window or args.memlevel):
-        # uvicorn's sansio protocol creates the deflate factory inline with 12/5; override it so a
-        # window/memLevel variant can be measured end to end without patching the installed package.
-        import functools
-
+    if args.deflate == "on" and (args.window or args.memlevel or args.level):
+        # uvicorn's sansio protocol builds the deflate factory inline and passes window/memLevel
+        # explicitly, so a functools.partial would be overridden by the call's own keywords: the
+        # override has to be a subclass that forces its values regardless of what is passed.
         from uvicorn.protocols.websockets import websockets_sansio_impl as _sansio
         from websockets.extensions.permessage_deflate import (
             ServerPerMessageDeflateFactory as _Factory,
         )
 
-        kwargs = {"server_max_window_bits": args.window or 12,
-                  "client_max_window_bits": args.window or 12}
-        if args.memlevel:
-            kwargs["compress_settings"] = {"memLevel": args.memlevel}
-        _sansio.ServerPerMessageDeflateFactory = functools.partial(_Factory, **kwargs)
+        window, memlevel, level = args.window, args.memlevel, args.level
+
+        class _TunedFactory(_Factory):  # type: ignore[misc, valid-type]
+            def __init__(self, *a, **kw):
+                settings = {"memLevel": memlevel} if memlevel else {}
+                if level:
+                    settings["level"] = level
+                super().__init__(
+                    server_max_window_bits=window or 12,
+                    client_max_window_bits=window or 12,
+                    **({"compress_settings": settings} if settings else {}),
+                )
+
+        _sansio.ServerPerMessageDeflateFactory = _TunedFactory
+    print(f"deflate={args.deflate} window={args.window} memlevel={args.memlevel} level={args.level}",
+          flush=True)
     config = uvicorn.Config(
         app, host="127.0.0.1", port=args.port, log_level="warning",
         ws_per_message_deflate=args.deflate == "on",

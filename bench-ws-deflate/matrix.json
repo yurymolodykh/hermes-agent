@@ -1,7 +1,115 @@
 {
   "clients": 8,
-  "rounds": 3,
+  "rounds": 5,
   "scenarios": {
+    "delta-coalesced": {
+      "on": {
+        "wire": {
+          "mode": "delta-coalesced",
+          "repeat": 1,
+          "frames": 54,
+          "app_bytes": 29284,
+          "wire_s2c": 9571,
+          "wire_c2s": 310
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.07,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.074,
+            "cpu_ms_per_frame": 0.081
+          },
+          {
+            "cpu_s": 0.07,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.073,
+            "cpu_ms_per_frame": 0.081
+          },
+          {
+            "cpu_s": 0.07,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.077,
+            "cpu_ms_per_frame": 0.081
+          },
+          {
+            "cpu_s": 0.07,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.075,
+            "cpu_ms_per_frame": 0.081
+          },
+          {
+            "cpu_s": 0.08,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.076,
+            "cpu_ms_per_frame": 0.0926
+          }
+        ]
+      },
+      "off": {
+        "wire": {
+          "mode": "delta-coalesced",
+          "repeat": 1,
+          "frames": 54,
+          "app_bytes": 29284,
+          "wire_s2c": 29687,
+          "wire_c2s": 310
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.03,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.036,
+            "cpu_ms_per_frame": 0.0347
+          },
+          {
+            "cpu_s": 0.04,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.04,
+            "cpu_ms_per_frame": 0.0463
+          },
+          {
+            "cpu_s": 0.03,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.032,
+            "cpu_ms_per_frame": 0.0347
+          },
+          {
+            "cpu_s": 0.03,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.033,
+            "cpu_ms_per_frame": 0.0347
+          },
+          {
+            "cpu_s": 0.03,
+            "frames": 864,
+            "app_bytes": 468544,
+            "wall_s": 0.033,
+            "cpu_ms_per_frame": 0.0347
+          }
+        ]
+      },
+      "summary": {
+        "wire_s2c_deflate_on": 9571,
+        "wire_s2c_deflate_off": 29687,
+        "traffic_increase_off_pct": 210.2,
+        "traffic_saving_on_pct": 67.8,
+        "cpu_ms_per_frame_on_median": 0.081,
+        "cpu_ms_per_frame_off_median": 0.0347,
+        "cpu_wall_median_on": 0.075,
+        "cpu_wall_median_off": 0.033,
+        "app_bytes": 29284,
+        "frames": 54
+      }
+    },
     "delta": {
       "on": {
         "wire": {
@@ -9,30 +117,44 @@
           "repeat": 1,
           "frames": 911,
           "app_bytes": 118175,
-          "wire_s2c": 24153,
+          "wire_s2c": 24148,
           "wire_c2s": 300
         },
         "cpu": [
           {
-            "cpu_s": 0.46,
+            "cpu_s": 0.56,
             "frames": 14576,
             "app_bytes": 1890800,
-            "wall_s": 0.463,
-            "cpu_ms_per_frame": 0.0316
+            "wall_s": 0.562,
+            "cpu_ms_per_frame": 0.0384
           },
           {
-            "cpu_s": 0.42,
+            "cpu_s": 0.59,
             "frames": 14576,
             "app_bytes": 1890800,
-            "wall_s": 0.434,
-            "cpu_ms_per_frame": 0.0288
+            "wall_s": 0.583,
+            "cpu_ms_per_frame": 0.0405
           },
           {
-            "cpu_s": 0.42,
+            "cpu_s": 0.54,
             "frames": 14576,
             "app_bytes": 1890800,
-            "wall_s": 0.415,
-            "cpu_ms_per_frame": 0.0288
+            "wall_s": 0.549,
+            "cpu_ms_per_frame": 0.037
+          },
+          {
+            "cpu_s": 0.52,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.528,
+            "cpu_ms_per_frame": 0.0357
+          },
+          {
+            "cpu_s": 0.53,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.534,
+            "cpu_ms_per_frame": 0.0364
           }
         ]
       },
@@ -47,37 +169,51 @@
         },
         "cpu": [
           {
-            "cpu_s": 0.28,
+            "cpu_s": 0.33,
             "frames": 14576,
             "app_bytes": 1890800,
-            "wall_s": 0.287,
-            "cpu_ms_per_frame": 0.0192
+            "wall_s": 0.335,
+            "cpu_ms_per_frame": 0.0226
           },
           {
-            "cpu_s": 0.3,
+            "cpu_s": 0.33,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.333,
+            "cpu_ms_per_frame": 0.0226
+          },
+          {
+            "cpu_s": 0.42,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.427,
+            "cpu_ms_per_frame": 0.0288
+          },
+          {
+            "cpu_s": 0.35,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.35,
+            "cpu_ms_per_frame": 0.024
+          },
+          {
+            "cpu_s": 0.31,
             "frames": 14576,
             "app_bytes": 1890800,
             "wall_s": 0.311,
-            "cpu_ms_per_frame": 0.0206
-          },
-          {
-            "cpu_s": 0.29,
-            "frames": 14576,
-            "app_bytes": 1890800,
-            "wall_s": 0.288,
-            "cpu_ms_per_frame": 0.0199
+            "cpu_ms_per_frame": 0.0213
           }
         ]
       },
       "summary": {
-        "wire_s2c_deflate_on": 24153,
+        "wire_s2c_deflate_on": 24148,
         "wire_s2c_deflate_off": 121956,
-        "traffic_increase_off_pct": 404.9,
+        "traffic_increase_off_pct": 405.0,
         "traffic_saving_on_pct": 80.2,
-        "cpu_ms_per_frame_on_median": 0.0288,
-        "cpu_ms_per_frame_off_median": 0.0199,
-        "cpu_wall_median_on": 0.434,
-        "cpu_wall_median_off": 0.288,
+        "cpu_ms_per_frame_on_median": 0.037,
+        "cpu_ms_per_frame_off_median": 0.0226,
+        "cpu_wall_median_on": 0.549,
+        "cpu_wall_median_off": 0.335,
         "app_bytes": 118175,
         "frames": 911
       }
@@ -94,25 +230,39 @@
         },
         "cpu": [
           {
-            "cpu_s": 0.08,
+            "cpu_s": 0.1,
             "frames": 960,
             "app_bytes": 3280160,
-            "wall_s": 0.088,
-            "cpu_ms_per_frame": 0.0833
+            "wall_s": 0.111,
+            "cpu_ms_per_frame": 0.1042
+          },
+          {
+            "cpu_s": 0.15,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.148,
+            "cpu_ms_per_frame": 0.1562
+          },
+          {
+            "cpu_s": 0.14,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.145,
+            "cpu_ms_per_frame": 0.1458
+          },
+          {
+            "cpu_s": 0.15,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.155,
+            "cpu_ms_per_frame": 0.1563
           },
           {
             "cpu_s": 0.1,
             "frames": 960,
             "app_bytes": 3280160,
-            "wall_s": 0.091,
+            "wall_s": 0.098,
             "cpu_ms_per_frame": 0.1042
-          },
-          {
-            "cpu_s": 0.08,
-            "frames": 960,
-            "app_bytes": 3280160,
-            "wall_s": 0.087,
-            "cpu_ms_per_frame": 0.0833
           }
         ]
       },
@@ -127,25 +277,39 @@
         },
         "cpu": [
           {
+            "cpu_s": 0.1,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.11,
+            "cpu_ms_per_frame": 0.1042
+          },
+          {
+            "cpu_s": 0.11,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.104,
+            "cpu_ms_per_frame": 0.1146
+          },
+          {
             "cpu_s": 0.07,
             "frames": 960,
             "app_bytes": 3280160,
-            "wall_s": 0.072,
+            "wall_s": 0.079,
             "cpu_ms_per_frame": 0.0729
           },
           {
             "cpu_s": 0.07,
             "frames": 960,
             "app_bytes": 3280160,
-            "wall_s": 0.073,
+            "wall_s": 0.074,
             "cpu_ms_per_frame": 0.0729
           },
           {
-            "cpu_s": 0.08,
+            "cpu_s": 0.09,
             "frames": 960,
             "app_bytes": 3280160,
-            "wall_s": 0.085,
-            "cpu_ms_per_frame": 0.0833
+            "wall_s": 0.08,
+            "cpu_ms_per_frame": 0.0937
           }
         ]
       },
@@ -154,10 +318,10 @@
         "wire_s2c_deflate_off": 205437,
         "traffic_increase_off_pct": 5593.9,
         "traffic_saving_on_pct": 98.2,
-        "cpu_ms_per_frame_on_median": 0.0833,
-        "cpu_ms_per_frame_off_median": 0.0729,
-        "cpu_wall_median_on": 0.088,
-        "cpu_wall_median_off": 0.073,
+        "cpu_ms_per_frame_on_median": 0.1458,
+        "cpu_ms_per_frame_off_median": 0.0937,
+        "cpu_wall_median_on": 0.145,
+        "cpu_wall_median_off": 0.08,
         "app_bytes": 205010,
         "frames": 60
       }
@@ -169,30 +333,44 @@
           "repeat": 1,
           "frames": 30,
           "app_bytes": 970130,
-          "wire_s2c": 37235,
+          "wire_s2c": 37265,
           "wire_c2s": 301
         },
         "cpu": [
           {
-            "cpu_s": 0.32,
+            "cpu_s": 0.4,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.317,
-            "cpu_ms_per_frame": 0.6667
+            "wall_s": 0.403,
+            "cpu_ms_per_frame": 0.8333
           },
           {
-            "cpu_s": 0.31,
+            "cpu_s": 0.44,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.319,
-            "cpu_ms_per_frame": 0.6458
+            "wall_s": 0.445,
+            "cpu_ms_per_frame": 0.9167
           },
           {
-            "cpu_s": 0.31,
+            "cpu_s": 0.43,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.317,
-            "cpu_ms_per_frame": 0.6458
+            "wall_s": 0.434,
+            "cpu_ms_per_frame": 0.8958
+          },
+          {
+            "cpu_s": 0.4,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.401,
+            "cpu_ms_per_frame": 0.8333
+          },
+          {
+            "cpu_s": 0.38,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.378,
+            "cpu_ms_per_frame": 0.7917
           }
         ]
       },
@@ -207,37 +385,51 @@
         },
         "cpu": [
           {
-            "cpu_s": 0.23,
+            "cpu_s": 0.33,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.235,
-            "cpu_ms_per_frame": 0.4792
+            "wall_s": 0.338,
+            "cpu_ms_per_frame": 0.6875
           },
           {
-            "cpu_s": 0.32,
+            "cpu_s": 0.33,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.33,
-            "cpu_ms_per_frame": 0.6667
+            "wall_s": 0.331,
+            "cpu_ms_per_frame": 0.6875
           },
           {
-            "cpu_s": 0.36,
+            "cpu_s": 0.29,
             "frames": 480,
             "app_bytes": 15522080,
-            "wall_s": 0.356,
-            "cpu_ms_per_frame": 0.75
+            "wall_s": 0.296,
+            "cpu_ms_per_frame": 0.6042
+          },
+          {
+            "cpu_s": 0.35,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.363,
+            "cpu_ms_per_frame": 0.7292
+          },
+          {
+            "cpu_s": 0.33,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.326,
+            "cpu_ms_per_frame": 0.6875
           }
         ]
       },
       "summary": {
-        "wire_s2c_deflate_on": 37235,
+        "wire_s2c_deflate_on": 37265,
         "wire_s2c_deflate_off": 970437,
-        "traffic_increase_off_pct": 2506.2,
+        "traffic_increase_off_pct": 2504.2,
         "traffic_saving_on_pct": 96.2,
-        "cpu_ms_per_frame_on_median": 0.6458,
-        "cpu_ms_per_frame_off_median": 0.6667,
-        "cpu_wall_median_on": 0.317,
-        "cpu_wall_median_off": 0.33,
+        "cpu_ms_per_frame_on_median": 0.8333,
+        "cpu_ms_per_frame_off_median": 0.6875,
+        "cpu_wall_median_on": 0.403,
+        "cpu_wall_median_off": 0.331,
         "app_bytes": 970130,
         "frames": 30
       }
@@ -249,30 +441,44 @@
           "repeat": 1,
           "frames": 508,
           "app_bytes": 164236,
-          "wire_s2c": 22209,
+          "wire_s2c": 22207,
           "wire_c2s": 300
         },
         "cpu": [
           {
-            "cpu_s": 0.41,
+            "cpu_s": 0.37,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.41,
-            "cpu_ms_per_frame": 0.0504
+            "wall_s": 0.369,
+            "cpu_ms_per_frame": 0.0455
           },
           {
-            "cpu_s": 0.31,
+            "cpu_s": 0.38,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.325,
-            "cpu_ms_per_frame": 0.0381
+            "wall_s": 0.379,
+            "cpu_ms_per_frame": 0.0468
+          },
+          {
+            "cpu_s": 0.37,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.381,
+            "cpu_ms_per_frame": 0.0455
           },
           {
             "cpu_s": 0.34,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.335,
+            "wall_s": 0.336,
             "cpu_ms_per_frame": 0.0418
+          },
+          {
+            "cpu_s": 0.39,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.389,
+            "cpu_ms_per_frame": 0.048
           }
         ]
       },
@@ -287,37 +493,51 @@
         },
         "cpu": [
           {
-            "cpu_s": 0.19,
+            "cpu_s": 0.37,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.197,
-            "cpu_ms_per_frame": 0.0234
+            "wall_s": 0.385,
+            "cpu_ms_per_frame": 0.0455
           },
           {
-            "cpu_s": 0.18,
+            "cpu_s": 0.37,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.174,
-            "cpu_ms_per_frame": 0.0221
+            "wall_s": 0.389,
+            "cpu_ms_per_frame": 0.0455
           },
           {
-            "cpu_s": 0.17,
+            "cpu_s": 0.37,
             "frames": 8128,
             "app_bytes": 2627776,
-            "wall_s": 0.178,
-            "cpu_ms_per_frame": 0.0209
+            "wall_s": 0.4,
+            "cpu_ms_per_frame": 0.0455
+          },
+          {
+            "cpu_s": 0.35,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.375,
+            "cpu_ms_per_frame": 0.0431
+          },
+          {
+            "cpu_s": 0.33,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.337,
+            "cpu_ms_per_frame": 0.0406
           }
         ]
       },
       "summary": {
-        "wire_s2c_deflate_on": 22209,
+        "wire_s2c_deflate_on": 22207,
         "wire_s2c_deflate_off": 166425,
         "traffic_increase_off_pct": 649.4,
         "traffic_saving_on_pct": 86.7,
-        "cpu_ms_per_frame_on_median": 0.0418,
-        "cpu_ms_per_frame_off_median": 0.0221,
-        "cpu_wall_median_on": 0.335,
-        "cpu_wall_median_off": 0.178,
+        "cpu_ms_per_frame_on_median": 0.0455,
+        "cpu_ms_per_frame_off_median": 0.0455,
+        "cpu_wall_median_on": 0.379,
+        "cpu_wall_median_off": 0.385,
         "app_bytes": 164236,
         "frames": 508
       }
