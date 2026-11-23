@@ -132,16 +132,6 @@ async def transcribe_audio_upload(
     if not (normalized_mime_type.startswith("audio/") or normalized_mime_type == "video/webm"):
         raise HTTPException(status_code=400, detail="Payload must be an audio recording")
 
-    try:
-        audio_bytes = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Audio payload is not valid base64")
-
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Audio recording is empty")
-    if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Audio recording is too large")
-
     temp_path = ""
     try:
         with http_failure("Desktop voice transcription failed", 500, "Transcription failed"):
@@ -356,22 +346,22 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
 
     mime_type = _SPEAK_MIME_BY_EXT.get(os.path.splitext(file_path)[1].lower(), "audio/mpeg")
 
-    def _read_and_unlink() -> bytes:
-        # Off-loop: synthesized audio can be several MB; reading it inline
-        # blocks the uvicorn event loop. Unlink rides the same thread hop so
-        # the temp file cannot outlive an early return.
+    def _read_encoded_and_unlink() -> str:
+        # Off-loop: synthesized audio can be several MB; reading AND base64-encoding it inline
+        # blocks the uvicorn event loop. Encoding rides the same thread hop as the read so the
+        # bytes are touched once, and unlink rides it too so the temp file cannot outlive an
+        # early return.
         try:
             with open(file_path, "rb") as fh:
-                return fh.read()
+                return _encode_b64(fh.read())
         finally:
             _unlink_quietly(file_path)
 
     try:
-        audio_bytes = await asyncio.to_thread(_read_and_unlink)
+        encoded = await off_loop(_read_encoded_and_unlink)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not read audio: {exc}")
 
-    encoded = base64.b64encode(audio_bytes).decode("ascii")
     return {
         "ok": True, "data_url": f"data:{mime_type};base64,{encoded}", "mime_type": mime_type,
         "provider": result.get("provider"),
