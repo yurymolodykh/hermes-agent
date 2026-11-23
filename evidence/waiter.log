@@ -1,5 +1,2 @@
-Traceback (most recent call last):
-  File "/home/hermes/.hermes/kanban/workspaces/t_9f42e621/evidence/repro_store_lock.py", line 19, in <module>
-    from tools.checkpoint_pruning import PruneError, store_lock, store_lock_path  # noqa: E402
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ModuleNotFoundError: No module named 'tools'
+WAITER pid=1309239 FAILED after 0.027s: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/repro-store-before
+WAITER lock-holder-fds: ['pid 1309228 (/home/hermes/t72venv/bin/python /home/hermes/.hermes/kanban/workspaces/t_9f42e621/evidence/repro_store_lock.py /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/repro-store-before 6 hold)']

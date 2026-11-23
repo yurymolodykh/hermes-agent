@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from tools.checkpoint_pruning import PruneError, store_lock, store_lock_path  # noqa: E402

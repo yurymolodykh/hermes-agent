@@ -1,5 +1,2 @@
-Traceback (most recent call last):
-  File "/home/hermes/.hermes/kanban/workspaces/t_9f42e621/evidence/repro_store_lock.py", line 19, in <module>
-    from tools.checkpoint_pruning import PruneError, store_lock, store_lock_path  # noqa: E402
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ModuleNotFoundError: No module named 'tools'
+HOLDER pid=1309228 lock=/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/.repro-store-before.lock holding 6.0s
+HOLDER released
