@@ -345,14 +345,15 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 
 DEFAULT_BOARD = "default"
 
-# Hard wall-clock cap written into every card created without an explicit
-# ``max_runtime_seconds``. The board's median run is ~35 min but 34 % of successful
-# runs exceeded 50 min (mean 89, p90 ≈ 95), and a card that is authored to close in
-# 30–50 min should never reach a safety limit at all. The soft time budget already
-# reaches profiles through ``agent.run_budget_seconds: 2700``; this is the hard stop
-# behind it. It is written into the ROW at creation, deliberately NOT a dispatcher
-# default, so cards that already exist keep their own (NULL = uncapped) value.
-DEFAULT_MAX_RUNTIME_SECONDS = 3600
+# Hard wall-clock fuse written into every card created without an explicit
+# ``max_runtime_seconds``. POLICY (owner decision, 23.11.2026): one hour per card is
+# a TARGET, not a ceiling. The board's median run is ~37 min, ~30 % of runs exceed
+# 60 min and 15 % exceed 90 — so a limit AT the target kills cards the planner merely
+# underestimated. The fuse therefore sits at 2x the target: it only stops runaway
+# work, never a card that is close to done. The soft signal is separate and earlier:
+# ``agent.run_budget_seconds: 5400`` injects a one-time "wrap up and deliver" notice
+# at 80 % of that (≈72 min), which is a nudge, not a kill.
+DEFAULT_MAX_RUNTIME_SECONDS = 7200
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
