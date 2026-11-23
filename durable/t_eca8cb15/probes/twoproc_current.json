@@ -1,0 +1,134 @@
+{
+  "mode": "current",
+  "token_present": true,
+  "status": [
+    {
+      "n": 1,
+      "each_p50_ms": 3.3,
+      "each_max_ms": 3.3,
+      "health_probe_ms": 2.0
+    },
+    {
+      "n": 2,
+      "each_p50_ms": 5.9,
+      "each_max_ms": 5.9,
+      "health_probe_ms": 1.9
+    },
+    {
+      "n": 4,
+      "each_p50_ms": 11.2,
+      "each_max_ms": 11.5,
+      "health_probe_ms": 1.9
+    },
+    {
+      "n": 8,
+      "each_p50_ms": 23.2,
+      "each_max_ms": 23.3,
+      "health_probe_ms": 2.2
+    },
+    {
+      "n": 16,
+      "each_p50_ms": 49.6,
+      "each_max_ms": 54.8,
+      "health_probe_ms": 9.0
+    }
+  ],
+  "sessions": [
+    {
+      "n": 1,
+      "each_p50_ms": 14.3,
+      "each_max_ms": 14.3,
+      "health_probe_ms": 1.8
+    },
+    {
+      "n": 2,
+      "each_p50_ms": 22.6,
+      "each_max_ms": 22.6,
+      "health_probe_ms": 1.9
+    },
+    {
+      "n": 4,
+      "each_p50_ms": 39.2,
+      "each_max_ms": 43.3,
+      "health_probe_ms": 1.9
+    },
+    {
+      "n": 8,
+      "each_p50_ms": 121.1,
+      "each_max_ms": 159.4,
+      "health_probe_ms": 3.4
+    },
+    {
+      "n": 16,
+      "each_p50_ms": 325.2,
+      "each_max_ms": 373.4,
+      "health_probe_ms": 15.2
+    }
+  ],
+  "messages": [
+    {
+      "n": 1,
+      "each_p50_ms": 11.5,
+      "each_max_ms": 11.5,
+      "health_probe_ms": 1.8
+    },
+    {
+      "n": 2,
+      "each_p50_ms": 10.4,
+      "each_max_ms": 10.4,
+      "health_probe_ms": 1.8
+    },
+    {
+      "n": 4,
+      "each_p50_ms": 31.0,
+      "each_max_ms": 33.6,
+      "health_probe_ms": 1.9
+    },
+    {
+      "n": 8,
+      "each_p50_ms": 55.8,
+      "each_max_ms": 69.0,
+      "health_probe_ms": 2.8
+    },
+    {
+      "n": 16,
+      "each_p50_ms": 145.0,
+      "each_max_ms": 164.3,
+      "health_probe_ms": 2.9
+    }
+  ],
+  "search": [
+    {
+      "n": 1,
+      "each_p50_ms": 34.2,
+      "each_max_ms": 34.2,
+      "health_probe_ms": 2.0
+    },
+    {
+      "n": 2,
+      "each_p50_ms": 86.2,
+      "each_max_ms": 86.2,
+      "health_probe_ms": 2.1
+    },
+    {
+      "n": 4,
+      "each_p50_ms": 258.5,
+      "each_max_ms": 260.4,
+      "health_probe_ms": 3.4
+    },
+    {
+      "n": 8,
+      "each_p50_ms": 820.1,
+      "each_max_ms": 850.4,
+      "health_probe_ms": 8.5
+    },
+    {
+      "n": 16,
+      "each_p50_ms": 1461.0,
+      "each_max_ms": 1615.2,
+      "health_probe_ms": 40.8
+    }
+  ],
+  "home": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/t-eca8-h-cfsjnxbk/home",
+  "port": "42971"
+}
