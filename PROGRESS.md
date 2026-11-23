@@ -92,6 +92,68 @@
 
 ---
 
+# PROGRESS — t_9bddc422: убрать упоминание диска из `owner_unavailable`
+
+## Состояние: ГОТОВО. Коммит `9c058a57bab` в ветке `wt/t_9bddc422`, дерево чистое.
+
+* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_9bddc422`
+* База: `660c14d4093`
+* Diff = `git show 9c058a57bab` (17 локалей + 1 тест, 35+/20-)
+
+## Что сделано
+
+1. Во всех 17 поставляемых локалях (`locales/*.yaml`, кроме `*.tui.yaml`) в ключе
+   `explainer.persistence.owner_unavailable` отрицающая оговорка «Диск и другие процессы
+   Hermes здесь ни при чём» заменена утвердительной «Это не проблема хранилища»
+   (en: `This is not a storage problem`). Из текста ушли слова disk/drive/диск/قرص/
+   Festplatte/disque/disco/diosca/lemez/磁碟/磁盘/ディスク/디스크 и «другой процесс Hermes».
+   Переводы сделаны по смыслу для каждого языка, дословно по образцу вердикта для en/ru.
+2. `tests/agent/test_turn_completion_explainer.py` — в
+   `test_explanation_persistence_owner_unavailable_never_blames_disk` добавлены строгие
+   проверки `assert "disk" not in lower`, `"out of room" not in lower`,
+   `"another hermes process" not in lower`; плюс отдельная проверка ru-локали
+   (`диск` / `закончилось место` / `другой процесс`) через `parse_locale_file`, потому что
+   форматтер рендерит только активную локаль.
+
+## Доказательства (`evidence-t9bddc422/`, gitignored `evidence-*/`)
+
+* `red-before-locale-fix.txt` — тест с новыми проверками ДО правки локалей:
+  **2 failed, 32 passed** (`AssertionError: assert 'disk' not in '⚠️ no reply…'` оба параметра).
+* `green-after-locale-fix.txt` — ПОСЛЕ правки: **34 tests passed, 0 failed**.
+* `grep-and-copy.txt` — критерий 1: 0/17 локалей с запрещёнными словами в `owner_unavailable`;
+  буквальный `grep -rn "out of room\|another hermes process\|Диск и\|на диске закончилось" locales/`
+  находит только ключ `explainer.persistence.default` (общий текст «неизвестной причины»),
+  который вне области карточки и не менялся.
+* `adjacent-regression.txt` / `adjacent-baseline-locales.txt` — смежные наборы:
+  7 падений и с правкой, и на базовых локалях (идентичный набор) — предсуществующий артефакт
+  `home_io_guard` на путях `.git/worktrees` в worktree-полосе, не связан с правкой.
+
+## Окружение (важно для повтора)
+
+`scripts/run_tests.sh` без указания интерпретатора падает («no bootstrap Python found») и
+подхватывает venv, чей `sys.prefix` — симлинк `installs/bc197d…` → `installs/019d0d…`;
+`home_io_guard` сравнивает лексический путь и ругается на site-packages. Рабочий вызов:
+
+```
+HERMES_PYTHON=/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-9bbf42a937e84eb3a86cc3daad8a5c69/venv/bin/python \
+  scripts/run_tests.sh tests/agent/test_turn_completion_explainer.py
+```
+
+## Проверки
+
+* `test_turn_completion_explainer.py` → **34 passed**.
+* `ruff check --config ruff.pre-commit.toml` на тесте → All checks passed.
+* `python -m scripts.code_health --base 660c14d4093` → 0 blocking, 0 advisory.
+
+## Передача
+
+Ревизия `9c058a57bab`, ветка `wt/t_9bddc422`, НЕ влита в общую ветку, служба не перезапускалась —
+это отдельный шаг оркестратора. Коммит сделан ops-autocommit'ом (`wip(auto): t_9bddc422`),
+содержимое проверено: 34 изменённые строки локалей — все `owner_unavailable`, соседние причины
+не тронуты.
+
+---
+
 # (архив) PROGRESS — t_0650ebf8: мягкий бюджет сохраняет работу и в не-git каталоге
 
 ## Состояние: реализовано, проверено, закоммичено (`60626efab961`). Передано на ревью 15-sre-qa.

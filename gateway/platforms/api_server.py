@@ -112,6 +112,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
+from gateway.platforms import api_server_fs as _api_fs
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
@@ -178,27 +179,9 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 
 
-class ThreadSafeAsyncQueue(asyncio.Queue):
-    """``asyncio.Queue`` a non-loop thread (run_conversation's executor) can push into via
-    ``put_threadsafe``; the SSE consumer's ``await get()`` is woken by ``call_soon_threadsafe``."""
-
-    def put_threadsafe(self, item, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
-        (loop or self._loop_ref).call_soon_threadsafe(self.put_nowait, item)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Always constructed inside a running async handler (the SSE
-        # request handlers below), so get_running_loop() is safe here.
-        self._loop_ref = asyncio.get_running_loop()
-
-
-def _sse_frame(
-    data: Any, *, event: str | None = None, ensure_ascii: bool = True, id: Optional[int] = None
-) -> bytes:
-    """Encode one SSE frame (``id:``/``event:`` lines if given, then ``data: <json>\n\n``) for
-    every SSE writer. ``ensure_ascii=False`` keeps raw non-ASCII on the wire."""
-    prefix = (f"id: {id}\n" if id is not None else "") + (f"event: {event}\n" if event else "")
-    return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
+# SSE primitives live in the topical sibling (line-cap offset); re-exported so the mixin, the
+# /v1/runs stream and the tests keep importing them from this facade.
+from gateway.platforms.api_server_sse import ThreadSafeAsyncQueue, _sse_frame
 
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -1585,6 +1568,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+        # Read-only file surface: the chat's "Download" button asks these for a message
+        # attachment's bytes (the panel's /api/fs/download). Bytes out only — no upload/mkdir/
+        # delete route belongs on this platform.
+        routes.extend(_api_fs.http_routes(self))
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:

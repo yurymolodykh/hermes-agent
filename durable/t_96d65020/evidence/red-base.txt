@@ -1,0 +1,194 @@
+/home/hermes/t72venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:299: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+FFFF.F.FFF                                                               [100%]
+=================================== FAILURES ===================================
+____________ test_unreadable_subdirectory_preserves_whole_workspace ____________
+
+kanban_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_unreadable_subdirectory_p0/.hermes')
+origin_repo = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_unreadable_subdirectory_p0/project')
+
+    def test_unreadable_subdirectory_preserves_whole_workspace(kanban_home, origin_repo):
+        """An unreadable directory is "cannot tell", never "nothing here".
+    
+        The bug this pins: ``_child_dirs`` swallowed ``OSError`` into ``[]``, so a
+        middle directory the scan could not enter read as "no subdirectories". The
+        unpushed repo underneath was never seen, ``truncated`` stayed False, the
+        verdict came back ``None`` ("clean") — and ``rmtree`` destroyed every
+        readable file around the one directory it could not read.
+        """
+        with kbc.connect() as conn:
+            task_id, ws = _scratch_task(conn)
+            repo = _clone_into(origin_repo, ws / "mid" / "clone")
+            (repo / "work.txt").write_text("local only\n", encoding="utf-8")
+            _git("add", "work.txt", cwd=repo)
+            _git("commit", "-m", "never pushed", cwd=repo)
+            (ws / "notes.md").write_text("readable neighbour\n", encoding="utf-8")
+            barrier = ws / "mid"
+            _lock(barrier)
+            try:
+                assert kb.complete_task(conn, task_id, result="done")
+    
+                preserved = _events(conn, task_id, PRESERVED_EVENT)
+>               assert len(preserved) == 1, "one workspace, one event"
+E               AssertionError: one workspace, one event
+E               assert 0 == 1
+E                +  where 0 = len([])
+
+tests/hermes_cli/test_kanban_scratch_unsaved_work.py:276: AssertionError
+______________ test_unreadable_workspace_root_preserves_workspace ______________
+
+kanban_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_unreadable_workspace_root0/.hermes')
+
+    def test_unreadable_workspace_root_preserves_workspace(kanban_home):
+        """A workspace root that cannot be listed is "cannot tell" too."""
+        with kbc.connect() as conn:
+            task_id, ws = _scratch_task(conn)
+            (ws / "notes.md").write_text("scratch\n", encoding="utf-8")
+            _lock(ws)
+            try:
+                assert kb.complete_task(conn, task_id, result="done")
+                preserved = _events(conn, task_id, PRESERVED_EVENT)
+>               assert len(preserved) == 1
+E               assert 0 == 1
+E                +  where 0 = len([])
+
+tests/hermes_cli/test_kanban_scratch_unsaved_work.py:298: AssertionError
+___________ test_hard_delete_refuses_and_keeps_unsaved_scratch_work ____________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_hard_delete_refuses_and_k0/hermes_home')
+
+    def test_hard_delete_refuses_and_keeps_unsaved_scratch_work(fresh_home):
+        task_id, ws = _board_with_scratch_task("probeboard", unsaved=True)
+        repo = ws / "clone"
+    
+>       with pytest.raises(ValueError) as excinfo:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:115: Failed
+_____________ test_hard_delete_with_force_reports_what_it_discards _____________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_hard_delete_with_force_re0/hermes_home')
+
+    def test_hard_delete_with_force_reports_what_it_discards(fresh_home):
+        task_id, ws = _board_with_scratch_task("forceboard", unsaved=True)
+    
+>       res = kb.remove_board("forceboard", archive=False, force=True)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: remove_board() got an unexpected keyword argument 'force'
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:131: TypeError
+_________________ test_force_on_a_clean_board_reports_nothing __________________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_force_on_a_clean_board_re0/hermes_home')
+
+    def test_force_on_a_clean_board_reports_nothing(fresh_home):
+        _board_with_scratch_task("quietboard", unsaved=False)
+    
+>       res = kb.remove_board("quietboard", archive=False, force=True)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: remove_board() got an unexpected keyword argument 'force'
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:154: TypeError
+____________ test_unreadable_workspace_root_also_vetoes_the_delete _____________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_unreadable_workspace_root1/hermes_home')
+
+    def test_unreadable_workspace_root_also_vetoes_the_delete(fresh_home):
+        """"Could not look" is not "nothing there": an unlistable root blocks the delete."""
+        _task_id, ws = _board_with_scratch_task("lockedboard", unsaved=False)
+        root = ws.parent
+        root.chmod(0o000)
+        try:
+            with pytest.raises(ValueError) as excinfo:
+>               kb.remove_board("lockedboard", archive=False)
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:179: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/kanban_db_boards.py:194: in remove_board
+    shutil.rmtree(d)
+tests/home_io_guard.py:189: in guarded
+    return original(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/shutil.py:859: in rmtree
+    _rmtree_impl(path, dir_fd, onexc)
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/shutil.py:721: in _rmtree_safe_fd
+    _rmtree_safe_fd_step(stack, onexc)
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/shutil.py:803: in _rmtree_safe_fd_step
+    onexc(func, path, err, direntry=orig_entry, dir_fd=parent_fd)
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/shutil.py:766: in _rmtree_safe_fd_step
+    topfd = os.open(name, os.O_RDONLY | os.O_NONBLOCK, dir_fd=dirfd)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path = 'workspaces', flags = 2048, args = (), kwargs = {'dir_fd': 18}
+
+    @wraps(original_open)
+    def guarded_open(path, flags, *args, **kwargs):
+        self.check(path, dir_fd=kwargs.get("dir_fd"), destructive=bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC)))
+>       fd = original_open(path, flags, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       PermissionError: [Errno 13] Permission denied: '/tmp/pytest-of-hermes/pytest-1608/test_unreadable_workspace_root1/hermes_home/kanban/boards/lockedboard/workspaces'
+
+tests/home_io_guard.py:215: PermissionError
+_________________________ test_cli_reports_the_refusal _________________________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_cli_reports_the_refusal0/hermes_home')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_cli_reports_the_refusal0')
+
+    def test_cli_reports_the_refusal(fresh_home, tmp_path):
+        """The operator sees the refusal and the recovery step, not a bare traceback."""
+        _board_with_scratch_task("cliboard", unsaved=True)
+        result = _run_cli(["boards", "rm", "cliboard", "--delete"])
+    
+>       assert result.returncode != 0
+E       assert 0 != 0
+E        +  where 0 = CompletedProcess(args=['boards', 'rm', 'cliboard', '--delete'], returncode=0, stdout="Board 'cliboard' deleted.\n", stderr='').returncode
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:191: AssertionError
+____________________ test_cli_force_deletes_and_lists_paths ____________________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_cli_force_deletes_and_lis0/hermes_home')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-1608/test_cli_force_deletes_and_lis0')
+
+    def test_cli_force_deletes_and_lists_paths(fresh_home, tmp_path):
+        _task_id, ws = _board_with_scratch_task("cliforce", unsaved=True)
+>       result = _run_cli(["boards", "rm", "cliforce", "--delete", "--force"])
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:200: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/hermes_cli/test_kanban_board_delete_guard.py:103: in _run_cli
+    namespace = parser.parse_args(["kanban", *args])
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/argparse.py:2012: in parse_args
+    self.error(msg)
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/argparse.py:2785: in error
+    self.exit(2, _('%(prog)s: error: %(message)s\n') % args)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = ArgumentParser(prog='hermes', usage=None, description=None, formatter_class=<class 'argparse.HelpFormatter'>, conflict_handler='error', add_help=True)
+status = 2, message = 'hermes: error: unrecognized arguments: --force\n'
+
+    def exit(self, status=0, message=None):
+        if message:
+            self._print_message(message, _sys.stderr)
+>       _sys.exit(status)
+E       SystemExit: 2
+
+../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/argparse.py:2772: SystemExit
+----------------------------- Captured stderr call -----------------------------
+usage: hermes [-h] {kanban} ...
+hermes: error: unrecognized arguments: --force
+=========================== short test summary info ============================
+FAILED tests/hermes_cli/test_kanban_scratch_unsaved_work.py::test_unreadable_subdirectory_preserves_whole_workspace
+FAILED tests/hermes_cli/test_kanban_scratch_unsaved_work.py::test_unreadable_workspace_root_preserves_workspace
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_hard_delete_refuses_and_keeps_unsaved_scratch_work
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_hard_delete_with_force_reports_what_it_discards
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_force_on_a_clean_board_reports_nothing
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_unreadable_workspace_root_also_vetoes_the_delete
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_cli_reports_the_refusal
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_cli_force_deletes_and_lists_paths
+8 failed, 2 passed in 7.72s

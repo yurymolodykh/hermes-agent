@@ -9,7 +9,10 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import sqlite3
 import time
 from typing import Any
 from typing import Optional
@@ -143,9 +146,89 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
-def remove_board(slug: str, *, archive: bool = True) -> dict:
+def _board_scratch_workspaces(d: Path) -> tuple[list[Path], bool]:
+    """Scratch workspace dirs inside a board directory, plus an unreadable flag.
+
+    A named board keeps its task scratch dirs at ``boards/<slug>/workspaces/<id>/``
+    — inside the tree ``remove_board(archive=False)`` deletes. An unlistable root
+    is reported as such instead of "no workspaces": the caller must not read
+    "could not look" as "nothing there".
+    """
+    root = d / "workspaces"
+    if not root.exists():
+        return [], False
+    found: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        found.append(Path(entry.path))
+                except OSError:
+                    return found, True
+    except OSError:
+        return [], True
+    return found, False
+
+
+def _preserved_board_workspaces(slug: str, d: Path) -> tuple[list[Path], list[Path]]:
+    """Apply the scratch-workspace guard to every task dir of a board about to be deleted.
+
+    Returns ``(preserved, unverified)``: dirs holding git work that exists nowhere
+    else (kept and recorded with the same ``workspace_cleanup_preserved_unsaved_work``
+    event as completion/gc), and dirs whose contents could not be verified. Both
+    lists veto a hard delete — ``remove_board`` would otherwise destroy exactly
+    what the guard promised to save.
+    """
+    from hermes_cli import kanban_db_workspace as kbw
+
+    task_dirs, root_unreadable = _board_scratch_workspaces(d)
+    preserved: list[Path] = []
+    unverified: list[Path] = [d / "workspaces"] if root_unreadable else []
+    if not task_dirs:
+        return preserved, unverified
+    conn = None
+    db_path = d / "kanban.db"
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            conn = None
+    try:
+        for path in sorted(task_dirs):
+            if conn is not None:
+                if kbw._preserve_scratch_workspace(conn, path.name, path):
+                    preserved.append(path)
+                continue
+            # No readable DB: judge by the scan alone (no event can be recorded).
+            try:
+                unsaved = kbw._scratch_workspace_unsaved_reason(path)
+            except OSError:
+                unverified.append(path)
+                continue
+            if unsaved is not None:
+                preserved.append(path)
+        if conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.commit()
+    finally:
+        if conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+    return preserved, unverified
+
+
+def remove_board(slug: str, *, archive: bool = True, force: bool = False) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``.
+
+    A hard delete walks the board's ``workspaces/`` first and refuses with
+    :class:`ValueError` while any task dir holds git work that exists nowhere
+    else (or cannot be verified) — completing a task preserves such a directory,
+    and deleting the board tree would destroy it silently. ``force=True``
+    overrides the refusal and reports the paths it discarded under ``preserved``.
+    """
     _kb._assert_not_delegated_child_mutation()
     normed = _kb._require_slug(slug)
     if normed == _kb.DEFAULT_BOARD:
@@ -153,6 +236,22 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     d = _kb.board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
+
+    # Vet a hard delete BEFORE anything mutates: the guard walks the board and
+    # records the save on each task, but a refusal must not cost the operator
+    # the active-board pin. (The archive path only renames the tree, so the
+    # preserved workspaces travel with it.)
+    preserved: list[Path] = []
+    unverified: list[Path] = []
+    if not archive:
+        preserved, unverified = _preserved_board_workspaces(normed, d)
+        if (preserved or unverified) and not force:
+            listed = ", ".join(str(p) for p in [*preserved, *unverified])
+            raise ValueError(
+                f"board {normed!r} holds scratch workspaces with unsaved work that exists "
+                f"nowhere else ({listed}); recover them first, or re-run with --force "
+                f"to delete the board anyway"
+            )
 
     # If the user removed the currently-active board, revert to default.
     if _kb.get_current_board() == normed:
@@ -192,7 +291,10 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     import shutil
     shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+    result: dict[str, Any] = {"slug": normed, "action": "deleted", "new_path": ""}
+    if preserved or unverified:
+        result["preserved"] = [str(p) for p in [*preserved, *unverified]]
+    return result
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

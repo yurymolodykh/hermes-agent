@@ -8,6 +8,7 @@ these assert the response shape as well as the on-disk outcome.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect_closing
 
 
 def _load_plugin_router():
@@ -81,6 +83,40 @@ def test_delete_board_hard_leaves_nothing(client):
     r = client.delete("/api/plugins/kanban/boards/widget?delete=true")
     assert r.status_code == 200, r.text
     assert r.json()["result"]["action"] == "deleted"
+    assert not kb.board_dir("widget").exists()
+
+
+def test_hard_delete_is_refused_while_a_workspace_holds_unsaved_work(client):
+    """The dashboard delete is the same backend path, so the guard has to answer there too."""
+    client.post("/api/plugins/kanban/boards", json={"slug": "widget"})
+    with connect_closing(board="widget") as conn:
+        task_id = kb.create_task(conn, title="scratch task")
+    ws = kb.workspaces_root(board="widget") / task_id
+    repo = ws / "clone"
+    repo.mkdir(parents=True)
+    for args in (("init", "-b", "main", str(repo)), ("config", "user.email", "t@example.com"),
+                 ("config", "user.name", "t")):
+        subprocess.run(["git", *args], check=True, capture_output=True, timeout=60,
+                       encoding="utf-8", errors="replace")
+    (repo / "work.txt").write_text("only copy\n", encoding="utf-8")
+    for args in (("add", "work.txt"), ("commit", "-m", "never pushed")):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, timeout=60,
+                       encoding="utf-8", errors="replace")
+    with connect_closing(board="widget") as conn:
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? WHERE id = ?",
+            (str(ws), task_id),
+        )
+        conn.commit()
+
+    refused = client.delete("/api/plugins/kanban/boards/widget?delete=true")
+    assert refused.status_code == 400, refused.text
+    assert str(ws) in refused.json()["detail"]
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "only copy\n"
+
+    forced = client.delete("/api/plugins/kanban/boards/widget?delete=true&force=true")
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["result"]["preserved"] == [str(ws)]
     assert not kb.board_dir("widget").exists()
 
 

@@ -366,42 +366,60 @@ _SCRATCH_REPO_SCAN_SKIP = frozenset({
 _SCRATCH_REPO_SCAN_MAX_DEPTH = 8
 
 
-def _child_dirs(path: Path) -> list[Path]:
-    """Immediate subdirectories of *path* that cannot hold vendored tool state."""
-    try:
+def _child_dirs(path: Path) -> tuple[list[Path], bool]:
+    """Immediate subdirectories of *path*, plus an unreadable flag.
+
+    The flag says "this listing could not be trusted": an unreadable directory
+    (``chmod 000`` from the worker itself, a root-owned dir, a broken FUSE/NFS
+    mount) hides whatever it holds, so an empty list here must never be read as
+    "there are no subdirectories".
+    """
+    found: list[Path] = []
+    with contextlib.suppress(OSError):
         with os.scandir(path) as entries:
-            return [
-                Path(entry.path) for entry in entries
-                if entry.name not in _SCRATCH_REPO_SCAN_SKIP
-                and entry.is_dir(follow_symlinks=False)
-            ]
-    except OSError:
-        return []
+            for entry in entries:
+                if entry.name in _SCRATCH_REPO_SCAN_SKIP:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        found.append(Path(entry.path))
+                except OSError:
+                    # One entry that cannot be stat()ed is as opaque as a
+                    # directory that cannot be listed.
+                    return found, True
+            return found, False
+    return found, True
 
 
-def _iter_scratch_repos(root: Path) -> tuple[list[Path], bool]:
-    """Git working-tree roots at or below ``root`` (bounded scan), plus a truncation flag.
+def _iter_scratch_repos(root: Path) -> tuple[list[Path], Optional[str]]:
+    """Git working-tree roots at or below ``root`` (bounded scan) plus a "cannot tell" reason.
 
     A scratch workspace is arbitrary user space: a worker may clone a repo into it
     or into a subdirectory of it. A found repo is not descended — a submodule's
     own work already shows up as a changed entry in its parent. The depth cap keeps
-    the scan cheap; when it stops the walk early the flag says the tree was not
-    fully searched, so the caller can treat "not found" as "cannot tell".
+    the scan cheap; when it stops the walk early, or when a directory cannot be
+    listed at all, the second element says the tree was not fully searched, so the
+    caller can treat "not found" as "cannot tell" (``None`` = fully searched).
     """
     found: list[Path] = []
-    truncated = False
+    unverified: Optional[str] = None
     pending: list[tuple[Path, int]] = [(root, 0)]
     while pending:
         current, depth = pending.pop()
         if (current / ".git").exists():
             found.append(current)
             continue
-        children = _child_dirs(current)
+        children, unreadable = _child_dirs(current)
+        if unreadable:
+            # An unreadable node hides whatever it holds — most importantly a
+            # repository with unpushed commits. Never read that as "empty".
+            unverified = unverified or "workspace tree not fully readable"
         if depth >= _SCRATCH_REPO_SCAN_MAX_DEPTH:
-            truncated = truncated or bool(children)
+            if children:
+                unverified = unverified or "workspace tree too deep to verify"
             continue
         pending.extend((child, depth + 1) for child in children)
-    return found, truncated
+    return found, unverified
 
 
 def _scratch_repo_unsaved_reason(repo: Path) -> Optional[str]:
@@ -442,16 +460,18 @@ def _scratch_repo_unsaved_reason(repo: Path) -> Optional[str]:
 def _scratch_workspace_unsaved_reason(wp: Path) -> Optional[tuple[Path, str]]:
     """First (repo, reason) inside *wp* whose work must not be destroyed, or ``None``.
 
-    A scan that stopped before covering the whole tree reports "cannot tell"
-    instead of ``None``: a repository too deep to see may still be there.
+    A scan that stopped before covering the whole tree — depth cap or an
+    unreadable directory — reports "cannot tell" instead of ``None``: a
+    repository the walk could not see may still be there, and the caller's only
+    safe verdict on doubt is to keep the directory.
     """
-    repos, truncated = _iter_scratch_repos(wp)
+    repos, unverified = _iter_scratch_repos(wp)
     for repo in repos:
         reason = _scratch_repo_unsaved_reason(repo)
         if reason is not None:
             return repo, reason
-    if truncated:
-        return wp, "workspace tree too deep to verify"
+    if unverified is not None:
+        return wp, unverified
     return None
 
 

@@ -1,0 +1,27 @@
+OK   adapter started on 127.0.0.1:8648
+FAIL download 200 — status=404
+FAIL download exact size — 14 bytes
+FAIL download sha256 — d5558cd419c8d46b…
+FAIL download Content-Disposition attachment
+FAIL download Content-Type — text/plain; charset=utf-8
+FAIL HEAD 200 with Content-Length — 404 14
+FAIL read-data-url 200 — status=404
+FAIL read-data-url sha256 matches — …
+FAIL read-data-url prefix
+FAIL no token -> 401 — status=404
+FAIL missing path -> 404 with detail — 404 {}
+FAIL sensitive .env -> 403 — status=404
+FAIL credential key -> 403 — status=404
+FAIL credential dir config -> 403 — status=404
+FAIL outside locked root -> 403 — 404 {}
+FAIL over the size ceiling -> 413 — 404 {}
+FAIL own session_id -> 200 same bytes — status=404
+FAIL unknown session_id -> 404 — 404 {}
+FAIL own session_id data-url -> 200 same bytes — status=404
+OK   (info) session key known — agent:main:a…
+OK   unknown profile -> 404 — status=404
+OK   no write route under /api/fs
+FAIL registered read surface
+
+4/24 checks passed
+failed: download 200; download exact size; download sha256; download Content-Disposition attachment; download Content-Type; HEAD 200 with Content-Length; read-data-url 200; read-data-url sha256 matches; read-data-url prefix; no token -> 401; missing path -> 404 with detail; sensitive .env -> 403; credential key -> 403; credential dir config -> 403; outside locked root -> 403; over the size ceiling -> 413; own session_id -> 200 same bytes; unknown session_id -> 404; own session_id data-url -> 200 same bytes; registered read surface

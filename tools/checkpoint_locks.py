@@ -339,9 +339,11 @@ class LockHygiene:
             return
         self._notified_failures.add(key)
         logger.warning("%s", key)
-        from tools.checkpoint_notice import post_worker_notice
-
         try:
+            # Imported inside the guard: a partial/broken install can raise ImportError
+            # here, and a notice must never break the turn it is reporting on.
+            from tools.checkpoint_notice import post_worker_notice
+
             post_worker_notice(key)
         except Exception:  # a notice must never break the turn
             logger.debug("checkpoint card notice failed", exc_info=True)

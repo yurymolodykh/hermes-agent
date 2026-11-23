@@ -1513,10 +1513,18 @@ def rename_board(slug: str, payload: RenameBoardBody):
 
 
 @router.delete("/boards/{slug}")
-def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
-    """Archive (default) or hard-delete a board."""
+def delete_board(
+    slug: str,
+    delete: bool = Query(False, description="Hard-delete instead of archive"),
+    force: bool = Query(
+        False,
+        description="With delete=true: hard-delete even when task workspaces hold unsaved git work",
+    ),
+):
+    """Archive (default) or hard-delete a board; a hard delete is refused (400) while a
+    task workspace still holds git work that exists nowhere else, unless ``force``."""
     with _value_error_400():
-        res = kanban_db.remove_board(slug, archive=not delete)
+        res = kanban_db.remove_board(slug, archive=not delete, force=force)
     return {"result": res, "current": kanban_db.get_current_board()}
 
 

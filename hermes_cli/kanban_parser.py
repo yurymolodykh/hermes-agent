@@ -112,7 +112,11 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("--delete", action="store_true",
              help="Hard-delete the board directory instead of archiving it. "
-                  "Default is to move it to boards/_archived/ so it's recoverable."),
+                  "Default is to move it to boards/_archived/ so it's recoverable. "
+                  "Refused while a task workspace holds unsaved git work."),
+        _arg("--force", action="store_true",
+             help="With --delete: delete even when task workspaces hold unsaved git "
+                  "work, printing the paths being discarded."),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
     _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
     _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
