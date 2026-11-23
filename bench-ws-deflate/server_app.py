@@ -90,31 +90,46 @@ async def bench_ws(ws: WebSocket) -> None:
     # A unique nonce per frame stops deflate's context takeover from "remembering" a repeated frame:
     # without it a loop of identical 32 KB frames compresses ~100x and overstates the traffic saving.
     nonce = f"{time.monotonic_ns()}"
+    emitter = _EMIT.get(mode, _emit_panel)
     for it in range(repeat):
         tag = f"{nonce}-{it}"
-        if mode == "delta-coalesced":
-            # ws.py coalesces streamed deltas on a 33 ms timer, so a real frame carries ~0.5-1 KB of
-            # text, not one token. This mode is the shape the loop actually sends.
-            for idx, body in enumerate(BODIES[:40]):
-                for frame in delta_frames(body, chunk=600, nonce=f"{tag}-{idx}"):
-                    await ws.send_text(frame)
-        elif mode == "delta":
-            for idx, body in enumerate(BODIES[:40]):
-                for frame in delta_frames(body, nonce=f"{tag}-{idx}"):
-                    await ws.send_text(frame)
-        elif mode == "card":
-            for _i in range(60):
-                await ws.send_text(control_card(f"{tag}-{_i}"))
-        elif mode == "models":
-            for _i in range(30):
-                await ws.send_text(model_options(f"{tag}-{_i}"))
-        else:  # one panel session: streamed reply + cards + one model list
-            for idx, body in enumerate(BODIES[:20]):
-                for frame in delta_frames(body, nonce=f"{tag}-{idx}"):
-                    await ws.send_text(frame)
-                await ws.send_text(control_card(f"{tag}-{idx}"))
-            await ws.send_text(model_options(tag))
+        await emitter(ws, tag)
     await ws.close()
+
+
+async def _emit_panel(ws: WebSocket, tag: str) -> None:
+    """One panel session: streamed reply + a card after each chunk + one model list."""
+    for idx, body in enumerate(BODIES[:20]):
+        for frame in delta_frames(body, nonce=f"{tag}-{idx}"):
+            await ws.send_text(frame)
+        await ws.send_text(control_card(f"{tag}-{idx}"))
+    await ws.send_text(model_options(tag))
+
+
+async def _emit_delta_coalesced(ws, tag):
+    for idx, body in enumerate(BODIES[:40]):
+        for frame in delta_frames(body, chunk=600, nonce=f"{tag}-{idx}"):
+            await ws.send_text(frame)
+
+
+async def _emit_delta(ws, tag):
+    for idx, body in enumerate(BODIES[:40]):
+        for frame in delta_frames(body, nonce=f"{tag}-{idx}"):
+            await ws.send_text(frame)
+
+
+async def _emit_card(ws, tag):
+    for i in range(60):
+        await ws.send_text(control_card(f"{tag}-{i}"))
+
+
+async def _emit_models(ws, tag):
+    for i in range(30):
+        await ws.send_text(model_options(f"{tag}-{i}"))
+
+
+_EMIT = {"delta-coalesced": _emit_delta_coalesced, "delta": _emit_delta,
+         "card": _emit_card, "models": _emit_models, "panel": _emit_panel}
 
 
 def main() -> None:

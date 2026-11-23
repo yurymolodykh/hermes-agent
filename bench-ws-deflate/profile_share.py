@@ -98,8 +98,8 @@ async def main() -> None:
         proc = subprocess.run(
             ["sudo", "-n", PY_SPY, "record", "-d", str(args.seconds), "-r", str(args.rate),
              "-f", "raw", "-o", raw, "--pid", str(srv.pid), "--nonblocking", "--threads"],
-            capture_output=True, text=True)
-        subprocess.run(["sudo", "-n", "chmod", "644", raw], capture_output=True)
+            capture_output=True, text=True, timeout=args.seconds + 120)
+        subprocess.run(["sudo", "-n", "chmod", "644", raw], capture_output=True, timeout=60)
         wall = time.perf_counter() - t0
         sys.stderr.write((proc.stdout + proc.stderr)[-600:] + "\n")
         load.cancel()

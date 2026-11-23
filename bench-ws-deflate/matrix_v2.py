@@ -44,6 +44,12 @@ def cpu_seconds(pid: int) -> float:
     return (int(parts[13]) + int(parts[14])) / 100.0
 
 
+def _write_json(path: str, data: dict) -> None:
+    """Serialise off the event loop: the file is small but a blocking write must not stall it."""
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+
+
 async def wait_ready(port: int) -> None:
     for _ in range(160):
         try:
@@ -108,7 +114,8 @@ async def main() -> None:
                 pid, port = servers[d].pid, PORTS[d]
                 out = subprocess.run([sys.executable, f"{HERE}/drive.py",
                                       "--port", str(port), "--mode", mode],
-                                     capture_output=True, text=True, check=True)
+                                     capture_output=True, text=True, check=True,
+                                     timeout=120)
                 wire = json.loads(out.stdout.strip().splitlines()[-1])
                 await burst(port, mode, args.repeat, args.clients)  # warm
                 samples = []
@@ -144,8 +151,7 @@ async def main() -> None:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
-    with open(args.out, "w") as fh:
-        json.dump(report, fh, indent=2, ensure_ascii=False)
+    await asyncio.to_thread(_write_json, args.out, report)
     print(f"written {args.out}")
 
 

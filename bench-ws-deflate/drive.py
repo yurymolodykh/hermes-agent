@@ -30,10 +30,7 @@ async def relay(client_reader: asyncio.StreamReader, client_writer: asyncio.Stre
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            try:
-                dst.close()
-            except Exception:
-                pass
+            dst.close()  # closing an already-broken pipe is a no-op, not an error worth masking
 
     await asyncio.gather(pump(client_reader, server_writer, "c2s"),
                          pump(server_reader, client_writer, "s2c"))

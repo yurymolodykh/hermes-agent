@@ -30,6 +30,12 @@ def cpu_seconds(pid: int) -> float:
     return (int(parts[13]) + int(parts[14])) / 100.0
 
 
+def _write_json(path: str, data: dict) -> None:
+    """Serialise off the event loop: the file is small but a blocking write must not stall it."""
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+
+
 async def wait_ready(port: int) -> None:
     for _ in range(160):
         try:
@@ -109,8 +115,7 @@ async def main() -> None:
             "stdev_pct_control": round(ctrl["stdev"] / ctrl["median"] * 100, 1),
         }
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        with open(args.out, "w") as fh:
-            json.dump(report, fh, indent=2, ensure_ascii=False)
+        await asyncio.to_thread(_write_json, args.out, report)
     finally:
         for p in servers.values():
             p.terminate()

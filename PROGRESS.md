@@ -1,36 +1,49 @@
-# PROGRESS — t_5bb8406e: замер сжатия WebSocket и решение по объёму
+# PROGRESS — t_5bb8406e: замер сжатия WebSocket permessage-deflate
 
-## Состояние: измерение готово, решение принято, правка production не требуется. Идёт финальный прогон профилей + отчёт.
+## Состояние: ИЗМЕРЕНО, РЕШЕНИЕ ПРИНЯТО, отчёт написан. Осталось: проверить стенд после правок линта → коммит → публикация.
 
-* Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_5bb8406e`, ветка `wt/t_5bb8406e`
-* Гейт публикации: `ops-card-merge.py --task t_5bb8406e` (не выполнен)
+### Сделано (всё проверено инструментом)
 
-## Установлено (проверено по коду и живой системе)
+1. **Доля сжатия в занятости цикла (py-spy, `-r 100`, 15 с, 8 клиентов)** —
+   `bench-ws-deflate/profile-shares.jsonl`, 12 прогонов:
+   * `delta-coalesced`: дефолт 323 занятых среза, 127 в deflate = **39,3 %**; выкл → 100 срезов, 0 deflate.
+   * `panel`: дефолт 974 среза, 380 deflate = **39,0 %**; выкл → 124, 0.
+   * Ранее тем же методом 43,9 % — диапазон 39–44 %.
+2. **Трафик (TCP-релей `drive.py`, байты на сокете)**:
+   delta ×3,1 / card ×56,9 / models ×26,1 / panel ×7,5 при отключении; экономия при включённом 67–98 %.
+3. **CPU на кадр (`cpu_precise.py`, выборка ~1 с, чередование вариантов)**:
+   `models` repeat20: дефолт 0,8875 мс, w13 −16,4 %, w15 −7,3 %, выкл −33,1 %, control −3,5 % (=шум);
+   `delta` repeat40: дефолт 0,0748, w13 −7,2 %, выкл −55,7 %, control −1,0 %.
+4. **Тюнинг опровергнут** (`matrix-v2.json`, медианы 4 сценариев): level1 +35,4 % трафика,
+   level4 +11,1 %, memLevel1 +2,4 % и +21,6 % CPU, noCTX +137,4 %, окно 9 +89,2 % (card +1623 %),
+   окно 10 +24,2 %, окно 11 +10,6 % — экономии CPU нет. Окно 13/15 улучшает обе оси,
+   но требует подмены `ServerPerMessageDeflateFactory` в uvicorn (ключ не предусмотрен).
+5. **Код уже гейтован** до этой карточки: `web_server_lifecycle.py:588` и `web_server.py:1091`,
+   коммит `1ae92cf59f2` (прочитано сообщение коммита — совпадает).
+6. **Топология подтверждена**: nginx `sites-available/molodykh-pipe` проксирует на
+   `127.0.0.1:9120` и **передаёт** `X-Real-IP`/`X-Forwarded-For`; uvicorn решает про сжатие
+   в `__init__` протокола (:97) до `connection_made` (:128-134) ⇒ гейт «по клиенту» невозможен
+   без подмены класса протокола (`web_server_lifecycle.py:598` — `proxy_headers=auth_required`).
 
-1. Production УЖЕ гейтит deflate: `hermes_cli/web_server_lifecycle.py:588`
-   `per_message_deflate = auth_required or host not in _LOOPBACK_HOST_VALUES`;
-   `hermes_cli/web_server.py:1091` — то же для dashboard. Введено коммитом
-   `1ae92cf59f2` (py-spy: 48 % цикла на WS-отправке, половина — deflate).
-2. Живой шлюз слушает `127.0.0.1:9120`, но `dashboard.public_url=https://molodykh.su`
-   + `basic_auth` → `listener_auth_required(...)` = True → **deflate включён**.
-   Именно поэтому py-spy видит `PerMessageDeflate.encode` в живом профиле.
-3. nginx (мастер pid 1243) терминирует TLS на 127.0.0.1:80/443 и проксирует на
-   loopback → все удалённые пиры приходят с 127.0.0.1. **Гейт по пиру невозможен**:
-   отличить локального клиента от проксированного нельзя (uvicorn решает на
-   `connection_made`, до TLS/Host/заголовков).
+### Решение
+**Оставить сжатие как есть.** Отключение: ×3,1…×56,9 трафика за 33–56 % CPU на кадр. Ужатие:
+ни один доступный ключ не экономит CPU. Правок продакшн-кода нет — и это результат замера.
 
-## Замеры
+### Осталось
+1. Проверить, что стенд запускается после правок линта (`server_app.py` теперь dispatch-таблица
+   `_EMIT`, `_write_json` вынесен в `asyncio.to_thread`, добавлены timeout'ы).
+2. `git add -A && git commit`.
+3. Публикация: `env -u HERMES_HOME /usr/bin/python3 /home/hermes/workspaces/01-orchestrator/ops/bin/ops-card-merge.py --task t_5bb8406e`.
+4. `kanban_request_review` с ревьюером `09-independent-reviewer`.
 
-* py-spy, 15 с, 8 клиентов, `delta-coalesced`: **доля срезов в deflate 43,9 %**
-  (152 из 346 срезов); deflate off — 0 % и втрое меньше занятых срезов (75).
-* Матрица (matrix-v2.json), контроль (те же настройки через override-фабрику)
-  совпадает с базой в пределах 0,8 % — путь подмены фабрики достоверен.
-* Ужатие опровергнуто: level 1/4 и memLevel 1 дают +2…+174 % трафика без выигрыша
-  CPU; `no_context_takeover` +75…+712 % трафика и +20…+50 % CPU.
-* Отключение: трафик ×2,1…×56 (медиана ~×7), CPU на кадр −22…−60 %.
+### Локаторы
+* Отчёт: `bench-ws-deflate/REPORT.md`
+* Данные: `matrix-v2.json`, `matrix-window.json`, `cpu-precise.json`, `cpu-precise-delta.json`,
+  `noise-floor.json`, `profile-shares.jsonl`
+* Код стенда: `server_app.py`, `drive.py`, `matrix_v2.py`, `cpu_precise.py`, `noise_floor.py`,
+  `profile_share.py`, `run_profiles.sh`
+* База: merge-base с `main` = `3b4215785882`
 
-## Следующий шаг
-
-1. Дождаться `bench-ws-deflate/profile-shares.jsonl` (12 прогонов py-spy).
-2. `bench-ws-deflate/REPORT.md` — цифры до/после, решение, обоснование.
-3. Коммит → `ops-card-merge.py` → `kanban_request_review` (09-independent-reviewer).
+### Предупреждение оператора
+Чекпоинты не снимаются (`checkpoint store is busy`). Вся работа лежит в git-файлах worktree
+и запушена в ref `refs/hermes-wip/t_5bb8406e`; коммит — следующий шаг.
