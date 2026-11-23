@@ -1,0 +1,140 @@
+{
+  "mode": "models",
+  "repeat": 20,
+  "clients": 8,
+  "variants": {
+    "on": {
+      "argv": [
+        "--deflate",
+        "on"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        0.63542,
+        1.15625,
+        1.06875,
+        0.8875,
+        1.06667,
+        0.83542,
+        0.7875
+      ],
+      "median": 0.8875,
+      "stdev": 0.18538,
+      "stdev_pct": 20.9,
+      "vs_on_pct": 0.0,
+      "wall_median": 4.2817
+    },
+    "control": {
+      "argv": [
+        "--deflate",
+        "on",
+        "--baseline"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        1.02708,
+        0.77083,
+        0.85625,
+        1.08125,
+        0.91042,
+        0.82708,
+        0.82917
+      ],
+      "median": 0.85625,
+      "stdev": 0.11405,
+      "stdev_pct": 13.3,
+      "vs_on_pct": -3.5,
+      "wall_median": 4.1122
+    },
+    "w13": {
+      "argv": [
+        "--deflate",
+        "on",
+        "--window",
+        "13"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        0.79375,
+        0.74167,
+        1.33958,
+        0.73333,
+        0.69792,
+        0.60625,
+        0.7625
+      ],
+      "median": 0.74167,
+      "stdev": 0.24069,
+      "stdev_pct": 32.5,
+      "vs_on_pct": -16.4,
+      "wall_median": 3.5773
+    },
+    "w15": {
+      "argv": [
+        "--deflate",
+        "on",
+        "--window",
+        "15"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        0.90833,
+        0.82292,
+        1.14167,
+        0.57708,
+        0.60417,
+        1.0375,
+        0.76458
+      ],
+      "median": 0.82292,
+      "stdev": 0.21029,
+      "stdev_pct": 25.6,
+      "vs_on_pct": -7.3,
+      "wall_median": 3.9763
+    },
+    "level1": {
+      "argv": [
+        "--deflate",
+        "on",
+        "--level",
+        "1"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        0.91667,
+        0.63958,
+        0.87083,
+        1.11042,
+        0.59792,
+        0.84167,
+        0.86875
+      ],
+      "median": 0.86875,
+      "stdev": 0.17291,
+      "stdev_pct": 19.9,
+      "vs_on_pct": -2.1,
+      "wall_median": 4.169
+    },
+    "off": {
+      "argv": [
+        "--deflate",
+        "off"
+      ],
+      "frames_per_sample": 4800,
+      "cpu_ms_per_frame": [
+        0.64167,
+        0.62083,
+        0.58333,
+        1.09583,
+        0.51667,
+        0.59375,
+        0.5
+      ],
+      "median": 0.59375,
+      "stdev": 0.20313,
+      "stdev_pct": 34.2,
+      "vs_on_pct": -33.1,
+      "wall_median": 2.8664
+    }
+  }
+}
