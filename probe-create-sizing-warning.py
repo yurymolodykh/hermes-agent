@@ -61,13 +61,18 @@ def make(title: str, body: str, assignee: str = "03-software-engineer",
 
 
 def show(label: str, card: dict) -> None:
+    with connect_closing(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (card["task_id"],),
+        ).fetchone()
     print(f"\n--- {label} ---")
     print("  ok                   :", card.get("ok"), "| task_id:", card.get("task_id"))
     print("  estimated_minutes    :", card.get("estimated_minutes"))
     print("  max_runtime_seconds  :", card.get("max_runtime_seconds"))
     print("  sizing_warning       :", card.get("sizing_warning") or "None")
+    print("  row status after     :", row["status"] if row else "GONE")
     assert card.get("ok"), card
-    assert "archived" not in card or True
+    assert row is not None and row["status"] == "archived", ("not archived", dict(row) if row else None)
 
 
 budget_table()
