@@ -673,10 +673,6 @@ async def _collect_status(profile_dir: Optional[Path], requested_profile: str,
         "gateway_drainable": derive_gateway_drainable(
             gateway_running=gateway_running, gateway_state=gateway_state),
         "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
-        # Serving mode of the blocking-work offload (handler_offload.py): "threaded" carries a
-        # worker count; "inline" is the pre-change single-process path. Live counters show a pool
-        # under pressure (queue_depth) instead of leaving it to guesswork.
-        "handler_offload": _handler_offload_view(),
         **auth, "nous_session_valid": local["nous_session_valid"]}
 
     # Stable per-install identity (first call may touch disk). Omitted (not null) when

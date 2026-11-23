@@ -1,0 +1,36 @@
+{
+  "burst": 64,
+  "payload_kb": 256,
+  "workers": 16,
+  "codes": {
+    "200": 64
+  },
+  "lat_p50_ms": 797.0,
+  "lat_max_ms": 1118.4,
+  "burst_wall_ms": 1169.3,
+  "offload_before": {
+    "mode": "threaded",
+    "enabled": true,
+    "workers": 16,
+    "submitted": 0,
+    "inline": 0,
+    "in_flight": 0,
+    "queue_depth": 0,
+    "max_queue_depth": 0,
+    "avg_wait_ms": 0.0
+  },
+  "offload_after": {
+    "mode": "threaded",
+    "enabled": true,
+    "workers": 16,
+    "submitted": 0,
+    "inline": 0,
+    "in_flight": 0,
+    "queue_depth": 0,
+    "max_queue_depth": 0,
+    "avg_wait_ms": 0.0
+  },
+  "queued": false,
+  "all_ok": true,
+  "target_ok": true
+}
