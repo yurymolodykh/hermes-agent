@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.config import cfg_get
 from hermes_cli.web_routers._common import config_scoped_to_thread
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_server_dashboard import (
     _BUILTIN_DASHBOARD_THEMES, _discover_user_themes, _invalidate_plugins_hub_cache, _merged_plugins_hub,
     _plugin_consent_withheld,
@@ -436,9 +437,8 @@ async def serve_plugin_asset(plugin_name: str, file_path: str, profile: Optional
 
     if not target.is_relative_to(base.resolve()):
         raise HTTPException(status_code=403, detail="Path traversal blocked")
-    if not target.exists() or not target.is_file():
+    if not await off_loop(target.is_file):
         raise HTTPException(status_code=404, detail="File not found")
-
     media_type = _PLUGIN_ASSET_CONTENT_TYPES.get(target.suffix.lower())
     if media_type is None:
         raise HTTPException(status_code=404, detail="File not found")

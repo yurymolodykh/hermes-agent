@@ -1425,7 +1425,7 @@ async def import_profile_endpoint(body: ProfileImport, request: Request):
     # Bundled desktop appearance overlay, so the desktop needn't make another round-trip.
     desktop_overlay = None
     overlay_path = profile_dir / "desktop.json"
-    if overlay_path.is_file():
+    if await off_loop(overlay_path.is_file):
         desktop_overlay = _best_effort(
             "Reading desktop.json from imported profile %s failed", imported,
             fn=lambda: _read_desktop_overlay(profile_dir))

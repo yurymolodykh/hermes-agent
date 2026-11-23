@@ -23,6 +23,8 @@ guessing; ``wait_ms`` records how long a caller waited for a slot.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import logging
 import os
 import threading
@@ -201,8 +203,16 @@ class HandlerOffload:
 
 
 def _bind(fn: Callable[..., Any], args: tuple, kwargs: Dict[str, Any]) -> Callable[[], Any]:
+    """Wrap the call with a COPY of the caller's contextvars.
+
+    ``run_in_executor`` does not propagate context (``asyncio.to_thread`` does), and the
+    profile-scope contextvar is how a request's profile reaches ``get_hermes_home()``: without
+    this copy a worker would read the launch profile and write into the wrong home.
+    """
+    ctx = contextvars.copy_context()
+
     def _call() -> Any:
-        return fn(*args, **kwargs)
+        return ctx.run(functools.partial(fn, *args, **kwargs))
 
     return _call
 

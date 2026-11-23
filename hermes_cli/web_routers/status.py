@@ -31,6 +31,7 @@ from hermes_cli.version_info import get_version_info
 from hermes_constants import get_process_hermes_home, profile_name_for_home
 from hermes_cli.web_models import CuratorPause, LearningNodeRef, LearningNodeEdit, DebugShareRequest
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile, scoped_to_thread
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_status_cache import TtlSingleFlightCache
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -522,7 +523,19 @@ def _fts_rebuild_status() -> Optional[dict[str, Any]]:
 #: the profile list there without a session (#60585).
 _WEBAPP_SIGNED_OUT_STATUS_KEYS = frozenset({
     "version", "release_date", "gateway_running", "gateway_state", "overall", "components",
-    "auth_required", "auth_providers", "auth_flows"})
+    "auth_required", "auth_providers", "auth_flows", "handler_offload"})
+
+
+def _handler_offload_view() -> dict[str, Any]:
+    """``/api/status`` view of the handler-offload mode and pool (never raises)."""
+    try:
+        from hermes_cli.web_routers.handler_offload import offload_status
+
+        view = offload_status()
+        view["mode"] = "threaded" if view.get("enabled") else "inline"
+        return view
+    except Exception:  # status must answer even if the seam is unavailable
+        return {"mode": "unknown"}
 
 
 async def _webapp_caller_signed_out(request: Request) -> bool:
@@ -660,6 +673,10 @@ async def _collect_status(profile_dir: Optional[Path], requested_profile: str,
         "gateway_drainable": derive_gateway_drainable(
             gateway_running=gateway_running, gateway_state=gateway_state),
         "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
+        # Serving mode of the blocking-work offload (handler_offload.py): "threaded" carries a
+        # worker count; "inline" is the pre-change single-process path. Live counters show a pool
+        # under pressure (queue_depth) instead of leaving it to guesswork.
+        "handler_offload": _handler_offload_view(),
         **auth, "nous_session_valid": local["nous_session_valid"]}
 
     # Stable per-install identity (first call may touch disk). Omitted (not null) when
@@ -1005,7 +1022,7 @@ async def get_logs(
         raise HTTPException(status_code=400, detail=f"Unknown log file: {file}")
     with _config_profile_scope(profile):
         log_path = get_hermes_home() / "logs" / log_name
-    if not log_path.exists():
+    if not await off_loop(log_path.exists):
         return {"file": file, "lines": []}
 
     try:

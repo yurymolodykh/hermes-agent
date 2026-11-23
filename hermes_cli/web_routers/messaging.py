@@ -38,6 +38,7 @@ from hermes_cli.web_routers._common import (
     REDACTED_CREDENTIAL_WRITE_DETAIL, http_failure, is_redacted_credential_preview,
     redacted_credential_preview,
 )
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_models import (
     MessagingPlatformUpdate, TelegramOnboardingApply, TelegramOnboardingStart,
     WhatsAppOnboardingApply, WhatsAppOnboardingStart,
@@ -703,6 +704,17 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart, profile: Opti
     allowed_users = _normalize_whatsapp_allowed_users(body.allowed_users)
 
     target_profile = body.profile or profile
+    # The whole critical section is synchronous filesystem work (creds exists, session backup
+    # rename+mkdir, bridge.pid read) under a process lock — one worker hop keeps the lock held
+    # for exactly the same span while the event loop stays free.
+    return await off_loop(
+        _start_whatsapp_onboarding_blocking, mode, allowed_users, target_profile, body.reset_session)
+
+
+def _start_whatsapp_onboarding_blocking(
+    mode: str, allowed_users: str, target_profile: Optional[str], reset_session: bool,
+) -> dict[str, Any]:
+    """The synchronous body of the WhatsApp onboarding start (runs on the offload pool)."""
     with _config_profile_scope(target_profile), _whatsapp_onboarding_lock:
         _prune_whatsapp_onboarding_sessions()
         session_path = _whatsapp_session_path()
@@ -714,7 +726,7 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart, profile: Opti
             expires_at=datetime.fromtimestamp(expires_at_ts, UTC).isoformat().replace("+00:00", "Z"),
             expires_at_ts=expires_at_ts, profile=target_profile,
         )
-        already_linked = not body.reset_session and (session_path / "creds.json").exists()
+        already_linked = not reset_session and (session_path / "creds.json").exists()
         if already_linked:  # creds on disk: report connected without pairing
             account_id, account_name, account_phone = _whatsapp_linked_account_from_session(session_path)
             fields.update(status="connected", account_id=account_id, account_name=account_name, account_phone=account_phone)
@@ -726,7 +738,7 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart, profile: Opti
             _reserve_whatsapp_session(record)
             launched = False
             try:
-                if body.reset_session:
+                if reset_session:
                     _backup_whatsapp_session(session_path)
                 pairing_id = _register_whatsapp_session(session_path, record)
                 _launch_whatsapp_pairing(pairing_id, record, session_path)
