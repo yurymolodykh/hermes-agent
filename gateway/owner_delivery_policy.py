@@ -14,6 +14,7 @@ without an adapter, a database or a clock.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ DEFAULT_ARTIFACT_EXTENSIONS = (
 _DECISION_BLOCK_KINDS = frozenset({"needs_input", "capability"})
 
 _SUPPRESSION_LOG_NAME = "delivery-policy-suppressed.log"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -199,5 +202,6 @@ def record_suppressed(
         with target.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True
-    except Exception:
+    except OSError as exc:  # journal unavailable is a logging problem, not a delivery one
+        logger.debug("kanban owner policy: cannot append suppression journal: %s", exc)
         return False

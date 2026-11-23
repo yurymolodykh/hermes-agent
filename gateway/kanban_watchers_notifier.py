@@ -118,7 +118,7 @@ def has_open_ancestor(conn: Any, task_id: str) -> bool:
                     return True
                 seen.add(parent_id)
                 frontier.append(parent_id)
-    except Exception:  # a graph read must never break delivery
+    except Exception:  # health: allow BLE001 -- a graph read must never break delivery
         return True
     return False
 
@@ -410,7 +410,7 @@ def _owner_delivery_config() -> OwnerDeliveryConfig:
 
         cfg = load_config()
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- config read is optional; defaults apply
         logger.debug("kanban notifier: cannot read owner delivery policy (%s); using defaults", exc)
         kanban_cfg = {}
     return OwnerDeliveryConfig.from_config(kanban_cfg)
