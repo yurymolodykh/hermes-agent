@@ -19,22 +19,22 @@ import time
 import websockets
 
 HERE = "/home/hermes/.hermes/hermes-agent/.worktrees/t_5bb8406e/bench-ws-deflate"
-PORTS = {"on": 18501, "control": 18502, "level1": 18503, "level4": 18504, "off": 18505,
-         "notakeover": 18506, "memlevel1": 18507}
+PORTS = {"on": 18501, "control": 18502, "w9": 18503, "w10": 18504, "w11": 18505,
+         "w13": 18506, "w15": 18507, "off": 18508}
 MODES = ("delta-coalesced", "card", "models", "panel")
 ARGV = {
-    # bare uvicorn: the production default for a gated listener
+    # bare uvicorn: the production default for a gated listener (window 12, memLevel 5, level 6)
     "on": ["--deflate", "on"],
     # control: the SAME settings re-declared through the override factory. If this does not match
     # "on", the override path itself is unfaithful and no tuned variant can be trusted.
     "control": ["--deflate", "on", "--baseline"],
-    "level1": ["--deflate", "on", "--level", "1"],
-    "level4": ["--deflate", "on", "--level", "4"],
+    # the documented lever: server_max_window_bits, memLevel left at uvicorn's 5
+    "w9": ["--deflate", "on", "--window", "9"],
+    "w10": ["--deflate", "on", "--window", "10"],
+    "w11": ["--deflate", "on", "--window", "11"],
+    "w13": ["--deflate", "on", "--window", "13"],
+    "w15": ["--deflate", "on", "--window", "15"],
     "off": ["--deflate", "off"],
-    # per-message window reset: the documented memory/CPU lever (websockets compression topics)
-    "notakeover": ["--deflate", "on", "--no-context-takeover"],
-    # smallest zlib memory footprint at the default window and level
-    "memlevel1": ["--deflate", "on", "--memlevel", "1"],
 }
 
 
