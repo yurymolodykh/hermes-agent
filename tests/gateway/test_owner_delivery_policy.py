@@ -486,7 +486,12 @@ def test_platforms_list_does_not_affect_other_platforms(run_tick):
     _completed_task(artifacts=["/tmp/report.md"], parent_open=True, platform="local")
     _completed_task(artifacts=["/tmp/report.md"], parent_open=True, platform="telegram")
 
-    python_adapter = RecordingAdapter()
-    run_tick(python_adapter, _policy(), platform=Platform.LOCAL)
-    assert len(python_adapter.sent) == 1, "local delivered even though the policy is on for telegram"
+    local_adapter = RecordingAdapter()
+    run_tick(local_adapter, _policy(), platform=Platform.LOCAL)
+    assert len(local_adapter.sent) == 1, "local delivered even though the policy is on for telegram"
+    assert run_tick.rows() == [], "a local tick journals nothing"
+
+    telegram_adapter = RecordingAdapter()
+    run_tick(telegram_adapter, _policy())
+    assert telegram_adapter.sent == [], "the telegram card is held back by the policy"
     assert {r["platform"] for r in run_tick.rows()} == {"telegram"}
