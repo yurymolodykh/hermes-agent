@@ -197,18 +197,33 @@ def clear_scheduled_until(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def due_tasks(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[tuple[str, int]]:
-    """``[(task_id, scheduled_until)]`` for parked cards whose deadline has passed."""
+    """``[(task_id, scheduled_until)]`` for parked cards whose deadline has passed.
+
+    Two sources, one list: the ``scheduled_until`` column, then — for cards parked
+    before it existed — the legacy marker in their own notes. The legacy read is
+    capped by ``_LEGACY_SCAN_COMMENTS`` and only runs for deadline-less parked
+    cards, so the tick stays cheap on a board with no legacy rows.
+    """
     stamp = int(now if now is not None else time.time())
     rows = conn.execute(
         "SELECT id, scheduled_until FROM tasks "
-        "WHERE status = 'scheduled' AND scheduled_until IS NOT NULL "
+        "WHERE status = 'scheduled' "
         "ORDER BY scheduled_until ASC"
     ).fetchall()
     due: list[tuple[str, int]] = []
+    legacy: list[str] = []
     for row in rows:
-        epoch = _kb()._to_epoch(row["scheduled_until"])
+        raw = row["scheduled_until"]
+        if raw is None:
+            legacy.append(row["id"])
+            continue
+        epoch = _kb()._to_epoch(raw)
         if epoch is not None and int(epoch) <= stamp:
             due.append((row["id"], int(epoch)))
+    for task_id in legacy:
+        epoch = legacy_deadline_from_comments(conn, task_id, now=stamp)
+        if epoch is not None and epoch <= stamp:
+            due.append((task_id, epoch))
     return due
 
 
@@ -277,16 +292,22 @@ def wake_due_tasks(conn: sqlite3.Connection, *, now: Optional[int] = None) -> li
 
 
 def pending_wakeups(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict[str, Any]]:
-    """``[{id, scheduled_until, scheduled_until_local, overdue_seconds}]`` for the board summary."""
+    """``[{id, title, scheduled_until, scheduled_until_local, overdue_seconds}]`` for the board summary.
+
+    Deadline-less parked cards are included when their own notes carry a legacy
+    marker (that is a real deadline, just stored the old way), so the summary
+    shows everything the tick will wake.
+    """
     stamp = int(time.time())
     rows = conn.execute(
-        "SELECT id, title, scheduled_until FROM tasks "
-        "WHERE status = 'scheduled' AND scheduled_until IS NOT NULL "
+        "SELECT id, title, scheduled_until FROM tasks WHERE status = 'scheduled' "
         "ORDER BY scheduled_until ASC LIMIT ?", (int(limit),),
     ).fetchall()
     out: list[dict[str, Any]] = []
     for row in rows:
         epoch = _kb()._to_epoch(row["scheduled_until"])
+        if epoch is None:
+            epoch = legacy_deadline_from_comments(conn, row["id"], now=stamp)
         if epoch is None:
             continue
         out.append({
@@ -296,6 +317,7 @@ def pending_wakeups(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict[s
             "scheduled_until_local": format_local(int(epoch)),
             "overdue_seconds": max(0, stamp - int(epoch)),
         })
+    out.sort(key=lambda c: c["scheduled_until"])
     return out
 
 

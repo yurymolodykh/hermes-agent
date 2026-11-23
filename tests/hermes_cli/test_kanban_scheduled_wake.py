@@ -64,7 +64,8 @@ def test_parse_until_accepts_epoch_and_offset_and_rejects_junk(kanban_home):
     msk = kbsch.parse_until("2026-11-25T04:40:00")
     utc = kbsch.parse_until("2026-11-25T04:40:00+00:00")
     assert msk is not None and utc is not None
-    assert msk - utc == 3 * 3600, "Moscow is UTC+3"
+    # Same wall clock, Moscow is UTC+3 → its instant is EARLIER by three hours.
+    assert utc - msk == 3 * 3600, "Moscow is UTC+3"
     for junk in ("", "   ", "soon", None, True, "25.11 04:40"):
         assert kbsch.parse_until(junk) is None
 

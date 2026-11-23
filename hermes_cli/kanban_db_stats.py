@@ -44,10 +44,14 @@ def _scheduled_stats(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
     no_deadline = 0
     overdue = 0
     for row in conn.execute(
-        "SELECT scheduled_until FROM tasks WHERE status = 'scheduled'"
+        "SELECT id, scheduled_until FROM tasks WHERE status = 'scheduled'"
     ):
         total += 1
         epoch = _kb()._to_epoch(row["scheduled_until"])
+        if epoch is None:
+            # A card parked before the column existed still carries its deadline
+            # in its own notes — that is a deadline, not an anomaly.
+            epoch = kbsch.legacy_deadline_from_comments(conn, row["id"], now=now)
         if epoch is None:
             no_deadline += 1
         elif int(epoch) <= now:
