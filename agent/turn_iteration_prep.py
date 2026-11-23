@@ -111,6 +111,18 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
                 " This workspace is not a git repository, so a copy of it was written "
                 f"to {_wip.locator} — that archive survives the budget stop."
             )
+        elif _wip is not None and _wip.mode == "partial":
+            # No copy exists: the tree is over the archive cap. Saying "it survives"
+            # here (as the notice used to) is a promise the run cannot keep.
+            notice += (
+                " Only a partial record was written"
+                + (f" to {_wip.locator}" if _wip.locator else "")
+                + ": this workspace is not a git repository and its tree is larger than "
+                "the archive limit, so no copy of it exists. Commit or hand off what "
+                "matters NOW — a budget stop loses the rest."
+            )
+        elif _wip is not None and _wip.detail:
+            notice += f" The workspace was not saved: {_wip.detail}."
     message = messages[-1]
     content = message.get("content", "")
     if isinstance(content, str):

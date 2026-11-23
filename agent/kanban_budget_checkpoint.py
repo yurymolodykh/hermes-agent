@@ -21,6 +21,7 @@ worker that has nothing to save must not get an empty commit.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -81,9 +82,10 @@ class WipPreservation:
     durable record a budget stop reports on.
     """
 
-    mode: str = "none"            # "git" | "archive" | "none"
-    locator: Optional[str] = None  # ``refs/hermes-wip/<task>`` or the tarball path
-    detail: Optional[str] = None  # why nothing was saved, when mode == "none"
+    mode: str = "none"            # "git" | "archive" | "partial" | "none"
+    locator: Optional[str] = None  # ``refs/hermes-wip/<task>``, the tarball path,
+                                   # or the partial record when the tree was too big
+    detail: Optional[str] = None  # why nothing (complete) was saved
 
 
 def _git(cwd: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -485,12 +487,23 @@ def preserve_wip_tree(
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     tid = (task_id or (os.environ.get("HERMES_KANBAN_TASK") or "task")).strip()
     try:
-        archive = _archive_tree(root, files, tid, stamp)
+        outcome = _archive_tree(root, files, tid, stamp)
     except (OSError, tarfile.TarError) as exc:
         return WipPreservation(detail=f"архив не создан: {exc}")
-    if archive:
-        return WipPreservation(mode="archive", locator=archive)
-    return WipPreservation(detail="архив не создан")
+    if outcome is None:
+        return WipPreservation(detail="архив не создан")
+    if outcome.complete:
+        return WipPreservation(mode="archive", locator=outcome.path)
+    # The tree is larger than the cap: nothing was copied, and saying otherwise
+    # would be the same false promise the old notice made.
+    return WipPreservation(
+        mode="partial",
+        locator=outcome.path,
+        detail=(
+            "дерево больше потолка архива — копия частичная: ни один файл не "
+            f"скопирован, записан только признак потери в {outcome.path}"
+        ),
+    )
 
 
 def checkpoint_wip(
@@ -537,12 +550,19 @@ def checkpoint_wip(
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     tid = (task_id or (os.environ.get("HERMES_KANBAN_TASK") or "task")).strip()
     try:
-        archive = _archive_tree(root, files, tid, stamp)
+        outcome = _archive_tree(root, files, tid, stamp)
     except (OSError, tarfile.TarError) as exc:
         return WipCheckpoint(detail=f"{detail}; архив не создан: {exc}")
-    if archive:
-        return WipCheckpoint(mode="archive", archive=archive, files=files, detail=detail)
-    return WipCheckpoint(detail=detail or "нечего сохранять", files=files)
+    if outcome is None:
+        return WipCheckpoint(detail=detail or "нечего сохранять", files=files)
+    if outcome.complete:
+        return WipCheckpoint(mode="archive", archive=outcome.path, files=files, detail=detail)
+    # Nothing was copied: report the loss instead of a copy that does not exist.
+    loss = (
+        "дерево больше потолка архива — копия частичная: ни один файл не скопирован, "
+        f"признак потери в {outcome.path}"
+    )
+    return WipCheckpoint(detail=f"{detail}; {loss}" if detail else loss, files=files)
 
 
 def _open_items(workspace: Optional[Path]) -> list[str]:

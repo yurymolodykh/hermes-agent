@@ -149,7 +149,7 @@ def test_a_truncated_archive_is_never_the_one_the_notice_names(card_env, monkeyp
     """
     from agent import kanban_budget_checkpoint as kbc
 
-    workspace, home = card_env
+    workspace, _home = card_env
     (workspace / "a.txt").write_text("A" * 100, encoding="utf-8")
     (workspace / "b.txt").write_text("B" * 100, encoding="utf-8")
     before = {n: (workspace / n).stat() for n in ("a.txt", "b.txt")}
@@ -189,7 +189,7 @@ def test_over_cap_repeats_write_one_partial_copy_and_say_so(card_env, monkeypatc
     """
     from agent import kanban_budget_checkpoint as kbc
 
-    workspace, home = card_env
+    workspace, _home = card_env
     for i in range(4):
         (workspace / f"part{i}.bin").write_bytes(b"P" * (256 * 1024))
     monkeypatch.setattr(kbc, "_ARCHIVE_MAX_BYTES", 300 * 1024)
