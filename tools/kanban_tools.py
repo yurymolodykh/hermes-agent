@@ -1112,6 +1112,11 @@ def _card_sizing(assignee: str, body: Any) -> tuple[Optional[str], Optional[int]
         return None, None
 
 
+def _card_sizing_warning(assignee: str, body: Any) -> Optional[str]:
+    """The advisory alone (kept for callers/probes that only want the text)."""
+    return _card_sizing(assignee, body)[0]
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""

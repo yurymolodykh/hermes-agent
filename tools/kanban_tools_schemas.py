@@ -456,7 +456,9 @@ KANBAN_CREATE_SCHEMA = _schema(
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "
-                "task with outcome='timed_out'."
+                "task with outcome='timed_out'. Omit it to get the "
+                "3600 s (60 min) hard wall written into the card; an "
+                "explicit value always wins."
         )),
         "initial_status": {
             "type": "string",
