@@ -62,6 +62,11 @@ def card_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.setenv("HERMES_PROFILE", "03-software-engineer")
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    # The reminder's "already named this run" list is process state; a leftover
+    # name from another test must not silently protect a file here.
+    from agent import kanban_budget_checkpoint as _kbc
+
+    monkeypatch.setattr(_kbc, "_NAMED_OFFERS", {})
     return workspace, home
 
 

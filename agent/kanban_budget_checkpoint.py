@@ -231,14 +231,22 @@ def _run_key() -> str:
 
 
 def _remember_named(path: str) -> None:
-    """Record a copy this run's reminder points at, replacing a previous run's set."""
+    """Record a copy this run's reminder points at, replacing a previous run's set.
+
+    The reminder fires at most once per run (``_iteration_budget_warning_injected``
+    latches), so in practice this holds the single path the model was told about.
+    The cap is a safety valve for the hard-stop path: it keeps the pin list from
+    growing without bound while never dropping the newest offer.
+    """
     key = _run_key()
     for stale in [k for k in _NAMED_OFFERS if k != key]:
         del _NAMED_OFFERS[stale]
     offered = _NAMED_OFFERS.setdefault(key, [])
     shown = str(path)
-    if shown not in offered:
-        offered.append(shown)
+    if shown in offered:
+        offered.remove(shown)
+    offered.append(shown)
+    del offered[:-_ARCHIVE_RETENTION]
 
 
 def _named_in_run() -> set[str]:
