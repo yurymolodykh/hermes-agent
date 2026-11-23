@@ -122,8 +122,8 @@ async def main() -> None:
 
         for mode in MODES:
             entry: dict = {}
-            for d in servers:
-                pid, port = servers[d].pid, PORTS[d]
+            for d, proc in servers.items():
+                pid, port = proc.pid, PORTS[d]
                 out = await _run(sys.executable, f"{HERE}/drive.py",
                                  "--port", str(port), "--mode", mode,
                                  capture_output=True, text=True, check=True,
