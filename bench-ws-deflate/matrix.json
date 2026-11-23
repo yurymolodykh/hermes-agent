@@ -1,0 +1,326 @@
+{
+  "clients": 8,
+  "rounds": 3,
+  "scenarios": {
+    "delta": {
+      "on": {
+        "wire": {
+          "mode": "delta",
+          "repeat": 1,
+          "frames": 911,
+          "app_bytes": 118175,
+          "wire_s2c": 24153,
+          "wire_c2s": 300
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.46,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.463,
+            "cpu_ms_per_frame": 0.0316
+          },
+          {
+            "cpu_s": 0.42,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.434,
+            "cpu_ms_per_frame": 0.0288
+          },
+          {
+            "cpu_s": 0.42,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.415,
+            "cpu_ms_per_frame": 0.0288
+          }
+        ]
+      },
+      "off": {
+        "wire": {
+          "mode": "delta",
+          "repeat": 1,
+          "frames": 911,
+          "app_bytes": 118175,
+          "wire_s2c": 121956,
+          "wire_c2s": 300
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.28,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.287,
+            "cpu_ms_per_frame": 0.0192
+          },
+          {
+            "cpu_s": 0.3,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.311,
+            "cpu_ms_per_frame": 0.0206
+          },
+          {
+            "cpu_s": 0.29,
+            "frames": 14576,
+            "app_bytes": 1890800,
+            "wall_s": 0.288,
+            "cpu_ms_per_frame": 0.0199
+          }
+        ]
+      },
+      "summary": {
+        "wire_s2c_deflate_on": 24153,
+        "wire_s2c_deflate_off": 121956,
+        "traffic_increase_off_pct": 404.9,
+        "traffic_saving_on_pct": 80.2,
+        "cpu_ms_per_frame_on_median": 0.0288,
+        "cpu_ms_per_frame_off_median": 0.0199,
+        "cpu_wall_median_on": 0.434,
+        "cpu_wall_median_off": 0.288,
+        "app_bytes": 118175,
+        "frames": 911
+      }
+    },
+    "card": {
+      "on": {
+        "wire": {
+          "mode": "card",
+          "repeat": 1,
+          "frames": 60,
+          "app_bytes": 205010,
+          "wire_s2c": 3608,
+          "wire_c2s": 299
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.08,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.088,
+            "cpu_ms_per_frame": 0.0833
+          },
+          {
+            "cpu_s": 0.1,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.091,
+            "cpu_ms_per_frame": 0.1042
+          },
+          {
+            "cpu_s": 0.08,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.087,
+            "cpu_ms_per_frame": 0.0833
+          }
+        ]
+      },
+      "off": {
+        "wire": {
+          "mode": "card",
+          "repeat": 1,
+          "frames": 60,
+          "app_bytes": 205010,
+          "wire_s2c": 205437,
+          "wire_c2s": 299
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.07,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.072,
+            "cpu_ms_per_frame": 0.0729
+          },
+          {
+            "cpu_s": 0.07,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.073,
+            "cpu_ms_per_frame": 0.0729
+          },
+          {
+            "cpu_s": 0.08,
+            "frames": 960,
+            "app_bytes": 3280160,
+            "wall_s": 0.085,
+            "cpu_ms_per_frame": 0.0833
+          }
+        ]
+      },
+      "summary": {
+        "wire_s2c_deflate_on": 3608,
+        "wire_s2c_deflate_off": 205437,
+        "traffic_increase_off_pct": 5593.9,
+        "traffic_saving_on_pct": 98.2,
+        "cpu_ms_per_frame_on_median": 0.0833,
+        "cpu_ms_per_frame_off_median": 0.0729,
+        "cpu_wall_median_on": 0.088,
+        "cpu_wall_median_off": 0.073,
+        "app_bytes": 205010,
+        "frames": 60
+      }
+    },
+    "models": {
+      "on": {
+        "wire": {
+          "mode": "models",
+          "repeat": 1,
+          "frames": 30,
+          "app_bytes": 970130,
+          "wire_s2c": 37235,
+          "wire_c2s": 301
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.32,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.317,
+            "cpu_ms_per_frame": 0.6667
+          },
+          {
+            "cpu_s": 0.31,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.319,
+            "cpu_ms_per_frame": 0.6458
+          },
+          {
+            "cpu_s": 0.31,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.317,
+            "cpu_ms_per_frame": 0.6458
+          }
+        ]
+      },
+      "off": {
+        "wire": {
+          "mode": "models",
+          "repeat": 1,
+          "frames": 30,
+          "app_bytes": 970130,
+          "wire_s2c": 970437,
+          "wire_c2s": 301
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.23,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.235,
+            "cpu_ms_per_frame": 0.4792
+          },
+          {
+            "cpu_s": 0.32,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.33,
+            "cpu_ms_per_frame": 0.6667
+          },
+          {
+            "cpu_s": 0.36,
+            "frames": 480,
+            "app_bytes": 15522080,
+            "wall_s": 0.356,
+            "cpu_ms_per_frame": 0.75
+          }
+        ]
+      },
+      "summary": {
+        "wire_s2c_deflate_on": 37235,
+        "wire_s2c_deflate_off": 970437,
+        "traffic_increase_off_pct": 2506.2,
+        "traffic_saving_on_pct": 96.2,
+        "cpu_ms_per_frame_on_median": 0.6458,
+        "cpu_ms_per_frame_off_median": 0.6667,
+        "cpu_wall_median_on": 0.317,
+        "cpu_wall_median_off": 0.33,
+        "app_bytes": 970130,
+        "frames": 30
+      }
+    },
+    "panel": {
+      "on": {
+        "wire": {
+          "mode": "panel",
+          "repeat": 1,
+          "frames": 508,
+          "app_bytes": 164236,
+          "wire_s2c": 22209,
+          "wire_c2s": 300
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.41,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.41,
+            "cpu_ms_per_frame": 0.0504
+          },
+          {
+            "cpu_s": 0.31,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.325,
+            "cpu_ms_per_frame": 0.0381
+          },
+          {
+            "cpu_s": 0.34,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.335,
+            "cpu_ms_per_frame": 0.0418
+          }
+        ]
+      },
+      "off": {
+        "wire": {
+          "mode": "panel",
+          "repeat": 1,
+          "frames": 508,
+          "app_bytes": 164236,
+          "wire_s2c": 166425,
+          "wire_c2s": 300
+        },
+        "cpu": [
+          {
+            "cpu_s": 0.19,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.197,
+            "cpu_ms_per_frame": 0.0234
+          },
+          {
+            "cpu_s": 0.18,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.174,
+            "cpu_ms_per_frame": 0.0221
+          },
+          {
+            "cpu_s": 0.17,
+            "frames": 8128,
+            "app_bytes": 2627776,
+            "wall_s": 0.178,
+            "cpu_ms_per_frame": 0.0209
+          }
+        ]
+      },
+      "summary": {
+        "wire_s2c_deflate_on": 22209,
+        "wire_s2c_deflate_off": 166425,
+        "traffic_increase_off_pct": 649.4,
+        "traffic_saving_on_pct": 86.7,
+        "cpu_ms_per_frame_on_median": 0.0418,
+        "cpu_ms_per_frame_off_median": 0.0221,
+        "cpu_wall_median_on": 0.335,
+        "cpu_wall_median_off": 0.178,
+        "app_bytes": 164236,
+        "frames": 508
+      }
+    }
+  }
+}
