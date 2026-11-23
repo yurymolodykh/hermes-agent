@@ -66,7 +66,7 @@ def card_env(tmp_path, monkeypatch):
     # name from another test must not silently protect a file here.
     from agent import kanban_budget_checkpoint as _kbc
 
-    monkeypatch.setattr(_kbc, "_NAMED_OFFERS", {})
+    monkeypatch.setattr(_kbc, "_NAMED_OFFERS", {}, raising=False)
     return workspace, home
 
 
