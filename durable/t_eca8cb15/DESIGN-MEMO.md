@@ -101,7 +101,8 @@ python3 durable/t_eca8cb15/probes/probe_body_ops.py   # -> body_ops.json / body_
 верхушкой ветки не менялся — проверяется `git diff --stat 47d3ac2b449b..HEAD -- hermes_cli/`,
 вывод пуст): регистраций в `hermes_cli/web_routers/*.py` (38 модулей) — **336** =
 HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (уникальных 299), `def` 35
-(уникальных 35). Из HTTP-регистраций `async` 291, `def` 35.
+(уникальных 35). Разбивка по слоям: HTTP-глаголы 325 (`async` 290, `def` 35), `api_route` 1
+(`async`), `websocket` 10 (все `async`) — итого `async` 290 + 1 + 10 = 301.
 `def`-обработчики Starlette исполняет через `run_in_threadpool` — они не блокируют цикл и в
 список правок не входят. Из 301 `async`-обработчиков **173** уже содержат обёртку пула; разбивка
 по обёрткам — тоже вывод скрипта (ключи `offload_calls` / `offload_handlers_by_kind`, печатаются
