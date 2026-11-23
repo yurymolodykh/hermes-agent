@@ -39,7 +39,7 @@
 
 ## Изменения (локаторы)
 
-1. **`hermes_cli/kanban_preserved_workspaces.py`** (новый, 232 строки) —
+1. **`hermes_cli/kanban_preserved_workspaces.py`** (новый, 261 строка) —
    реестр сохранённых каталогов:
    * `record(conn, task_id, path, repo, reason)` — идемпотентно по
      `(task, path)`: событие добавляется, только если у задачи ещё нет события
@@ -67,7 +67,7 @@
    исчезнувший каталог не рекламируется.
 6. **`website/docs/user-guide/features/kanban.md`** — раздел про `scratch`
    описывает реестр и команду поиска вместо неисполнимого «уберите вручную».
-7. **`tests/hermes_cli/test_kanban_preserved_provenance.py`** (новый, 6 тестов).
+7. **`tests/hermes_cli/test_kanban_preserved_provenance.py`** (новый, 231 строка, 6 тестов).
 
 Retention чекпойнтов и уборка `worktree` не тронуты. Обход каталогов
 (`_repo_has_unsaved_work`, `_scratch_workspace`) не менялся.
