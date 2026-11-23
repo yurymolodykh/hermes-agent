@@ -95,21 +95,47 @@ python3 durable/t_eca8cb15/probes/probe_body_ops.py   # -> body_ops.json / body_
 `route_audit.py` берёт ревизию из `git rev-parse HEAD` и печатает её в отчёте; `probe_body_ops.py`
 печатает только измеренные числа. Оба — обычный `python3`, без зависимостей проекта.
 
-**Перепись на ревизии `0dabefdc65e6`** (`probes/route_audit.json`, ключ `stats`):
-регистраций в `hermes_cli/web_routers/*.py` (38 модулей) — **336** = HTTP-глаголы 325 +
-`api_route` 1 + `websocket` 10; `async def` 301 (уникальных 299), `def` 35 (уникальных 35).
+**Перепись на ревизии `47d3ac2b449b`** — вывод скрипта, ключ `stats` в
+`probes/route_audit.json` (ревизия печатается самим скриптом в `git_rev` и в первой строке
+`route_audit.md`; числа относятся к коду `hermes_cli/web_routers`, и он между этой ревизией и
+верхушкой ветки не менялся — проверяется `git diff --stat 47d3ac2b449b..HEAD -- hermes_cli/`,
+вывод пуст): регистраций в `hermes_cli/web_routers/*.py` (38 модулей) — **336** =
+HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (уникальных 299), `def` 35
+(уникальных 35). Из HTTP-регистраций `async` 291, `def` 35.
 `def`-обработчики Starlette исполняет через `run_in_threadpool` — они не блокируют цикл и в
-список правок не входят. Из 301 `async`-обработчиков **173** уже содержат обёртку пула
-(`asyncio.to_thread` 102, `run_in_threadpool` 18, `run_in_executor` 1, проектные обёртки 55) —
-это образец для правки, а не список долга.
+список правок не входят. Из 301 `async`-обработчиков **173** уже содержат обёртку пула; разбивка
+по обёрткам — тоже вывод скрипта (ключи `offload_calls` / `offload_handlers_by_kind`, печатаются
+таблицей в `route_audit.md`):
+
+| Обёртка | Вызовов | Обработчиков |
+|---|---|---|
+| `asyncio.to_thread` | 142 | 104 |
+| `config_scoped_to_thread` | 29 | 27 |
+| `scoped_to_thread` | 19 | 19 |
+| `run_in_threadpool` | 18 | 18 |
+| `_run_config_scoped` | 5 | 5 |
+| `loop.run_in_executor` | 2 | 1 |
+| `_read_off_loop` | 2 | 2 |
+| `_hub_lookup` | 2 | 2 |
+
+(Один обработчик может пользоваться двумя обёртками, поэтому сумма по столбцу «Обработчиков»
+больше 173 — это разные срезы, а не противоречие.)
+
+**Сверка с живым приложением, а не с текстом:** `python3 durable/t_eca8cb15/probes/route_audit.py --live`
+на той же ревизии печатает по объекту `hermes_cli.web_server.app`:
+`web_routers_http: [326, [291, 35]]` (всего / async / def), `web_routers_ws: 10`,
+`all_http: [402, [323, 79]]`, `all_ws: 11`. То есть числа AST-переписи и живого FastAPI-объекта
+сходятся по нашим 38 модулям (326 = 291 + 35; 336 = 326 + 10 WS).
 
 > Расхождение с прежней редакцией этого раздела («316 маршрутов, 285 async, 37 с `to_thread`»)
-> объясняется дефектом самого аудита, а не изменением кода: фильтр по имени объекта-роутера
-> (`router`) терял `manage_router`, `hub_router`, `config_router`, `sessions_router`,
-> `status_router`, `list_router`, `search_router`, `logs_router` (36 регистраций), а признак
-> «уже оффлоадит» считался по трём именитым токенам и не видел проектных обёрток. Аудит
-> исправлен: объект-роутер больше не проверяется, обёртки перечислены явно в docstring скрипта.
-> Обе цифры теперь печатает один и тот же скрипт.
+> объясняется двумя дефектами самого аудита, а не изменением кода: (1) фильтр по имени
+> объекта-роутера (`router`) терял `manage_router`, `hub_router`, `config_router`,
+> `sessions_router`, `status_router`, `list_router`, `search_router`, `logs_router`
+> (36 регистраций); (2) признак «уже оффлоадит» считался по трём именитым токенам
+> и не видел проектных обёрток (`config_scoped_to_thread`, `scoped_to_thread`, `_read_off_loop`,
+> `_hub_lookup`, `_run_config_scoped`). Аудит исправлен: объект-роутер больше не проверяется,
+> обёртки перечислены явно в `OFFLOAD_CALLS`, а разбивка печатается, а не считается руками.
+> Все цифры этого раздела воспроизводятся одной командой из абзаца выше.
 
 #### Порог отбора (явный, механический)
 
@@ -131,7 +157,7 @@ p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данны
 
 | Локатор | Вызов (строка) | Цена по `body_ops.json` | Решение |
 |---|---|---|---|
-| `files.py:1083` `fs_write_text` | `tmp.write_text` 1139, `os.replace` 1140, `tmp.unlink` 1142/1145 | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 1061 мс | **оффлоад** (размер) |
+| `files.py:1083` `fs_write_text` | `tmp.write_text` 1139, `os.replace` 1140, `tmp.unlink` 1142/1145 (в петле же `target.stat` 1122 и `parent.is_dir` 1134 — метаданные, 0,006 мс, остаются) | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 1061 мс | **оффлоад** (размер) |
 | `audio.py:90` `transcribe_audio_upload` | `base64.b64decode` 107, `tmp.write` 123 | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс | **оффлоад** (размер) |
 | `audio.py:299` `speak_text` | `base64.b64encode` 348 | 25 МиБ p50 103 мс; 1 МиБ p50 2,6 мс | **оффлоад** (размер) |
 | `files.py:472` `proxy_remote_media` | `base64.b64encode` 509 | ≤25 МиБ (`_MEDIA_MAX_BYTES`) p50 103 мс | **оффлоад** (только кодирование) |
@@ -174,8 +200,8 @@ p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данны
 - `_whatsapp_session_path()` (708), `_prune_whatsapp_onboarding_sessions()` (707),
   `_whatsapp_linked_account_from_session(session_path)` (719) — чтение каталога и `creds.json`,
   суммарно микросекунды, порог не превышен;
-- `_backup_whatsapp_session(session_path)` (730 → `web_whatsapp_session.py:48-52`) — `rename` +
-  `mkdir(mode=0o700)` + `unlink` детей: 0,22 мс, порог не превышен.
+- `_backup_whatsapp_session(session_path)` (730 → `web_whatsapp_session.py:48-52`) — `exists` +
+  `rename` сессии в `mkdtemp` + `mkdir(mode=0o700)`: 0,22 мс, порог не превышен.
 
 **Настоящая проблема здесь другая, и она не про дисковый ввод-вывод:** тело исполняется под
 `_whatsapp_onboarding_lock` (706) — это `threading.RLock` (`messaging.py:373`), взятый в
@@ -186,8 +212,9 @@ p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данны
 
 **Решение: в этой карточке не править, но назвать явно и вынести как отдельный дефект** для
 `t_f238ce77` или следующей задачи — замена `threading.RLock` на `asyncio.Lock` (или на
-`anyio.Lock` при смешанном доступе из потоков) требует ревизии всех 15 мест захвата
-(`messaging.py:506, 556, 575, 591, 601, 623, 652, 706, 752, 762, 784, 795, 804, 812`) и не
+`anyio.Lock` при смешанном доступе из потоков) требует ревизии всех 14 мест захвата
+(`messaging.py:506, 556, 575, 591, 601, 623, 652, 706, 752, 762, 784, 795, 804, 812` —
+перечень печатается AST-фильтром `ast.With` по имени лока; 742 — докстринг, не захват) и не
 является «оффлоадом одного вызова». Порог §1.3 к нему не применяется — это другой класс.
 
 **Границы, которые решает эта записка:**
@@ -325,7 +352,7 @@ dashboard:
 
 | № | Файл:строка | Функция | Что уходит в поток | Цена по `body_ops.json` |
 |---|---|---|---|---|
-| 1 | `hermes_cli/web_routers/files.py:1083` | `fs_write_text` | `tmp.write_text` (1139), `os.replace` (1140) + два `tmp.unlink` (1142/1145) — одним `to_thread`, чтобы порядок «временный → атомарная замена» не разъехался | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 **1061** мс |
+| 1 | `hermes_cli/web_routers/files.py:1083` | `fs_write_text` | `tmp.write_text` (1139), `os.replace` (1140) + два `tmp.unlink` (1142/1145) — одним `to_thread`, чтобы порядок «временный → атомарная замена» не разъехался. `target.stat()` (1122) и `target.parent.is_dir()` (1134) остаются в цикле: 0,006 мс, порог §1.3 не превышен | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 **1061** мс |
 | 2 | `hermes_cli/web_routers/audio.py:90` | `transcribe_audio_upload` | `base64.b64decode` (107) и запись временного файла (123) | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс |
 | 3 | `hermes_cli/web_routers/audio.py:299` | `speak_text` | `base64.b64encode` (348) — рядом с уже существующим `_read_and_unlink` (344) | 25 МиБ p50 103 мс |
 | 4 | `hermes_cli/web_routers/files.py:472` | `proxy_remote_media` | `base64.b64encode` (509), кодирование ответа | ≤25 МиБ p50 103 мс |
@@ -454,6 +481,7 @@ p95 в 1000 раз выше медианы (`write_text` под нагрузко
 cd /home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15
 python3 durable/t_eca8cb15/probes/route_audit.py --json durable/t_eca8cb15/probes/route_audit.json \
     --md durable/t_eca8cb15/probes/route_audit.md
+python3 durable/t_eca8cb15/probes/route_audit.py --live   # сверка переписи с живым FastAPI-объектом
 python3 durable/t_eca8cb15/probes/probe_body_ops.py
 python3 durable/t_eca8cb15/probes/probe_fs_cost.py
 python3 durable/t_eca8cb15/probes/probe_messaging_block.py
