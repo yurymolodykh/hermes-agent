@@ -140,7 +140,13 @@ def classify_kanban_event(
     if kind == "completed":
         if has_open_ancestor:
             return None, "service:intermediate_card"
-        kept = filter_artifacts(artifacts or (), extensions)
+        raw_artifacts = artifacts
+        if raw_artifacts is None:
+            # Accept the paths straight off the event payload: that is where the handoff
+            # writes them, and a caller that has the payload must not also have to unwrap it.
+            raw_artifacts = (payload or {}).get("artifacts") or ()
+        kept = filter_artifacts(
+            raw_artifacts if isinstance(raw_artifacts, (list, tuple)) else (), extensions)
         summary = _payload_value(payload, "summary")
         if not summary and task is not None:
             summary = str(getattr(task, "result", "") or "").strip()
