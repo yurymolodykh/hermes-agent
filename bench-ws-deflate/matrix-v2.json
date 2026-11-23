@@ -1,0 +1,1598 @@
+{
+  "clients": 8,
+  "rounds": 5,
+  "scenarios": {
+    "delta-coalesced": {
+      "variants": {
+        "on": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 9571,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.07,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.075,
+              "cpu_ms_per_frame": 0.081
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.082,
+              "cpu_ms_per_frame": 0.0926
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.058,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.049,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.048,
+              "cpu_ms_per_frame": 0.0579
+            }
+          ]
+        },
+        "control": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 9545,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.048,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.047,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.047,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.046,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.048,
+              "cpu_ms_per_frame": 0.0463
+            }
+          ]
+        },
+        "level1": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 10387,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.044,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.044,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.052,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.045,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.048,
+              "cpu_ms_per_frame": 0.0579
+            }
+          ]
+        },
+        "level4": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 9750,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.055,
+              "cpu_ms_per_frame": 0.0694
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.051,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.047,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.04,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.047,
+              "cpu_ms_per_frame": 0.0463
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.048,
+              "cpu_ms_per_frame": 0.0579
+            }
+          ]
+        },
+        "off": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 29687,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.02,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.028,
+              "cpu_ms_per_frame": 0.0231
+            },
+            {
+              "cpu_s": 0.02,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.026,
+              "cpu_ms_per_frame": 0.0231
+            },
+            {
+              "cpu_s": 0.03,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.026,
+              "cpu_ms_per_frame": 0.0347
+            },
+            {
+              "cpu_s": 0.02,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.025,
+              "cpu_ms_per_frame": 0.0231
+            },
+            {
+              "cpu_s": 0.02,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.025,
+              "cpu_ms_per_frame": 0.0231
+            }
+          ]
+        },
+        "notakeover": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 16776,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.059,
+              "cpu_ms_per_frame": 0.0694
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.059,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.058,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.058,
+              "cpu_ms_per_frame": 0.0694
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.063,
+              "cpu_ms_per_frame": 0.0694
+            }
+          ]
+        },
+        "memlevel1": {
+          "wire": {
+            "mode": "delta-coalesced",
+            "repeat": 1,
+            "frames": 54,
+            "app_bytes": 29284,
+            "wire_s2c": 9817,
+            "wire_c2s": 310
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.06,
+              "cpu_ms_per_frame": 0.0694
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.056,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.059,
+              "cpu_ms_per_frame": 0.0694
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.06,
+              "cpu_ms_per_frame": 0.0579
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 864,
+              "app_bytes": 468544,
+              "wall_s": 0.057,
+              "cpu_ms_per_frame": 0.0694
+            }
+          ]
+        }
+      },
+      "summary": {
+        "on": {
+          "wire_s2c": 9571,
+          "traffic_vs_default_pct": 0.0,
+          "cpu_ms_per_frame_median": 0.0579,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.058,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "control": {
+          "wire_s2c": 9545,
+          "traffic_vs_default_pct": -0.3,
+          "cpu_ms_per_frame_median": 0.0463,
+          "cpu_vs_default_pct": -20.0,
+          "wall_median": 0.047,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "level1": {
+          "wire_s2c": 10387,
+          "traffic_vs_default_pct": 8.5,
+          "cpu_ms_per_frame_median": 0.0463,
+          "cpu_vs_default_pct": -20.0,
+          "wall_median": 0.045,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "level4": {
+          "wire_s2c": 9750,
+          "traffic_vs_default_pct": 1.9,
+          "cpu_ms_per_frame_median": 0.0579,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.048,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "off": {
+          "wire_s2c": 29687,
+          "traffic_vs_default_pct": 210.2,
+          "cpu_ms_per_frame_median": 0.0231,
+          "cpu_vs_default_pct": -60.1,
+          "wall_median": 0.026,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "notakeover": {
+          "wire_s2c": 16776,
+          "traffic_vs_default_pct": 75.3,
+          "cpu_ms_per_frame_median": 0.0694,
+          "cpu_vs_default_pct": 19.9,
+          "wall_median": 0.059,
+          "frames": 54,
+          "app_bytes": 29284
+        },
+        "memlevel1": {
+          "wire_s2c": 9817,
+          "traffic_vs_default_pct": 2.6,
+          "cpu_ms_per_frame_median": 0.0694,
+          "cpu_vs_default_pct": 19.9,
+          "wall_median": 0.059,
+          "frames": 54,
+          "app_bytes": 29284
+        }
+      }
+    },
+    "card": {
+      "variants": {
+        "on": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 3608,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.079,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.09,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.084,
+              "cpu_ms_per_frame": 0.0938
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.09,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.11,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.108,
+              "cpu_ms_per_frame": 0.1146
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.091,
+              "cpu_ms_per_frame": 0.0833
+            }
+          ]
+        },
+        "control": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 3581,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.082,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.083,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.09,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.09,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.085,
+              "cpu_ms_per_frame": 0.0938
+            },
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.107,
+              "cpu_ms_per_frame": 0.1042
+            }
+          ]
+        },
+        "level1": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 9904,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.109,
+              "cpu_ms_per_frame": 0.1042
+            },
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.1,
+              "cpu_ms_per_frame": 0.1042
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.088,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.09,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.091,
+              "cpu_ms_per_frame": 0.0938
+            },
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.097,
+              "cpu_ms_per_frame": 0.1042
+            }
+          ]
+        },
+        "level4": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 5356,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.12,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.125,
+              "cpu_ms_per_frame": 0.125
+            },
+            {
+              "cpu_s": 0.09,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.096,
+              "cpu_ms_per_frame": 0.0938
+            },
+            {
+              "cpu_s": 0.09,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.094,
+              "cpu_ms_per_frame": 0.0938
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.089,
+              "cpu_ms_per_frame": 0.0833
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.082,
+              "cpu_ms_per_frame": 0.0833
+            }
+          ]
+        },
+        "off": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 205437,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.05,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.06,
+              "cpu_ms_per_frame": 0.0521
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.06,
+              "cpu_ms_per_frame": 0.0625
+            },
+            {
+              "cpu_s": 0.06,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.058,
+              "cpu_ms_per_frame": 0.0625
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.058,
+              "cpu_ms_per_frame": 0.0521
+            },
+            {
+              "cpu_s": 0.05,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.055,
+              "cpu_ms_per_frame": 0.0521
+            }
+          ]
+        },
+        "notakeover": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 29303,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.13,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.132,
+              "cpu_ms_per_frame": 0.1354
+            },
+            {
+              "cpu_s": 0.12,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.129,
+              "cpu_ms_per_frame": 0.125
+            },
+            {
+              "cpu_s": 0.15,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.136,
+              "cpu_ms_per_frame": 0.1562
+            },
+            {
+              "cpu_s": 0.12,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.127,
+              "cpu_ms_per_frame": 0.125
+            },
+            {
+              "cpu_s": 0.12,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.128,
+              "cpu_ms_per_frame": 0.125
+            }
+          ]
+        },
+        "memlevel1": {
+          "wire": {
+            "mode": "card",
+            "repeat": 1,
+            "frames": 60,
+            "app_bytes": 205010,
+            "wire_s2c": 3604,
+            "wire_c2s": 299
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.108,
+              "cpu_ms_per_frame": 0.1042
+            },
+            {
+              "cpu_s": 0.1,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.107,
+              "cpu_ms_per_frame": 0.1042
+            },
+            {
+              "cpu_s": 0.11,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.114,
+              "cpu_ms_per_frame": 0.1146
+            },
+            {
+              "cpu_s": 0.07,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.074,
+              "cpu_ms_per_frame": 0.0729
+            },
+            {
+              "cpu_s": 0.08,
+              "frames": 960,
+              "app_bytes": 3280160,
+              "wall_s": 0.079,
+              "cpu_ms_per_frame": 0.0833
+            }
+          ]
+        }
+      },
+      "summary": {
+        "on": {
+          "wire_s2c": 3608,
+          "traffic_vs_default_pct": 0.0,
+          "cpu_ms_per_frame_median": 0.0833,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.09,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "control": {
+          "wire_s2c": 3581,
+          "traffic_vs_default_pct": -0.7,
+          "cpu_ms_per_frame_median": 0.0833,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.085,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "level1": {
+          "wire_s2c": 9904,
+          "traffic_vs_default_pct": 174.5,
+          "cpu_ms_per_frame_median": 0.1042,
+          "cpu_vs_default_pct": 25.1,
+          "wall_median": 0.097,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "level4": {
+          "wire_s2c": 5356,
+          "traffic_vs_default_pct": 48.4,
+          "cpu_ms_per_frame_median": 0.0938,
+          "cpu_vs_default_pct": 12.6,
+          "wall_median": 0.094,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "off": {
+          "wire_s2c": 205437,
+          "traffic_vs_default_pct": 5593.9,
+          "cpu_ms_per_frame_median": 0.0521,
+          "cpu_vs_default_pct": -37.5,
+          "wall_median": 0.058,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "notakeover": {
+          "wire_s2c": 29303,
+          "traffic_vs_default_pct": 712.2,
+          "cpu_ms_per_frame_median": 0.125,
+          "cpu_vs_default_pct": 50.1,
+          "wall_median": 0.129,
+          "frames": 60,
+          "app_bytes": 205010
+        },
+        "memlevel1": {
+          "wire_s2c": 3604,
+          "traffic_vs_default_pct": -0.1,
+          "cpu_ms_per_frame_median": 0.1042,
+          "cpu_vs_default_pct": 25.1,
+          "wall_median": 0.107,
+          "frames": 60,
+          "app_bytes": 205010
+        }
+      }
+    },
+    "models": {
+      "variants": {
+        "on": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 37235,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.3,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.299,
+              "cpu_ms_per_frame": 0.625
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.294,
+              "cpu_ms_per_frame": 0.6042
+            },
+            {
+              "cpu_s": 0.3,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.303,
+              "cpu_ms_per_frame": 0.625
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.296,
+              "cpu_ms_per_frame": 0.6042
+            },
+            {
+              "cpu_s": 0.32,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.316,
+              "cpu_ms_per_frame": 0.6667
+            }
+          ]
+        },
+        "control": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 37224,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.32,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.319,
+              "cpu_ms_per_frame": 0.6667
+            },
+            {
+              "cpu_s": 0.34,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.345,
+              "cpu_ms_per_frame": 0.7083
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.29,
+              "cpu_ms_per_frame": 0.6042
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.299,
+              "cpu_ms_per_frame": 0.6042
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.289,
+              "cpu_ms_per_frame": 0.6042
+            }
+          ]
+        },
+        "level1": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 57813,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.27,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.271,
+              "cpu_ms_per_frame": 0.5625
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.288,
+              "cpu_ms_per_frame": 0.5833
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.283,
+              "cpu_ms_per_frame": 0.6042
+            },
+            {
+              "cpu_s": 0.27,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.276,
+              "cpu_ms_per_frame": 0.5625
+            },
+            {
+              "cpu_s": 0.3,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.305,
+              "cpu_ms_per_frame": 0.625
+            }
+          ]
+        },
+        "level4": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 44030,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.36,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.365,
+              "cpu_ms_per_frame": 0.75
+            },
+            {
+              "cpu_s": 0.34,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.347,
+              "cpu_ms_per_frame": 0.7083
+            },
+            {
+              "cpu_s": 0.36,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.358,
+              "cpu_ms_per_frame": 0.75
+            },
+            {
+              "cpu_s": 0.33,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.337,
+              "cpu_ms_per_frame": 0.6875
+            },
+            {
+              "cpu_s": 0.34,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.34,
+              "cpu_ms_per_frame": 0.7083
+            }
+          ]
+        },
+        "off": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 970437,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.26,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.261,
+              "cpu_ms_per_frame": 0.5417
+            },
+            {
+              "cpu_s": 0.23,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.243,
+              "cpu_ms_per_frame": 0.4792
+            },
+            {
+              "cpu_s": 0.24,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.233,
+              "cpu_ms_per_frame": 0.5
+            },
+            {
+              "cpu_s": 0.23,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.238,
+              "cpu_ms_per_frame": 0.4792
+            },
+            {
+              "cpu_s": 0.26,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.26,
+              "cpu_ms_per_frame": 0.5417
+            }
+          ]
+        },
+        "notakeover": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 42197,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.32,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.327,
+              "cpu_ms_per_frame": 0.6667
+            },
+            {
+              "cpu_s": 0.36,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.363,
+              "cpu_ms_per_frame": 0.75
+            },
+            {
+              "cpu_s": 0.35,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.352,
+              "cpu_ms_per_frame": 0.7292
+            },
+            {
+              "cpu_s": 0.42,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.435,
+              "cpu_ms_per_frame": 0.875
+            },
+            {
+              "cpu_s": 0.62,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.633,
+              "cpu_ms_per_frame": 1.2917
+            }
+          ]
+        },
+        "memlevel1": {
+          "wire": {
+            "mode": "models",
+            "repeat": 1,
+            "frames": 30,
+            "app_bytes": 970130,
+            "wire_s2c": 42669,
+            "wire_c2s": 301
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.41,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.414,
+              "cpu_ms_per_frame": 0.8542
+            },
+            {
+              "cpu_s": 0.35,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.363,
+              "cpu_ms_per_frame": 0.7292
+            },
+            {
+              "cpu_s": 0.35,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.348,
+              "cpu_ms_per_frame": 0.7292
+            },
+            {
+              "cpu_s": 0.37,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.381,
+              "cpu_ms_per_frame": 0.7708
+            },
+            {
+              "cpu_s": 0.38,
+              "frames": 480,
+              "app_bytes": 15522080,
+              "wall_s": 0.373,
+              "cpu_ms_per_frame": 0.7917
+            }
+          ]
+        }
+      },
+      "summary": {
+        "on": {
+          "wire_s2c": 37235,
+          "traffic_vs_default_pct": 0.0,
+          "cpu_ms_per_frame_median": 0.625,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.299,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "control": {
+          "wire_s2c": 37224,
+          "traffic_vs_default_pct": -0.0,
+          "cpu_ms_per_frame_median": 0.6042,
+          "cpu_vs_default_pct": -3.3,
+          "wall_median": 0.299,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "level1": {
+          "wire_s2c": 57813,
+          "traffic_vs_default_pct": 55.3,
+          "cpu_ms_per_frame_median": 0.5833,
+          "cpu_vs_default_pct": -6.7,
+          "wall_median": 0.283,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "level4": {
+          "wire_s2c": 44030,
+          "traffic_vs_default_pct": 18.2,
+          "cpu_ms_per_frame_median": 0.7083,
+          "cpu_vs_default_pct": 13.3,
+          "wall_median": 0.347,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "off": {
+          "wire_s2c": 970437,
+          "traffic_vs_default_pct": 2506.2,
+          "cpu_ms_per_frame_median": 0.5,
+          "cpu_vs_default_pct": -20.0,
+          "wall_median": 0.243,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "notakeover": {
+          "wire_s2c": 42197,
+          "traffic_vs_default_pct": 13.3,
+          "cpu_ms_per_frame_median": 0.75,
+          "cpu_vs_default_pct": 20.0,
+          "wall_median": 0.363,
+          "frames": 30,
+          "app_bytes": 970130
+        },
+        "memlevel1": {
+          "wire_s2c": 42669,
+          "traffic_vs_default_pct": 14.6,
+          "cpu_ms_per_frame_median": 0.7708,
+          "cpu_vs_default_pct": 23.3,
+          "wall_median": 0.373,
+          "frames": 30,
+          "app_bytes": 970130
+        }
+      }
+    },
+    "panel": {
+      "variants": {
+        "on": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 22207,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.3,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.297,
+              "cpu_ms_per_frame": 0.0369
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.286,
+              "cpu_ms_per_frame": 0.0357
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.295,
+              "cpu_ms_per_frame": 0.0357
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.295,
+              "cpu_ms_per_frame": 0.0344
+            },
+            {
+              "cpu_s": 0.3,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.295,
+              "cpu_ms_per_frame": 0.0369
+            }
+          ]
+        },
+        "control": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 22181,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.31,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.298,
+              "cpu_ms_per_frame": 0.0381
+            },
+            {
+              "cpu_s": 0.32,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.327,
+              "cpu_ms_per_frame": 0.0394
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.304,
+              "cpu_ms_per_frame": 0.0357
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.282,
+              "cpu_ms_per_frame": 0.0357
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.287,
+              "cpu_ms_per_frame": 0.0344
+            }
+          ]
+        },
+        "level1": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 25631,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.22,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.231,
+              "cpu_ms_per_frame": 0.0271
+            },
+            {
+              "cpu_s": 0.24,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.23,
+              "cpu_ms_per_frame": 0.0295
+            },
+            {
+              "cpu_s": 0.22,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.229,
+              "cpu_ms_per_frame": 0.0271
+            },
+            {
+              "cpu_s": 0.26,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.259,
+              "cpu_ms_per_frame": 0.032
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.283,
+              "cpu_ms_per_frame": 0.0344
+            }
+          ]
+        },
+        "level4": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 23093,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.27,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.271,
+              "cpu_ms_per_frame": 0.0332
+            },
+            {
+              "cpu_s": 0.37,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.372,
+              "cpu_ms_per_frame": 0.0455
+            },
+            {
+              "cpu_s": 0.3,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.303,
+              "cpu_ms_per_frame": 0.0369
+            },
+            {
+              "cpu_s": 0.29,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.296,
+              "cpu_ms_per_frame": 0.0357
+            },
+            {
+              "cpu_s": 0.34,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.343,
+              "cpu_ms_per_frame": 0.0418
+            }
+          ]
+        },
+        "off": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 166425,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.2,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.203,
+              "cpu_ms_per_frame": 0.0246
+            },
+            {
+              "cpu_s": 0.17,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.177,
+              "cpu_ms_per_frame": 0.0209
+            },
+            {
+              "cpu_s": 0.19,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.189,
+              "cpu_ms_per_frame": 0.0234
+            },
+            {
+              "cpu_s": 0.16,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.173,
+              "cpu_ms_per_frame": 0.0197
+            },
+            {
+              "cpu_s": 0.19,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.181,
+              "cpu_ms_per_frame": 0.0234
+            }
+          ]
+        },
+        "notakeover": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 66523,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.36,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.365,
+              "cpu_ms_per_frame": 0.0443
+            },
+            {
+              "cpu_s": 0.39,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.389,
+              "cpu_ms_per_frame": 0.048
+            },
+            {
+              "cpu_s": 0.37,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.373,
+              "cpu_ms_per_frame": 0.0455
+            },
+            {
+              "cpu_s": 0.45,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.456,
+              "cpu_ms_per_frame": 0.0554
+            },
+            {
+              "cpu_s": 0.51,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.524,
+              "cpu_ms_per_frame": 0.0627
+            }
+          ]
+        },
+        "memlevel1": {
+          "wire": {
+            "mode": "panel",
+            "repeat": 1,
+            "frames": 508,
+            "app_bytes": 164236,
+            "wire_s2c": 22701,
+            "wire_c2s": 300
+          },
+          "cpu": [
+            {
+              "cpu_s": 0.37,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.376,
+              "cpu_ms_per_frame": 0.0455
+            },
+            {
+              "cpu_s": 0.37,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.37,
+              "cpu_ms_per_frame": 0.0455
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.284,
+              "cpu_ms_per_frame": 0.0344
+            },
+            {
+              "cpu_s": 0.28,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.283,
+              "cpu_ms_per_frame": 0.0344
+            },
+            {
+              "cpu_s": 0.3,
+              "frames": 8128,
+              "app_bytes": 2627776,
+              "wall_s": 0.302,
+              "cpu_ms_per_frame": 0.0369
+            }
+          ]
+        }
+      },
+      "summary": {
+        "on": {
+          "wire_s2c": 22207,
+          "traffic_vs_default_pct": 0.0,
+          "cpu_ms_per_frame_median": 0.0357,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.295,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "control": {
+          "wire_s2c": 22181,
+          "traffic_vs_default_pct": -0.1,
+          "cpu_ms_per_frame_median": 0.0357,
+          "cpu_vs_default_pct": 0.0,
+          "wall_median": 0.298,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "level1": {
+          "wire_s2c": 25631,
+          "traffic_vs_default_pct": 15.4,
+          "cpu_ms_per_frame_median": 0.0295,
+          "cpu_vs_default_pct": -17.4,
+          "wall_median": 0.231,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "level4": {
+          "wire_s2c": 23093,
+          "traffic_vs_default_pct": 4.0,
+          "cpu_ms_per_frame_median": 0.0369,
+          "cpu_vs_default_pct": 3.4,
+          "wall_median": 0.303,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "off": {
+          "wire_s2c": 166425,
+          "traffic_vs_default_pct": 649.4,
+          "cpu_ms_per_frame_median": 0.0234,
+          "cpu_vs_default_pct": -34.5,
+          "wall_median": 0.181,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "notakeover": {
+          "wire_s2c": 66523,
+          "traffic_vs_default_pct": 199.6,
+          "cpu_ms_per_frame_median": 0.048,
+          "cpu_vs_default_pct": 34.5,
+          "wall_median": 0.389,
+          "frames": 508,
+          "app_bytes": 164236
+        },
+        "memlevel1": {
+          "wire_s2c": 22701,
+          "traffic_vs_default_pct": 2.2,
+          "cpu_ms_per_frame_median": 0.0369,
+          "cpu_vs_default_pct": 3.4,
+          "wall_median": 0.302,
+          "frames": 508,
+          "app_bytes": 164236
+        }
+      }
+    }
+  }
+}

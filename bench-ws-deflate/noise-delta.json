@@ -1,0 +1,61 @@
+{
+  "on": {
+    "cpu_ms_per_frame": [
+      0.1042,
+      0.081,
+      0.0926,
+      0.1042,
+      0.081,
+      0.081,
+      0.0694,
+      0.081
+    ],
+    "median": 0.081,
+    "stdev": 0.0124,
+    "min": 0.0694,
+    "max": 0.1042,
+    "wall_median": 0.07505
+  },
+  "control": {
+    "cpu_ms_per_frame": [
+      0.081,
+      0.0694,
+      0.1157,
+      0.081,
+      0.081,
+      0.081,
+      0.0579,
+      0.081
+    ],
+    "median": 0.081,
+    "stdev": 0.0164,
+    "min": 0.0579,
+    "max": 0.1157,
+    "wall_median": 0.07014999999999999
+  },
+  "off": {
+    "cpu_ms_per_frame": [
+      0.0347,
+      0.0347,
+      0.0347,
+      0.0694,
+      0.0463,
+      0.0579,
+      0.0463,
+      0.0463
+    ],
+    "median": 0.0463,
+    "stdev": 0.0124,
+    "min": 0.0347,
+    "max": 0.0694,
+    "wall_median": 0.0451
+  },
+  "_noise_floor": {
+    "mode": "delta-coalesced",
+    "pairs": 8,
+    "median_diff_pct": 0.0,
+    "max_pair_diff_pct": 28.6,
+    "stdev_pct_on": 15.3,
+    "stdev_pct_control": 20.2
+  }
+}
