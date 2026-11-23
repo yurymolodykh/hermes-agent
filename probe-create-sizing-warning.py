@@ -82,7 +82,7 @@ show("4 критерия, широкий предел 14400 с (предупре
      make("probe: four criteria, wide wall", FOUR, max_runtime_seconds=14400))
 show("9 критериев, профиль 08-visual-media-designer (обе оси)",
      make("probe: nine criteria", BIG, assignee="08-visual-media-designer"))
-show("2 критерия, 'fits' на обеих осях",
+show("2 критерия (интерполяция 61→81 = 74 мин, поэтому ось минут честно срабатывает)",
      make("probe: two criteria", SMALL))
 print("\nA card with no acceptance heading cannot be sized — the rule stays silent:")
 print(f"  {kt._card_sizing_warning('03-software-engineer', 'Just make it work.')!r}")
