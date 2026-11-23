@@ -18,6 +18,12 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from gateway.owner_delivery_policy import (
+    OwnerDeliveryConfig,
+    classify_kanban_event,
+    filter_artifacts,
+    record_suppressed,
+)
 from gateway.wake import session_owned_by_profile
 
 
@@ -76,6 +82,45 @@ _REOPEN_EVENT_KINDS = (
     "created", "promoted", "unblocked", "claimed", "spawned", "worker_bound",
     "scheduled", "review_requested", "changes_requested", "respawn_guarded",
 )
+
+
+_CLOSED_ANCESTOR_STATUSES = frozenset({"done", "archived"})
+# Bound for the recursive ancestor walk: a malformed (cyclic) link graph must not hang a tick.
+_ANCESTOR_WALK_LIMIT = 200
+
+
+def has_open_ancestor(conn: Any, task_id: str) -> bool:
+    """Whether any transitive ancestor of ``task_id`` is still open (not done/archived).
+
+    A card finished under an open parent is an intermediate step of a bigger card, so
+    its completion is machine flow for the owner, not a deliverable. Cycle-safe and
+    never raises: an unreadable graph counts as "open" (the conservative side — better
+    to stay quiet in Telegram than to page the owner for a sub-step).
+    """
+    try:
+        seen: set[str] = {task_id}
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop()
+            rows = conn.execute(
+                "SELECT p.id, p.status FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ?",
+                (current,),
+            ).fetchall()
+            for row in rows:
+                parent_id = row["id"] if hasattr(row, "keys") else row[0]
+                status = row["status"] if hasattr(row, "keys") else row[1]
+                if parent_id in seen:
+                    continue
+                if str(status) not in _CLOSED_ANCESTOR_STATUSES:
+                    return True
+                if len(seen) >= _ANCESTOR_WALK_LIMIT:
+                    return True
+                seen.add(parent_id)
+                frontier.append(parent_id)
+    except Exception:  # a graph read must never break delivery
+        return True
+    return False
 
 
 def _epochs_for(conn: Any, task_id: str, kinds: tuple) -> list[int]:
