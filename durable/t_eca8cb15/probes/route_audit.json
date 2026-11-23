@@ -1,0 +1,443 @@
+{
+  "routers_dir": "hermes_cli/web_routers",
+  "modules": 38,
+  "stats": {
+    "registrations": 299,
+    "http_verb": 288,
+    "api_route": 1,
+    "websocket": 10,
+    "async": 269,
+    "def": 30,
+    "async_unique": 267,
+    "def_unique": 30,
+    "async_with_offload": 0
+  },
+  "blocking_handlers": [
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/analytics.py",
+      "file_line": 35,
+      "handler": "get_config_raw",
+      "route": "get /api/config/raw",
+      "route_line": 34,
+      "calls": [
+        [
+          50,
+          "path.exists"
+        ],
+        [
+          52,
+          "path.read_text"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/audio.py",
+      "file_line": 522,
+      "handler": "transcribe_stream_ws",
+      "route": "websocket /api/audio/transcribe-stream",
+      "route_line": 521,
+      "calls": [
+        [
+          593,
+          "asyncio.sleep"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/config_env.py",
+      "file_line": 1011,
+      "handler": "validate_provider_credential",
+      "route": "post /api/providers/validate",
+      "route_line": 1010,
+      "calls": [
+        [
+          1067,
+          "httpx.AsyncClient"
+        ],
+        [
+          1067,
+          "httpx.Timeout"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/dashboard_ui.py",
+      "file_line": 364,
+      "handler": "post_plugin_visibility",
+      "route": "post /api/dashboard/plugins/{name:path}/visibility",
+      "route_line": 363,
+      "calls": [
+        [
+          381,
+          "hidden_list.remove"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/dashboard_ui.py",
+      "file_line": 409,
+      "handler": "serve_plugin_asset",
+      "route": "get /dashboard-plugins/{plugin_name}/{file_path:path}",
+      "route_line": 408,
+      "calls": [
+        [
+          437,
+          "base.resolve"
+        ],
+        [
+          439,
+          "target.exists"
+        ],
+        [
+          439,
+          "target.is_file"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 428,
+      "handler": "get_media",
+      "route": "get /api/media",
+      "route_line": 427,
+      "calls": [
+        [
+          442,
+          "target.is_file"
+        ],
+        [
+          444,
+          "target.stat"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 472,
+      "handler": "proxy_remote_media",
+      "route": "get /api/media/proxy",
+      "route_line": 471,
+      "calls": [
+        [
+          495,
+          "httpx.AsyncClient"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 569,
+      "handler": "upload_chat_image",
+      "route": "post /api/chat/image-upload",
+      "route_line": 568,
+      "calls": [
+        [
+          596,
+          "target.write_bytes"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 936,
+      "handler": "upload_managed_file_stream",
+      "route": "post /api/files/upload-stream",
+      "route_line": 935,
+      "calls": [
+        [
+          946,
+          "target.parent.mkdir"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 1083,
+      "handler": "fs_write_text",
+      "route": "post /api/fs/write-text",
+      "route_line": 1082,
+      "calls": [
+        [
+          1122,
+          "target.stat"
+        ],
+        [
+          1134,
+          "target.parent.is_dir"
+        ],
+        [
+          1139,
+          "tmp.write_text"
+        ],
+        [
+          1140,
+          "os.replace"
+        ],
+        [
+          1142,
+          "tmp.unlink"
+        ],
+        [
+          1145,
+          "tmp.unlink"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 1389,
+      "handler": "fs_git_root",
+      "route": "get /api/fs/git-root",
+      "route_line": 1388,
+      "calls": [
+        [
+          1401,
+          "target.stat"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/local_models.py",
+      "file_line": 796,
+      "handler": "local_models_delete",
+      "route": "delete /api/local-models/models/{model_id}",
+      "route_line": 795,
+      "calls": [
+        [
+          803,
+          "path.unlink"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/local_models.py",
+      "file_line": 1041,
+      "handler": "local_models_sideload",
+      "route": "post /api/local-models/sideload",
+      "route_line": 1040,
+      "calls": [
+        [
+          1045,
+          "src.is_file"
+        ],
+        [
+          1048,
+          "dest.exists"
+        ],
+        [
+          1050,
+          "dest.parent.mkdir"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 500,
+      "handler": "get_memory_status",
+      "route": "get /api/memory",
+      "route_line": 499,
+      "calls": [
+        [
+          514,
+          "p.stat"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 544,
+      "handler": "reset_memory",
+      "route": "post /api/memory/reset",
+      "route_line": 543,
+      "calls": [
+        [
+          563,
+          "path.exists"
+        ],
+        [
+          565,
+          "path.unlink"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 601,
+      "handler": "run_backup",
+      "route": "post /api/ops/backup",
+      "route_line": 600,
+      "calls": [
+        [
+          608,
+          "archive.parent.mkdir"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 620,
+      "handler": "download_dashboard_backup",
+      "route": "get /api/ops/backup/download",
+      "route_line": 619,
+      "calls": [
+        [
+          631,
+          "target.is_file"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 666,
+      "handler": "run_import_upload",
+      "route": "post /api/ops/import-upload",
+      "route_line": 665,
+      "calls": [
+        [
+          674,
+          "staging_dir.mkdir"
+        ],
+        [
+          685,
+          "target.unlink"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
+      "file_line": 826,
+      "handler": "list_checkpoints",
+      "route": "get /api/ops/checkpoints",
+      "route_line": 825,
+      "calls": [
+        [
+          834,
+          "cp_dir.is_dir"
+        ],
+        [
+          835,
+          "os.scandir"
+        ],
+        [
+          838,
+          "child.is_dir"
+        ],
+        [
+          841,
+          "child.rglob"
+        ],
+        [
+          842,
+          "f.is_file"
+        ],
+        [
+          844,
+          "f.stat"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/profiles.py",
+      "file_line": 1124,
+      "handler": "open_profile_terminal_endpoint",
+      "route": "post /api/profiles/{name}/open-terminal",
+      "route_line": 1123,
+      "calls": [
+        [
+          1130,
+          "subprocess.Popen"
+        ],
+        [
+          1132,
+          "command.replace"
+        ],
+        [
+          1133,
+          "subprocess.Popen"
+        ],
+        [
+          1139,
+          "subprocess.Popen"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/profiles.py",
+      "file_line": 1195,
+      "handler": "get_profile_soul",
+      "route": "get /api/profiles/{name}/soul",
+      "route_line": 1194,
+      "calls": [
+        [
+          1201,
+          "soul_path.exists"
+        ],
+        [
+          1203,
+          "soul_path.read_text"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/profiles.py",
+      "file_line": 1237,
+      "handler": "apply_soul_questionnaire",
+      "route": "post /api/profiles/{name}/soul/apply-questionnaire",
+      "route_line": 1236,
+      "calls": [
+        [
+          1261,
+          "soul_path.exists"
+        ],
+        [
+          1261,
+          "soul_path.read_text"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/profiles.py",
+      "file_line": 1395,
+      "handler": "import_profile_endpoint",
+      "route": "post /api/profiles/import",
+      "route_line": 1394,
+      "calls": [
+        [
+          1419,
+          "overlay_path.is_file"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/skills.py",
+      "file_line": 458,
+      "handler": "get_skill_content",
+      "route": "get /api/skills/content",
+      "route_line": 457,
+      "calls": [
+        [
+          468,
+          "skill_md.exists"
+        ],
+        [
+          471,
+          "skill_md.read_text"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/webapp_relay_proxy.py",
+      "file_line": 294,
+      "handler": "relay_ws",
+      "route": "websocket ",
+      "route_line": 293,
+      "calls": [
+        [
+          326,
+          "connect"
+        ]
+      ]
+    }
+  ],
+  "async_with_offload": 84
+}
