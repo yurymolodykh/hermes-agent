@@ -1,0 +1,122 @@
+{
+  "parallel": 8,
+  "mib": 8,
+  "runs": [
+    {
+      "mode": "inline",
+      "parallel": 8,
+      "payload_mib": 8,
+      "burst_wall_ms": 111.0,
+      "ticks_inside_burst": 1,
+      "loop_unavailable": {
+        "max_gap_ms": 110.9,
+        "p99_gap_ms": 110.9,
+        "p50_gap_ms": 110.9,
+        "gaps_ms": [
+          0.1,
+          110.9
+        ]
+      },
+      "offload_counters": {
+        "mode": "inline",
+        "enabled": false,
+        "workers": 0,
+        "submitted": 0,
+        "inline": 8,
+        "in_flight": 0,
+        "queue_depth": 0,
+        "max_queue_depth": 0,
+        "avg_wait_ms": 0.0
+      }
+    },
+    {
+      "mode": "threaded",
+      "parallel": 8,
+      "payload_mib": 8,
+      "burst_wall_ms": 106.7,
+      "ticks_inside_burst": 4,
+      "loop_unavailable": {
+        "max_gap_ms": 78.8,
+        "p99_gap_ms": 78.8,
+        "p50_gap_ms": 10.2,
+        "gaps_ms": [
+          0.2,
+          78.8,
+          10.7,
+          10.2,
+          6.8
+        ]
+      },
+      "offload_counters": {
+        "mode": "threaded",
+        "enabled": true,
+        "workers": 8,
+        "submitted": 8,
+        "inline": 8,
+        "in_flight": 0,
+        "queue_depth": 0,
+        "max_queue_depth": 8,
+        "avg_wait_ms": 55.03
+      }
+    },
+    {
+      "mode": "inline",
+      "parallel": 8,
+      "payload_mib": 8,
+      "burst_wall_ms": 795.9,
+      "ticks_inside_burst": 1,
+      "loop_unavailable": {
+        "max_gap_ms": 795.7,
+        "p99_gap_ms": 795.7,
+        "p50_gap_ms": 795.7,
+        "gaps_ms": [
+          0.1,
+          795.7
+        ]
+      },
+      "offload_counters": {
+        "mode": "inline",
+        "enabled": false,
+        "workers": 0,
+        "submitted": 8,
+        "inline": 16,
+        "in_flight": 0,
+        "queue_depth": 0,
+        "max_queue_depth": 8,
+        "avg_wait_ms": 55.03
+      }
+    },
+    {
+      "mode": "threaded",
+      "parallel": 8,
+      "payload_mib": 8,
+      "burst_wall_ms": 90.4,
+      "ticks_inside_burst": 6,
+      "loop_unavailable": {
+        "max_gap_ms": 38.6,
+        "p99_gap_ms": 38.6,
+        "p50_gap_ms": 10.1,
+        "gaps_ms": [
+          0.1,
+          10.3,
+          10.1,
+          10.1,
+          38.6,
+          12.9,
+          8.3
+        ]
+      },
+      "offload_counters": {
+        "mode": "threaded",
+        "enabled": true,
+        "workers": 8,
+        "submitted": 16,
+        "inline": 16,
+        "in_flight": 0,
+        "queue_depth": 0,
+        "max_queue_depth": 8,
+        "avg_wait_ms": 68.17
+      }
+    }
+  ]
+}
