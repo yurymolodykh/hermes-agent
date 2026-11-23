@@ -246,6 +246,131 @@ def test_a_complete_copy_clears_the_loss_record_and_a_shrunk_tree_is_copied(
     assert not (task_attachments_dir("t_probe") / "wip-partial.json").exists()
 
 
+def test_reuse_of_an_existing_archive_clears_the_stale_loss_record(card_env, monkeypatch):
+    """A tree that comes back to an already-copied state must not keep the loss record.
+
+    The reuse branch returns the existing complete archive before the write path
+    runs, so the overwritten ``wip-partial.json`` ("the tree is over the cap, not
+    one file was copied") used to outlive the loss it described. A human opening
+    the card's attachments then read a false statement next to a real copy.
+    """
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    workspace, _home = card_env
+    (workspace / "a.txt").write_text("A" * 100, encoding="utf-8")
+    (workspace / "b.txt").write_text("B" * 100, encoding="utf-8")
+    before = {n: (workspace / n).stat() for n in ("a.txt", "b.txt")}
+
+    first = kbc.preserve_wip_tree(task_id="t_probe")
+    assert first.mode == "archive" and first.locator
+    out_dir = task_attachments_dir("t_probe")
+
+    monkeypatch.setattr(kbc, "_ARCHIVE_MAX_BYTES", 1024)
+    (workspace / "a.txt").write_text("A" * 5000, encoding="utf-8")
+    over = kbc.preserve_wip_tree(task_id="t_probe")
+    assert over.mode == "partial"
+    assert (out_dir / "wip-partial.json").exists()
+
+    # Back to exactly the copied state: same bytes, same sizes, same mtimes.
+    (workspace / "a.txt").write_text("A" * 100, encoding="utf-8")
+    for name, st in before.items():
+        os.utime(workspace / name, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    again = kbc.preserve_wip_tree(task_id="t_probe")
+    assert again.mode == "archive"
+    assert str(again.locator) == str(first.locator)
+    assert not (out_dir / "wip-partial.json").exists(), (
+        "the loss record outlived the loss it describes"
+    )
+
+
+def test_archive_retention_bounds_the_complete_pairs(card_env):
+    """Every distinct tree earns its own copy; the directory must not grow forever."""
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    workspace, _home = card_env
+    written = []
+    for i in range(6):
+        (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
+        # A distinct mtime per generation: the fingerprint includes it by design.
+        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
+        out = kbc.preserve_wip_tree(task_id="t_probe")
+        assert out.mode == "archive"
+        written.append(str(out.locator))
+
+    out_dir = task_attachments_dir("t_probe")
+    tarballs = sorted(p.name for p in out_dir.glob("wip-*.tar.gz"))
+    markers = sorted(p.name for p in out_dir.glob("wip-*.tar.gz.done"))
+    assert len(tarballs) <= kbc._ARCHIVE_RETENTION, f"unbounded history: {tarballs}"
+    assert len(markers) == len(tarballs), f"pairs must stay paired: {tarballs} / {markers}"
+    assert Path(written[-1]).name in tarballs, "the newest copy is always kept"
+    # No orphan markers left behind by the pruning.
+    for marker in out_dir.glob("wip-*.tar.gz.done"):
+        assert marker.with_name(marker.name[: -len(".done")]).exists()
+
+
+def test_archive_retention_keeps_one_generation_of_unmarked_tarballs(card_env):
+    """Legacy archives (no ``.done``) are not reusable but one generation is kept."""
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    workspace, _home = card_env
+    out_dir = task_attachments_dir("t_probe")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    legacy = []
+    for index, stamp in enumerate(("20260101T000000", "20260102T000000", "20260103T000000")):
+        archive = out_dir / f"wip-{stamp}.tar.gz"
+        archive.write_bytes(b"legacy")
+        os.utime(archive, ns=(1_700_000_000_000_000_000 + index * 10**9,) * 2)
+        legacy.append(archive)
+
+    (workspace / "a.txt").write_text("fresh\n", encoding="utf-8")
+    assert kbc.preserve_wip_tree(task_id="t_probe").mode == "archive"
+
+    surviving = [p.name for p in legacy if p.exists()]
+    assert surviving == [legacy[-1].name], (
+        f"one generation of unmarked archives survives, not all: {surviving}"
+    )
+
+
+def test_retention_never_deletes_the_copy_the_reminder_names(card_env):
+    """A tree restored to an older state reuses an old copy; pruning must spare it.
+
+    The reuse branch hands the model the archive that already holds this exact
+    tree — which is now the *oldest* file on disk. Pruning by recency alone would
+    delete the very path the reminder text names, so the live pointer is exempt.
+    """
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    workspace, _home = card_env
+    (workspace / "a.txt").write_text("gen-0\n", encoding="utf-8")
+    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000,) * 2)
+    first = kbc.preserve_wip_tree(task_id="t_probe")
+    assert first.mode == "archive"
+    base_bytes = (workspace / "a.txt").read_bytes()
+
+    for i in range(1, 6):
+        (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
+        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
+        assert kbc.preserve_wip_tree(task_id="t_probe").mode == "archive"
+
+    # Back to the first generation: the reuse branch names the oldest archive.
+    (workspace / "a.txt").write_bytes(base_bytes)
+    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000,) * 2)
+    reused = kbc.preserve_wip_tree(task_id="t_probe")
+    assert reused.mode == "archive"
+    assert str(reused.locator) == str(first.locator)
+
+    named = Path(reused.locator)
+    assert named.exists(), "the copy the reminder names was pruned"
+    assert named.with_name(named.name + ".done").exists()
+    out_dir = task_attachments_dir("t_probe")
+    assert len(list(out_dir.glob("wip-*.tar.gz"))) <= kbc._ARCHIVE_RETENTION + 1
+
+
 def test_a_legacy_tarball_without_a_done_marker_is_not_reused(card_env):
     """Archives written before the marker existed are not provably complete.
 
