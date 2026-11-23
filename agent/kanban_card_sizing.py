@@ -41,6 +41,17 @@ BASE_ITERATIONS = 40
 # Head-room for the model's own bookkeeping turns (comments, heartbeats, greps).
 SAFETY_MARGIN = 1.0
 
+# Minutes are a second, independent axis: a card can fit its iteration budget and
+# still run for two hours. Measured on the shared board (672 runs, 17–23.11.2026,
+# successful runs only, duration = task_runs.ended_at − started_at): 65 % of runs
+# landed under 50 min with 0–4 acceptance items, 43 % with 5–6. Text features (body
+# length, file/line counts) separate duration poorly (AUC 0.58–0.60), so minutes are
+# allotted from the one feature that does: the acceptance-item count.
+BASE_MINUTES = 12
+MINUTES_PER_ITEM = 6
+# The owner's target for one run: a card is authored to close in 30–50 minutes.
+CARD_MINUTE_TARGET = 50
+
 _ACCEPTANCE_HEADING = re.compile(
     r"(?im)^\s*(?:#+\s*)?(?:\*\*)?\s*(?:приёмка|приемка|acceptance|критерии|"
     r"definition of done|done when)\b"
@@ -48,14 +59,33 @@ _ACCEPTANCE_HEADING = re.compile(
 _ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+\S")
 
 
+def estimate_minutes(acceptance_items: int) -> int:
+    """Minutes the rule allots to a card with this many acceptance items.
+
+    ``12 + 6 × items``: the fixed overhead of orienting and handing off plus six
+    minutes per acceptance criterion. Fitted on the shared board's successful runs
+    (see ``BASE_MINUTES``), so 3 items ≈ 30 min and 6 ≈ 48 min — the second lands
+    just under ``CARD_MINUTE_TARGET`` and a 7th item pushes the card over it.
+    """
+    return BASE_MINUTES + MINUTES_PER_ITEM * max(0, acceptance_items)
+
+
 @dataclass(frozen=True)
 class CardSizeEstimate:
-    """Estimated iterations for a card, and whether they exceed a budget."""
-
+    """Estimated iterations and minutes for a card, and whether they exceed a budget."""
     acceptance_items: int
     body_bytes: int
     estimated_iterations: int
     budget: Optional[int]
+    estimated_minutes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        # Derived rather than required: every caller that sizes a card gets the minute
+        # figure for free, and a hand-built estimate cannot disagree with the formula.
+        if self.estimated_minutes is None:
+            object.__setattr__(
+                self, "estimated_minutes", estimate_minutes(self.acceptance_items)
+            )
 
     @property
     def fits(self) -> bool:
@@ -119,7 +149,8 @@ def sizing_warning(estimate: CardSizeEstimate, *, assignee: str) -> Optional[str
         f"card volume may exceed the assignee's iteration budget: "
         f"{estimate.acceptance_items} acceptance items ≈ "
         f"{estimate.estimated_iterations} iterations vs {estimate.budget} for "
-        f"'{assignee}'. Split the card, or raise `agent.max_turns` for that profile, "
+        f"'{assignee}', ≈ {estimate.estimated_minutes} мин при цели 30–{CARD_MINUTE_TARGET}. "
+        f"Split the card, or raise `agent.max_turns` for that profile, "
         f"or accept that it may stop mid-work (the WIP checkpoint keeps the tree)."
     )
 
@@ -162,11 +193,15 @@ def assignee_iteration_budget(assignee: str) -> Optional[int]:
 
 __all__ = [
     "BASE_ITERATIONS",
+    "BASE_MINUTES",
+    "CARD_MINUTE_TARGET",
     "ITERATIONS_PER_CRITERION",
+    "MINUTES_PER_ITEM",
     "CardSizeEstimate",
     "assignee_iteration_budget",
     "count_acceptance_items",
     "estimate_card",
     "estimate_iterations",
+    "estimate_minutes",
     "sizing_warning",
 ]

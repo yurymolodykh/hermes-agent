@@ -20,6 +20,7 @@ put the card back in ``todo`` first, exactly as a re-gate does.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -170,3 +171,69 @@ def test_unknown_budget_stays_silent(kanban_home: Path, monkeypatch: pytest.Monk
         tid = _promotable(conn, BIG)
         assert kb.get_task(conn, tid).status == "ready"
         assert _sizing_comments(conn, tid) == []
+
+
+def test_create_writes_the_default_hard_wall_into_the_row(kanban_home: Path) -> None:
+    """A card created without ``max_runtime_seconds`` carries 3600 in its own row:
+    the wall belongs to the card, and the dispatcher has no global default."""
+    from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
+
+    assert DEFAULT_MAX_RUNTIME_SECONDS == 3600
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unstated wall", assignee="03-software-engineer")
+        assert kb.get_task(conn, tid).max_runtime_seconds == 3600
+        row = conn.execute(
+            "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row[0] == 3600, "the value must be in the row, not a read-time default"
+
+
+def test_explicit_max_runtime_beats_the_default(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stated wall", assignee="03-software-engineer",
+            max_runtime_seconds=900,
+        )
+        assert kb.get_task(conn, tid).max_runtime_seconds == 900
+
+
+def test_preexisting_null_row_stays_uncapped(kanban_home: Path) -> None:
+    """Cards created before this default keep NULL (= no wall): the default is
+    written at creation only, so nothing rescales an existing board."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="03-software-engineer")
+        conn.execute("UPDATE tasks SET max_runtime_seconds = NULL WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.get_task(conn, tid).max_runtime_seconds is None
+
+
+def test_create_tool_response_reports_minutes_and_the_written_wall(monkeypatch, tmp_path):
+    """The ``kanban_create`` answer carries the minute estimate always and the wall
+    the row actually got, so a creator sees 3600 when it passed nothing."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.kanban_card_sizing.assignee_iteration_budget", lambda assignee: 300,
+    )
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    from tools import kanban_tools as kt
+
+    body = "## Приёмка\n" + "".join(f"- критерий {i}\n" for i in range(3))
+    d = json.loads(kt._handle_create({
+        "title": "three criteria", "assignee": "03-software-engineer",
+        "body": body, "workspace_kind": "scratch",
+    }))
+
+    assert d["ok"] is True
+    assert d["estimated_minutes"] == 30
+    assert d["max_runtime_seconds"] == 3600
+
+    explicit = json.loads(kt._handle_create({
+        "title": "narrow wall", "assignee": "03-software-engineer",
+        "body": body, "workspace_kind": "scratch", "max_runtime_seconds": 900,
+    }))
+    assert explicit["max_runtime_seconds"] == 900

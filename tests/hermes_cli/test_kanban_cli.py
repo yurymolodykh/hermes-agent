@@ -73,17 +73,20 @@ def test_run_slash_stats_text_includes_review_lane(kanban_home):
 
 
 def test_kanban_show_json_includes_runtime_limit(kanban_home):
+    """An explicit cap is shown verbatim; an omitted one still lands as the 3600 s
+    hard wall ``create_task`` writes into the row (see DEFAULT_MAX_RUNTIME_SECONDS) —
+    the default is a created-row value, never a read-time fallback."""
     with kbc.connect() as conn:
         bounded_id = kb.create_task(
             conn, title="bounded task", max_runtime_seconds=2700
         )
-        uncapped_id = kb.create_task(conn, title="uncapped task")
+        defaulted_id = kb.create_task(conn, title="defaulted task")
 
     bounded = json.loads(kc.run_slash(f"show {bounded_id} --json"))
-    uncapped = json.loads(kc.run_slash(f"show {uncapped_id} --json"))
+    defaulted = json.loads(kc.run_slash(f"show {defaulted_id} --json"))
 
     assert bounded["task"]["max_runtime_seconds"] == 2700
-    assert uncapped["task"]["max_runtime_seconds"] is None
+    assert defaulted["task"]["max_runtime_seconds"] == 3600
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

@@ -344,6 +344,15 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
+
+# Hard wall-clock cap written into every card created without an explicit
+# ``max_runtime_seconds``. The board's median run is ~35 min but 34 % of successful
+# runs exceeded 50 min (mean 89, p90 ≈ 95), and a card that is authored to close in
+# 30–50 min should never reach a safety limit at all. The soft time budget already
+# reaches profiles through ``agent.run_budget_seconds: 2700``; this is the hard stop
+# behind it. It is written into the ROW at creation, deliberately NOT a dispatcher
+# default, so cards that already exist keep their own (NULL = uncapped) value.
+DEFAULT_MAX_RUNTIME_SECONDS = 3600
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )
@@ -1300,6 +1309,11 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # The hard wall belongs to the card and is written into its row: an explicit value
+    # always wins, and a card created before this default keeps its own NULL (uncapped),
+    # because nothing downstream reads this as a dispatcher-wide fallback.
+    if max_runtime_seconds is None:
+        max_runtime_seconds = DEFAULT_MAX_RUNTIME_SECONDS
     if not title or not title.strip():
         raise ValueError("title is required")
     # Fuse (t_e0c9e1ce): a card with NO author and no named owner is the exact
