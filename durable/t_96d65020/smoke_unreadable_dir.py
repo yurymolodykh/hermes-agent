@@ -23,8 +23,8 @@ os.environ["HERMES_HOME"] = str(home)
 os.environ["HERMES_KANBAN_HOME"] = str(kanban_home)
 sys.path.insert(0, str(WORK))
 
-from hermes_cli import kanban_db as kb  # noqa: E402
-from hermes_cli import kanban_db_connect as kbc  # noqa: E402
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 kb.init_db()
 with kbc.connect() as conn:
@@ -37,7 +37,8 @@ ws = kb.workspaces_root() / tid
 repo = ws / "mid" / "clone"
 repo.mkdir(parents=True)
 def git(*a: str) -> None:
-    subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True,
+                   encoding="utf-8", errors="replace", timeout=60)
 git("init", "-b", "main", str(repo))
 git("config", "user.email", "t@e.com")
 git("config", "user.name", "t")

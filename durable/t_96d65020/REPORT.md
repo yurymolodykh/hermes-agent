@@ -152,7 +152,14 @@ CHECK board gone: True
 | `evidence/green-full.txt` | те же + `test_kanban_boards.py` (соседний набор борд): **58 passed, 2 failed** — ровно те же два предсуществующих падения, что и на базе (`evidence/base-boards.txt`: 24 passed, те же 2 failed), наши правки их не добавляют |
 | `evidence/green-neighbours.txt` | `tests/plugins/test_kanban_dashboard_plugin.py`, `test_kanban_cli.py`, `test_kanban_board_path_priority.py`, `test_kanban_board_project.py` — **67 passed** |
 | `evidence/base-boards.txt` | база по `test_kanban_boards.py`: 2 предсуществующих падения (`TestWorkerSpawnEnv`, `test_per_board_task_isolation_via_cli`) — те же на патче, не наши |
-| `ruff check` | All checks passed (5 изменённых модулей + 2 тестовых файла) |
+| `evidence/green-round2.txt` | раунд 2: `scratch_unsaved_work` + `board_delete_guard` + `gc_retention` — **37 passed** |
+| `evidence/red-base-pin-round2.txt` | раунд 2, красная база: `test_refusal_does_not_clear_the_active_board` и `test_cli_refusal_keeps_the_active_board` — **2 failed** на коде до правки (`assert 'default' == 'pinboard'`) |
+| `evidence/red-base-dashboard.txt` | раунд 2, красная база: дашбордный `DELETE ...?delete=true` на `b55cbeb3c64` возвращает 200 и сносит каталог — **1 failed** |
+| `evidence/smoke-unreadable-dir-round2.txt` | живой `chmod 000` на промежуточном каталоге: workspace сохранён, сосед цел, ровно одно событие, reason = `workspace tree not fully readable` |
+| `evidence/smoke-boards-rm-round2.txt` | живой CLI: `current before: smokeboard` → `rm --delete` exit 1 → `current after refusal: smokeboard` (пин выжил) → `--delete --force` exit 0 со списком путей |
+| `ruff check` | All checks passed по всем изменённым файлам; дерево целиком 79 находок = 79 на `b55cbeb3c64` (новых строк нет) |
+| `code_health --base b55cbeb3c64` | **0 blocking, 0 advisory** (16 файлов) |
+
 
 Команда прогона:
 
@@ -164,6 +171,27 @@ PYTHONPATH="$PWD:/home/hermes/.hermes/hermes-agent/.venv/lib/python3.14/site-pac
   tests/hermes_cli/test_kanban_board_delete_guard.py \
   tests/hermes_cli/test_kanban_gc_retention.py -q -p no:cacheprovider
 ```
+
+---
+
+## Раунд 2 — правки по ревью
+
+| Замечание ревью | Что сделано | Локатор |
+|---|---|---|
+| Отказ `rm --delete` снимал активную борду: `clear_current_board()` стоял до проверки | Обход `workspaces/` + `ValueError` перенесены **выше** любых мутаций (`clear_current_board`, `_INITIALIZED_PATHS.discard`); при `--force` результат тот же, что и раньше | `hermes_cli/kanban_db_boards.py:240-256` |
+| Тесты на пин отсутствовали | 3 новых теста: отказ не меняет `get_current_board()` (backend и реальный CLI-диспетчер), успешное удаление по-прежнему откатывает пин на `default` | `tests/hermes_cli/test_kanban_board_delete_guard.py:200,216,228` |
+| Смоук-скрипты валили гейт: PLW1510, RUF100, HX006 (git без `timeout=`) | `check=False, encoding="utf-8", errors="replace", timeout=` во всех `subprocess.run`, `# noqa: E402` убраны | `durable/t_96d65020/smoke_boards_rm.py:27,37`, `smoke_unreadable_dir.py:39` |
+| `REPORT.md` заявлял «All checks passed» без оговорки | Таблица прогонов дополнена полной атрибуцией ruff (79 = 79) и `code_health` (0 blocking, 0 advisory) | этот файл, раздел «Прогоны» |
+| Справочник CLI не описывал защиту | Строка `boards rm` в справочнике дополнена отказом при несохранённой/непроверяемой работе и флагом `--force` | `website/docs/reference/cli-commands.md:834` |
+| chmod-000 тесты без `skipif(root)` | `pytest.mark.skipif(os.geteuid() == 0)` на трёх chmod-тестах (конвенция `tests/AGENTS.md`) | `test_kanban_scratch_unsaved_work.py:251`, `test_kanban_board_delete_guard.py:173` |
+| Дашбордный путь не имел своего теста на отказ | Новый тест: `DELETE /boards/widget?delete=true` → 400 со списком путей, `&force=true` → 200 + `result.preserved` | `tests/plugins/test_kanban_board_lifecycle_api.py:87` |
+
+Прогон через `durable/t_96d65020/run_pytest.py` (композитный интерпретатор: `.venv` даёт ruamel/fastapi,
+`t72venv` — pytest; bridge строится в скрипте, чтобы общий checkout не попадал в командную строку).
+
+Дополнительно зелёные: `tests/plugins/test_kanban_board_lifecycle_api.py` + `test_kanban_dashboard_plugin.py`
++ три целевых файла — **80 passed**; `test_kanban_cli.py`, `test_kanban_board_path_priority.py`,
+`test_kanban_board_project.py`, `test_kanban_db_init.py` — **34 passed**.
 
 ---
 

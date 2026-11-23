@@ -1,0 +1,60 @@
+$ /home/hermes/t72venv/bin/python -m pytest tests/hermes_cli/test_kanban_board_delete_guard.py -q -k pin or refusal
+.F.F                                                                     [100%]
+=================================== FAILURES ===================================
+_________________ test_refusal_does_not_clear_the_active_board _________________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-2178/test_refusal_does_not_clear_th0/hermes_home')
+
+    def test_refusal_does_not_clear_the_active_board(fresh_home):
+        """A refused hard delete must not cost the operator the active-board pin.
+    
+        The guard used to run *after* ``clear_current_board()``, so a failed
+        ``rm --delete`` silently reverted the session to ``default`` even though the
+        board (and its work) was still there.
+        """
+        _task_id, _ws = _board_with_scratch_task("pinboard", unsaved=True)
+        kb.set_current_board("pinboard")
+        assert kb.get_current_board() == "pinboard"
+    
+        with pytest.raises(ValueError):
+            kb.remove_board("pinboard", archive=False)
+    
+>       assert kb.get_current_board() == "pinboard", "a refusal must leave the pin alone"
+E       AssertionError: a refusal must leave the pin alone
+E       assert 'default' == 'pinboard'
+E         
+E         - pinboard
+E         + default
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:214: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_811a7ec9: unsaved work (no remote-tracking refs (nothing pushed)) in /tmp/pytest-of-hermes/pytest-2178/test_refusal_does_not_clear_th0/hermes_home/kanban/boards/pinboard/workspaces/t_811a7ec9/clone — /tmp/pytest-of-hermes/pytest-2178/test_refusal_does_not_clear_th0/hermes_home/kanban/boards/pinboard/workspaces/t_811a7ec9 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+___________________ test_cli_refusal_keeps_the_active_board ____________________
+
+fresh_home = PosixPath('/tmp/pytest-of-hermes/pytest-2178/test_cli_refusal_keeps_the_act0/hermes_home')
+
+    def test_cli_refusal_keeps_the_active_board(fresh_home):
+        """End-to-end through the real parser/dispatcher: exit 1 and the pin survives."""
+        _task_id, _ws = _board_with_scratch_task("clipin", unsaved=True)
+        kb.set_current_board("clipin")
+    
+        result = _run_cli(["boards", "rm", "clipin", "--delete"])
+    
+        assert result.returncode != 0
+>       assert kb.get_current_board() == "clipin"
+E       AssertionError: assert 'default' == 'clipin'
+E         
+E         - clipin
+E         + default
+
+tests/hermes_cli/test_kanban_board_delete_guard.py:237: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_05764dd0: unsaved work (no remote-tracking refs (nothing pushed)) in /tmp/pytest-of-hermes/pytest-2178/test_cli_refusal_keeps_the_act0/hermes_home/kanban/boards/clipin/workspaces/t_05764dd0/clone — /tmp/pytest-of-hermes/pytest-2178/test_cli_refusal_keeps_the_act0/hermes_home/kanban/boards/clipin/workspaces/t_05764dd0 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+=========================== short test summary info ============================
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_refusal_does_not_clear_the_active_board
+FAILED tests/hermes_cli/test_kanban_board_delete_guard.py::test_cli_refusal_keeps_the_active_board
+2 failed, 2 passed, 7 deselected in 5.77s
+/home/hermes/t72venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:299: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))

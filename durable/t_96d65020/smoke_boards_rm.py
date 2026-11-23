@@ -26,7 +26,8 @@ PY = sys.executable
 
 def cli(*args: str) -> subprocess.CompletedProcess:
     r = subprocess.run([PY, "-m", "hermes_cli.main", "kanban", *args], env=env, cwd=str(WORK),
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, check=False,
+                       encoding="utf-8", errors="replace", timeout=180)
     print(f"$ hermes kanban {' '.join(args)}  -> exit {r.returncode}")
     print((r.stdout or "").strip())
     if r.stderr.strip():
@@ -35,7 +36,8 @@ def cli(*args: str) -> subprocess.CompletedProcess:
 
 
 def git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+                   encoding="utf-8", errors="replace", timeout=60)
 
 
 sys.path.insert(0, str(WORK))
@@ -45,8 +47,8 @@ for _var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN
     os.environ.pop(_var, None)
 os.environ["HERMES_HOME"] = str(home)
 os.environ["HERMES_KANBAN_HOME"] = str(kanban_home)
-from hermes_cli import kanban_db as kb  # noqa: E402
-from hermes_cli import kanban_db_connect as kbc  # noqa: E402
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 cli("boards", "create", "smokeboard")
 with kbc.connect_closing(board="smokeboard") as conn:
@@ -67,7 +69,13 @@ with kbc.connect_closing(board="smokeboard") as conn:
 board_dir = kb.board_dir("smokeboard")
 print("board dir exists:", board_dir.is_dir(), board_dir)
 
+# The refusal must not cost the operator the active-board pin.
+cli("boards", "switch", "smokeboard")
+print("current before:", kb.get_current_board())
+
 refuse = cli("boards", "rm", "smokeboard", "--delete")
+print("current after refusal:", kb.get_current_board())
+print("CHECK pin survived refusal:", kb.get_current_board() == "smokeboard")
 print("CHECK refused(rc!=0):", refuse.returncode != 0)
 print("CHECK board intact:", board_dir.is_dir())
 print("CHECK file intact:", (repo / "w.txt").read_text(encoding="utf-8").strip() == "only copy")

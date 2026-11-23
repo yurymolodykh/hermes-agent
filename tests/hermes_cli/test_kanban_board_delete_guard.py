@@ -11,6 +11,7 @@ else (or cannot be verified), unless ``force=True``.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -169,6 +170,7 @@ def test_archive_rename_path_is_unchanged(fresh_home):
     assert (moved / "clone" / "work.txt").read_text(encoding="utf-8") == "only copy\n"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 0o000 directory")
 def test_unreadable_workspace_root_also_vetoes_the_delete(fresh_home):
     """"Could not look" is not "nothing there": an unlistable root blocks the delete."""
     _task_id, ws = _board_with_scratch_task("lockedboard", unsaved=False)
@@ -193,6 +195,46 @@ def test_cli_reports_the_refusal(fresh_home, tmp_path):
     assert "unsaved work" in combined
     assert "--force" in combined
     assert kb.board_dir("cliboard").is_dir()
+
+
+def test_refusal_does_not_clear_the_active_board(fresh_home):
+    """A refused hard delete must not cost the operator the active-board pin.
+
+    The guard used to run *after* ``clear_current_board()``, so a failed
+    ``rm --delete`` silently reverted the session to ``default`` even though the
+    board (and its work) was still there.
+    """
+    _task_id, _ws = _board_with_scratch_task("pinboard", unsaved=True)
+    kb.set_current_board("pinboard")
+    assert kb.get_current_board() == "pinboard"
+
+    with pytest.raises(ValueError):
+        kb.remove_board("pinboard", archive=False)
+
+    assert kb.get_current_board() == "pinboard", "a refusal must leave the pin alone"
+    assert kb.current_board_path().exists()
+
+
+def test_successful_delete_still_reverts_the_pin(fresh_home):
+    """The reversion the guard must not break: a real delete still falls back to default."""
+    _task_id, _ws = _board_with_scratch_task("goneboard", unsaved=False)
+    kb.set_current_board("goneboard")
+
+    kb.remove_board("goneboard", archive=False)
+
+    assert kb.get_current_board() == kb.DEFAULT_BOARD
+    assert not kb.current_board_path().exists()
+
+
+def test_cli_refusal_keeps_the_active_board(fresh_home):
+    """End-to-end through the real parser/dispatcher: exit 1 and the pin survives."""
+    _task_id, _ws = _board_with_scratch_task("clipin", unsaved=True)
+    kb.set_current_board("clipin")
+
+    result = _run_cli(["boards", "rm", "clipin", "--delete"])
+
+    assert result.returncode != 0
+    assert kb.get_current_board() == "clipin"
 
 
 def test_cli_force_deletes_and_lists_paths(fresh_home, tmp_path):

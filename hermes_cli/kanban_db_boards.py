@@ -237,6 +237,22 @@ def remove_board(slug: str, *, archive: bool = True, force: bool = False) -> dic
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
+    # Vet a hard delete BEFORE anything mutates: the guard walks the board and
+    # records the save on each task, but a refusal must not cost the operator
+    # the active-board pin. (The archive path only renames the tree, so the
+    # preserved workspaces travel with it.)
+    preserved: list[Path] = []
+    unverified: list[Path] = []
+    if not archive:
+        preserved, unverified = _preserved_board_workspaces(normed, d)
+        if (preserved or unverified) and not force:
+            listed = ", ".join(str(p) for p in [*preserved, *unverified])
+            raise ValueError(
+                f"board {normed!r} holds scratch workspaces with unsaved work that exists "
+                f"nowhere else ({listed}); recover them first, or re-run with --force "
+                f"to delete the board anyway"
+            )
+
     # If the user removed the currently-active board, revert to default.
     if _kb.get_current_board() == normed:
         _kb.clear_current_board()
@@ -274,14 +290,6 @@ def remove_board(slug: str, *, archive: bool = True, force: bool = False) -> dic
         )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     import shutil
-    preserved, unverified = _preserved_board_workspaces(normed, d)
-    if (preserved or unverified) and not force:
-        listed = ", ".join(str(p) for p in [*preserved, *unverified])
-        raise ValueError(
-            f"board {normed!r} holds scratch workspaces with unsaved work that exists "
-            f"nowhere else ({listed}); recover them first, or re-run with --force "
-            f"to delete the board anyway"
-        )
     shutil.rmtree(d)
     result: dict[str, Any] = {"slug": normed, "action": "deleted", "new_path": ""}
     if preserved or unverified:

@@ -11,6 +11,7 @@ local commits, uncommitted changes, a stash or history that was never pushed.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -246,11 +247,16 @@ def _lock(path: Path) -> None:
     path.chmod(0o000)
 
 
+# root ignores the 0o000 mode, so the "unreadable" premise would silently vanish.
+_not_root = pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 0o000 directory")
+
+
 def _unlock(path: Path) -> None:
     if path.exists() or path.is_symlink():
         path.chmod(0o755)
 
 
+@_not_root
 def test_unreadable_subdirectory_preserves_whole_workspace(kanban_home, origin_repo):
     """An unreadable directory is "cannot tell", never "nothing here".
 
@@ -286,6 +292,7 @@ def test_unreadable_subdirectory_preserves_whole_workspace(kanban_home, origin_r
         assert "never pushed" in _git("log", "--oneline", "HEAD", cwd=repo)
 
 
+@_not_root
 def test_unreadable_workspace_root_preserves_workspace(kanban_home):
     """A workspace root that cannot be listed is "cannot tell" too."""
     with kbc.connect() as conn:

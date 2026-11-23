@@ -1,11 +1,11 @@
 # PROGRESS — t_96d65020: Д1 + Д2 (нечитаемый каталог = «не знаю»; `boards rm --delete` под защитой)
 
-## Состояние: ГОТОВО, передано на ревью
+## Состояние: раунд 2 — правки по ревью внесены и проверены. Остались коммит, push, handoff
 
 * Дерево: `/home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020`, ветка `wt/t_96d65020`
-* База: `b55cbeb3c64`; верхушка: `79ef7c11c19`; запушена в `ours` (`git ls-remote ours refs/heads/wt/t_96d65020` совпадает)
-* Дерево чистое (`git status --short` пуст)
-* Отчёт: `durable/t_96d65020/REPORT.md`; доказательства: `durable/t_96d65020/evidence/`
+* База: `b55cbeb3c64`; верхушка предыдущего раунда: `aee1af815a1`
+* Отчёт: `durable/t_96d65020/REPORT.md` (раздел «Раунд 2»); доказательства: `durable/t_96d65020/evidence/`
+* Прогон тестов: `/home/hermes/t72venv/bin/python durable/t_96d65020/run_pytest.py <pytest args>`
 
 ## Сделано
 
@@ -48,11 +48,40 @@
 * `smoke-unreadable-dir.txt` — живой `complete_task` с `chmod 000` на промежуточном каталоге.
 * `ruff check` — All checks passed.
 
+## Раунд 2 — правки по ревью
+
+1. `hermes_cli/kanban_db_boards.py:240-256` — обход `workspaces/` и `ValueError` перенесены **выше**
+   `clear_current_board()` / `_INITIALIZED_PATHS.discard()`: отказ больше не снимает пин активной борды.
+2. `tests/hermes_cli/test_kanban_board_delete_guard.py:200,216,228` — 3 новых теста на пин
+   (backend-отказ, CLI-отказ, успешное удаление по-прежнему откатывает на `default`);
+   `skipif(geteuid()==0)` на chmod-тесте (`:173`).
+3. `tests/hermes_cli/test_kanban_scratch_unsaved_work.py:251` — `skipif(geteuid()==0)` на двух chmod-тестах.
+4. `tests/plugins/test_kanban_board_lifecycle_api.py:87` — новый тест дашбордного DELETE:
+   `?delete=true` → 400 со списком путей, `&force=true` → 200 + `result.preserved`.
+5. `durable/t_96d65020/smoke_*.py` — `check=False, encoding, errors, timeout=` во всех `subprocess.run`,
+   `# noqa: E402` убраны; добавлен `run_pytest.py` (композитный интерпретатор).
+6. `website/docs/reference/cli-commands.md:834` — строка `boards rm` дополнена защитой и `--force`.
+7. `durable/t_96d65020/REPORT.md` — раздел «Раунд 2» + полная атрибуция ruff (79 = 79 на базе) и code_health.
+
+## Проверки раунда 2
+
+* целевые 3 файла: **37 passed** (`evidence/green-round2.txt`)
+* + `test_kanban_board_lifecycle_api.py` и `test_kanban_dashboard_plugin.py`: **80 passed**
+* соседние (`test_kanban_cli`, `board_path_priority`, `board_project`, `db_init`): **34 passed**
+* красная база: 2 теста пина падают на `aee1af815a1` (`evidence/red-base-pin-round2.txt`),
+  дашбордный тест падает на `b55cbeb3c64` (`evidence/red-base-dashboard.txt`)
+* `ruff check` — All checks passed; по дереву 79 находок = 79 на базе; `code_health --base b55cbeb3c64`
+  — **0 blocking, 0 advisory**
+* живые смоуки: `evidence/smoke-unreadable-dir-round2.txt`, `evidence/smoke-boards-rm-round2.txt`
+  (второй показывает `current before: smokeboard` → `current after refusal: smokeboard`)
+
 ## Следующий шаг
 
-1. Ревьюеру: сверить дифф `b55cbeb3c64..wt/t_96d65020` по 7 файлам + 2 тестовым.
-2. Merge в `feature/multiuser-access` — за оркестратором, не мной.
-3. Д4–Д7 из вердикта в карточку не входили.
+1. `git add -A && git commit` (t_96d65020), `git push ours wt/t_96d65020`.
+2. `kanban_comment` — самопроверка раунда 2; `kanban_complete` с artifacts:
+   `durable/t_96d65020/REPORT.md`, `durable/t_96d65020/evidence/`.
+3. Merge в `feature/multiuser-access` — за оркестратором, не мной.
+4. Д4–Д7 из вердикта в карточку не входили.
 
 Примечание: `PROGRESS.md` в корне дерева принадлежит карточке `t_4cb8f83b`, которая делит этот
 workspace; не перезаписывал.
