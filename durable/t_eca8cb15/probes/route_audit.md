@@ -1,4 +1,4 @@
-Ревизия: `a1d2d25e95d3d9936f173ad38177079982ccb111`. Сгенерировано `durable/t_eca8cb15/probes/route_audit.py`.
+Ревизия: `fb2ae1100440b5cf6c142f5080797af424c10d1a`. Сгенерировано `durable/t_eca8cb15/probes/route_audit.py`.
 
 Регистраций в `hermes_cli/web_routers/*.py` (38 модулей): **336** = HTTP 325 + `api_route` 1 + WS 10; `async` 301 (уникальных 299), `def` 35. `async`-обработчиков с оффлоадом: **173**.
 
@@ -14,6 +14,7 @@
 | `loop.run_in_executor` | 2 | 1 |
 | `_read_off_loop` | 2 | 2 |
 | `_hub_lookup` | 2 | 2 |
+
 | Файл:строка | Обработчик | Блокирующие вызовы (строка:вызов) |
 |---|---|---|
 | `actions.py:386` | `get_action_status` | 436:`proc.wait` |

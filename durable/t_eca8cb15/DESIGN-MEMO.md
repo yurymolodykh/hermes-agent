@@ -129,9 +129,10 @@ HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (ун�
 
 > Расхождение с прежней редакцией этого раздела («316 маршрутов, 285 async, 37 с `to_thread`»)
 > объясняется двумя дефектами самого аудита, а не изменением кода: (1) фильтр по имени
-> объекта-роутера (`router`) терял `manage_router`, `hub_router`, `config_router`,
-> `sessions_router`, `status_router`, `list_router`, `search_router`, `logs_router`
-> (36 регистраций); (2) признак «уже оффлоадит» считался по трём именитым токенам
+> объекта-роутера (`router`) терял регистрации у прочих роутеров — 37 из 336 на этой ревизии
+> (`sessions.py` 18, `skills.py` 8, `config_env.py` 4, `profiles.py` 4, `actions.py` 2,
+> `status.py` 1; проверяется AST-фильтром по `deco.func.value.id != "router"`); (2) признак
+> «уже оффлоадит» считался по трём именитым токенам
 > и не видел проектных обёрток (`config_scoped_to_thread`, `scoped_to_thread`, `_read_off_loop`,
 > `_hub_lookup`, `_run_config_scoped`). Аудит исправлен: объект-роутер больше не проверяется,
 > обёртки перечислены явно в `OFFLOAD_CALLS`, а разбивка печатается, а не считается руками.

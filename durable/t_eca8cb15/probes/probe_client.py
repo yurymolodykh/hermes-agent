@@ -112,7 +112,7 @@ def main() -> int:
 
     curve("status", lambda i: (lambda: timed(base + "/api/status")))
     curve("sessions", lambda i: (lambda: timed(base + "/api/sessions?limit=20")))
-    curve("messages", lambda i: (lambda: timed(base + "/api/sessions/s%d/messages?limit=500" % i)))
+    curve("messages", lambda i: (lambda: timed(base + f"/api/sessions/s{i}/messages?limit=500")))
     curve("search", lambda i: (lambda: timed(base + "/api/sessions/search?q=message&limit=20")))
 
     res["home"] = str(HOME)

@@ -242,13 +242,13 @@ class Finder(ast.NodeVisitor):
         self._nested: Finder | None = None
 
     # --- вложенные функции -------------------------------------------------
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._scan_nested(node)
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._scan_nested(node)
 
-    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+    def visit_Lambda(self, node: ast.Lambda) -> None:
         inner = Finder()
         inner._nested = self if self._nested is None else self._nested
         outer = self._nested or self
@@ -437,6 +437,7 @@ def render_md(out: dict, rev: str) -> str:
     for kind, n_calls in (out.get("offload_calls") or {}).items():
         lines.append(f"| `{kind}` | {n_calls} | {kinds.get(kind, 0)} |")
     lines += [
+        "",
         "| Файл:строка | Обработчик | Блокирующие вызовы (строка:вызов) |",
         "|---|---|---|",
     ]
