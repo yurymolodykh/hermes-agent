@@ -18,8 +18,8 @@ own history rather than on a linear guess. Both are stated in work items the car
 already names: its acceptance criteria.
 
 Measured on the shared board (``task_runs`` joined to ``tasks``, duration =
-``ended_at − started_at``, runs with a usable duration, 17–23.11.2026: 763 runs,
-percentiles by nearest rank on the sorted durations):
+``ended_at − started_at``, runs started in the pinned window 17.11.2026 00:00 –
+24.11.2026 00:00 UTC: 764 runs, percentiles by nearest rank on the sorted durations):
 
 ===========  =======  ======  ======  ==========
 acceptance   runs     p50     p80     share > 60
@@ -29,13 +29,16 @@ items       (n)       min     min     min
 3            52       40      81      29 %
 4            233      42      79      30 %
 5            170      46      90      36 %
-6            54       52      91      48 %
+6            55       59      86      49 %
 ===========  =======  ======  ======  ==========
 
-Above six items the figure is held at the six-item point. The 7+ bucket (27 runs)
-measures *lower* — p50 38, p80 75 — because those cards are mostly fan-out parents
-whose wall clock is orchestration, not work; letting that dip through would predict a
-bigger card as faster. Two items has four runs and is interpolated, not tabulated.
+The window is pinned because the board is live: the 6-item bucket has ~55 runs, where a
+single finished run moves p80 by several minutes, so an unpinned table could never be
+reproduced by a later re-measurement. Above six items the figure is held at the six-item
+point. The 7+ bucket (27 runs) measures *lower* — p50 38, p80 75 — because those cards are
+mostly fan-out parents whose wall clock is orchestration, not work; letting that dip
+through would predict a bigger card as faster. Two items has four runs and is
+interpolated, not tabulated.
 
 The whole sample: median 38 min, p80 76 min, 30 % of runs longer than 60 min, 40 %
 longer than 50 min. The old ``12 + 6 × items`` line put four items at 36 min — a 2.2×
@@ -73,12 +76,14 @@ SAFETY_MARGIN = 1.0
 # clamped to the last point above it — no point is extrapolated from a formula.
 #
 # Source: ``task_runs`` JOIN ``tasks`` on the shared board, ``ended_at − started_at``
-# in seconds, runs with a usable duration, 17–23.11.2026 (763 runs), acceptance items
-# counted by ``count_acceptance_items`` on the task body, percentiles by nearest rank.
+# in seconds, runs started inside 17.11.2026 00:00 – 24.11.2026 00:00 UTC (764 runs),
+# acceptance items counted by ``count_acceptance_items`` on the task body, percentiles
+# by nearest rank. The window is pinned so the table stays reproducible: the board is
+# live, and one finished run moves the 6-item bucket by ~5 min (n≈55 is a thin sample).
 # Recheck with ``tests/agent/test_kanban_card_sizing.py``'s ``CALIBRATION_*``
 # round-trip; the docstring table is the same measurement.
-CALIBRATION_P50_MINUTES = {0: 23, 3: 40, 4: 42, 5: 46, 6: 52}
-CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 91}
+CALIBRATION_P50_MINUTES = {0: 23, 3: 40, 4: 42, 5: 46, 6: 59}
+CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 86}
 # The owner's target for one run: a card is authored to close in 30–50 minutes.
 CARD_MINUTE_TARGET = 50
 # Wall-clock cap written into a card that names none (``hermes_cli.kanban_db``'s own
