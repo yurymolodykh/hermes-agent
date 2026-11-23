@@ -157,11 +157,26 @@ def test_explanation_persistence_owner_unavailable_never_blames_disk(failure):
     assert out.strip() != ""
     # Names the owner-side condition the error cannot distinguish further.
     assert "gateway" in lower or "шлюз" in lower
-    # The exact false diagnosis: drive full / a second process holding state.db.
-    assert "out of room" not in lower and "закончилось место" not in lower
-    assert "another hermes process" not in lower and "другой процесс hermes" not in lower
+    # The exact false diagnosis: drive full / a second process holding state.db. The user reads
+    # this copy, so the words alone are enough to bring the wrong theory back — not even a
+    # negated "the disk is not the problem" clause is allowed.
+    assert "disk" not in lower
+    assert "out of room" not in lower
+    assert "another hermes process" not in lower
     assert "free some space" not in lower
     assert "close other hermes" not in lower
+    # The same rule holds in the shipped Russian copy, which the test above cannot reach
+    # (the formatter renders the active locale).
+    from pathlib import Path
+
+    from agent.i18n_layers import parse_locale_file
+
+    ru = parse_locale_file(Path(__file__).resolve().parents[2] / "locales" / "ru.yaml")[
+        "explainer.persistence.owner_unavailable"
+    ].lower()
+    assert "диск" not in ru
+    assert "закончилось место" not in ru
+    assert "другой процесс" not in ru
     # And it must not be the generic last-resort body.
     assert out != AIAgent._format_turn_completion_explanation("session_persistence_failed", "unknown")
 
