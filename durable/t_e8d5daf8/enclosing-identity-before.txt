@@ -1,2 +1,0 @@
-$ git --git-dir=<platform>/.git config --local --get-regexp ^user\.
-exit=1

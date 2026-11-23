@@ -1,7 +1,0 @@
-Preserving scratch workspace for task t_98c394d5: unsaved work (workspace tree not fully readable) in /home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/d1kanban/kanban/workspaces/t_98c394d5 — /home/hermes/.hermes/hermes-agent/.worktrees/t_96d65020/durable/t_96d65020/d1kanban/kanban/workspaces/t_98c394d5 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
-CHECK workspace kept: True
-CHECK readable neighbour intact: True
-CHECK unpushed file intact: True
-CHECK exactly one preserved event: True
-CHECK reason says it could not read: True
-reason: workspace tree not fully readable
