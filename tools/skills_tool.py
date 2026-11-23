@@ -52,10 +52,15 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH, _known_stat=None)
     names, not only mtimes: an install and an uninstall inside one coarse mtime tick (1-2 s on some
     filesystems) leave every mtime equal, and the change must still show.
 
-    One ``os.scandir`` per directory yields the child names AND each child's mtime from the parent's
-    readdir buffer (``DirEntry.stat`` is already filled by the kernel there, so descending costs no
-    extra ``os.stat``). Only the root, whose parent nobody scanned, is stat'ed explicitly. The output
-    is identical to the previous ``os.stat`` + ``scandir`` per directory; ~30 % fewer syscalls.
+    One ``os.scandir`` per directory yields the child names and their ``DirEntry`` objects; the root,
+    whose parent nobody scanned, is stat'ed explicitly. ``DirEntry.stat`` still issues a real stat
+    syscall, so this does NOT reduce the syscall count the way the previous claim said: a
+    161-directory walk under ``strace -f -c -e trace=newfstatat,getdents64,openat`` reports
+    440 ``getdents64`` / 451 ``openat`` / 250 ``newfstatat`` for both trees (repeated runs agree;
+    a stray +/-2 ``openat`` comes from interpreter import basis, not from the walk). Timings are noisy:
+    five interleaved rounds of both trees gave per-walk medians from 3.1 to 5.8 ms with overlapping
+    ranges and no reproducible direction, so no speedup factor is quoted — any figure needs >=5
+    interleaved runs reported with their spread. The output is identical to the previous implementation.
     """
     from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
     try:
@@ -98,8 +103,8 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
 
     Deliberately NOT memoised: ``test_skill_added_on_disk_after_the_first_scan_is_served_without_reload``
     and its nested-category sibling install a skill between two calls and require the very next call to
-    see it, so any TTL on this value is a correctness regression, not a tuning knob. The cost is cut in
-    the walk itself instead (see ``_dir_tree_signature``).
+    see it, so any TTL on this value is a correctness regression, not a tuning knob. The walk itself is
+    a single ``os.scandir`` per directory (see ``_dir_tree_signature``), but no speedup is claimed for it.
     """
     from agent import skill_utils as _skill_utils
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
