@@ -1,0 +1,393 @@
+▶ not activated — using HERMES_PYTHON: /home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 104 test files (~709 tests) under ['tests/hermes_cli/test_kanban_anonymous_card_fuse.py', 'tests/hermes_cli/test_kanban_auto_continue.py', 'tests/hermes_cli/test_kanban_aux_affinity.py', 'tests/hermes_cli/test_kanban_block_classify.py', 'tests/hermes_cli/test_kanban_blocked_sticky.py', 'tests/hermes_cli/test_kanban_block_kinds.py', 'tests/hermes_cli/test_kanban_board_delete_guard.py', 'tests/hermes_cli/test_kanban_board_path_priority.py', 'tests/hermes_cli/test_kanban_board_project.py', 'tests/hermes_cli/test_kanban_boards.py', 'tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py', 'tests/hermes_cli/test_kanban_cli_exit_status.py', 'tests/hermes_cli/test_kanban_cli_failure_limit_config.py', 'tests/hermes_cli/test_kanban_cli.py', 'tests/hermes_cli/test_kanban_closed_card_never_runs.py', 'tests/hermes_cli/test_kanban_comment_queries.py', 'tests/hermes_cli/test_kanban_complete_live_claim_guard.py', 'tests/hermes_cli/test_kanban_core_functionality.py', 'tests/hermes_cli/test_kanban_count_notify_subs.py', 'tests/hermes_cli/test_kanban_create_body_file.py', 'tests/hermes_cli/test_kanban_creator_origin.py', 'tests/hermes_cli/test_kanban_credential_startup_exit.py', 'tests/hermes_cli/test_kanban_day_window.py', 'tests/hermes_cli/test_kanban_db_init.py', 'tests/hermes_cli/test_kanban_db.py', 'tests/hermes_cli/test_kanban_db_repair.py', 'tests/hermes_cli/test_kanban_decompose_db.py', 'tests/hermes_cli/test_kanban_decompose.py', 'tests/hermes_cli/test_kanban_default_assignee.py', 'tests/hermes_cli/test_kanban_diagnostics.py', 'tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py', 'tests/hermes_cli/test_kanban_dispatcher_capacity_telemetry.py', 'tests/hermes_cli/test_kanban_dispatch_lock.py', 'tests/hermes_cli/test_kanban_dispatch_tick_hook.py', 'tests/hermes_cli/test_kanban_dispatch_unknown_assignee_event.py', 'tests/hermes_cli/test_kanban_empty_completion.py', 'tests/hermes_cli/test_kanban_failure_limit_sweeps.py', 'tests/hermes_cli/test_kanban_gateway_restart_handoff.py', 'tests/hermes_cli/test_kanban_gc_retention.py', 'tests/hermes_cli/test_kanban_goal_judge_affinity.py', 'tests/hermes_cli/test_kanban_goal_mode.py', 'tests/hermes_cli/test_kanban_goal_mode_worker_log.py', 'tests/hermes_cli/test_kanban_graph_identity.py', 'tests/hermes_cli/test_kanban_host_cap.py', 'tests/hermes_cli/test_kanban_init_lock_bounded.py', 'tests/hermes_cli/test_kanban_keypool_integration.py', 'tests/hermes_cli/test_kanban_keypool_red_proof.py', 'tests/hermes_cli/test_kanban_keypool_release.py', 'tests/hermes_cli/test_kanban_lifecycle_hooks.py', 'tests/hermes_cli/test_kanban_list_undecodable_text.py', 'tests/hermes_cli/test_kanban_managed_exit_reconciliation.py', 'tests/hermes_cli/test_kanban_managed_result_pid.py', 'tests/hermes_cli/test_kanban_managed_worker_loss.py', 'tests/hermes_cli/test_kanban_memory_guard.py', 'tests/hermes_cli/test_kanban_notify.py', 'tests/hermes_cli/test_kanban_owner_lost_budget.py', 'tests/hermes_cli/test_kanban_owner_receipt_reclaim.py', 'tests/hermes_cli/test_kanban_parent_reopen_invalidation.py', 'tests/hermes_cli/test_kanban_per_profile_cap.py', 'tests/hermes_cli/test_kanban_pr_acceptance.py', 'tests/hermes_cli/test_kanban_preserved_provenance.py', 'tests/hermes_cli/test_kanban_project_link.py', 'tests/hermes_cli/test_kanban_promote.py', 'tests/hermes_cli/test_kanban_promotion_sizing.py', 'tests/hermes_cli/test_kanban_real_persist_refusal.py', 'tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py', 'tests/hermes_cli/test_kanban_restart_interrupt_budget.py', 'tests/hermes_cli/test_kanban_restart_worker_survival.py', 'tests/hermes_cli/test_kanban_resume_guard.py', 'tests/hermes_cli/test_kanban_review_lifecycle_complete.py', 'tests/hermes_cli/test_kanban_review_lifecycle.py', 'tests/hermes_cli/test_kanban_review_surfaces.py', 'tests/hermes_cli/test_kanban_scratch_unsaved_work.py', 'tests/hermes_cli/test_kanban_specify_db.py', 'tests/hermes_cli/test_kanban_specify.py', 'tests/hermes_cli/test_kanban_split_outside_dispatch_lock.py', 'tests/hermes_cli/test_kanban_split_secret_scope.py', 'tests/hermes_cli/test_kanban_swarm.py', 'tests/hermes_cli/test_kanban_task_updated_hook.py', 'tests/hermes_cli/test_kanban_terminal_worker_reaper.py', 'tests/hermes_cli/test_kanban_test_board_isolation.py', 'tests/hermes_cli/test_kanban_transfer.py', 'tests/hermes_cli/test_kanban_unknown_with_saved_result.py', 'tests/hermes_cli/test_kanban_watch_banner.py', 'tests/hermes_cli/test_kanban_worker_admission_wait.py', 'tests/hermes_cli/test_kanban_worker_env_provisioning.py', 'tests/hermes_cli/test_kanban_worker_exit_decode.py', 'tests/hermes_cli/test_kanban_worker_exit_trailer.py', 'tests/hermes_cli/test_kanban_worker_image_extraction.py', 'tests/hermes_cli/test_kanban_worker_lifecycle_hooks.py', 'tests/hermes_cli/test_kanban_worker_owner_wait.py', 'tests/hermes_cli/test_kanban_worker_pid_fingerprint.py', 'tests/hermes_cli/test_kanban_worker_restart_wait.py', 'tests/hermes_cli/test_kanban_worker_session_source.py', 'tests/hermes_cli/test_kanban_worker_socket_recovery.py', 'tests/hermes_cli/test_kanban_worker_spawn_toolsets.py', 'tests/hermes_cli/test_kanban_worker_terminal_cwd.py', 'tests/hermes_cli/test_kanban_worker_terminal_scope.py', 'tests/hermes_cli/test_kanban_workflow.py', 'tests/hermes_cli/test_kanban_worktree_isolation.py', 'tests/hermes_cli/test_kanban_worktree_teardown.py', 'tests/hermes_cli/test_kanban_worktree_unicode_path.py', 'tests/hermes_cli/test_kanban_write_guard.py', 'tests/hermes_cli/test_kanban_write_txn_busy_retry.py']; running with -j 8
+[  0.6% |     4/~709 | ✓4 | ✗0] ✓ tests/hermes_cli/test_kanban_worker_pid_fingerprint.py (4✓, 14.3s)
+[  1.7% |    12/~709 | ✓22 | ✗ 0] ✓ tests/hermes_cli/test_kanban_owner_receipt_reclaim.py (18✓, 17.1s)
+[  3.4% |    24/~709 | ✓35 | ✗ 0] ✓ tests/hermes_cli/test_kanban_host_cap.py (13✓, 19.8s)
+[  4.1% |    29/~709 | ✓40 | ✗ 0] ✓ tests/hermes_cli/test_kanban_pr_acceptance.py (5✓, 23.9s)
+[  5.9% |    42/~709 | ✓55 | ✗ 0] ✓ tests/hermes_cli/test_kanban_auto_continue.py (15✓, 25.0s)
+[  7.3% |    52/~709 | ✓65 | ✗ 0] ✓ tests/hermes_cli/test_kanban_cli.py (10✓, 19.2s)
+[  9.4% |    67/~709 | ✓84 | ✗ 0] ✓ tests/hermes_cli/test_kanban_transfer.py (19✓, 14.5s)
+[ 12.8% |    91/~709 | ✓110 | ✗  0] ✓ tests/hermes_cli/test_kanban_review_lifecycle.py (26✓, 36.5s)
+[ 15.4% |   109/~709 | ✓134 | ✗  0] ✓ tests/hermes_cli/test_kanban_review_lifecycle_complete.py (24✓, 36.9s)
+[ 18.2% |   129/~709 | ✓160 | ✗  0] ✓ tests/hermes_cli/test_kanban_boards.py (26✓, 39.5s)
+[ 19.3% |   137/~709 | ✓168 | ✗  0] ✓ tests/hermes_cli/test_kanban_review_surfaces.py (8✓, 18.1s)
+[ 20.7% |   147/~709 | ✓178 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_env_provisioning.py (10✓, 18.0s)
+[ 21.4% |   152/~709 | ✓183 | ✗  0] ✓ tests/hermes_cli/test_kanban_db_init.py (5✓, 9.1s)
+[ 23.0% |   163/~709 | ✓194 | ✗  0] ✓ tests/hermes_cli/test_kanban_board_delete_guard.py (11✓, 11.2s)
+[ 23.6% |   167/~709 | ✓198 | ✗  0] ✓ tests/hermes_cli/test_kanban_split_secret_scope.py (4✓, 17.6s)
+[ 24.1% |   171/~709 | ✓202 | ✗  0] ✓ tests/hermes_cli/test_kanban_parent_reopen_invalidation.py (4✓, 13.0s)
+[ 25.0% |   177/~709 | ✓211 | ✗  0] ✓ tests/hermes_cli/test_kanban_dispatch_claim_allowlist.py (9✓, 14.0s)
+[ 26.1% |   185/~709 | ✓219 | ✗  0] ✓ tests/hermes_cli/test_kanban_promotion_sizing.py (8✓, 13.8s)
+[ 27.5% |   195/~709 | ✓229 | ✗  0] ✓ tests/hermes_cli/test_kanban_decompose.py (10✓, 9.8s)
+[ 28.9% |   205/~709 | ✓240 | ✗  0] ✓ tests/hermes_cli/test_kanban_keypool_integration.py (11✓, 15.7s)
+[ 31.2% |   221/~709 | ✓256 | ✗  0] ✓ tests/hermes_cli/test_kanban_restart_worker_survival.py (16✓, 11.4s)
+[ 32.3% |   229/~709 | ✓264 | ✗  0] ✓ tests/hermes_cli/test_kanban_anonymous_card_fuse.py (8✓, 10.3s)
+[ 34.6% |   245/~709 | ✓280 | ✗  0] ✓ tests/hermes_cli/test_kanban_scratch_unsaved_work.py (16✓, 30.2s)
+[ 36.4% |   258/~709 | ✓293 | ✗  0] ✓ tests/hermes_cli/test_kanban_closed_card_never_runs.py (13✓, 11.3s)
+[ 37.1% |   263/~709 | ✓298 | ✗  0] ✓ tests/hermes_cli/test_kanban_empty_completion.py (5✓, 9.3s)
+[ 37.8% |   268/~709 | ✓303 | ✗  0] ✓ tests/hermes_cli/test_kanban_terminal_worker_reaper.py (5✓, 11.8s)
+[ 39.4% |   279/~709 | ✓314 | ✗  0] ✓ tests/hermes_cli/test_kanban_memory_guard.py (11✓, 11.1s)
+[ 46.1% |   327/~709 | ✓368 | ✗  0] ✓ tests/hermes_cli/test_kanban_db.py (54✓ 1s, 53.2s)
+[ 46.7% |   331/~709 | ✓372 | ✗  0] ✓ tests/hermes_cli/test_kanban_real_persist_refusal.py (4✓, 8.5s)
+[ 48.4% |   343/~709 | ✓384 | ✗  0] ✓ tests/hermes_cli/test_kanban_owner_lost_budget.py (12✓, 11.5s)
+[ 49.1% |   348/~709 | ✓389 | ✗  0] ✓ tests/hermes_cli/test_kanban_swarm.py (5✓, 7.6s)
+[ 49.9% |   354/~709 | ✓396 | ✗  0] ✓ tests/hermes_cli/test_kanban_restart_interrupt_budget.py (7✓, 8.3s)
+[ 50.5% |   358/~709 | ✓400 | ✗  0] ✓ tests/hermes_cli/test_kanban_block_kinds.py (4✓, 8.6s)
+[ 50.9% |   361/~709 | ✓404 | ✗  0] ✓ tests/hermes_cli/test_kanban_lifecycle_hooks.py (4✓, 8.2s)
+[ 51.5% |   365/~709 | ✓409 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_exit_trailer.py (5✓, 8.9s)
+[ 52.0% |   369/~709 | ✓413 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_lifecycle_hooks.py (4✓, 9.0s)
+[ 54.2% |   384/~709 | ✓428 | ✗  0] ✓ tests/hermes_cli/test_kanban_keypool_release.py (15✓, 9.5s)
+[ 54.7% |   388/~709 | ✓432 | ✗  0] ✓ tests/hermes_cli/test_kanban_db_repair.py (4✓, 6.6s)
+[ 55.4% |   393/~709 | ✓437 | ✗  0] ✓ tests/hermes_cli/test_kanban_board_project.py (5✓, 5.3s)
+[ 56.0% |   397/~709 | ✓441 | ✗  0] ✓ tests/hermes_cli/test_kanban_split_outside_dispatch_lock.py (4✓, 7.9s)
+[ 56.6% |   401/~709 | ✓445 | ✗  0] ✓ tests/hermes_cli/test_kanban_complete_live_claim_guard.py (4✓, 9.0s)
+[ 56.7% |   402/~709 | ✓448 | ✗  0] ✓ tests/hermes_cli/test_kanban_watch_banner.py (3✓, 5.3s)
+[ 57.1% |   405/~709 | ✓451 | ✗  0] ✓ tests/hermes_cli/test_kanban_blocked_sticky.py (3✓, 8.1s)
+[ 57.5% |   408/~709 | ✓454 | ✗  0] ✓ tests/hermes_cli/test_kanban_dispatch_tick_hook.py (3✓, 8.3s)
+[ 57.8% |   410/~709 | ✓469 | ✗  0] ✓ tests/hermes_cli/test_kanban_credential_startup_exit.py (15✓, 6.1s)
+[ 58.1% |   412/~709 | ✓471 | ✗  0] ✓ tests/hermes_cli/test_kanban_per_profile_cap.py (2✓, 7.6s)
+[ 58.5% |   415/~709 | ✓474 | ✗  0] ✓ tests/hermes_cli/test_kanban_list_undecodable_text.py (3✓, 6.8s)
+[ 58.8% |   417/~709 | ✓476 | ✗  0] ✓ tests/hermes_cli/test_kanban_failure_limit_sweeps.py (2✓, 7.2s)
+[ 59.1% |   419/~709 | ✓478 | ✗  0] ✓ tests/hermes_cli/test_kanban_block_classify.py (2✓, 6.9s)
+[ 59.4% |   421/~709 | ✓480 | ✗  0] ✓ tests/hermes_cli/test_kanban_dispatch_unknown_assignee_event.py (2✓, 7.1s)
+[ 59.5% |   422/~709 | ✓481 | ✗  0] ✓ tests/hermes_cli/test_kanban_cli_exit_status.py (1✓, 7.7s)
+[ 59.8% |   424/~709 | ✓483 | ✗  0] ✓ tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py (2✓, 6.4s)
+[ 60.2% |   427/~709 | ✓486 | ✗  0] ✓ tests/hermes_cli/test_kanban_project_link.py (3✓, 5.3s)
+[ 62.2% |   441/~709 | ✓500 | ✗  0] ✓ tests/hermes_cli/test_kanban_board_path_priority.py (14✓, 6.7s)
+[ 62.5% |   443/~709 | ✓502 | ✗  0] ✓ tests/hermes_cli/test_kanban_task_updated_hook.py (2✓, 7.6s)
+[ 62.8% |   445/~709 | ✓504 | ✗  0] ✓ tests/hermes_cli/test_kanban_graph_identity.py (2✓, 5.2s)
+[ 63.2% |   448/~709 | ✓507 | ✗  0] ✓ tests/hermes_cli/test_kanban_promote.py (3✓, 5.8s)
+[ 63.5% |   450/~709 | ✓509 | ✗  0] ✓ tests/hermes_cli/test_kanban_default_assignee.py (2✓, 7.8s)
+[ 64.7% |   459/~709 | ✓518 | ✗  0] ✓ tests/hermes_cli/test_kanban_preserved_provenance.py (9✓, 18.4s)
+[ 65.2% |   462/~709 | ✓521 | ✗  0] ✓ tests/hermes_cli/test_kanban_specify_db.py (3✓, 5.9s)
+[ 65.3% |   463/~709 | ✓523 | ✗  0] ✓ tests/hermes_cli/test_kanban_managed_result_pid.py (2✓, 7.9s)
+[ 66.1% |   469/~709 | ✓529 | ✗  0] ✓ tests/hermes_cli/test_kanban_test_board_isolation.py (6✓, 4.5s)
+[ 66.6% |   472/~709 | ✓532 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_image_extraction.py (3✓, 5.9s)
+[ 66.9% |   474/~709 | ✓534 | ✗  0] ✓ tests/hermes_cli/test_kanban_decompose_db.py (2✓, 5.2s)
+[ 67.1% |   476/~709 | ✓536 | ✗  0] ✓ tests/hermes_cli/test_kanban_dispatch_lock.py (2✓, 6.1s)
+[ 67.3% |   477/~709 | ✓537 | ✗  0] ✓ tests/hermes_cli/test_kanban_comment_queries.py (1✓, 4.0s)
+[ 68.4% |   485/~709 | ✓545 | ✗  0] ✓ tests/hermes_cli/test_kanban_goal_mode.py (8✓, 5.0s)
+[ 68.7% |   487/~709 | ✓547 | ✗  0] ✓ tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py (2✓, 5.2s)
+[ 69.1% |   490/~709 | ✓550 | ✗  0] ✓ tests/hermes_cli/test_kanban_keypool_red_proof.py (3✓, 6.2s)
+[ 69.4% |   492/~709 | ✓552 | ✗  0] ✓ tests/hermes_cli/test_kanban_specify.py (2✓, 5.5s)
+[ 70.4% |   499/~709 | ✓562 | ✗  0] ✓ tests/hermes_cli/test_kanban_gc_retention.py (10✓, 11.3s)
+[ 71.1% |   504/~709 | ✓567 | ✗  0] ✓ tests/hermes_cli/test_kanban_diagnostics.py (5✓, 4.1s)
+[ 71.5% |   507/~709 | ✓571 | ✗  0] ✓ tests/hermes_cli/test_kanban_aux_affinity.py (4✓, 4.6s)
+[ 71.8% |   509/~709 | ✓573 | ✗  0] ✓ tests/hermes_cli/test_kanban_init_lock_bounded.py (2✓, 4.9s)
+[ 72.1% |   511/~709 | ✓575 | ✗  0] ✓ tests/hermes_cli/test_kanban_create_body_file.py (2✓, 5.1s)
+[ 72.4% |   513/~709 | ✓577 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_admission_wait.py (2✓, 4.0s)
+[ 72.8% |   516/~709 | ✓580 | ✗  0] ✓ tests/hermes_cli/test_kanban_write_guard.py (3✓, 4.3s)
+[ 74.3% |   527/~709 | ✓591 | ✗  0] ✓ tests/hermes_cli/test_kanban_unknown_with_saved_result.py (11✓, 4.3s)
+[ 76.4% |   542/~709 | ✓606 | ✗  0] ✓ tests/hermes_cli/test_kanban_dispatcher_capacity_telemetry.py (15✓, 5.0s)
+[ 77.0% |   546/~709 | ✓610 | ✗  0] ✓ tests/hermes_cli/test_kanban_count_notify_subs.py (4✓, 5.3s)
+[ 77.3% |   548/~709 | ✓612 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_owner_wait.py (2✓, 5.4s)
+[ 79.1% |   561/~709 | ✓642 | ✗  0] ✓ tests/hermes_cli/test_kanban_day_window.py (30✓, 6.4s)
+[ 79.5% |   564/~709 | ✓643 | ✗  0] ✓ tests/hermes_cli/test_kanban_worktree_unicode_path.py (1✓ 2s, 4.8s)
+[ 80.3% |   569/~709 | ✓648 | ✗  0] ✓ tests/hermes_cli/test_kanban_cli_failure_limit_config.py (5✓, 3.8s)
+[ 81.0% |   574/~709 | ✓653 | ✗  0] ✓ tests/hermes_cli/test_kanban_goal_judge_affinity.py (5✓, 4.2s)
+[ 81.4% |   577/~709 | ✓656 | ✗  0] ✓ tests/hermes_cli/test_kanban_write_txn_busy_retry.py (3✓, 5.5s)
+[ 81.7% |   579/~709 | ✓658 | ✗  0] ✓ tests/hermes_cli/test_kanban_worktree_isolation.py (2✓, 6.4s)
+[ 81.8% |   580/~709 | ✓664 | ✗  0] ✓ tests/hermes_cli/test_kanban_managed_exit_reconciliation.py (6✓, 4.7s)
+[ 81.9% |   581/~709 | ✓664 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_exit_decode.py (1s, 2.8s)
+[ 82.1% |   582/~709 | ✓665 | ✗  0] ✓ tests/hermes_cli/test_kanban_goal_mode_worker_log.py (1✓, 3.8s)
+[ 83.1% |   589/~709 | ✓676 | ✗  0] ✓ tests/hermes_cli/test_kanban_workflow.py (11✓, 4.7s)
+[ 83.6% |   593/~709 | ✓677 | ✗  0] ✗ tests/hermes_cli/test_kanban_worker_restart_wait.py (1✓, 7.5s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_worker_restart_wait.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/python.py", line 1717, in _traceback_filter
+  ║ INTERNALERROR>     ntraceback = traceback.cut(path=path, firstlineno=firstlineno)
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 398, in cut
+  ║ INTERNALERROR>     codepath = code.path
+  ║ INTERNALERROR>                ^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 94, in path
+  ║ INTERNALERROR>     if not p.exists():
+  ║ INTERNALERROR>            ~~~~~~~~^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py", line 671, in exists
+  ║ INTERNALERROR>     return os.path.exists(self)
+  ║ INTERNALERROR>            ~~~~~~~~~~~~~~^^^^^^
+  ║ INTERNALERROR>   File "<frozen genericpath>", line 19, in exists
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 187, in guarded
+  ║ INTERNALERROR>     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ INTERNALERROR>     ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>                destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+  ║ INTERNALERROR>                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 127, in check
+  ║ INTERNALERROR>     self.refuse(value)
+  ║ INTERNALERROR>     ~~~~~~~~~~~^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 160, in refuse
+  ║ INTERNALERROR>     raise AssertionError(
+  ║ INTERNALERROR>     ...<2 lines>...
+  ║ INTERNALERROR>     )
+  ║ INTERNALERROR> AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/installs/8829693b0667efc2/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py
+  ║ INTERNALERROR> Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ ============================== 1 passed in 2.52s ===============================
+  ║ 
+  ║ (pytest child exit status 3)
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_worker_restart_wait.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 83.8% |   594/~709 | ✓679 | ✗  1] ✗ tests/hermes_cli/test_kanban_creator_origin.py (2✓ 1✗, 11.8s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_creator_origin.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║             kn.add_notify_sub(conn, task_id=owner, platform="telegram", chat_id="chat",
+  ║                              delivery_mode="wake", notifier_profile="default")
+  ║             if surface == "builtin":
+  ║                 tid = decompose_triage_task(conn, owner, root_assignee="default",
+  ║                                            children=[{"title": "child"}])[0]
+  ║             elif surface == "db":
+  ║                 tid = kb.create_task(conn, title="child", creator_task_id=owner)
+  ║             else:
+  ║                 import json
+  ║                 import argparse
+  ║                 from hermes_cli.kanban import kanban_command
+  ║                 from hermes_cli.kanban_parser import build_parser
+  ║                 parser = argparse.ArgumentParser()
+  ║                 build_parser(parser.add_subparsers())
+  ║                 monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
+  ║                 assert kanban_command(parser.parse_args(["kanban", "create", "child", "--json"])) == 0
+  ║                 tid = json.loads(capsys.readouterr().out)["id"]
+  ║             assert kb.get_task(conn, tid).session_id == "durable"
+  ║             subs = kn.list_notify_subs(conn, tid)
+  ║ >           assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
+  ║ E           AssertionError: assert (1 == 1 and 'notify+wake' == 'wake'
+  ║ E            +  where 1 = len([{'task_id': 't_f9482aa7', 'platform': 'telegram', 'chat_id': 'chat', 'thread_id': '', ...}])
+  ║ E             
+  ║ E             - wake
+  ║ E             + notify+wake)
+  ║ 
+  ║ tests/hermes_cli/test_kanban_creator_origin.py:34: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_creator_origin.py::test_creator_origin_survives_without_dependency_parent[cli]
+  ║ ========================= 1 failed, 2 passed in 4.40s ==========================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_creator_origin.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 84.6% |   600/~709 | ✓679 | ✗  7] ✗ tests/hermes_cli/test_kanban_gateway_restart_handoff.py (6✗, 13.7s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_gateway_restart_handoff.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:771: in open
+  ║     return io.open(self, mode, buffering, encoding, errors, newline)
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.worktrees/manifest.json')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.worktrees/manifest.json
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_worker_is_spawned_in_restart_safe_scope
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_worker_spawn_fails_closed_without_scope
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_managed_gateway_scope_builder_fails_closed_if_binary_disappears
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_standalone_dispatcher_keeps_direct_worker_spawn
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently
+  ║ FAILED tests/hermes_cli/test_kanban_gateway_restart_handoff.py::test_real_user_systemd_scope_preserves_worker_context
+  ║ ============================== 6 failed in 5.50s ===============================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_gateway_restart_handoff.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 88.0% |   624/~709 | ✓684 | ✗  7] ✗ tests/hermes_cli/test_kanban_notify.py (5✓, 14.0s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_notify.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/python.py", line 1717, in _traceback_filter
+  ║ INTERNALERROR>     ntraceback = traceback.cut(path=path, firstlineno=firstlineno)
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 398, in cut
+  ║ INTERNALERROR>     codepath = code.path
+  ║ INTERNALERROR>                ^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 94, in path
+  ║ INTERNALERROR>     if not p.exists():
+  ║ INTERNALERROR>            ~~~~~~~~^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py", line 671, in exists
+  ║ INTERNALERROR>     return os.path.exists(self)
+  ║ INTERNALERROR>            ~~~~~~~~~~~~~~^^^^^^
+  ║ INTERNALERROR>   File "<frozen genericpath>", line 19, in exists
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 187, in guarded
+  ║ INTERNALERROR>     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ INTERNALERROR>     ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>                destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+  ║ INTERNALERROR>                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 127, in check
+  ║ INTERNALERROR>     self.refuse(value)
+  ║ INTERNALERROR>     ~~~~~~~~~~~^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 160, in refuse
+  ║ INTERNALERROR>     raise AssertionError(
+  ║ INTERNALERROR>     ...<2 lines>...
+  ║ INTERNALERROR>     )
+  ║ INTERNALERROR> AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/installs/8829693b0667efc2/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py
+  ║ INTERNALERROR> Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ ============================== 5 passed in 5.44s ===============================
+  ║ 
+  ║ (pytest child exit status 3)
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_notify.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 89.6% |   635/~709 | ✓701 | ✗  7] ✗ tests/hermes_cli/test_kanban_worker_socket_recovery.py (17✓, 11.1s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_worker_socket_recovery.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/python.py", line 1717, in _traceback_filter
+  ║ INTERNALERROR>     ntraceback = traceback.cut(path=path, firstlineno=firstlineno)
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 398, in cut
+  ║ INTERNALERROR>     codepath = code.path
+  ║ INTERNALERROR>                ^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/_pytest/_code/code.py", line 94, in path
+  ║ INTERNALERROR>     if not p.exists():
+  ║ INTERNALERROR>            ~~~~~~~~^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py", line 671, in exists
+  ║ INTERNALERROR>     return os.path.exists(self)
+  ║ INTERNALERROR>            ~~~~~~~~~~~~~~^^^^^^
+  ║ INTERNALERROR>   File "<frozen genericpath>", line 19, in exists
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 187, in guarded
+  ║ INTERNALERROR>     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ INTERNALERROR>     ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>                destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+  ║ INTERNALERROR>                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 127, in check
+  ║ INTERNALERROR>     self.refuse(value)
+  ║ INTERNALERROR>     ~~~~~~~~~~~^^^^^^^
+  ║ INTERNALERROR>   File "/home/hermes/.hermes/hermes-agent/.worktrees/t_e414a3cc/tests/home_io_guard.py", line 160, in refuse
+  ║ INTERNALERROR>     raise AssertionError(
+  ║ INTERNALERROR>     ...<2 lines>...
+  ║ INTERNALERROR>     )
+  ║ INTERNALERROR> AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/installs/8829693b0667efc2/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py
+  ║ INTERNALERROR> Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ ============================== 17 passed in 4.60s ==============================
+  ║ 
+  ║ (pytest child exit status 3)
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_worker_socket_recovery.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 89.7% |   636/~709 | ✓701 | ✗  8] ✗ tests/hermes_cli/test_kanban_worker_terminal_cwd.py (1✗, 8.4s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_worker_terminal_cwd.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ pm/environments.py:162: in _payload_manifest
+  ║     manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+  ║                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:787: in read_text
+  ║     with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+  ║          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:771: in open
+  ║     return io.open(self, mode, buffering, encoding, errors, newline)
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.worktrees/manifest.json')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.worktrees/manifest.json
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_worker_terminal_cwd.py::test_terminal_cwd_pinned_to_workspace
+  ║ ============================== 1 failed in 2.84s ===============================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_worker_terminal_cwd.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 90.4% |   641/~709 | ✓705 | ✗  9] ✗ tests/hermes_cli/test_kanban_worker_session_source.py (4✓ 1✗, 21.3s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_worker_session_source.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ hermes_cli/_early_recovery.py:960: in restore_interrupted_pull
+  ║     if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+  ║            ^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:691: in is_file
+  ║     return os.path.isfile(self)
+  ║            ^^^^^^^^^^^^^^^^^^^^
+  ║ <frozen genericpath>:39: in isfile
+  ║     ???
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.git/worktrees/t_e414a3cc/hermes-update-pull')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.git/worktrees/t_e414a3cc/hermes-update-pull
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_worker_session_source.py::test_kanban_rows_stay_out_of_the_session_list
+  ║ ========================= 1 failed, 4 passed in 9.81s ==========================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_worker_session_source.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 91.0% |   645/~709 | ✓707 | ✗ 11] ✗ tests/hermes_cli/test_kanban_worker_terminal_scope.py (2✓ 2✗, 10.4s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_worker_terminal_scope.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+  ║                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:787: in read_text
+  ║     with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+  ║          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ ../../../tools/python-3.14.9+20261021-linux-x64/lib/python3.14/pathlib/__init__.py:771: in open
+  ║     return io.open(self, mode, buffering, encoding, errors, newline)
+  ║            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ tests/home_io_guard.py:187: in guarded
+  ║     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
+  ║ tests/home_io_guard.py:127: in check
+  ║     self.refuse(value)
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ value = PosixPath('/home/hermes/.hermes/hermes-agent/.worktrees/manifest.json')
+  ║ 
+  ║     @staticmethod
+  ║     def refuse(value):
+  ║ >       raise AssertionError(
+  ║             f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+  ║             "Use the isolated HERMES_HOME or a temporary fixture instead."
+  ║         )
+  ║ E       AssertionError: TEST BUG: file I/O against the REAL hermes home: /home/hermes/.hermes/hermes-agent/.worktrees/manifest.json
+  ║ E       Use the isolated HERMES_HOME or a temporary fixture instead.
+  ║ 
+  ║ tests/home_io_guard.py:160: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_worker_terminal_scope.py::test_worker_for_another_profile_never_inherits_the_dispatchers_credentials
+  ║ FAILED tests/hermes_cli/test_kanban_worker_terminal_scope.py::test_worker_for_another_profile_can_still_import_hermes
+  ║ ========================= 2 failed, 2 passed in 3.55s ==========================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_worker_terminal_scope.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
