@@ -1,10 +1,12 @@
-"""AST audit: blocking calls inside `async def` handlers without offload.
+"""AST audit: blocking calls that still run ON the event loop.
 
 A `def` handler is fine (Starlette runs it in a worker thread). A blocking call
-inside `async def` that is not already inside `asyncio.to_thread(...)` /
-`run_in_threadpool(...)` / `await run_blocking(...)` blocks the event loop.
+inside `async def` blocks the loop unless it sits in code that is offloaded:
+either directly (`asyncio.to_thread(...)`, `run_in_threadpool(...)`) or inside a
+closure/helper that the handler passes to one of those by name
+(`_run()` defined in the handler and awaited as `scoped_to_thread(profile, _run)`).
 
-Usage: python3 durable/t_a61becbc/audit_blocking.py [dir ...]
+Usage: python3 audit_blocking.py [dir ...]
 """
 from __future__ import annotations
 
@@ -16,11 +18,15 @@ BLOCKING_ATTRS = {
     "read_text", "write_text", "read_bytes", "write_bytes", "mkdir", "unlink", "rmdir",
     "replace", "rename", "listdir", "walk", "scandir", "glob", "rglob", "iterdir",
     "exists", "is_dir", "is_file", "stat", "lstat", "copyfile", "copytree", "rmtree",
-    "wait", "communicate", "readline", "readlines", "fileno", "flush", "fsync",
-    "connect", "recv", "sendall", "sleep", "run", "call", "check_output", "Popen",
-    "Executable", "execute", "fetchall", "fetchone", "execute", "commit", "begin",
+    "communicate", "readline", "readlines", "fsync",
+    "check_output", "check_call", "Popen", "urlopen",
 }
-OFFLOAD_FUNCS = {"to_thread", "run_in_threadpool", "run_blocking", "run_sync", "_read_off_loop"}
+# Blocking sinks. `fetchone`/`execute` are SQLite; `subprocess.run` is a shell spawn.
+BLOCKING_NAMES = {"open", "input", "sleep", "urlopen"}
+OFFLOAD_FUNCS = {
+    "to_thread", "run_in_threadpool", "run_blocking", "run_sync", "_read_off_loop",
+    "scoped_to_thread", "config_scoped_to_thread", "run_in_executor", "submit",
+}
 
 
 def _callee_name(func: ast.AST) -> str:
@@ -31,37 +37,50 @@ def _callee_name(func: ast.AST) -> str:
     return ""
 
 
-def _offloaded_node_ids(tree: ast.AST) -> set[int]:
-    """Ids of every node sitting inside an offload call's arguments."""
+def _offload_target_names(tree: ast.AST) -> set[str]:
+    """Names of functions/closures handed to an offload helper."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _callee_name(node.func) in OFFLOAD_FUNCS:
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                if isinstance(arg, ast.Name):
+                    names.add(arg.id)
+                elif isinstance(arg, ast.Attribute):
+                    names.add(arg.attr)
+    return names
+
+
+def _nodes_inside_offload(tree: ast.AST) -> set[int]:
     inside: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _callee_name(node.func) in OFFLOAD_FUNCS:
             for arg in node.args:
                 for sub in ast.walk(arg):
                     inside.add(id(sub))
-            for kw in node.keywords:
-                for sub in ast.walk(kw.value):
-                    inside.add(id(sub))
     return inside
 
 
 def audit(paths: list[pathlib.Path]) -> list[tuple[str, str, int, str]]:
-    rows: list[tuple[str, str, int, str]] = []
+    rows = []
     for path in paths:
         tree = ast.parse(path.read_text())
-        offloaded = _offloaded_node_ids(tree)
+        offloaded = _nodes_inside_offload(tree)
+        by_name = _offload_target_names(tree)
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.AsyncFunctionDef):
                 continue
+            # Local closures that are handed to an offload helper are off-loop.
+            for inner in ast.walk(fn):
+                if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)) and inner is not fn \
+                        and inner.name in by_name:
+                    for sub in ast.walk(inner):
+                        offloaded.add(id(sub))
             for node in ast.walk(fn):
-                if not isinstance(node, ast.Call):
-                    continue
-                if id(node) in offloaded:
+                if not isinstance(node, ast.Call) or id(node) in offloaded:
                     continue
                 name = _callee_name(node.func)
-                if name not in BLOCKING_ATTRS:
-                    continue
-                rows.append((str(path), fn.name, node.lineno, name))
+                if name in BLOCKING_ATTRS or name in BLOCKING_NAMES:
+                    rows.append((str(path), fn.name, node.lineno, name))
     return rows
 
 
