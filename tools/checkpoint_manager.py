@@ -65,7 +65,7 @@ from hermes_cli.gitlock import clear_stale_tmp_packs
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from utils import env_int, rmtree_readonly
-from tools.checkpoint_locks import LockHygiene, index_lock_contention
+from tools.checkpoint_locks import LockHygiene
 
 logger = logging.getLogger(__name__)
 
@@ -1083,7 +1083,19 @@ class CheckpointManager(LockHygiene):
 
         self._checkpointed_dirs.add(abs_dir)
 
-        self._sweep_index_locks_once()
+        # The startup sweep reaches the platform holder probe, whose failure modes are not
+        # limited to OSError.  This is a deliberate catch-all boundary: the docstring promises
+        # "Never raises" for the whole method, so the sweep cannot be allowed to make that
+        # promise conditional on what the probe can throw.  It is guarded separately from the
+        # store so a dead sweep is attributed to its own stage instead of the vague ``store``,
+        # and the turn keeps the checkpoint it could still take.
+        sweep_failure: Optional[str] = None
+        try:
+            self._sweep_index_locks_once()
+        except Exception as sweep_error:
+            logger.debug("Checkpoint lock sweep failed (non-fatal): %s", sweep_error,
+                         exc_info=True)
+            sweep_failure = f"{type(sweep_error).__name__}: {sweep_error}"
 
         try:
             from tools.checkpoint_pruning import store_lock
@@ -1092,12 +1104,24 @@ class CheckpointManager(LockHygiene):
                 taken = self._take(abs_dir, reason)
                 if not taken and self._last_failure:
                     self._notify(self._failure_message())
-                return taken
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             self._record_failure(abs_dir, "store", f"{type(e).__name__}: {e}")
             self._notify(self._failure_message())
             return False
+
+        # ``_take()`` clears ``_last_failure`` at its start, so a sweep record is restored
+        # only when the checkpoint itself had nothing worse to report.  The notice is its own
+        # text, not ``_failure_message()``: when the sweep dies but ``taken`` is True the
+        # checkpoint itself did work, and claiming "checkpoints are NOT being taken" would be
+        # false — the hazard is a stale index lock blocking the *next* one.
+        if sweep_failure and self._last_failure is None:
+            self._record_failure(abs_dir, "index lock sweep", sweep_failure)
+            self._notify(
+                f"⚠️ Checkpoint lock sweep failed for {abs_dir}: index lock sweep — "
+                f"{sweep_failure}. Checkpoints still work; a stale index lock may block the "
+                f"next one until it is cleared.")
+        return taken
 
     def list_checkpoints(self, working_dir: str) -> list[dict]:
         """List available checkpoints for a directory (most recent first)."""
