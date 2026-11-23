@@ -655,6 +655,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    if task.status == "scheduled":
+        # Observability: when will it come back, or is it parked for a human?
+        if task.scheduled_until:
+            field("wakes", f"{kbschedule.format_local(task.scheduled_until)} (timer)")
+        else:
+            field("wakes", "no deadline — a human must unblock it (schedule <id> --until …)")
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -1321,6 +1327,11 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    sched_line = kbschedule.describe_schedule(stats)
+    if sched_line:
+        print(f"\n{sched_line}")
+        for card in stats.get("next_wakeups") or []:
+            print(f"  {card['id']}  {card['scheduled_until_local']}  {card['title']}")
     return 0
 
 
