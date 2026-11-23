@@ -1,0 +1,102 @@
+{
+  "tmpdir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-body-ops-gi48k51z",
+  "threshold_ms": 1.0,
+  "note": ">=1 мс или размер задаёт вызывающий (8 МиБ / 25 МиБ) -> оффлоад; метаданные (~0,003–0,06 мс) остаются в цикле",
+  "ops": {
+    "encode_8MiB": {
+      "p50_ms": 0.6897,
+      "max_ms": 7.503,
+      "n": 5
+    },
+    "write_text_8MiB_plus_replace": {
+      "p50_ms": 17.5043,
+      "max_ms": 44.8639,
+      "n": 5
+    },
+    "stat_4k": {
+      "p50_ms": 0.0069,
+      "max_ms": 0.0513,
+      "n": 200
+    },
+    "parent_is_dir": {
+      "p50_ms": 0.0051,
+      "max_ms": 0.0146,
+      "n": 200
+    },
+    "b64decode_25MiB": {
+      "p50_ms": 228.9365,
+      "max_ms": 299.4163,
+      "n": 5
+    },
+    "write_bytes_25MiB": {
+      "p50_ms": 86.0961,
+      "max_ms": 103.8792,
+      "n": 5
+    },
+    "mkdir_exist_ok_existing": {
+      "p50_ms": 0.012,
+      "max_ms": 0.0544,
+      "n": 50
+    },
+    "os_link": {
+      "p50_ms": 0.0447,
+      "max_ms": 0.1155,
+      "n": 20
+    },
+    "os_symlink": {
+      "p50_ms": 0.1324,
+      "max_ms": 0.2,
+      "n": 20
+    },
+    "unlink_missing_ok_missing": {
+      "p50_ms": 0.0213,
+      "max_ms": 0.0618,
+      "n": 50
+    },
+    "popen_only": {
+      "p50_ms": 0.3455,
+      "max_ms": 0.9822,
+      "n": 30
+    },
+    "wait_on_exited_proc": {
+      "p50_ms": 0.0007,
+      "max_ms": 0.0068,
+      "n": 50
+    },
+    "exists": {
+      "p50_ms": 0.0054,
+      "max_ms": 0.0588,
+      "n": 200
+    },
+    "is_file": {
+      "p50_ms": 0.0055,
+      "max_ms": 0.1619,
+      "n": 200
+    },
+    "git_root_walk_50_dirs": {
+      "p50_ms": 0.1765,
+      "max_ms": 0.3177,
+      "n": 50
+    },
+    "rglob_220_entries": {
+      "p50_ms": 1.7849,
+      "max_ms": 2.1036,
+      "n": 10
+    },
+    "creds_json_exists": {
+      "p50_ms": 0.0221,
+      "max_ms": 0.1469,
+      "n": 200
+    },
+    "str_replace_on_isoformat": {
+      "p50_ms": 0.0003,
+      "max_ms": 0.0045,
+      "n": 200
+    },
+    "session_rename_plus_mkdir": {
+      "p50_ms": 0.3042,
+      "max_ms": 0.8128,
+      "n": 20
+    }
+  }
+}
