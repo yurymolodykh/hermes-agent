@@ -107,12 +107,25 @@ def user_record_name(login: str) -> str:
 
 
 def users_file_path() -> Optional[Path]:
-    """The configured users file, or ``None`` when the install names none."""
-    from hermes_cli import dashboard_users as du
+    """The configured users file, or ``None`` when the install names none.
+
+    A relative value resolves against the *root* install, not the profile's own home: the
+    sign-in table belongs to the install everybody logs into, and ``hermes user add`` is
+    often run from a profile session (``get_hermes_home()`` = the profile directory).
+    """
+    from pathlib import Path as _Path
+
     from hermes_cli.config import cfg_get, load_config
 
-    value = cfg_get(load_config(), "dashboard", "basic_auth", "users_file", default="")
-    return du.resolve_users_file_path(value)
+    value = str(cfg_get(load_config(), "dashboard", "basic_auth", "users_file", default="") or "").strip()
+    if not value:
+        return None
+    path = _Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    from hermes_constants import get_hermes_root
+
+    return _Path(get_hermes_root()) / path
 
 
 def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
@@ -121,9 +134,20 @@ def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
     Returns the path and an undo that clears the key it just set (a no-op when the
     install already named a file). Without a configured path ``UserStore`` refuses to
     write at all, so a user created here would have no password to sign in with.
+
+    The *root* install owns the sign-in table: ``hermes user add`` may run from a profile
+    session, where ``get_hermes_home()`` is the profile directory and the relative default
+    would quietly write a table nobody signs in against. A relative configured value is
+    therefore resolved against the root, never against the profile's own home.
     """
+    from hermes_constants import get_hermes_root
+
+    root = Path(get_hermes_root())
     existing = users_file_path()
     if existing is not None:
+        raw = str(existing)
+        if not Path(raw).is_absolute():  # pragma: no cover - users_file_path resolves already
+            return root / existing, (lambda: None)
         return existing, (lambda: None)
     from hermes_cli.config import get_config_path
     from hermes_cli.config_backend import write_config_keys
@@ -136,6 +160,8 @@ def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
     resolved = users_file_path()
     if resolved is None:  # pragma: no cover - the write above always resolves
         raise Failed("could not configure dashboard.basic_auth.users_file")
+    if not Path(str(resolved)).is_absolute():
+        resolved = root / resolved
     return resolved, undo
 
 
