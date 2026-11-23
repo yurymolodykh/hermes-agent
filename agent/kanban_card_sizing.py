@@ -18,19 +18,25 @@ own history rather than on a linear guess. Both are stated in work items the car
 already names: its acceptance criteria.
 
 Measured on the shared board (``task_runs`` joined to ``tasks``, duration =
-``ended_at − started_at``, runs with a usable duration, 17–23.11.2026: 754 runs):
+``ended_at − started_at``, runs with a usable duration, 17–23.11.2026: 763 runs,
+percentiles by linear interpolation on the sorted durations):
 
 ===========  =======  ======  ======  ==========
 acceptance   runs     p50     p80     share > 60
 items       (n)       min     min     min
 ===========  =======  ======  ======  ==========
-0            224      23      61      21 %
-3            49       42      81      31 %
-4            231      42      79      30 %
-5            165      45      90      35 %
+0            223      23      61      21 %
+3            52       41      79      29 %
+4            233      42      79      30 %
+5            170      46      90      36 %
 6            54       55      88      48 %
 7            9        48      96      44 %
 ===========  =======  ======  ======  ==========
+
+Two- and eight-plus-item buckets exist but are not tabulated: 2 items has only four
+runs, and 8+ (18 runs, p50 21 min) is dominated by fan-out cards whose wall clock is
+mostly orchestration, not work. The last tabulated point (7) is thin too, so the
+figure above it is held, not extrapolated.
 
 The whole sample: median 38 min, 30 % of runs longer than 60 min, 40 % longer than
 50 min. The old ``12 + 6 × items`` line put four items at 36 min — a 2.2×
@@ -68,10 +74,12 @@ SAFETY_MARGIN = 1.0
 # clamped to the last point above it — no point is extrapolated from a formula.
 #
 # Source: ``task_runs`` JOIN ``tasks`` on the shared board, ``ended_at − started_at``
-# in seconds, runs with a usable duration, 17–23.11.2026 (754 runs), acceptance items
-# counted by ``count_acceptance_items`` on the task body.
-CALIBRATION_P50_MINUTES = {0: 23, 3: 42, 4: 42, 5: 45, 6: 55, 7: 48}
-CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 88, 7: 96}
+# in seconds, runs with a usable duration, 17–23.11.2026 (763 runs), acceptance items
+# counted by ``count_acceptance_items`` on the task body, percentiles by linear
+# interpolation. Recheck with ``tests/agent/test_kanban_card_sizing.py``'s
+# ``CALIBRATION_*`` round-trip; the docstring table is the same measurement.
+CALIBRATION_P50_MINUTES = {0: 23, 3: 41, 4: 42, 5: 46, 6: 55, 7: 48}
+CALIBRATION_P80_MINUTES = {0: 61, 3: 79, 4: 79, 5: 90, 6: 88, 7: 96}
 # The owner's target for one run: a card is authored to close in 30–50 minutes.
 CARD_MINUTE_TARGET = 50
 # Wall-clock cap written into a card that names none (``hermes_cli.kanban_db``'s own
