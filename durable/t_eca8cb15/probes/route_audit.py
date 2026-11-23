@@ -338,6 +338,11 @@ def collect(modules: list[Path]) -> tuple[list[dict], dict]:
 def audit(handlers: list[dict]) -> dict:
     blocking_rows, meta_only_rows, nested_rows = [], [], []
     offload_handlers = 0
+    # Разбивка оффлоада: сколько вызовов и сколько обработчиков на каждую обёртку.
+    # Печатается, чтобы §1.3 не зависел от ручного подсчёта (прежняя редакция
+    # приводила 102/18/1/55 без команды, которой это проверяется).
+    offload_calls: dict[str, int] = {}
+    offload_handlers_by_kind: dict[str, int] = {}
     for h in handlers:
         if not h["is_async"]:
             continue
@@ -346,6 +351,14 @@ def audit(handlers: list[dict]) -> dict:
             f.visit(stmt)
         if f.offload_wrappers:
             offload_handlers += 1
+        kinds: set[str] = set()
+        for node in ast.walk(h["node"]):
+            if isinstance(node, ast.Call) and is_offloaded(node):
+                name = dotted(node.func)
+                offload_calls[name] = offload_calls.get(name, 0) + 1
+                kinds.add(name)
+        for kind in kinds:
+            offload_handlers_by_kind[kind] = offload_handlers_by_kind.get(kind, 0) + 1
         base = {k: v for k, v in h.items() if k != "node"}
         if f.blocking:
             blocking_rows.append({**base, "calls": f.blocking})
@@ -367,7 +380,10 @@ def audit(handlers: list[dict]) -> dict:
             "meta_only_handlers": meta_only_rows,
             "nested_helpers": [r for r in nested_rows if r["offloaded"]],
             "nested_left": [r for r in nested_rows if not r["offloaded"]],
-            "async_with_offload": offload_handlers}
+            "async_with_offload": offload_handlers,
+            "offload_calls": dict(sorted(offload_calls.items(), key=lambda kv: -kv[1])),
+            "offload_handlers_by_kind": dict(sorted(offload_handlers_by_kind.items(),
+                                                    key=lambda kv: -kv[1]))}
 
 
 def live_counts() -> dict:
@@ -412,6 +428,15 @@ def render_md(out: dict, rev: str) -> str:
         f"+ WS {s['websocket']}; `async` {s['async']} (уникальных {s['async_unique']}), "
         f"`def` {s['def']}. `async`-обработчиков с оффлоадом: **{out['async_with_offload']}**.",
         "",
+        "Разбивка оффлоада (обёртка → вызовов / обработчиков):",
+        "",
+        "| Обёртка | Вызовов | Обработчиков |",
+        "|---|---|---|",
+    ]
+    kinds = out.get("offload_handlers_by_kind") or {}
+    for kind, n_calls in (out.get("offload_calls") or {}).items():
+        lines.append(f"| `{kind}` | {n_calls} | {kinds.get(kind, 0)} |")
+    lines += [
         "| Файл:строка | Обработчик | Блокирующие вызовы (строка:вызов) |",
         "|---|---|---|",
     ]

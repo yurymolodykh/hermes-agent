@@ -1,5 +1,5 @@
 {
-  "git_rev": "3fd85f466f9a0e5fb25e271a1bc5c3fd5dfbea8d",
+  "git_rev": "47d3ac2b449b4a41e8b29a822468291627cb8566",
   "routers_dir": "hermes_cli/web_routers",
   "modules": 38,
   "stats": {
@@ -598,5 +598,25 @@
     }
   ],
   "nested_left": [],
-  "async_with_offload": 173
+  "async_with_offload": 173,
+  "offload_calls": {
+    "asyncio.to_thread": 142,
+    "config_scoped_to_thread": 29,
+    "scoped_to_thread": 19,
+    "run_in_threadpool": 18,
+    "_run_config_scoped": 5,
+    "loop.run_in_executor": 2,
+    "_read_off_loop": 2,
+    "_hub_lookup": 2
+  },
+  "offload_handlers_by_kind": {
+    "asyncio.to_thread": 104,
+    "config_scoped_to_thread": 27,
+    "scoped_to_thread": 19,
+    "run_in_threadpool": 18,
+    "_run_config_scoped": 5,
+    "_read_off_loop": 2,
+    "_hub_lookup": 2,
+    "loop.run_in_executor": 1
+  }
 }
