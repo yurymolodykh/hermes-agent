@@ -94,16 +94,18 @@ Retention чекпойнтов и уборка `worktree` не тронуты. �
 * `checks.txt` — `ruff check --config ruff.pre-commit.toml` → `All checks
   passed!`; `python -m scripts.code_health --base 3e1895729437` →
   `0 blocking, 0 advisory`.
-* `wide-suite.txt` — широкий набор `tests/hermes_cli/test_kanban_*.py`
-  (104 файла): **756 passed, 29 failed, 4 skipped**. Все 13 не-зелёных файлов
-  падают **идентично на чистой базе** (проверено прогоном того же набора в
-  `git archive`-дереве) — это предсуществующий артефакт окружения worktree:
-  страж `tests/home_io_guard.py` ругается на путь
+* `wide-suite-baseline.txt` + `wide-suite-delta.txt` — **решающее сравнение**:
+  тот же набор, прогнанный на чистом `git archive 3e1895729437` (без моей
+  правки, но с новым тестовым файлом) даёт
+  `103 files, 750 passed, 29 failed, 4 skipped; FAILED: 13 of 103 files`
+  — те же 29 падений в тех же 13 файлах. С правкой:
+  `104 files, 756 passed, 29 failed, 4 skipped; FAILED: 13 of 104 files`.
+  Дельта ровно `+1 файл`, `+6 тестов пройдено`, `0 новых падений`.
+  Падения предсуществующие: страж `tests/home_io_guard.py` ругается на путь
   `<worktree>/hermes-update-pull` (80 совпадений `TEST BUG: file I/O against
-  the REAL hermes home` в полном прогоне, в том числе во всех 12 падениях
-  `test_kanban_resume_guard.py`), плюс 4 файла с «all passed but pytest exited
-  non-zero». Ни одного падения, связанного с правкой, нет: наборы «только на
-  базе» и «только с правкой» пусты.
+  the REAL hermes home`, все 12 падений `test_kanban_resume_guard.py` — из них),
+  плюс 4 файла «all passed but pytest exited non-zero». Ни одного падения,
+  связанного с правкой, нет.
 * `live-smoke.txt` — живой прогон через настоящий `hermes kanban gc` на
   изолированном `HERMES_HOME`:
   1. карточка завершена → архивирована → **hard-deleted**; `gc` печатает
