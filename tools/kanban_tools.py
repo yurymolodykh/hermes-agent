@@ -1091,11 +1091,14 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
-def _card_sizing_warning(assignee: str, body: Any) -> Optional[str]:
-    """Advisory when a card's declared volume cannot fit the assignee's budget.
+def _card_sizing(assignee: str, body: Any) -> tuple[Optional[str], Optional[int]]:
+    """``(advisory, estimated_minutes)`` for a card about to be created.
 
     Never raises and never blocks: a sizing heuristic must not be able to fail a
-    create. Returns None whenever the rule has nothing to say.
+    create. The minute figure is reported even when the card fits (an advisory
+    that only appears on overrun would never let a creator author to the 30–50
+    minute target); the advisory itself stays None whenever the rule has nothing
+    to say.
     """
     try:
         from agent.kanban_card_sizing import (
@@ -1103,10 +1106,10 @@ def _card_sizing_warning(assignee: str, body: Any) -> Optional[str]:
         )
         budget = assignee_iteration_budget(assignee)
         estimate = estimate_card(body if isinstance(body, str) else None, budget)
-        return sizing_warning(estimate, assignee=assignee)
+        return sizing_warning(estimate, assignee=assignee), estimate.estimated_minutes
     except Exception:
         logger.debug("card sizing estimate failed for assignee %s", assignee, exc_info=True)
-        return None
+        return None, None
 
 
 @_kanban_handler("kanban_create")
@@ -1131,7 +1134,7 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    sizing_note = _card_sizing_warning(str(assignee), args.get("body"))
+    sizing_note, estimated_minutes = _card_sizing(str(assignee), args.get("body"))
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1169,8 +1172,15 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        # ``estimated_minutes`` is always reported (None only if the rule crashed);
+        # ``sizing_warning`` only when the card does not fit. ``max_runtime_seconds``
+        # comes back from the row, so a creator who omitted it sees the 3600 wall
+        # that ``create_task`` actually wrote.
         return _ok(task_id=new_tid, **landed, **gate,
                    **({"sizing_warning": sizing_note} if sizing_note else {}),
+                   **({"estimated_minutes": estimated_minutes}
+                      if estimated_minutes is not None else {}),
+                   max_runtime_seconds=kb.get_task(conn, new_tid).max_runtime_seconds,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 

@@ -90,3 +90,42 @@ def test_assignee_budget_treats_an_unlimited_profile_as_no_budget(tmp_path, monk
     )
 
     assert kanban_card_sizing.assignee_iteration_budget("open") is None
+
+
+def test_estimate_minutes_is_calibrated_on_acceptance_items():
+    """12 + 6 × items: three criteria ≈ 30 min, six ≈ 48 — under the 50-minute target,
+    while a seventh item pushes the card over it. Fitted on the board's runs."""
+    from agent.kanban_card_sizing import CARD_MINUTE_TARGET, estimate_minutes
+
+    assert CARD_MINUTE_TARGET == 50
+    assert estimate_minutes(3) == 30
+    assert estimate_minutes(6) == 48
+    assert estimate_minutes(3) < CARD_MINUTE_TARGET <= estimate_minutes(7)
+
+
+def test_estimate_minutes_survives_a_card_with_no_criteria():
+    """A card naming no criteria must still size (0 items → the fixed overhead),
+    never divide or raise: the creator sees a number, not a crash."""
+    from agent.kanban_card_sizing import CardSizeEstimate, estimate_card, estimate_minutes
+
+    assert estimate_minutes(0) == 12
+    # Negative input is a caller bug, not a negative runtime.
+    assert estimate_minutes(-3) == 12
+    assert estimate_card("just prose, no acceptance section\n", budget=300).estimated_minutes == 12
+    # A hand-built estimate derives the same figure instead of disagreeing.
+    assert CardSizeEstimate(
+        acceptance_items=6, body_bytes=10, estimated_iterations=220, budget=300,
+    ).estimated_minutes == 48
+
+
+def test_sizing_warning_carries_the_minute_estimate():
+    """The advisory names the minutes next to the target so a creator can trim the
+    card before it is ever dispatched (50 min is the ceiling of the 30–50 target)."""
+    from agent.kanban_card_sizing import estimate_card, sizing_warning
+
+    body = "## Приёмка\n" + "".join(f"- критерий {i}\n" for i in range(9))
+    warning = sizing_warning(estimate_card(body, budget=120), assignee="x")
+
+    assert warning is not None
+    assert "66 мин" in warning and "30–50" in warning
+    assert "310 iterations" in warning  # the iteration part is unchanged
