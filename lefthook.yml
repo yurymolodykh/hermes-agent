@@ -1,5 +1,8 @@
 pre-commit:
   jobs:
+    - name: guard card artifacts
+      run: just artifact-guard
+
     - name: lint python
       glob: "*.py" # glob filter
       run: just ruff {staged_files}

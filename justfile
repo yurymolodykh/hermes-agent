@@ -196,6 +196,10 @@ lock:
 ruff +files:
     scripts/hermes-python -m scripts.code_health.ruff_runner check --config ruff.pre-commit.toml "$@"
 
+# Pre-commit: refuse card service artifacts (PROGRESS*, durable/, evidence-*, REPORT-*.md)
+artifact-guard:
+    scripts/hermes-python -m hermes_cli.repo_artifact_guard
+
 # Pre-commit: eslint on the given files, from the calling workspace
 [group('hooks')]
 [no-cd]
