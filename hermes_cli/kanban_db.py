@@ -4062,46 +4062,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-# --- Stats + SLA helpers ---
-
-def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
-    by_status: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
-    ):
-        by_status[row["status"]] = int(row["n"])
-
-    by_assignee = _counts_by_assignee(conn)
-
-    oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
-    ).fetchone()
-    now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
-
-    return {
-        "by_status": by_status,
-        "by_assignee": by_assignee,
-        "oldest_ready_age_seconds": oldest_ready_age,
-        "now": now,
-    }
-
-
-def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
-    """``{assignee: {status: n}}`` over non-archived tasks."""
-    counts: dict[str, dict[str, int]] = {}
-    for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
-    ):
-        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
-    return counts
+# --- Stats + SLA helpers (moved to ``kanban_db_stats``; re-exported at the tail) ---
 
 
 def _to_epoch(val) -> Optional[int]:
@@ -4126,15 +4087,14 @@ def _to_epoch(val) -> Optional[int]:
         return None
 
 
+def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """``{assignee: {status: n}}`` over non-archived tasks (see ``kanban_db_stats``)."""
+    return kanban_db_stats.counts_by_assignee(conn)
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
-    now = int(time.time())
-    _c, _s, _co = task.created_at, task.started_at, task.completed_at  # from_row coerced
-    return {
-        "created_age_seconds": now - _c if _c is not None else None,
-        "started_age_seconds": now - _s if _s is not None else None,
-        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
-    }
+    return kanban_db_stats.task_age(task)
 
 
 # --- Retention + garbage collection ---
@@ -4341,6 +4301,9 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli import kanban_db_sizing
+from hermes_cli import kanban_db_schedule
+from hermes_cli import kanban_db_stats
+from hermes_cli.kanban_db_stats import board_stats
 from hermes_cli.kanban_db_promotion import (
     _has_sticky_block,
     _latest_event,
