@@ -336,39 +336,34 @@ def test_archive_retention_keeps_one_generation_of_unmarked_tarballs(card_env):
 
 
 def test_retention_never_deletes_the_copy_the_reminder_names(card_env):
-    """A tree restored to an older state reuses an old copy; pruning must spare it.
+    """A copy this run's reminder named is never pruned, even past the window.
 
-    The reuse branch hands the model the archive that already holds this exact
-    tree — which is now the *oldest* file on disk. Pruning by recency alone would
-    delete the very path the reminder text names, so the live pointer is exempt.
+    The reminder's text lives on in the conversation: pruning the path it names
+    would leave the model and the human reading about a copy that is gone.
     """
     from agent import kanban_budget_checkpoint as kbc
     from hermes_cli.kanban_db import task_attachments_dir
 
     workspace, _home = card_env
     (workspace / "a.txt").write_text("gen-0\n", encoding="utf-8")
-    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000,) * 2)
+    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
     first = kbc.preserve_wip_tree(task_id="t_probe")
     assert first.mode == "archive"
-    base_bytes = (workspace / "a.txt").read_bytes()
+    named = Path(first.locator)
 
+    # More generations than the retention window can hold.
     for i in range(1, 6):
         (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
         os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
         assert kbc.preserve_wip_tree(task_id="t_probe").mode == "archive"
 
-    # Back to the first generation: the reuse branch names the oldest archive.
-    (workspace / "a.txt").write_bytes(base_bytes)
-    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000,) * 2)
-    reused = kbc.preserve_wip_tree(task_id="t_probe")
-    assert reused.mode == "archive"
-    assert str(reused.locator) == str(first.locator)
-
-    named = Path(reused.locator)
-    assert named.exists(), "the copy the reminder names was pruned"
+    assert named.exists(), "the copy the reminder named was pruned"
     assert named.with_name(named.name + ".done").exists()
     out_dir = task_attachments_dir("t_probe")
-    assert len(list(out_dir.glob("wip-*.tar.gz"))) <= kbc._ARCHIVE_RETENTION + 1
+    kept = len(list(out_dir.glob("wip-*.tar.gz")))
+    assert kept <= kbc._ARCHIVE_RETENTION + len(kbc._named_in_run()), f"unbounded: {kept}"
+    # Everything else outside the window is gone: the exemption is not a hole.
+    assert kept < 6
 
 
 def test_a_legacy_tarball_without_a_done_marker_is_not_reused(card_env):

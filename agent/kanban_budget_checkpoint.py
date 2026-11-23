@@ -215,19 +215,34 @@ _PARTIAL_FILE = "wip-partial.json"
 # without bound. Keep the newest N complete pairs — plus, in one unmarked
 # generation, the legacy archives written before the marker existed.
 _ARCHIVE_RETENTION = 3
-# Paths this process has already offered to the model. Pruning must not revoke a
-# copy a reminder already named (the model and the human act on that path), so
-# they are exempt — bounded, because a long run must not pin an endless set.
-_NAMED_RING = 8
-_NAMED_IN_RUN: "OrderedDict[str, None]" = OrderedDict()
+# The archives this run has already named to the model. Their paths stay in the
+# conversation for the rest of the run, so pruning one would leave a successor
+# reading a notice about a copy that no longer exists — the one rule that
+# overrides the retention window. Cleared when the run changes, so the list is
+# only ever as long as this run's own saving history.
+_NAMED_OFFERS: "dict[str, list[str]]" = {}
+
+
+def _run_key() -> str:
+    """Identity of the current reminder stream (its run, else its card)."""
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID") or os.environ.get("HERMES_KANBAN_TASK") or ""
+    return raw.strip() or "-"
 
 
 def _remember_named(path: str) -> None:
-    """Record a copy offered in this run, dropping the oldest beyond the ring."""
-    _NAMED_IN_RUN[str(path)] = None
-    _NAMED_IN_RUN.move_to_end(str(path))
-    while len(_NAMED_IN_RUN) > _NAMED_RING:
-        _NAMED_IN_RUN.popitem(last=False)
+    """Record a copy offered by this run's reminder as off-limits for pruning."""
+    key = _run_key()
+    for stale in [k for k in _NAMED_OFFERS if k != key]:
+        del _NAMED_OFFERS[stale]
+    offered = _NAMED_OFFERS.setdefault(key, [])
+    shown = str(path)
+    if shown not in offered:
+        offered.append(shown)
+
+
+def _named_in_run() -> set[str]:
+    """Paths this run's reminders already named — never pruning candidates."""
+    return set(_NAMED_OFFERS.get(_run_key(), ()))
 
 
 def _mtime_ns(path: Path) -> int:
@@ -240,19 +255,19 @@ def _mtime_ns(path: Path) -> int:
 def _prune_archives(out_dir: Path) -> list[str]:
     """Keep the newest ``_ARCHIVE_RETENTION`` complete pairs and one unmarked generation.
 
-    Every archive not pruned here is still meaningful: a pair is reusable, an
-    unmarked tarball is the last reminder of a previous code version. Anything
-    older is dead weight in a directory a human browses. A path named in this run
-    is never pruned, and a marker never outlives its tarball (or vice versa).
+    Every archive kept here is still meaningful: a pair is reusable, a single
+    unmarked tarball is the last remnant of a previous code version. Anything
+    older is dead weight in a directory a human browses. A copy this run already
+    named is never pruned, and a marker never outlives its tarball (or vice versa).
     """
     removed: list[str] = []
     try:
-        archives = [p for p in out_dir.glob(f"wip-*.tar.gz") if p.is_file()]
+        archives = [p for p in out_dir.glob("wip-*.tar.gz") if p.is_file()]
     except OSError:
         return removed
     marked = [p for p in archives if p.with_name(p.name + _DONE_SUFFIX).is_file()]
     unmarked = [p for p in archives if p not in marked]
-    named = set(_NAMED_IN_RUN)
+    named = _named_in_run()
 
     for old in sorted(marked, key=_mtime_ns, reverse=True)[_ARCHIVE_RETENTION:]:
         if str(old) in named:
@@ -266,6 +281,8 @@ def _prune_archives(out_dir: Path) -> list[str]:
 
     # One generation of unmarked tarballs survives: the newest.
     for old in sorted(unmarked, key=_mtime_ns, reverse=True)[1:]:
+        if str(old) in named:
+            continue
         try:
             old.unlink()
         except OSError:
