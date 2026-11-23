@@ -425,6 +425,16 @@ def _read_base64_file(path: Path) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _b64_text(data: bytes) -> str:
+    """BASE64 text of already-read bytes: pure CPU, off the loop for multi-MB payloads."""
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64_data_url(data: bytes, mime_type: str) -> str:
+    """One pass from bytes to a ``data:`` URL — encode and build the string in the worker."""
+    return f"data:{mime_type};base64,{_b64_text(data)}"
+
+
 @router.get("/api/media")
 async def get_media(path: str):
     """Return a gateway-local image as a base64 data URL for remote clients
