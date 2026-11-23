@@ -80,30 +80,149 @@
    («8 запросов по 2,0 с по очереди») относилась к состоянию **до** t_f4d564cb; на текущей
    ревизии одиночный warm status — 3,3 мс.
 
-### 1.3 Точный список блокирующих обработчиков (AST-аудит)
+### 1.3 Точный список блокирующих обработчиков (AST-аудит + цена вызова)
 
-Маршрутов в `hermes_cli/web_routers/*.py`: **316** (`async` 285, `def` 31). `def`-обработчики
-Starlette сам уводит в пул потоков, поэтому они не блокируют цикл. Блокирующие вызовы **внутри
-`async def` без оффлоада** — ровно 9 штук:
+**Как получить числа (воспроизводимо, без ручного счёта):**
 
-| Локатор | Вызов | Почему остаётся в цикле сейчас | Что делать |
+```bash
+cd "$(git -C /home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15 rev-parse --show-toplevel)" 2>/dev/null || cd .
+python3 durable/t_eca8cb15/probes/route_audit.py \
+    --json durable/t_eca8cb15/probes/route_audit.json \
+    --md   durable/t_eca8cb15/probes/route_audit.md
+python3 durable/t_eca8cb15/probes/probe_body_ops.py   # -> body_ops.json / body_ops.md
+```
+
+`route_audit.py` берёт ревизию из `git rev-parse HEAD` и печатает её в отчёте; `probe_body_ops.py`
+печатает только измеренные числа. Оба — обычный `python3`, без зависимостей проекта.
+
+**Перепись на ревизии `47d3ac2b449b`** — вывод скрипта, ключ `stats` в
+`probes/route_audit.json` (ревизия печатается самим скриптом в `git_rev` и в первой строке
+`route_audit.md`; числа относятся к коду `hermes_cli/web_routers`, и он между этой ревизией и
+верхушкой ветки не менялся — проверяется `git diff --stat 47d3ac2b449b..HEAD -- hermes_cli/`,
+вывод пуст): регистраций в `hermes_cli/web_routers/*.py` (38 модулей) — **336** =
+HTTP-глаголы 325 + `api_route` 1 + `websocket` 10; `async def` 301 (уникальных 299), `def` 35
+(уникальных 35). Из HTTP-регистраций `async` 291, `def` 35.
+`def`-обработчики Starlette исполняет через `run_in_threadpool` — они не блокируют цикл и в
+список правок не входят. Из 301 `async`-обработчиков **173** уже содержат обёртку пула; разбивка
+по обёрткам — тоже вывод скрипта (ключи `offload_calls` / `offload_handlers_by_kind`, печатаются
+таблицей в `route_audit.md`):
+
+| Обёртка | Вызовов | Обработчиков |
+|---|---|---|
+| `asyncio.to_thread` | 142 | 104 |
+| `config_scoped_to_thread` | 29 | 27 |
+| `scoped_to_thread` | 19 | 19 |
+| `run_in_threadpool` | 18 | 18 |
+| `_run_config_scoped` | 5 | 5 |
+| `loop.run_in_executor` | 2 | 1 |
+| `_read_off_loop` | 2 | 2 |
+| `_hub_lookup` | 2 | 2 |
+
+(Один обработчик может пользоваться двумя обёртками, поэтому сумма по столбцу «Обработчиков»
+больше 173 — это разные срезы, а не противоречие.)
+
+**Сверка с живым приложением, а не с текстом:** `python3 durable/t_eca8cb15/probes/route_audit.py --live`
+на той же ревизии печатает по объекту `hermes_cli.web_server.app`:
+`web_routers_http: [326, [291, 35]]` (всего / async / def), `web_routers_ws: 10`,
+`all_http: [402, [323, 79]]`, `all_ws: 11`. То есть числа AST-переписи и живого FastAPI-объекта
+сходятся по нашим 38 модулям (326 = 291 + 35; 336 = 326 + 10 WS).
+
+> Расхождение с прежней редакцией этого раздела («316 маршрутов, 285 async, 37 с `to_thread`»)
+> объясняется двумя дефектами самого аудита, а не изменением кода: (1) фильтр по имени
+> объекта-роутера (`router`) терял регистрации у прочих роутеров — 37 из 336 на этой ревизии
+> (`sessions.py` 18, `skills.py` 8, `config_env.py` 4, `profiles.py` 4, `actions.py` 2,
+> `status.py` 1; проверяется AST-фильтром по `deco.func.value.id != "router"`); (2) признак
+> «уже оффлоадит» считался по трём именитым токенам
+> и не видел проектных обёрток (`config_scoped_to_thread`, `scoped_to_thread`, `_read_off_loop`,
+> `_hub_lookup`, `_run_config_scoped`). Аудит исправлен: объект-роутер больше не проверяется,
+> обёртки перечислены явно в `OFFLOAD_CALLS`, а разбивка печатается, а не считается руками.
+> Все цифры этого раздела воспроизводятся одной командой из абзаца выше.
+
+#### Порог отбора (явный, механический)
+
+Обращение к файловой системе или CPU-операция из `async def` уходит в пул, если выполнено
+хотя бы одно:
+
+1. медиана **p50 ≥ 1,0 мс**, или
+2. хвост **p95 ≥ 10,0 мс** (именно он стопорит цикл в худшем случае), или
+3. **размер задаёт вызывающий** — лимит тела 8 / 16 / 25 / 100 МиБ у `fs_write_text`,
+   `fs_read_data_url`, `audio.py`, `_MANAGED_FILE_MAX_BYTES`; тогда считаем по верхней границе
+   лимита, а не по типичному файлу.
+
+Иначе вызов остаётся в цикле. Порог не теоретический: `probes/body_ops.json` меряет ровно те
+операции, что стоят в телах (`mkdir` на существующем каталоге — 0,007 мс, `exists` — 0,004 мс,
+а `write_text` 8 МиБ + `os.replace` — p50 114 мс, p95 1061 мс; `base64.b64decode` 25 МиБ —
+p50 256 мс; `Path.unlink` файла 1 ГиБ с реальными данными — p50 1584 мс).
+
+#### Обработчики с блокирующим вызовом без оффлоада — 12 (`blocking_handlers`)
+
+| Локатор | Вызов (строка) | Цена по `body_ops.json` | Решение |
 |---|---|---|---|
-| `web_routers/actions.py:386` `get_action_status` | `.wait()` | ожидание завершения действия | оффлоад в поток |
-| `web_routers/audio.py:522` `transcribe_stream_ws` | `sleep` | пауза в WS-стриме | оставить (WS, не HTTP) |
-| `web_routers/files.py:936` `upload_managed_file_stream` | `mkdir` | подготовка каталога | оффлоад |
-| `web_routers/local_models.py:796` `local_models_delete` | `unlink` | удаление файла модели | оффлоад |
-| `web_routers/messaging.py:701` `start_whatsapp_onboarding` | `replace` | запись файла | оффлоад |
-| `web_routers/ops.py:601` `run_backup` | `mkdir` | подготовка каталога | оффлоад |
-| `web_routers/ops.py:666` `run_import_upload` | `mkdir`, `unlink` | подготовка каталога | оффлоад |
-| `web_routers/profiles.py:1195` `get_profile_soul` | `read_text` | чтение SOUL.md | оффлоад |
-| `web_routers/webapp_relay_proxy.py:294` `relay_ws` | `connect` | WS-ретранслятор | оставить (WS) |
+| `files.py:1083` `fs_write_text` | `tmp.write_text` 1139, `os.replace` 1140, `tmp.unlink` 1142/1145 (в петле же `target.stat` 1122 и `parent.is_dir` 1134 — метаданные, 0,006 мс, остаются) | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 1061 мс | **оффлоад** (размер) |
+| `audio.py:90` `transcribe_audio_upload` | `base64.b64decode` 107, `tmp.write` 123 | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс | **оффлоад** (размер) |
+| `audio.py:299` `speak_text` | `base64.b64encode` 348 | 25 МиБ p50 103 мс; 1 МиБ p50 2,6 мс | **оффлоад** (размер) |
+| `files.py:472` `proxy_remote_media` | `base64.b64encode` 509 | ≤25 МиБ (`_MEDIA_MAX_BYTES`) p50 103 мс | **оффлоад** (только кодирование) |
+| `files.py:1203` `fs_read_data_url` | `base64.b64encode` 1216 (ветка удалённого backend) | 16 МиБ p50 59 мс | **оффлоад** (перенести в уже существующий `_render` 1233–1238) |
+| `local_models.py:796` `local_models_delete` | `path.unlink` 803 | 8 МиБ p50 0,7 мс, но файлы модели до 100+ МиБ: 1 ГиБ реальных данных p50 1584 мс | **оффлоад** (размер файла задаёт пользователь) |
+| `actions.py:386` `get_action_status` | `_tail_lines` 394, 403, 404 (до 4 чтений) | лог 64 МиБ: p50 2,6 мс, max 3,0 мс | **оффлоад** (p50 > 1 мс) |
+| `files.py:936` `upload_managed_file_stream` | `target.parent.mkdir` 946 | 0,007 мс; сама запись уже `to_thread` по чанкам (`stream_upload_to_path`) | **остаётся** — порог не превышен |
+| `ops.py:601` `run_backup` | `archive.parent.mkdir` 608 | 0,007 мс | **остаётся** |
+| `ops.py:666` `run_import_upload` | `staging_dir.mkdir` 674, `zipfile.is_zipfile` 684, `target.unlink` 685 | `mkdir` 0,007 мс; `is_zipfile` 50 МиБ p50 0,025 мс (читает только хвост); `unlink` свежего файла 0,011 мс | **остаётся** |
+| `local_models.py:1041` `local_models_sideload` | `dest.parent.mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,007 / 0,029 / 0,062 мс | **остаётся** |
+| `profiles.py:1124` `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | Popen 0,41 мс (fire-and-forget; `which` уже в `to_thread`) | **остаётся** |
 
-37 других async-обработчиков уже используют `asyncio.to_thread` — образец для правки.
+Итог: **7 обработчиков уходят в пул, 5 остаются по порогу** — и остаются они не «потому что
+мелкие», а потому что цена измерена и она на два порядка ниже порога.
+
+#### Что остаётся в цикле сознательно
+
+- **Метаданные** (`meta_only_handlers`, 7 обработчиков): `dashboard_ui.py:409` `serve_plugin_asset`
+  (`exists`/`is_file` 439), `files.py:428` `get_media` (442/444), `files.py:1389` `fs_git_root`
+  (`stat` 1401), `ops.py:620` `download_dashboard_backup` (631), `ops.py:647` `run_import`
+  (`os.path.isfile` 652), `profiles.py:1395` `import_profile_endpoint` (1419), `status.py:998`
+  `get_logs` (`exists` 1008). Цена каждого — 0,003–0,004 мс; обход вверх до `.git`
+  (`files.py:1405`, 50 каталогов) — 0,14 мс. На 8 одновременных запросах это доли миллисекунды,
+  тогда как сам `to_thread` стоит дороже (переключение + копирование контекста).
+  **Решение: остаются.**
+- **WebSocket-петли**: `audio.py:522` `transcribe_stream_ws` (`sleep`), `webapp_relay_proxy.py:294`
+  `relay_ws` (`connect`) — WS обязан жить в цикле событий, это не HTTP-параллельность.
+  **Решение: не трогать.**
+- **Вложенные помощники** (`nested_helpers`, 11): обработчик оффлоадит помощник по имени
+  (`_run`, `_read`, `_fetch`, `_render`) — уже правильные. `nested_left` на этой ревизии пуст.
+
+#### Отдельно: `messaging.py:701` `start_whatsapp_onboarding` (исправление прежней редакции)
+
+В прежней редакции этот обработчик значился как «`replace` → `to_thread`». Это было **неверно**:
+единственный `replace` в теле — строковый, `datetime.fromtimestamp(expires_at_ts, UTC).isoformat()
+.replace("+00:00", "Z")` (строка 714), цена 0,0003 мс; файловых замен в теле нет вообще.
+Что действительно стоит денег и что делает этот обработчик особенным:
+
+- `(session_path / "creds.json").exists()` (717) — 0,011 мс, порог не превышен;
+- `_whatsapp_session_path()` (708), `_prune_whatsapp_onboarding_sessions()` (707),
+  `_whatsapp_linked_account_from_session(session_path)` (719) — чтение каталога и `creds.json`,
+  суммарно микросекунды, порог не превышен;
+- `_backup_whatsapp_session(session_path)` (730 → `web_whatsapp_session.py:48-52`) — `exists` +
+  `rename` сессии в `mkdtemp` + `mkdir(mode=0o700)`: 0,22 мс, порог не превышен.
+
+**Настоящая проблема здесь другая, и она не про дисковый ввод-вывод:** тело исполняется под
+`_whatsapp_onboarding_lock` (706) — это `threading.RLock` (`messaging.py:373`), взятый в
+`async def` через `with`. Если лок в этот момент держит поток из пула (например,
+`_launch_whatsapp_pairing` или соседний обработчик того же лока), `with` **блокирует весь цикл
+событий** до освобождения, без шанса отдать управление другой корутине. Это единственный
+блокировщик цикла в этом файле, и он не лечится `to_thread` вокруг файловых операций.
+
+**Решение: в этой карточке не править, но назвать явно и вынести как отдельный дефект** для
+`t_f238ce77` или следующей задачи — замена `threading.RLock` на `asyncio.Lock` (или на
+`anyio.Lock` при смешанном доступе из потоков) требует ревизии всех 14 мест захвата
+(`messaging.py:506, 556, 575, 591, 601, 623, 652, 706, 752, 762, 784, 795, 804, 812` —
+перечень печатается AST-фильтром `ast.With` по имени лока; 742 — докстринг, не захват) и не
+является «оффлоадом одного вызова». Порог §1.3 к нему не применяется — это другой класс.
 
 **Границы, которые решает эта записка:**
-- из цикла событий уходят: файловые операции (8 локаторов выше) и всё `def`-шное (уже в пуле);
-- остаются в цикле: маршруты, чья работа — `await` на уже-асинхронных примитивах (кэш статуса,
-  коалесинг чтений), и WebSocket-петли, которые обязаны жить в цикле;
+- из цикла событий уходят ровно 7 локаторов выше (чтение/запись данных и кодирование base64 на
+  размере тела) и всё `def`-шное (Starlette уже уводит его в пул);
+- остаются: маршруты на уже-асинхронных примитивах (кэш статуса, коалесинг чтений),
+  метаданные-проверки и WebSocket-петли;
 - единственный писатель состояния — процесс, владеющий арендой профиля (§2).
 
 ---
@@ -117,9 +236,10 @@ Starlette сам уводит в пул потоков, поэтому они н
   `live_runtime_owner(home)` возвращает PID живого владельца. Текст отказа:
   `Exclusive maintenance refused: … Drain and stop the gateway, then retry.`
   (`gateway/runtime_ownership.py:350`).
-- **Отдельный дашборд не пишет сам.** `hermes_cli/web_server_sessions.py:277`
-  `_mutate_via_gateway_owner` → `client.rpc('session.mutate', …)` через control socket;
-  `_mutate_offline_store` (строка 154) исполняется **только под арендой** и открыто говорит:
+- **Отдельный дашборд не пишет сам.** `hermes_cli/web_server_sessions.py:190`
+  `_mutate_via_gateway_owner` (определение; вызов — строка 304) → `client.rpc('session.mutate', …)`
+  через control socket; `_mutate_offline_store` (строка 156) исполняется **только под арендой** и
+  открыто говорит:
   «Runs under the exact owner lock (409 while any gateway owns the store, **never a second
   writer beside it**)».
 - **Подтверждено замером.** `probes/writes.json`: при 2+ одновременных записях из одного
@@ -167,7 +287,7 @@ WS/PTY, которые нельзя разнести без новой шины.
 
 | | |
 |---|---|
-| **Цена** | Правка 8 локаторов из §1.3 на `asyncio.to_thread` (образец — 37 существующих). Полный список файлов и функций — §5. |
+| **Цена** | Правка 7 локаторов из §1.3/§5.1 на `asyncio.to_thread` (образец — 173 async-обработчика, которые уже так делают). Пять локаторов остаются по измеренному порогу, это обосновано в §1.3. |
 | **Риск** | Наименьший: нет новых процессов, нет новой сериализации состояния, WS/PTY остаются в том же процессе, единственный писатель не трогается. |
 | **Сложность откатa** | **Наименьшая**: одна настройка конфига; правки аддитивные, каждый `to_thread` откатывается независимо; поведение до/после отличается только тем, что цикл не блокируется. |
 | **Потолок** | Ограничен GIL и CPU: `search` n=16 всё равно ~1,4 с. Семафор (`anyio.CapacityLimiter`) не даёт пулу потоков съесть память. |
@@ -183,9 +303,9 @@ HTTP.
 | Параллельность чтений | высокая | высокая | средняя (потолок GIL/CPU) |
 | Единственный писатель | сохраняется | **нарушается** | сохраняется как есть |
 | WS/PTY без новой шины | нет | нет | **да** |
-| Стоимость правки | очень высокая | высокая | **низкая (8 локаторов)** |
+| Стоимость правки | очень высокая | высокая | **низкая (7 локаторов)** |
 | Откат | средний | низкий, но с рестартом | **одна настройка** |
-| Доказанный выигрыш по замеру | не показан | только CPU | устраняет 9 блокировок цикла |
+| Доказанный выигрыш по замеру | не показан | только CPU | устраняет 7 подтверждённых блокировок цикла (p50 до 1584 мс, p95 до 1061 мс) |
 
 ---
 
@@ -225,18 +345,45 @@ dashboard:
 
 ## 5. Что предстоит менять (для t_f238ce77)
 
-### 5.1 Точки правки (все — `async def` с блокирующим вызовом)
+### 5.1 Точки правки (`async def` с блокирующим вызовом; порядок = приоритет)
 
-| Файл:строка | Функция | Правка |
-|---|---|---|
-| `hermes_cli/web_routers/files.py:936` | `upload_managed_file_stream` | `mkdir` → `await asyncio.to_thread(...)` |
-| `hermes_cli/web_routers/local_models.py:796` | `local_models_delete` | `unlink` → `to_thread` |
-| `hermes_cli/web_routers/messaging.py:701` | `start_whatsapp_onboarding` | `replace` → `to_thread` |
-| `hermes_cli/web_routers/ops.py:601` | `run_backup` | `mkdir` → `to_thread` |
-| `hermes_cli/web_routers/ops.py:666` | `run_import_upload` | `mkdir`, `unlink` → `to_thread` |
-| `hermes_cli/web_routers/profiles.py:1195` | `get_profile_soul` | `read_text` → `to_thread` |
-| `hermes_cli/web_routers/actions.py:386` | `get_action_status` | `.wait()` → `to_thread` (учесть таймаут) |
-| `hermes_cli/web_routers/audio.py:522`, `webapp_relay_proxy.py:294` | WS-петли | **не трогать** — WS обязан быть в цикле |
+Порядок задан измеренной ценой из `probes/body_ops.json` — сверху то, что блокирует цикл дольше
+всего. Семь строк — единственные правки; ещё пять локаторов остаются по порогу §1.3 и записаны
+здесь, чтобы ревью не искало их заново.
+
+| № | Файл:строка | Функция | Что уходит в поток | Цена по `body_ops.json` |
+|---|---|---|---|---|
+| 1 | `hermes_cli/web_routers/files.py:1083` | `fs_write_text` | `tmp.write_text` (1139), `os.replace` (1140) + два `tmp.unlink` (1142/1145) — одним `to_thread`, чтобы порядок «временный → атомарная замена» не разъехался. `target.stat()` (1122) и `target.parent.is_dir()` (1134) остаются в цикле: 0,006 мс, порог §1.3 не превышен | `write_text` 8 МиБ + `replace`: p50 114 мс, p95 **1061** мс |
+| 2 | `hermes_cli/web_routers/audio.py:90` | `transcribe_audio_upload` | `base64.b64decode` (107) и запись временного файла (123) | `b64decode` 25 МиБ p50 256 мс; запись 25 МиБ p50 90 мс |
+| 3 | `hermes_cli/web_routers/audio.py:299` | `speak_text` | `base64.b64encode` (348) — рядом с уже существующим `_read_and_unlink` (344) | 25 МиБ p50 103 мс |
+| 4 | `hermes_cli/web_routers/files.py:472` | `proxy_remote_media` | `base64.b64encode` (509), кодирование ответа | ≤25 МиБ p50 103 мс |
+| 5 | `hermes_cli/web_routers/local_models.py:796` | `local_models_delete` | `path.unlink` (803) — размер файла задаёт пользователь | 8 МиБ 0,7 мс, но 1 ГиБ реальных данных p50 **1584** мс |
+| 6 | `hermes_cli/web_routers/files.py:1203` | `fs_read_data_url` | `base64.b64encode` в удалённой ветке (1216) — перенести в существующий `_render` (1233–1238), который уже в `to_thread` (1238) | 16 МиБ p50 59 мс |
+| 7 | `hermes_cli/web_routers/actions.py:386` | `get_action_status` | `_tail_lines` ×4 (394, 403, 404) — одним `to_thread` с таймаутом ожидания действия (436 остаётся прямым: `Popen.wait` на завершённом процессе 0,0004 мс) | лог 64 МиБ p50 2,6 мс |
+
+Локаторы **вне списка правок** (порог §1.3 не превышен, цена измерена):
+
+| Файл:строка | Функция | Заявленный блокирующий вызов | Измеренная цена | Почему остаётся |
+|---|---|---|---|---|
+| `hermes_cli/web_routers/files.py:936` | `upload_managed_file_stream` | `target.parent.mkdir` (946) | 0,007 мс | сама запись уже `to_thread` по чанкам в `stream_upload_to_path` |
+| `hermes_cli/web_routers/ops.py:601` | `run_backup` | `archive.parent.mkdir` (608) | 0,007 мс | каталог подготовки |
+| `hermes_cli/web_routers/ops.py:666` | `run_import_upload` | `mkdir` 674, `is_zipfile` 684, `unlink` 685 | 0,007 / 0,025 / 0,011 мс | `is_zipfile` читает только хвост архива |
+| `hermes_cli/web_routers/local_models.py:1041` | `local_models_sideload` | `mkdir` 1050, `os.link` 1052, `os.symlink` 1055 | 0,007 / 0,029 / 0,062 мс | метаданные, копирование уже вне цикла |
+| `hermes_cli/web_routers/profiles.py:1124` | `open_profile_terminal_endpoint` | `subprocess.Popen` 1130/1133/1139 | 0,41 мс | fire-and-forget; `which` уже в `to_thread` |
+
+**`profiles.py:1195` `get_profile_soul` из старого списка убран:** `read_text` там уже вызывается
+через `_read_off_loop` (1203) — это не долг, а образец. **`messaging.py:701` из списка правок
+убран и заменён отдельным дефектом** (см. конец §1.3): там блокирует не файловый вызов, а
+`threading.RLock` (706), и `to_thread` вокруг `replace`/`exists` ничего не лечит.
+
+**WebSocket-петли — не трогать:** `audio.py:522` `transcribe_stream_ws`, `webapp_relay_proxy.py:294`
+`relay_ws`. WS обязан жить в цикле событий; это не HTTP-параллельность.
+
+**Порядок приоритета и почему он такой:** №1 отделён от остальных не сложностью, а тем, что его
+p95 в 1000 раз выше медианы (`write_text` под нагрузкой ждёт грязной страницы), а лимит 8 МиБ
+делает его худший случай единственным, который заметен пользователю как «панель замерла на
+секунду». №5 стоит выше №6/№7 только потому, что размер файла там задаёт не сервер, а
+пользователь (модели до сотен МиБ) — измеренный `unlink` 1 ГиБ = 1584 мс.
 
 ### 5.2 Новые/изменяемые модули
 
@@ -315,8 +462,30 @@ dashboard:
 
 ## 8. Артефакты
 
+- `probes/route_audit.py` — AST-аудит маршрутов: перепись (§1.3), порог отбора, три списка
+  (`blocking_handlers`, `meta_only_handlers`, `nested_helpers`/`nested_left`). Печатает ревизию.
+- `probes/route_audit.json`, `probes/route_audit.md` — вывод аудита на ревизии прогона.
+- `probes/probe_body_ops.py` — цена каждой операции из тел обработчиков (`body_ops.json` / `.md`);
+  на этих числах стоит порог §1.3 и порядок §5.1.
 - `probes/probe_client.py` — двухпроцессный стенд (сервер в своём процессе).
 - `probes/server_main.py` — серверная часть стенда (реальный `web_server.app`).
 - `probes/probe_store.py` — замер потолка хранилища (чтения/записи/процессы).
+- `probes/probe_messaging_block.py` → `messaging_block.json` — блокировки messaging (в т.ч.
+  `rename` сессии + `mkdir 0700`).
+- `probes/probe_fs_cost.py` → `fs_cost.json` — стоимость файловых операций.
 - `probes/head.json`, `probes/scale.json`, `probes/writes.json`, `probes/twoproc_current.json` —
   сырые результаты замеров, на которые ссылаются таблицы.
+
+### Как воспроизвести всё одной командой
+
+```bash
+cd /home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15
+python3 durable/t_eca8cb15/probes/route_audit.py --json durable/t_eca8cb15/probes/route_audit.json \
+    --md durable/t_eca8cb15/probes/route_audit.md
+python3 durable/t_eca8cb15/probes/route_audit.py --live   # сверка переписи с живым FastAPI-объектом
+python3 durable/t_eca8cb15/probes/probe_body_ops.py
+python3 durable/t_eca8cb15/probes/probe_fs_cost.py
+python3 durable/t_eca8cb15/probes/probe_messaging_block.py
+```
+
+Все четыре — обычный `python3`, без зависимостей проекта, без сети, во временном каталоге.
