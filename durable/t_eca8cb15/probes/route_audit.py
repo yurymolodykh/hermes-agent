@@ -51,11 +51,23 @@
    `archive|staging|home|soul|skill|child|store|db|catalog|lock|buf`. Правило
    документировано здесь и одинаково для всех файлов.
 
-4. **Уже оффлоадящие обработчики.** `async def`-обработчик, в теле которого есть
-   обёртка оффлоада (`asyncio.to_thread`, `anyio.to_thread.run_sync`,
-   `loop.run_in_executor`) — это образец правки для t_f238ce77 и отдельная цифра.
-   Вызовы лексически **внутри** первого аргумента такой обёртки блокирующими не
-   считаются: они уже исполняются в пуле потоков.
+4. **Оффлоад.** Обработчик считается уже оффлоадящим, если в теле есть обёртка
+   пула: `asyncio.to_thread`, `anyio.to_thread.run_sync`, `loop.run_in_executor`,
+   `starlette.concurrency.run_in_threadpool`, а также проектные обёртки, которые
+   сводятся к ним — `scoped_to_thread`, `config_scoped_to_thread` (`_common.py`),
+   `_read_off_loop` (`profiles.py`), `_hub_lookup` (`skills.py`),
+   `_run_config_scoped` (`audio.py`). Вызовы внутри первого аргумента (тела
+   лямбды/функции) блокирующими не считаются.
+
+5. **Вложенные функции.** Тело `def _run(): …` исполняется не в момент
+   объявления, поэтому считается отдельно: если имя помощника передано в обёртку
+   оффлоада (`_hub_lookup(_run, …)`), он помечается `offloaded: true`; иначе
+   попадает в `nested_left` — кандидат на ручное решение, а не в основной список.
+   Обратная сторона названа честно: блокирующий вызов во вложенной функции,
+   которую никто не оффлоадит, автоматически основным списком не ловится.
+
+Числа §1.3 записки — вывод этого скрипта на ревизии, указанной в записке;
+`--live` сверяет их с FastAPI-объектом; `--md` печатает готовую таблицу.
 """
 
 from __future__ import annotations
@@ -341,7 +353,8 @@ def audit(handlers: list[dict]) -> dict:
                         r["handler"] == h["handler"] and r["file"] == h["file"])]
     return {"blocking_handlers": blocking_rows,
             "meta_only_handlers": meta_only_rows,
-            "nested_helpers": nested_rows,
+            "nested_helpers": [r for r in nested_rows if r["offloaded"]],
+            "nested_left": [r for r in nested_rows if not r["offloaded"]],
             "async_with_offload": offload_handlers}
 
 
@@ -377,10 +390,55 @@ def live_counts() -> dict:
     }
 
 
+def render_md(out: dict, rev: str) -> str:
+    s = out["stats"]
+    lines = [
+        f"Ревизия: `{rev}`. Сгенерировано `durable/t_eca8cb15/probes/route_audit.py`.",
+        "",
+        f"Регистраций в `{out['routers_dir']}/*.py` ({out['modules']} модулей): "
+        f"**{s['registrations']}** = HTTP {s['http_verb']} + `api_route` {s['api_route']} "
+        f"+ WS {s['websocket']}; `async` {s['async']} (уникальных {s['async_unique']}), "
+        f"`def` {s['def']}. `async`-обработчиков с оффлоадом: **{out['async_with_offload']}**.",
+        "",
+        "| Файл:строка | Обработчик | Блокирующие вызовы (строка:вызов) |",
+        "|---|---|---|",
+    ]
+    for r in out["blocking_handlers"]:
+        calls = ", ".join(f"{n}:`{c}`" for n, c in r["calls"])
+        lines.append(f"| `{Path(r['file']).name}:{r['file_line']}` | `{r['handler']}` | {calls} |")
+    lines += ["", "Только метаданные (в порог не входят):", "",
+              "| Файл:строка | Обработчик | Вызовы |", "|---|---|---|"]
+    for r in out["meta_only_handlers"]:
+        calls = ", ".join(f"{n}:`{c}`" for n, c in r["calls"])
+        lines.append(f"| `{Path(r['file']).name}:{r['file_line']}` | `{r['handler']}` | {calls} |")
+    lines += ["", "Вложенные помощники, уже уходящие в пул по имени:", "",
+              "| Файл:строка | Обработчик | Помощник | Вызовы |", "|---|---|---|---|"]
+    for r in out["nested_helpers"]:
+        calls = ", ".join(f"{n}:`{c}`" for n, c in r["calls"])
+        lines.append(f"| `{Path(r['file']).name}:{r['line']}` | `{r['handler']}` | `{r['helper']}` | {calls} |")
+    if out["nested_left"]:
+        lines += ["", "**Вложенные помощники без оффлоада (ручное решение):**", "",
+                  "| Файл:строка | Обработчик | Помощник | Вызовы |", "|---|---|---|---|"]
+        for r in out["nested_left"]:
+            calls = ", ".join(f"{n}:`{c}`" for n, c in r["calls"])
+            lines.append(f"| `{Path(r['file']).name}:{r['line']}` | `{r['handler']}` | `{r['helper']}` | {calls} |")
+    return "\n".join(lines) + "\n"
+
+
+def git_rev(root: Path) -> str:
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
     ap.add_argument("--json")
+    ap.add_argument("--md")
     ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
     root = Path(args.root).resolve()
@@ -390,11 +448,14 @@ def main() -> int:
         return 0
     modules = sorted((root / ROUTERS_DIR).glob("*.py"))
     handlers, stats = collect(modules)
-    out = {"routers_dir": ROUTERS_DIR, "modules": len(modules), "stats": stats,
-           **audit(handlers)}
+    rev = git_rev(root)
+    out = {"git_rev": rev, "routers_dir": ROUTERS_DIR, "modules": len(modules),
+           "stats": stats, **audit(handlers)}
     text = json.dumps(out, ensure_ascii=False, indent=2)
     if args.json:
         Path(args.json).write_text(text + "\n", encoding="utf-8")
+    if args.md:
+        Path(args.md).write_text(render_md(out, rev), encoding="utf-8")
     print(text)
     return 0
 
