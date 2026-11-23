@@ -12,6 +12,7 @@ would break the same-size assertion.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -96,3 +97,75 @@ def test_same_size_rewrite_inside_one_timestamp_tick_is_seen(tmp_path, monkeypat
     env.write_bytes(b"TUI_RELOAD_PROBE=two\n")
     assert ss.load_env_file(env) == {"TUI_RELOAD_PROBE": "two"}
     assert len(calls) == 2
+
+
+def _settle(path) -> None:
+    """Age the file past ``utils.RACY_MTIME_WINDOW_NS`` so its signature is trusted on its own."""
+    import utils
+    old = time.time_ns() - (utils.RACY_MTIME_WINDOW_NS * 2)
+    os.utime(path, ns=(old, old))
+
+
+def test_a_settled_hit_does_not_open_the_file(tmp_path, monkeypatch):
+    """The whole point of the signature: a settled, unchanged ``.env`` costs one stat, not open+read."""
+    import builtins
+    import utils
+
+    env = tmp_path / ".env"
+    env.write_bytes(b"A=1\nB=2\n")
+    _settle(env)
+    monkeypatch.setattr(ss, "mtime_is_racy", lambda _mtime_ns: False)
+
+    opens: list[str] = []
+    real_open = builtins.open
+
+    def counting_open(file, *args, **kwargs):
+        opens.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    assert ss.load_env_file(env) == {"A": "1", "B": "2"}
+    opened_on_first = len(opens)
+    for _ in range(5):
+        assert ss.load_env_file(env) == {"A": "1", "B": "2"}
+    assert len(opens) == opened_on_first, f"a cache hit opened the file: {opens}"
+    monkeypatch.setattr(builtins, "open", real_open)
+
+
+def test_a_settled_edit_is_visible_on_the_very_next_call(tmp_path, monkeypatch):
+    """Settled signature + one append: the next call re-reads and serves the new value immediately."""
+    import utils
+
+    env = tmp_path / ".env"
+    env.write_bytes(b"KEY=aaa\n")
+    _settle(env)
+    monkeypatch.setattr(ss, "mtime_is_racy", lambda _mtime_ns: False)
+    assert ss.load_env_file(env) == {"KEY": "aaa"}
+
+    with env.open("ab") as fh:  # size changes as well as mtime
+        fh.write(b"NEW=bbb\n")
+    assert ss.load_env_file(env) == {"KEY": "aaa", "NEW": "bbb"}
+
+    # An atomic replace (new inode) with the SAME size and a restored mtime is still caught: ctime
+    # cannot be backdated from user space.
+    old = env.stat()
+    env.write_bytes(b"KEY=ccc\nNEW=d\x00d\n"[: old.st_size])
+    os.utime(env, ns=(old.st_atime_ns, old.st_mtime_ns))
+    assert ss.load_env_file(env) != {"KEY": "aaa", "NEW": "bbb"}
+
+
+def test_deleting_the_file_drops_the_memo_entry(tmp_path):
+    """A vanished ``.env`` must not keep serving its secrets from the memo (nor leave a phantom entry)."""
+    env = tmp_path / ".env"
+    env.write_bytes(b"SECRET=live\n")
+    _settle(env)
+    assert ss.load_env_file(env) == {"SECRET": "live"}
+    assert str(env) in ss._ENV_FILE_CACHE
+
+    env.unlink()
+    assert ss.load_env_file(env) == {}
+    assert str(env) not in ss._ENV_FILE_CACHE, "a deleted file left its secrets memoised"
+
+    # Recreated with different content: served fresh, not the pre-deletion map.
+    env.write_bytes(b"SECRET=other\n")
+    assert ss.load_env_file(env) == {"SECRET": "other"}
