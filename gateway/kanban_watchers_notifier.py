@@ -387,6 +387,18 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     return primary if profile == primary_profile else None
 
 
+def _policy_artifact_payload(event_payload: Any, extensions) -> Optional[dict]:
+    """Payload narrowed to whitelisted artifact paths, or ``None`` when nothing survives.
+
+    The shared ``_deliver_kanban_artifacts`` also harvests paths mentioned in the summary
+    and in ``task.result``; under the owner policy those prose mentions are dropped too,
+    otherwise a ``.md``/``.py`` referenced in prose would still ride out as a file.
+    """
+    raw = (event_payload or {}).get("artifacts") if isinstance(event_payload, dict) else None
+    kept = filter_artifacts(raw if isinstance(raw, (list, tuple)) else (), extensions)
+    return {"artifacts": kept} if kept else None
+
+
 def _owner_delivery_config() -> OwnerDeliveryConfig:
     """``kanban.owner_delivery_policy`` from the active profile's effective config.
 
@@ -845,11 +857,9 @@ class _KanbanNotification:
     # -- formatting --
 
     def _category_for_kind(self, kind: str) -> Optional[str]:
-        """Owner category of a claimed event (policy platforms only)."""
-        for category, _reason in self.categories.values():
-            if category == kind:
-                return category
-        return None
+        """Owner category of a claimed event kind (policy platforms only)."""
+        category = {kind: cat for cat, _reason in self.categories.values()}.get(kind)
+        return category
 
     def event_category(self, ev: Any) -> Optional[str]:
         """``decision`` / ``final`` / ``None`` for ``ev`` as classified at claim time."""
@@ -1021,10 +1031,18 @@ class _KanbanNotification:
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
         if ev.kind in ("completed", "review_requested"):
+            event_payload = getattr(ev, "payload", None)
+            if self.policy_active:
+                # Owner policy: only deliverable file types reach the chat. Filtering happens
+                # HERE, at the call site, so the shared delivery path keeps its full set for
+                # desktop/local, api_server and cron.
+                event_payload = _policy_artifact_payload(event_payload, self.owner_policy.artifact_extensions)
+                if event_payload is None:
+                    return True
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
-                    event_payload=getattr(ev, "payload", None), task=self.task,
+                    event_payload=event_payload, task=None if self.policy_active else self.task,
                 )
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)

@@ -1887,6 +1887,20 @@ DEFAULT_CONFIG = {
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,
+        # Owner delivery policy: on the platforms listed here the notifier delivers ONLY the
+        # categories an owner acts on — a request for their decision and the finished
+        # deliverables of a card (article + whitelisted files). Crashes, time-outs, comments,
+        # review handoffs and every other machine event stay on the board, and the creator's
+        # session is woken for a decision only. Other platforms (desktop `local`, api_server,
+        # cron) are untouched. `enabled: false` restores the previous behaviour verbatim.
+        "owner_delivery_policy": {
+            "enabled": True,
+            "platforms": ["telegram"],
+            "artifact_extensions": [
+                ".pdf", ".docx", ".doc", ".xlsx", ".pptx", ".html", ".htm",
+                ".png", ".jpg", ".jpeg", ".svg", ".webp", ".zip", ".csv", ".txt",
+            ],
+        },
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
