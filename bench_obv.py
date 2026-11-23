@@ -106,6 +106,7 @@ def run(tree: str, window: int = 15, burst: int = 8) -> dict:
     pid = int((home / "server.pid").read_text())
 
     cpu0 = _cpu_seconds(pid)
+    cpu_last = [(cpu0, 0.0)]
     t0 = time.perf_counter()
     stop = threading.Event()
     lat: list[float] = []
@@ -123,15 +124,22 @@ def run(tree: str, window: int = 15, burst: int = 8) -> dict:
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(burst)]
     for t in threads:
         t.start()
-    while time.perf_counter() - t0 < window + 2:
-        if spy.poll() is not None:
+    # py-spy terminates its child when the duration elapses, so keep the last live CPU reading
+    # instead of sampling /proc after the fact.
+    while time.perf_counter() - t0 < window:
+        try:
+            cpu_last[0] = (_cpu_seconds(pid), time.perf_counter() - t0)
+        except (FileNotFoundError, ProcessLookupError):
             break
-        time.sleep(0.2)
+        time.sleep(0.1)
     stop.set()
     for t in threads:
         t.join(timeout=60)
     wall = time.perf_counter() - t0
-    cpu1 = _cpu_seconds(pid)
+    try:
+        cpu1 = _cpu_seconds(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        cpu1, wall = cpu_last[0]
     try:
         spy.wait(timeout=30)
     except subprocess.TimeoutExpired:
