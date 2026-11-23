@@ -1,40 +1,61 @@
 #!/usr/bin/env python3
 """AST-аудит HTTP-маршрутов панели: где цикл событий действительно блокируется.
 
-Записка t_eca8cb15 §1.3 обязана быть воспроизводимой: числа ниже печатаются этим
-скриптом, а не считаются руками.
+Записка t_eca8cb15 §1.3 обязана быть воспроизводимой: каждое число ниже печатает
+этот скрипт, ничего не считается руками.
 
-Запуск (из корня чекаута):
+    python3 durable/t_eca8cb15/probes/route_audit.py --json durable/t_eca8cb15/probes/route_audit.json
+    # сверка с живым приложением (FastAPI-объект, а не текст):
+    python3 durable/t_eca8cb15/probes/route_audit.py --live
 
-    python3 durable/t_eca8cb15/probes/route_audit.py --json out.json --md out.md
+## Что считается
 
-Что считается:
+1. **Регистрации.** Декоратор `<любое_имя>.<verb>(...)` в
+   `hermes_cli/web_routers/*.py`, где `verb` из HTTP/WS-набора. Имя объекта-роутера
+   не проверяется: модули объявляют `router`, `admin_router`, `public_router` и др.,
+   и фильтр по `router` теряет часть регистраций. Один обработчик на двух путях —
+   две регистрации; уникальные обработчики считаются отдельно.
+   `api_route` и `websocket` считаются отдельно от `get/post/...`.
 
-1. **Регистрации маршрутов.** Каждый декоратор ``@router.<verb>(...)`` /
-   ``@app.<verb>(...)`` в ``hermes_cli/web_routers/*.py`` — одна регистрация
-   (``api_route`` считается отдельно от ``get/post/...``, ``websocket`` — отдельно
-   от HTTP). Один и тот же обработчик, зарегистрированный на два пути, даёт две
-   регистрации; уникальные обработчики считаются отдельно.
+2. **Синхронные обработчики (`def`).** Starlette исполняет их через
+   `run_in_threadpool`, то есть они НЕ блокируют цикл событий по построению и в
+   список правок не входят — их считает только перепись.
 
-2. **Синхронные обработчики (``def``).** Starlette исполняет их в пуле потоков
-   (``run_in_threadpool``), поэтому они НЕ блокируют цикл событий по построению.
-   В список правок не попадают.
+3. **Порог отбора блокирующего (ЯВНЫЙ).** В `async def`-обработчике блокирующим
+   считается вызов из списка ниже. Всё остальное — не блокирующее.
 
-3. **Блокирующее тело ``async def``.** Порог отбора — ЯВНЫЙ, белый список
-   блокирующих операций (``BLOCKING``): файловая система (``pathlib``/``os.*``),
-   ``sqlite3``, ``subprocess``, ``time.sleep``, ``socket.connect``, блокирующие
-   HTTP-клиенты, ``threading``-примитивы. Всё остальное (словари, строки,
-   ``datetime``, ``json``, отсутствие явных блокирующих вызовов) НЕ считается
-   блокирующим — иначе список правок раздувается мелочью вроде ``is_file()``,
-   чья цена на порядки меньше сетевого/дискового вызова.
+   * `PATH_IO` — трогает данные или строит/удаляет узлы: `read_text`, `read_bytes`,
+     `write_text`, `write_bytes`, `mkdir`, `makedirs`, `unlink`, `remove`, `rmdir`,
+     `rename`, `replace`, `chmod`, `touch`, `symlink_to`, `iterdir`, `glob`, `rglob`,
+     `scandir`, `listdir`, `walk`, `opens`/`open`, `getsize`, `readlink`, `fsync`.
+   * `open(...)` (встроенный и `io`/`codecs`) — чтение/запись файла.
+   * `os`/`shutil`/`subprocess`/`sqlite3`/`socket`/`requests`/`urllib` — любой вызов
+     с корнем в этом модуле (кроме конструкторов объектов).
+   * `time.sleep`, `threading.*.acquire/join/release`, `concurrent.futures` `wait`.
 
-   Вызов **не** считается блокирующим, если он лексически лежит внутри вложенной
-   функции/лямбды, переданной в ``asyncio.to_thread`` / ``anyio.to_thread.run_sync``
-   / ``loop.run_in_executor`` — то есть уже оффлоадится.
+   **Исключены из порога осознанно — метаданные** (`exists`, `is_file`, `is_dir`,
+   `is_symlink`, `stat`, `lstat`, `samefile`, `resolve`, `st_*`): это вызов
+   `stat(2)` ценой единицы микросекунд, на 8 одновременных запросах — доли
+   миллисекунды. Записи и чтения (пункт выше) стоят на два-четыре порядка дороже
+   и в список входят. Исключение печатается отдельным числом (`meta_only`), чтобы
+   обработчик «только со stat» был виден, а не просто отброшен.
 
-4. **Уже оффлоадящие обработчики.** ``async def``-обработчики, в теле которых есть
-   хотя бы один ``to_thread``/``run_in_executor`` — это образец правки и отдельная
-   цифра (не 37 и не 103: число печатается).
+   **Исключены асинхронные двойники:** `httpx.AsyncClient`, `asyncio.sleep`,
+   `asyncio.*`, `anyio.*` (кроме `anyio.to_thread.run_sync`, который сам оффлоадит),
+   `websockets.*` — они не блокируют цикл.
+
+   **Ложные срабатывания по имени метода** (`str.replace`, `list.remove`,
+   `dict.get`, `queue.get`) отсекаются проверкой получателя: `replace`/`remove`/
+   `run`/`get`/`open`/`write`/`read` считаются файловыми только если последний
+   компонент имени получателя содержит `path|file|dir|root|target|tmp|dest|src|`
+   `archive|staging|home|soul|skill|child|store|db|catalog|lock|buf`. Правило
+   документировано здесь и одинаково для всех файлов.
+
+4. **Уже оффлоадящие обработчики.** `async def`-обработчик, в теле которого есть
+   обёртка оффлоада (`asyncio.to_thread`, `anyio.to_thread.run_sync`,
+   `loop.run_in_executor`) — это образец правки для t_f238ce77 и отдельная цифра.
+   Вызовы лексически **внутри** первого аргумента такой обёртки блокирующими не
+   считаются: они уже исполняются в пуле потоков.
 """
 
 from __future__ import annotations
@@ -47,36 +68,40 @@ from pathlib import Path
 
 ROUTERS_DIR = "hermes_cli/web_routers"
 
-# --- порог отбора -----------------------------------------------------------
-# Модули, чьи вызовы в async-теле блокируют цикл событий.
-BLOCKING_MODULES = {"sqlite3", "subprocess", "shutil", "socket", "requests", "httpx"}
+VERBS = {"get", "post", "put", "patch", "delete", "head", "options",
+         "api_route", "websocket"}
 
-# Функции pathlib.Path / os, которые трогают диск или ждут.
-BLOCKING_ATTRS = {
-    # pathlib
-    "stat", "lstat", "exists", "is_file", "is_dir", "is_symlink", "read_text",
-    "read_bytes", "write_text", "write_bytes", "mkdir", "unlink", "rmdir",
-    "rename", "replace", "chmod", "symlink_to", "hardlink_to", "touch",
-    "resolve", "iterdir", "glob", "rglob", "walk", "samefile",
-    # os
-    "listdir", "scandir", "makedirs", "removedirs", "remove", "walk", "open",
-    "getsize", "getmtime", "access", "readlink",
-    # ожидание
-    "sleep", "wait", "waitpid", "call", "check_call", "check_output", "run",
-    "Popen", "connect", "recv", "sendall", "acquire", "join",
-    # блокирующие клиенты
-    "get", "post", "put", "delete", "request",
+# Трогает данные или строит/удаляет узлы — дороже метаданных на порядки.
+PATH_IO = {
+    "read_text", "read_bytes", "write_text", "write_bytes", "mkdir", "makedirs",
+    "unlink", "remove", "rmdir", "rename", "replace", "chmod", "touch",
+    "symlink_to", "hardlink_to", "iterdir", "glob", "rglob", "scandir",
+    "listdir", "walk", "open", "opens", "getsize", "readlink", "fsync",
+    "truncate", "copy", "copy2", "copyfile", "copytree", "move", "rmtree",
 }
 
-# Модули, чей `open` — обычное чтение файла.
-BLOCKING_BUILTINS_MODULES = {"io", "codecs"}
+# Метаданные: в порог не входят, но пересчитываются отдельно.
+PATH_META = {"exists", "is_file", "is_dir", "is_symlink", "stat", "lstat",
+             "samefile", "resolve"}
 
-# Обёртки оффлоада: вызов внутри них уже в пуле потоков.
-OFFLOAD_CALLS = {"to_thread", "run_in_executor", "run_sync", "run_async_in_threadpool"}
+BLOCKING_MODULES = {"os", "shutil", "subprocess", "sqlite3", "socket",
+                    "requests", "urllib", "fcntl", "msvcrt"}
+ASYNC_MODULES = {"asyncio", "anyio", "httpx", "websockets", "aiohttp", "trio",
+                 "starlette", "fastapi"}
+BLOCKING_CALLS = {"time.sleep", "threading.Event.wait", "threading.Lock.acquire",
+                  "threading.RLock.acquire", "concurrent.futures.wait",
+                  "select.select", "selectors.DefaultSelector"}
+
+OFFLOAD_CALLS = {"to_thread", "run_in_executor", "run_sync"}
+
+# Получатель «похож на путь» — см. пункт 3 докстринга.
+RECEIVER_HINTS = ("path", "file", "dir", "root", "target", "tmp", "dest", "src",
+                  "archive", "staging", "home", "soul", "skill", "child",
+                  "store", "db", "catalog", "lock", "buf", "proc", "pool",
+                  "future", "event", "thread", "tmpfile")
 
 
 def dotted(node: ast.AST) -> str:
-    """`a.b.c` для Attribute/Name цепочки, иначе ''."""
     parts: list[str] = []
     cur = node
     while isinstance(cur, ast.Attribute):
@@ -89,85 +114,120 @@ def dotted(node: ast.AST) -> str:
 
 
 def is_offloaded(call: ast.Call) -> bool:
-    """Вызов — обёртка оффлоада? (`asyncio.to_thread(fn, ...)`)."""
     return dotted(call.func).split(".")[-1] in OFFLOAD_CALLS
 
 
-def blocking_kind(call: ast.Call) -> str | None:
-    """Имя блокирующей операции для вызова, иначе None."""
-    name = dotted(call.func)
-    if not name:
+def _receiver_ok(call: ast.Call) -> bool:
+    """Получатель метода похож на путь/файл (см. RECEIVER_HINTS)."""
+    if not isinstance(call.func, ast.Attribute):
+        return False
+    recv = dotted(call.func.value) or (
+        call.func.value.id if isinstance(call.func.value, ast.Name) else ""
+    )
+    if not recv:
+        return False
+    last = recv.split(".")[-1].lower()
+    return any(h in last for h in RECEIVER_HINTS)
+
+
+def classify(call: ast.Call) -> tuple[str, str] | None:
+    """('blocking'|'meta', имя) для вызова, иначе None."""
+    full = dotted(call.func)
+    if not full:
         return None
-    last = name.split(".")[-1]
-    if name in BLOCKING_MODULES or name.split(".")[0] in BLOCKING_MODULES:
-        if last in {"Path", "PurePath", "str", "list", "dict"}:
+    root = full.split(".")[0]
+    last = full.split(".")[-1]
+
+    if full in BLOCKING_CALLS:
+        return ("blocking", full)
+    # Не блокирующее: разбор URL, чтение os.environ, идентификаторы процесса.
+    if root == "urllib" and full.split(".")[1:2] == ["parse"]:
+        return None
+    if root == "os" and full.split(".")[1:2] == ["environ"]:
+        return None
+    if full in {"os.getpid", "os.getcwd", "os.cpu_count", "os.urandom", "os.fspath"}:
+        return None
+    if root == "os" and full.split(".")[1:2] == ["path"] and last in {
+        "join", "basename", "dirname", "splitext", "isabs", "normpath",
+        "abspath", "expanduser",
+    }:
+        return None
+    if root == "os" and full.split(".")[1:2] == ["path"] and last in {
+        "exists", "isfile", "isdir", "getsize", "getmtime",
+    }:
+        return ("meta", full)
+    # Асинхронные модули/классы: httpx.AsyncClient, asyncio.sleep и т.п.
+    if root in ASYNC_MODULES:
+        if "AsyncClient" in full or "Async" in last:
             return None
-        return name
-    # `open(...)` из io/codecs и встроенный `open` трогают диск.
-    if last == "open" and name.split(".")[0] in (BLOCKING_BUILTINS_MODULES | {"builtins"}):
-        return name
-    if last in BLOCKING_ATTRS:
-        # `dict.get`, `queue.get`, `re.sub`... — не файловые. Отсекаем по получателю,
-        # если он очевидно не путь/файл: правило простое и документированное —
-        # `get/post` без модуля-клиента в цепочке не считаем (requests/httpx выше).
-        if last in {"get", "post", "put", "delete", "request", "run", "open"}:
-            return name if name.split(".")[0] in (BLOCKING_MODULES | BLOCKING_BUILTINS_MODULES) else None
-        return name
+        if last in {"get", "post", "put", "delete", "request", "stream"} and "Client" in full:
+            return ("blocking", full)  # httpx.Client — синхронный
+        return None
+    if root in BLOCKING_MODULES:
+        if last in {"Path", "PurePath", "str", "list", "dict", "fspath"}:
+            return None
+        if last in {"connect"} and root == "sqlite3":
+            return ("blocking", full)
+        return ("blocking", full)
+    if root == "builtins" and last == "open":
+        return ("blocking", full)
+    if last in {"open", "read", "write", "readlines", "writelines"} and _receiver_ok(call):
+        return ("blocking", full)
+    if last in PATH_IO:
+        # `str.replace`, `list.remove`, `dict.pop`, `re.sub` — не файловые.
+        if last in {"replace", "remove", "open", "walk", "copy", "move", "run"} and not _receiver_ok(call):
+            return None
+        return ("blocking", full)
+    if last in PATH_META:
+        return ("meta", full)
+    # Ожидание процесса/потока/будущего: ждёт, пока получатель «похож» на них.
+    if last in {"wait", "poll", "communicate", "join"} and _receiver_ok(call):
+        return ("blocking", full)
     return None
 
 
-class Handler:
-    def __init__(self, node: ast.AsyncFunctionDef | ast.FunctionDef, module: str, lineno: int,
-                 path: str, verb: str, is_async: bool):
-        self.name = node.name
-        self.module = module
-        self.lineno = node.lineno
-        self.route_lineno = lineno
-        self.path = path
-        self.verb = verb
-        self.is_async = is_async
-        self.node = node
-
-
-class BlockingFinder(ast.NodeVisitor):
-    """Ищет блокирующие вызовы, пропуская тела оффлоад-обёрток."""
-
+class Finder(ast.NodeVisitor):
     def __init__(self) -> None:
-        self.hits: list[tuple[int, str]] = []
-        self.offloaded_calls = 0
+        self.blocking: list[tuple[int, str]] = []
+        self.meta: list[tuple[int, str]] = []
+        self.offload_wrappers = 0
+
+    # Вложенные функции/лямбды исполняются не в момент объявления: их тело
+    # блокирующим не считается (иначе `def _run(): shutil.rmtree(...)` в
+    # scan_skill_hub попал бы в список, хотя `_run` уходит в to_thread через
+    # _hub_lookup). Обратная сторона названа в докстринге.
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+        return
 
     def visit_Call(self, node: ast.Call) -> None:
         if is_offloaded(node):
-            self.offloaded_calls += 1
-            # Обёртка оффлоада: её аргументы исполняются в пуле — не спускаемся.
-            for arg in node.args[:1]:
-                _skip(arg)
+            self.offload_wrappers += 1
+            # Первый аргумент исполняется в пуле — внутрь не спускаемся.
+            for arg in node.args[1:]:
+                self.visit(arg)
             for kw in node.keywords:
-                _skip(kw.value)
-            self.generic_visit_remaining(node)
+                self.visit(kw.value)
             return
-        kind = blocking_kind(node)
+        kind = classify(node)
         if kind:
-            self.hits.append((node.lineno, kind))
+            (self.blocking if kind[0] == "blocking" else self.meta).append(
+                (node.lineno, kind[1])
+            )
         self.generic_visit(node)
 
-    def generic_visit_remaining(self, node: ast.Call) -> None:
-        # Аргументы сверх первого (timeout и т.п.) — без обхода тела функции.
-        for arg in node.args[1:]:
-            self.visit(arg)
 
-
-def _skip(node: ast.AST) -> None:
-    """Не обходим узел: он исполняется в пуле потоков."""
-
-
-def collect(modules: list[Path]) -> tuple[list[Handler], dict]:
-    handlers: list[Handler] = []
+def collect(modules: list[Path]) -> tuple[list[dict], dict]:
+    handlers: list[dict] = []
     stats = {"registrations": 0, "http_verb": 0, "api_route": 0, "websocket": 0,
-             "async": 0, "def": 0, "async_unique": 0, "def_unique": 0,
-             "async_with_offload": 0}
-    seen_async: set[tuple[str, str]] = set()
-    seen_sync: set[tuple[str, str]] = set()
+             "async": 0, "def": 0}
+    uniq_async: set[tuple[str, str]] = set()
+    uniq_sync: set[tuple[str, str]] = set()
     for mod in sorted(modules):
         tree = ast.parse(mod.read_text(encoding="utf-8"), filename=str(mod))
         for node in ast.walk(tree):
@@ -177,68 +237,99 @@ def collect(modules: list[Path]) -> tuple[list[Handler], dict]:
                 if not isinstance(deco, ast.Call):
                     continue
                 fn = deco.func
-                if not isinstance(fn, ast.Attribute) or not isinstance(fn.value, ast.Name):
+                if not isinstance(fn, ast.Attribute):
                     continue
-                if fn.value.id not in {"router", "app"}:
+                if fn.attr not in VERBS:
                     continue
-                verb = fn.attr
-                if verb not in {"get", "post", "put", "patch", "delete", "head",
-                                "options", "api_route", "websocket"}:
-                    continue
-                route_path = ""
-                if deco.args and isinstance(deco.args[0], ast.Constant) and isinstance(deco.args[0].value, str):
-                    route_path = deco.args[0].value
+                path = ""
+                if deco.args and isinstance(deco.args[0], ast.Constant) \
+                        and isinstance(deco.args[0].value, str):
+                    path = deco.args[0].value
                 stats["registrations"] += 1
-                if verb == "websocket":
-                    stats["websocket"] += 1
-                elif verb == "api_route":
-                    stats["api_route"] += 1
-                else:
-                    stats["http_verb"] += 1
+                key = "websocket" if fn.attr == "websocket" else (
+                    "api_route" if fn.attr == "api_route" else "http_verb")
+                stats[key] += 1
                 is_async = isinstance(node, ast.AsyncFunctionDef)
                 stats["async" if is_async else "def"] += 1
-                key = (str(mod), node.name)
-                (seen_async if is_async else seen_sync).add(key)
-                handlers.append(Handler(node, str(mod), deco.lineno, route_path, verb, is_async))
-    stats["async_unique"] = len(seen_async)
-    stats["def_unique"] = len(seen_sync)
+                (uniq_async if is_async else uniq_sync).add((str(mod), node.name))
+                handlers.append({
+                    "file": str(mod), "file_line": node.lineno, "handler": node.name,
+                    "layer": key, "route": f"{fn.attr} {path}",
+                    "route_line": deco.lineno, "is_async": is_async,
+                    "node": node,
+                })
+    stats["async_unique"] = len(uniq_async)
+    stats["def_unique"] = len(uniq_sync)
     return handlers, stats
 
 
-def audit(handlers: list[Handler]) -> dict:
-    rows: list[dict] = []
+def audit(handlers: list[dict]) -> dict:
+    blocking_rows, meta_only_rows = [], []
     offload_handlers = 0
     for h in handlers:
-        if not h.is_async:
+        if not h["is_async"]:
             continue
-        finder = BlockingFinder()
-        for stmt in h.node.body:
-            finder.visit(stmt)
-        if finder.offloaded_calls:
+        f = Finder()
+        for stmt in h["node"].body:
+            f.visit(stmt)
+        if f.offload_wrappers:
             offload_handlers += 1
-        if finder.hits:
-            rows.append({
-                "file": h.module,
-                "file_line": h.lineno,
-                "handler": h.name,
-                "route": f"{h.verb} {h.path}",
-                "route_line": h.route_lineno,
-                "calls": finder.hits,
-            })
-    return {"blocking_handlers": rows, "async_with_offload": offload_handlers}
+        base = {k: v for k, v in h.items() if k != "node"}
+        if f.blocking:
+            blocking_rows.append({**base, "calls": f.blocking})
+        elif f.meta:
+            meta_only_rows.append({**base, "calls": f.meta})
+    return {"blocking_handlers": blocking_rows, "meta_only_handlers": meta_only_rows,
+            "async_with_offload": offload_handlers}
+
+
+def live_counts() -> dict:
+    """Перепись по живому FastAPI-объекту (не по тексту)."""
+    import inspect
+    from hermes_cli import web_server
+    app = web_server.app
+    http = [r for r in app.routes if getattr(r, "methods", None)]
+    ws = [r for r in app.routes if type(r).__name__ == "APIWebSocketRoute"]
+
+    def bucket(rs):
+        a = s = 0
+        for r in rs:
+            ep = getattr(r, "endpoint", None)
+            if ep is None:
+                continue
+            if inspect.iscoroutinefunction(ep):
+                a += 1
+            else:
+                s += 1
+        return [a, s]
+
+    def ours(rs):
+        return [r for r in rs if str(getattr(getattr(r, "endpoint", None),
+                                            "__module__", "")).startswith("hermes_cli.web_routers")]
+
+    return {
+        "all_http": [len(http), bucket(http)],
+        "all_ws": len(ws),
+        "web_routers_http": [len(ours(http)), bucket(ours(http))],
+        "web_routers_ws": len(ours(ws)),
+    }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
     ap.add_argument("--json")
-    ap.add_argument("--md")
+    ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
     root = Path(args.root).resolve()
+    if args.live:
+        sys.path.insert(0, str(root))
+        print(json.dumps(live_counts(), ensure_ascii=False, indent=2))
+        return 0
     modules = sorted((root / ROUTERS_DIR).glob("*.py"))
     handlers, stats = collect(modules)
-    result = audit(handlers)
-    out = {"routers_dir": ROUTERS_DIR, "modules": len(modules), "stats": stats, **result}
+    out = {"routers_dir": ROUTERS_DIR, "modules": len(modules), "stats": stats,
+           **audit(handlers)}
     text = json.dumps(out, ensure_ascii=False, indent=2)
     if args.json:
         Path(args.json).write_text(text + "\n", encoding="utf-8")
