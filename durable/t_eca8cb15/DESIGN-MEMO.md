@@ -432,13 +432,29 @@ dashboard:
 сравним с секундой ожидания в панели. №5 стоит выше №6/№7 потому, что размер файла там задаёт не
 сервер, а пользователь (модели до сотен МиБ): `unlink` 1 ГиБ — p95 1041 мс, при медиане 82 мс.
 
-> **Состояние на 23.11.2026:** правки №1–№7 (кроме `messaging.py`, см. ниже) уже реализованы и
-> влиты в `feature/multiuser-access` @ `bfd5c5ef51ed` (32 файла, шов
+> **Состояние на 23.11.2026 (проверено мной построчно в `feature/multiuser-access`, не по отчёту):**
+> вынос блокирующей работы влит в `bfd5c5ef51ed` (32 файла, шов
 > `hermes_cli/web_routers/handler_offload.py`, выключатель `dashboard.handler_offload` /
-> `HERMES_HANDLER_OFFLOAD=0`) — таблица выше остаётся спецификацией того, что закрыто, а остаток
-> аудита назван в `durable/t_a61becbc/REPORT.md`: 8 точек из 37 находок, из них 4 — осознанно
-> неблокирующие (`oauth.py:514/916`, `webapp_access.py:156`, `audio.py:593`, `display.py:125`,
-> ложное срабатывание `ops.py:207`) и `messaging.py:start_whatsapp_onboarding` (контракт 21 теста).
+> `HERMES_HANDLER_OFFLOAD=0`), но **таблица выше закрыта не вся**. Фактическое состояние по
+> целевому дереву:
+>
+> | № | Точка (целевая ветка) | Состояние в `feature/multiuser-access` |
+> |---|---|---|
+> | 1 | `files.py:1096 fs_write_text` | **оффлоадднут** — `off_loop(_fs_write_text_blocking, …)` (1138), внутри `write_text` 1167 + `os.replace` 1168 + `unlink` в `finally` |
+> | 2 | `audio.py:90 transcribe_audio_upload` | **НЕ оффлоадднут**: `base64.b64decode` (107) и `tmp.write` (123) остались в цикле |
+> | 3 | `audio.py:299 speak_text` | **частично**: в потоке только чтение+unlink (`_read_and_unlink`, 344); `base64.b64encode` (348) остался в цикле |
+> | 4 | `files.py:483 proxy_remote_media` | **НЕ оффлоадднут**: `base64.b64encode` (520) в цикле |
+> | 5 | `local_models.py:803 local_models_delete` | **оффлоадднут** — `off_loop(_variant_files_on_disk)` (808), `off_loop(_unlink_all)` (811) |
+> | 6 | `files.py:1231 fs_read_data_url` | **оффлоадднут** — `to_thread` (1236/1239/1249/1266) |
+> | 7 | `actions.py:386 get_action_status` | **НЕ оффлоадднут**: `_tail_lines` (394/403/404) в цикле |
+>
+> Итого закрыто 3 из 7 (№1, 5, 6), №3 — наполовину, №2/4/7 — остаток для `t_f238ce77`.
+> Номера строк §5.1 — на ревизии аудита `47d3ac2b449b`; в целевой ветке они сдвинуты:
+> `files.py` 1083→**1096**, 472→**483**, 1203→**1231**, `local_models.py` 796→**803**
+> (`audio.py:90/299` и `actions.py:386` не сдвинулись). Остаток полного аудита назван в
+> `durable/t_a61becbc/REPORT.md`: 8 находок из 37, из них 4 — осознанно неблокирующие
+> (`oauth.py:514/916`, `webapp_access.py:156`, `audio.py:593`, `display.py:125`, плюс ложное
+> срабатывание `ops.py:207`) и `messaging.py:start_whatsapp_onboarding` (контракт 21 теста).
 > **Имя выключателя в дереве — `dashboard.handler_offload`, и это единственное читаемое имя**;
 > `dashboard.parallelism` из первой редакции записки Hermes не читает (проверено: предупреждение
 > «not a recognized config key»), поэтому §4/§6/§5.2 приведены к `handler_offload`.
