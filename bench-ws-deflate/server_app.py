@@ -124,37 +124,48 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=None, help="server_max_window_bits")
     ap.add_argument("--memlevel", type=int, default=None, help="zlib memLevel")
     ap.add_argument("--level", type=int, default=None, help="zlib compress level (1..9)")
+    ap.add_argument("--baseline", action="store_true",
+                    help="pin uvicorn's own defaults explicitly (window 12, memLevel 5) so a "
+                         "variant that names only --level does not silently inherit the "
+                         "library's wider default window")
+    ap.add_argument("--no-context-takeover", action="store_true",
+                    help="server_no_context_takeover: reset the deflate window every message "
+                         "(lower memory, less CPU per message, worse ratio)")
     args = ap.parse_args()
-    if args.deflate == "on" and (args.window or args.memlevel or args.level):
+    if args.deflate == "on" and (args.window or args.memlevel or args.level or args.baseline
+                                 or args.no_context_takeover):
         # uvicorn's sansio protocol builds the deflate factory inline and passes window/memLevel
         # explicitly, so a functools.partial would be overridden by the call's own keywords: the
         # override has to be a subclass that forces its values regardless of what is passed.
+        #
+        # uvicorn 0.54's inline call is ServerPerMessageDeflateFactory(server_max_window_bits=12,
+        # client_max_window_bits=None, compress_settings={"memLevel": 5}) with no "level", i.e.
+        # zlib's default level 6. Any override here starts from THOSE values, not the library's
+        # (window 15, memLevel 8): otherwise a "--level 1" run also widens the window and the two
+        # variables move together.
         from uvicorn.protocols.websockets import websockets_sansio_impl as _sansio
         from websockets.extensions.permessage_deflate import (
             ServerPerMessageDeflateFactory as _Factory,
         )
 
-        window, memlevel, level = args.window, args.memlevel, args.level
+        window = args.window if args.window else 12
+        memlevel = args.memlevel if args.memlevel else 5
+        level = args.level
+        no_takeover = args.no_context_takeover
 
         class _TunedFactory(_Factory):  # type: ignore[misc, valid-type]
             def __init__(self, *a, **kw):
-                # Only the knobs the caller named are overridden; everything else keeps the
-                # library default (window 15, memLevel 8, level 6), so "level 1" stays a clean
-                # one-variable change and is not confounded by a narrow window.
-                extra = {}
-                if window:
-                    extra["server_max_window_bits"] = window
-                    extra["client_max_window_bits"] = window
-                settings = {"memLevel": memlevel} if memlevel else {}
+                settings = {"memLevel": memlevel}
                 if level:
                     settings["level"] = level
-                if settings:
-                    extra["compress_settings"] = settings
-                super().__init__(**extra)
+                super().__init__(
+                    server_max_window_bits=window,
+                    server_no_context_takeover=no_takeover,
+                    compress_settings=settings,
+                )
 
         _sansio.ServerPerMessageDeflateFactory = _TunedFactory
 
-        _sansio.ServerPerMessageDeflateFactory = _TunedFactory
     print(f"deflate={args.deflate} window={args.window} memlevel={args.memlevel} level={args.level}",
           flush=True)
     config = uvicorn.Config(
