@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -214,3 +215,58 @@ def test_over_cap_repeats_write_one_partial_copy_and_say_so(card_env, monkeypatc
     notice = messages[-1]["content"]
     assert "partial" in notice.lower()
     assert "survives the budget stop" not in notice
+
+
+def test_a_complete_copy_clears_the_loss_record_and_a_shrunk_tree_is_copied(
+    card_env, monkeypatch,
+):
+    """After a partial record, a tree that fits again must get a real copy.
+
+    Otherwise a stale ``wip-partial.json`` would keep telling successors "no copy
+    exists" long after the duplicate/scratch files that blew the cap were cleaned up.
+    """
+    from agent import kanban_budget_checkpoint as kbc
+
+    workspace, _home = card_env
+    for i in range(3):
+        (workspace / f"part{i}.bin").write_bytes(b"P" * (256 * 1024))
+    monkeypatch.setattr(kbc, "_ARCHIVE_MAX_BYTES", 300 * 1024)
+    over = kbc.preserve_wip_tree(task_id="t_probe")
+    assert over.mode == "partial"
+
+    for i in range(3):
+        (workspace / f"part{i}.bin").unlink()
+    (workspace / "small.txt").write_text("kept\n", encoding="utf-8")
+
+    fits = kbc.preserve_wip_tree(task_id="t_probe")
+    assert fits.mode == "archive" and fits.locator
+    with tarfile.open(fits.locator) as tar:
+        assert tar.getnames() == ["small.txt"]
+    from hermes_cli.kanban_db import task_attachments_dir
+    assert not (task_attachments_dir("t_probe") / "wip-partial.json").exists()
+
+
+def test_a_legacy_tarball_without_a_done_marker_is_not_reused(card_env):
+    """Archives written before the marker existed are not provably complete.
+
+    A tree identical to one of them gets a fresh, marked copy instead of being
+    handed back a file whose completeness nobody recorded.
+    """
+    from agent import kanban_budget_checkpoint as kbc
+    from hermes_cli.kanban_db import task_attachments_dir
+
+    workspace, _home = card_env
+    (workspace / "a.txt").write_text("A", encoding="utf-8")
+    first = kbc.preserve_wip_tree(task_id="t_probe")
+    out_dir = task_attachments_dir("t_probe")
+    # Drop the marker: this is what an archive from the previous code looks like.
+    legacy = [p for p in out_dir.glob("wip-*.tar.gz.done")]
+    assert legacy, "a complete copy must carry a completeness marker"
+    for marker in legacy:
+        marker.unlink()
+
+    legacy_archive = Path(first.locator)
+    second = kbc.preserve_wip_tree(task_id="t_probe")
+    assert second.mode == "archive"
+    assert str(second.locator) != str(first.locator)
+    assert legacy_archive.exists(), "the unmarked archive must be left alone, not deleted"

@@ -202,7 +202,6 @@ def _tree_fingerprint(root: Path, files: Iterable[str]) -> str:
     return digest.hexdigest()
 
 
-_FINGERPRINT_FILE = ".wip-fingerprint"
 # A complete tarball is only ever handed back when this marker, carrying the tree
 # fingerprint, sits beside it. An archive without one is not proof of anything:
 # the previous implementation left cut-off tarballs in this directory, and they
@@ -349,7 +348,8 @@ def _archive_tree(
     # ever called this tree's copy once it is known to be whole.
     try:
         (out_dir / f"{target.name}{_DONE_SUFFIX}").write_text(fingerprint + "\n", encoding="utf-8")
-        (out_dir / _FINGERPRINT_FILE).write_text(fingerprint + "\n", encoding="utf-8")
+        # A stale loss record for a tree that now fits would outlive its truth.
+        (out_dir / _PARTIAL_FILE).unlink(missing_ok=True)
     except OSError:
         pass
     return _ArchiveOutcome(str(target), complete=True)
