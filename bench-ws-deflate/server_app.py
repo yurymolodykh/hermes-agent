@@ -138,14 +138,21 @@ def main() -> None:
 
         class _TunedFactory(_Factory):  # type: ignore[misc, valid-type]
             def __init__(self, *a, **kw):
+                # Only the knobs the caller named are overridden; everything else keeps the
+                # library default (window 15, memLevel 8, level 6), so "level 1" stays a clean
+                # one-variable change and is not confounded by a narrow window.
+                extra = {}
+                if window:
+                    extra["server_max_window_bits"] = window
+                    extra["client_max_window_bits"] = window
                 settings = {"memLevel": memlevel} if memlevel else {}
                 if level:
                     settings["level"] = level
-                super().__init__(
-                    server_max_window_bits=window or 12,
-                    client_max_window_bits=window or 12,
-                    **({"compress_settings": settings} if settings else {}),
-                )
+                if settings:
+                    extra["compress_settings"] = settings
+                super().__init__(**extra)
+
+        _sansio.ServerPerMessageDeflateFactory = _TunedFactory
 
         _sansio.ServerPerMessageDeflateFactory = _TunedFactory
     print(f"deflate={args.deflate} window={args.window} memlevel={args.memlevel} level={args.level}",
