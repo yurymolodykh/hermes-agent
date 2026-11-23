@@ -321,6 +321,16 @@ KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 # BSD EX_UNAVAILABLE (the service the worker needed was not there).
 KANBAN_OWNER_LOST_EXIT_CODE = 69
 
+# Worker exit "the platform lost this attempt's execution" (OPS-16): the owner no longer knows the
+# execution it admitted (``prompt.receipt`` answered ``unknown``) and no ``worker_result`` was
+# written, so nothing on the board can say the work failed — a host watchdog's SIGTERM, an OOM kill
+# or a manual kill all land here. Booking it as exit 1 charged the card's failure budget for a
+# platform-caused loss (23.11.2026, run 708: 42 minutes of work booked ``crashed``). 71 == BSD
+# ``EX_OSERR``: the operating environment failed, the card's work did not. Requeued WITHOUT
+# counting a failure, and the run's outcome reads ``interrupted`` — it is the same platform
+# condition a gateway restart records for a turn it stopped.
+KANBAN_WORKER_LOST_EXIT_CODE = 71
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""

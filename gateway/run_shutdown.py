@@ -1982,10 +1982,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     async def _stop_interrupt_remaining_work(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Drain timed out: mark resume_pending, interrupt, settle, kill tool subprocesses, notify cron."""
         from gateway.run import GatewayRunner
+        # ``timed_out`` comes from ``_drain_work_counts``, which folds in the managed workers the
+        # drain WAITED on — but ``_running_agent_count`` alone does not, so a restart with six live
+        # managed workers logged "0 active agent(s)" and read as a phantom timeout (23.11.2026,
+        # 01:16:32: 6 units killed, journal said 0). Name them, or an operator cannot tell which
+        # work the force-stop interrupted.
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
-            "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
+            "%d managed-worker turn(s), %d in-flight cron job(s), %d api_server run(s), and "
+            "%d deferred agent worker(s); interrupting remaining work.", ctx.drain_elapsed,
+            self._running_agent_count(), managed_turn_count(self),
             self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions

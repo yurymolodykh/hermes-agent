@@ -30,6 +30,11 @@ OWNER_WAIT_FLOOR_S = 600.0
 # Exit code of a submitter that outlived the owner: EX_UNAVAILABLE. It is NOT a card failure — the
 # owner was absent, not the work wrong — so the crash sweep requeues without spending the budget.
 OWNER_LOST_EXIT_CODE = 69
+# Exit code of a submitter whose attempt the platform lost: the owner forgot the execution it
+# admitted and no ``worker_result`` exists, so nothing says the work failed. Booking it as 1 charged
+# the card's failure budget for a host watchdog kill or an OOM (23.11.2026, run 708: 42 minutes of
+# work booked ``crashed``). 71 == BSD EX_OSERR; the crash sweep requeues without counting a failure.
+WORKER_LOST_EXIT_CODE = 71
 
 
 def owner_wait_seconds():
@@ -127,6 +132,32 @@ async def run(params, board_db):
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+
+
+def _checkpoint_worker_lost(params, board_db, cause) -> None:
+    """Leave a durable note that this attempt stopped because the platform lost its execution.
+
+    A run with no settlement and no ``worker_result`` cannot say its work failed — an operator
+    reading the card must see that the platform lost the attempt, not that the card was wrong. The
+    note carries the cause the client already read, so the next attempt's worker context explains
+    what happened without re-diagnosing. Best-effort: a note that cannot be written must never
+    replace the exit code the sweep depends on.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        note = {
+            'kind': 'worker_lost',
+            'task_id': params['task_id'],
+            'run_id': params['run_id'],
+            'claim_lock': params['claim_lock'],
+            'detail': str(cause or '')[:300],
+        }
+        with connect_closing(Path(board_db)) as conn, kb.write_txn(conn):
+            kb._append_event(conn, params['task_id'], 'checkpoint', note, run_id=params['run_id'])
+    except Exception as exc:  # never mask the exit code the crash sweep reads
+        print(f'Kanban worker-lost checkpoint not written: {type(exc).__name__}: {exc}',
+              file=sys.stderr)
 
 
 def _checkpoint_owner_lost(params, board_db, claim, owner_wait, detail) -> None:
@@ -293,15 +324,22 @@ def _exit_code(receipt, params, board_db):
     if result.get('last_output'):
         print(result['last_output'])
     if receipt['status'] == 'unknown' and not result:
+        # No settlement AND no result: nothing on the board can say the work failed — the owner
+        # forgot the execution (a host watchdog's SIGTERM, an OOM kill, a manual kill). That is a
+        # PLATFORM loss, not a card failure: exiting 1 here spent the card's failure budget for it
+        # (23.11.2026, run 708 — 42 minutes of work booked ``crashed``). Leave the durable checkpoint
+        # and exit the platform-loss code the crash sweep requeues without charging.
         cause = _unknown_cause(params, board_db)
-        raise GatewayClientError(
-            'Kanban execution unknown; retained by owner — the admission never settled and no '
-            'worker_result was recorded for this attempt'
-            # Never assert an unverified fact here: `_unknown_cause` reports what it actually saw
-            # (a board event, a log line, or the read failure itself), so the absence of a cause
-            # means both sources were consulted and silent — not that the log "is empty".
-            + (f'. Cause: {cause}' if cause else
-               '. Cause unknown: neither the board nor the worker log could explain this attempt'))
+        _checkpoint_worker_lost(params, board_db, cause)
+        print('Kanban execution unknown; retained by owner — the admission never settled and no '
+              'worker_result was recorded for this attempt'
+              # Never assert an unverified fact here: `_unknown_cause` reports what it actually saw
+              # (a board event, a log line, or the read failure itself), so the absence of a cause
+              # means both sources were consulted and silent — not that the log "is empty".
+              + (f'. Cause: {cause}' if cause else
+                 '. Cause unknown: neither the board nor the worker log could explain this attempt'),
+              file=sys.stderr)
+        return WORKER_LOST_EXIT_CODE
     return result.get('exit_code', 1)
 
 
