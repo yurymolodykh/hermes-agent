@@ -210,6 +210,123 @@ _DONE_SUFFIX = ".done"
 # The single, overwritten record of a tree that cannot be archived whole. No
 # tarball is written for that case, so nothing truncated can be handed back.
 _PARTIAL_FILE = "wip-partial.json"
+# Retention: the board's attachment directory is the only place these copies
+# live, and a card whose threshold fires on every turn would otherwise grow it
+# without bound. Keep the newest N complete pairs — plus, in one unmarked
+# generation, the legacy archives written before the marker existed.
+_ARCHIVE_RETENTION = 3
+# Copies this run's reminders already pointed at. The reminder text lives on in
+# the conversation, so deleting one of those paths would leave the model and a
+# successor reading about a copy that no longer exists — the card's rule is that
+# a path named by a reminder of the *current* run is never pruned. The set is
+# cleared when the run changes, so it is bounded by this run's own reminder count,
+# and the directory share of a card is the window plus those names.
+_NAMED_OFFERS: dict[str, list[str]] = {}
+
+
+def _run_key() -> str:
+    """Identity of the current reminder stream (its run, else its card)."""
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID") or os.environ.get("HERMES_KANBAN_TASK") or ""
+    return raw.strip() or "-"
+
+
+def _remember_named(path: str) -> None:
+    """Record a copy this run's reminder points at, replacing a previous run's set.
+
+    The reminder fires at most once per run (``_iteration_budget_warning_injected``
+    latches), so in practice this holds the single path the model was told about.
+    The cap is a safety valve for the hard-stop path: it keeps the pin list from
+    growing without bound while never dropping the newest offer.
+    """
+    key = _run_key()
+    for stale in [k for k in _NAMED_OFFERS if k != key]:
+        del _NAMED_OFFERS[stale]
+    offered = _NAMED_OFFERS.setdefault(key, [])
+    shown = str(path)
+    if shown in offered:
+        offered.remove(shown)
+    offered.append(shown)
+    del offered[:-_ARCHIVE_RETENTION]
+
+
+def _named_in_run() -> set[str]:
+    """Paths this run's reminders already named — never pruning candidates."""
+    return set(_NAMED_OFFERS.get(_run_key(), ()))
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _prune_archives(out_dir: Path) -> list[str]:
+    """Keep the newest ``_ARCHIVE_RETENTION`` complete pairs and one unmarked generation.
+
+    Every archive kept here is still meaningful: a pair is reusable, a single
+    unmarked tarball is the last remnant of a previous code version. Anything
+    older is dead weight in a directory a human browses.
+
+    A copy this run's reminder already named is exempt even when recency would
+    drop it — the reuse branch can return the oldest archive on disk, and deleting
+    the very path the reminder points at would be worse than one extra file. A
+    marker never outlives its tarball (or vice versa).
+    """
+    removed: list[str] = []
+    try:
+        archives = [p for p in out_dir.glob("wip-*.tar.gz") if p.is_file()]
+    except OSError:
+        return removed
+    marked = [p for p in archives if p.with_name(p.name + _DONE_SUFFIX).is_file()]
+    unmarked = [p for p in archives if p not in marked]
+    named = _named_in_run()
+
+    for old in sorted(marked, key=_mtime_ns, reverse=True)[_ARCHIVE_RETENTION:]:
+        if str(old) in named:
+            continue
+        for victim in (old, old.with_name(old.name + _DONE_SUFFIX)):
+            try:
+                victim.unlink()
+            except OSError:
+                continue
+            removed.append(str(victim))
+
+    # One generation of unmarked tarballs survives: the newest.
+    for old in sorted(unmarked, key=_mtime_ns, reverse=True)[1:]:
+        if str(old) in named:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            continue
+        removed.append(str(old))
+
+    # A marker whose tarball is gone would make a missing copy look complete.
+    try:
+        orphans = list(out_dir.glob(f"wip-*.tar.gz{_DONE_SUFFIX}"))
+    except OSError:
+        orphans = []
+    for marker in orphans:
+        if not marker.with_name(marker.name[: -len(_DONE_SUFFIX)]).exists():
+            try:
+                marker.unlink()
+            except OSError:
+                continue
+            removed.append(str(marker))
+    return removed
+
+
+def _clear_stale_partial(out_dir: Path) -> None:
+    """Drop the loss record once a complete archive for the tree exists.
+
+    The record says "the tree is over the cap, not one file was copied"; beside a
+    real copy it is false, and a human browsing the card's attachments reads it.
+    """
+    try:
+        (out_dir / _PARTIAL_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -314,6 +431,11 @@ def _archive_tree(
     fingerprint = _tree_fingerprint(root, paths)
     unchanged = _existing_archive(out_dir, fingerprint)
     if unchanged:
+        # The reuse branch returns before the write path, so it must clear the
+        # loss record itself: beside a real copy that record is simply false.
+        _clear_stale_partial(out_dir)
+        _remember_named(unchanged)
+        _prune_archives(out_dir)
         return _ArchiveOutcome(unchanged, complete=True)
 
     try:
@@ -355,6 +477,8 @@ def _archive_tree(
         (out_dir / _PARTIAL_FILE).unlink(missing_ok=True)
     except OSError:
         pass
+    _remember_named(str(target))
+    _prune_archives(out_dir)
     return _ArchiveOutcome(str(target), complete=True)
 
 
