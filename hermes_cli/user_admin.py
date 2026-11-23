@@ -123,9 +123,9 @@ def users_file_path() -> Optional[Path]:
     path = _Path(value).expanduser()
     if path.is_absolute():
         return path
-    from hermes_constants import get_hermes_root
+    from hermes_constants import get_default_hermes_root
 
-    return _Path(get_hermes_root()) / path
+    return _Path(get_default_hermes_root()) / path
 
 
 def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
@@ -140,9 +140,9 @@ def ensure_users_file_configured() -> tuple[Path, Callable[[], None]]:
     would quietly write a table nobody signs in against. A relative configured value is
     therefore resolved against the root, never against the profile's own home.
     """
-    from hermes_constants import get_hermes_root
+    from hermes_constants import get_default_hermes_root
 
-    root = Path(get_hermes_root())
+    root = Path(get_default_hermes_root())
     existing = users_file_path()
     if existing is not None:
         raw = str(existing)
