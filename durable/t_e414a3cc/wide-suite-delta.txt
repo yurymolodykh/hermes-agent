@@ -1,0 +1,9 @@
+### Baseline vs patched — identical failure set proves no regression
+```
+baseline (3e1895729437 + only the new test file):
+=== Summary: 103 files, 750 tests passed, 29 failed, 4 skipped; FAILED: 13 of 103 files (100% complete) in 212.7s (8 workers) ===
+patched (this branch):
+=== Summary: 104 files, 756 tests passed, 29 failed, 4 skipped; FAILED: 13 of 104 files (100% complete) in 216.8s (8 workers) ===
+
+delta: +1 file (the new test file), +6 tests passed, 0 new failures, same 29 failures in the same 13 files.
+```

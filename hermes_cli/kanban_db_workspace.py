@@ -503,13 +503,14 @@ def _preserve_scratch_workspace(
         "on disk; declare it as an artifact or use worktree:/dir: to keep it",
         task_id, reason, repo, wp,
     )
-    try:
-        _kb._append_event(
-            conn, task_id, "workspace_cleanup_preserved_unsaved_work",
-            {"path": str(wp), "repo": str(repo), "reason": reason},
-        )
-    except sqlite3.Error:
-        pass
+    # The event alone is not enough provenance: ``task_events`` is
+    # retention-scoped and wiped by a hard delete, while the directory stays on
+    # disk forever. The durable registry beside the board DB keeps it findable
+    # (verdict t_896b6548, Д3) and records once per (task, path) so a repeated
+    # ``gc`` run does not append another row (Д7).
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    kpw.record(conn, task_id, wp, repo, reason)
     return True
 
 

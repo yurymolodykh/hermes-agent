@@ -1,0 +1,274 @@
+▶ not activated — using HERMES_PYTHON: /home/hermes/.hermes/installs/019d0d114d22b7e6/test-environment/gen-8f22a0933fa3482c9b164508f3f0f9e2/venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+fatal: не найден git репозиторий (или один из родительских каталогов): .git
+▶ launching test runner
+Discovered 1 test files (~6 tests) under ['tests/hermes_cli/test_kanban_preserved_provenance.py']; running with -j 8
+[100.0% |     6/~6 | ✓0 | ✗6] ✗ tests/hermes_cli/test_kanban_preserved_provenance.py (6✗, 18.2s)
+
+  ╔╍ Failed: tests/hermes_cli/test_kanban_preserved_provenance.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     def test_registry_survives_a_board_scoped_round_trip(kanban_home):
+  ║         """The registry lives next to the board DB, so a named board keeps its own."""
+  ║         kb.create_board("prov")
+  ║         with kbc.connect_closing(board="prov") as conn:
+  ║             task_id, ws = _ws_with_unpushed_repo(conn)
+  ║             assert kb.complete_task(conn, task_id, result="done")
+  ║             assert kb.archive_task(conn, task_id)
+  ║             assert kb.delete_archived_task(conn, task_id) is True
+  ║     
+  ║         path = Path(str(kb.kanban_db_path(board="prov"))).with_name(
+  ║             "kanban-preserved-workspaces.json"
+  ║         )
+  ║ >       assert path.exists(), "the durable registry never got written"
+  ║ E       AssertionError: the durable registry never got written
+  ║ E       assert False
+  ║ E        +  where False = exists()
+  ║ E        +    where exists = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/boards/prov/kanban-preserved-workspaces.json').exists
+  ║ 
+  ║ tests/hermes_cli/test_kanban_preserved_provenance.py:227: AssertionError
+  ║ ------------------------------ Captured log call -------------------------------
+  ║ WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0cd86439: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+  ║ WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0cd86439: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_event_retention_keeps_preserved_workspace_provenance
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_hard_delete_keeps_preserved_workspace_findable
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_prints_preserved_workspace_paths
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_forgets_a_preserved_dir_the_operator_removed
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_event_is_idempotent_on_repeated_runs
+  ║ FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_registry_survives_a_board_scoped_round_trip
+  ║ ============================== 6 failed in 9.90s ===============================
+  ║
+  ║  Repro: python -m pytest tests/hermes_cli/test_kanban_preserved_provenance.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 0 tests passed, 6 failed; FAILED: 1 of 1 file (100% complete) in 18.3s (8 workers) ===
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 18.2s  (runner wall: 18.3s, parallelism: 8x)
+  P50: 18.23s  P90: 18.23s  P95: 18.23s  P99: 18.23s  Max: 18.23s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     18.23s  tests/hermes_cli/test_kanban_preserved_provenance.py
+
+=== Failure output ===
+
+--- tests/hermes_cli/test_kanban_preserved_provenance.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.14.9, pytest-9.1.1, pluggy-1.7.0
+rootdir: /home/hermes/.hermes/cache/scratch/base-t_e414a3cc
+configfile: pyproject.toml
+plugins: asyncio-1.4.0, anyio-4.15.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 6 items
+
+tests/hermes_cli/test_kanban_preserved_provenance.py FFFFFF              [100%]
+
+=================================== FAILURES ===================================
+__________ test_event_retention_keeps_preserved_workspace_provenance ___________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_event_retention_keeps_pre0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x7dff2bbfaba0>
+
+    def test_event_retention_keeps_preserved_workspace_provenance(
+        kanban_home, capsys
+    ):
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert ws.is_dir()
+            assert _events(conn, task_id), "precondition: the guard recorded the save"
+            assert kb.archive_task(conn, task_id)
+            _age_events(conn, task_id)
+            # A neighbouring retention-scoped event must still be collected, so the
+            # assertion below cannot pass by retention simply doing nothing.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at)"
+                    " VALUES (?, NULL, 'completed', NULL, 0)",
+                    (task_id,),
+                )
+    
+            removed = kb.gc_events(conn, older_than_seconds=86400)
+    
+            assert removed >= 1, "unrelated old events are still pruned"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
+                (task_id,),
+            ).fetchone()[0] == 0
+            survived = _events(conn, task_id)
+>           assert len(survived) == 1, "retention ate the only pointer to the directory"
+E           AssertionError: retention ate the only pointer to the directory
+E           assert 0 == 1
+E            +  where 0 = len([])
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:121: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0077314d: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_event_retention_keeps_pre0/.hermes/kanban/workspaces/t_0077314d/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_event_retention_keeps_pre0/.hermes/kanban/workspaces/t_0077314d is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0077314d: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_event_retention_keeps_pre0/.hermes/kanban/workspaces/t_0077314d/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_event_retention_keeps_pre0/.hermes/kanban/workspaces/t_0077314d is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+_____________ test_hard_delete_keeps_preserved_workspace_findable ______________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x7dff2b848410>
+
+    def test_hard_delete_keeps_preserved_workspace_findable(kanban_home, capsys):
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+    
+            assert kb.delete_archived_task(conn, task_id) is True
+    
+            assert kb.get_task(conn, task_id) is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+            ).fetchone()[0] == 0
+            assert ws.is_dir(), "precondition: the directory outlives the card"
+    
+        assert _gc() == 0
+        out = capsys.readouterr().out
+>       assert str(ws) in out, (
+            "after a hard delete the operator has no command that names the "
+            f"preserved directory:\n{out}"
+        )
+E       AssertionError: after a hard delete the operator has no command that names the preserved directory:
+E         GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+E         
+E       assert '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43' in 'GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed\n'
+E        +  where '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43' = str(PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43'))
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:147: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0558fd43: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0558fd43: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_hard_delete_keeps_preserv0/.hermes/kanban/workspaces/t_0558fd43 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+___________________ test_gc_prints_preserved_workspace_paths ___________________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x7dff2debccd0>
+
+    def test_gc_prints_preserved_workspace_paths(kanban_home, capsys):
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+    
+        assert _gc() == 0
+        out = capsys.readouterr().out
+        assert "GC complete" in out
+>       assert str(ws) in out, f"gc must name the preserved directory:\n{out}"
+E       AssertionError: gc must name the preserved directory:
+E         GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed; 1 preserved for unsaved git work
+E         
+E       assert '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6' in 'GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed; 1 preserved for unsaved git work\n'
+E        +  where '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6' = str(PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6'))
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:167: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_12cb7ba6: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_12cb7ba6: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_12cb7ba6: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_prints_preserved_works0/.hermes/kanban/workspaces/t_12cb7ba6 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+_____________ test_gc_forgets_a_preserved_dir_the_operator_removed _____________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_forgets_a_preserved_di0/.hermes')
+capsys = <_pytest.capture.CaptureFixture object at 0x7dff2a49b100>
+
+    def test_gc_forgets_a_preserved_dir_the_operator_removed(kanban_home, capsys):
+        """Once the directory is gone the entry (and its event) go with it."""
+        import shutil
+    
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+        shutil.rmtree(ws)
+    
+        assert _gc() == 0
+        out = capsys.readouterr().out
+        assert str(ws) not in out, "a gone directory must not be advertised"
+        with kbc.connect_closing() as conn:
+>           assert _events(conn, task_id) == [], (
+                "the retained event must be reaped once its directory is gone"
+            )
+E           AssertionError: the retained event must be reaped once its directory is gone
+E           assert [Event(id=3, ... run_id=None)] == []
+E             
+E             Left contains 2 more items, first extra item: Event(id=3, task_id='t_f77157d3', kind='workspace_cleanup_preserved_unsaved_work', payload={'path': '/var/tmp/hermes-p...orkspaces/t_f77157d3/clone', 'reason': 'no remote-tracking refs (nothing pushed)'}, created_at=1795402089, run_id=None)
+E             Use -v to get more diff
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:184: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f77157d3: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_forgets_a_preserved_di0/.hermes/kanban/workspaces/t_f77157d3/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_forgets_a_preserved_di0/.hermes/kanban/workspaces/t_f77157d3 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f77157d3: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_forgets_a_preserved_di0/.hermes/kanban/workspaces/t_f77157d3/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_forgets_a_preserved_di0/.hermes/kanban/workspaces/t_f77157d3 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+_________________ test_gc_event_is_idempotent_on_repeated_runs _________________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes')
+
+    def test_gc_event_is_idempotent_on_repeated_runs(kanban_home):
+        with kbc.connect_closing() as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+    
+        for _ in range(3):
+            assert _gc() == 0
+    
+        with kbc.connect_closing() as conn:
+            events = _events(conn, task_id)
+>           assert len(events) == 1, (
+                f"each gc run re-recorded the same preserved directory: "
+                f"{[e.payload['path'] for e in events]}"
+            )
+E           AssertionError: each gc run re-recorded the same preserved directory: ['/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03', '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03', '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03', '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03', '/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03']
+E           assert 5 == 1
+E            +  where 5 = len([Event(id=3, task_id='t_f4a8bf03', kind='workspace_cleanup_preserved_unsaved_work', payload={'path': '/var/tmp/hermes-...rkspaces/t_f4a8bf03/clone', 'reason': 'no remote-tracking refs (nothing pushed)'}, created_at=1795402090, run_id=None)])
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:208: AssertionError
+----------------------------- Captured stdout call -----------------------------
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed; 1 preserved for unsaved git work
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed; 1 preserved for unsaved git work
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed; 1 preserved for unsaved git work
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f4a8bf03: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f4a8bf03: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f4a8bf03: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f4a8bf03: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_f4a8bf03: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_gc_event_is_idempotent_on0/.hermes/kanban/workspaces/t_f4a8bf03 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+_______________ test_registry_survives_a_board_scoped_round_trip _______________
+
+kanban_home = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes')
+
+    def test_registry_survives_a_board_scoped_round_trip(kanban_home):
+        """The registry lives next to the board DB, so a named board keeps its own."""
+        kb.create_board("prov")
+        with kbc.connect_closing(board="prov") as conn:
+            task_id, ws = _ws_with_unpushed_repo(conn)
+            assert kb.complete_task(conn, task_id, result="done")
+            assert kb.archive_task(conn, task_id)
+            assert kb.delete_archived_task(conn, task_id) is True
+    
+        path = Path(str(kb.kanban_db_path(board="prov"))).with_name(
+            "kanban-preserved-workspaces.json"
+        )
+>       assert path.exists(), "the durable registry never got written"
+E       AssertionError: the durable registry never got written
+E       assert False
+E        +  where False = exists()
+E        +    where exists = PosixPath('/var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/boards/prov/kanban-preserved-workspaces.json').exists
+
+tests/hermes_cli/test_kanban_preserved_provenance.py:227: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0cd86439: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+WARNING  hermes_cli.kanban_db:kanban_db_workspace.py:501 Preserving scratch workspace for task t_0cd86439: unsaved work (no remote-tracking refs (nothing pushed)) in /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439/clone — /var/tmp/hermes-pytest-1001/r-q1hki6pd/pytest-of-hermes/pytest-0/test_registry_survives_a_board0/.hermes/kanban/workspaces/t_0cd86439 is left on disk; declare it as an artifact or use worktree:/dir: to keep it
+=========================== short test summary info ============================
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_event_retention_keeps_preserved_workspace_provenance
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_hard_delete_keeps_preserved_workspace_findable
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_prints_preserved_workspace_paths
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_forgets_a_preserved_dir_the_operator_removed
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_gc_event_is_idempotent_on_repeated_runs
+FAILED tests/hermes_cli/test_kanban_preserved_provenance.py::test_registry_survives_a_board_scoped_round_trip
+============================== 6 failed in 9.90s ===============================
+
+=== 1 file with test failures ===
+  tests/hermes_cli/test_kanban_preserved_provenance.py  (6 tests failed)

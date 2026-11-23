@@ -1,0 +1,6 @@
+warning: Selection `RUF063` has no effect because preview is not enabled.
+warning: Selection `RUF068` has no effect because preview is not enabled.
+All checks passed!
+--- code_health ---
+
+code health: 9 files vs 3e1895729437: 0 blocking, 0 advisory (2.8s)

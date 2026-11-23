@@ -1,0 +1,57 @@
+== S1: PRE-UPGRADE preserved event (no registry row), card HARD-DELETED ==
+  delete_archived_task -> True
+  registry entries: 1 | preserved events left: 0 | dir on disk: True
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+Registered preserved scratch workspaces (1):
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_arch
+    task t_60800e65: pre-upgrade
+  Recover the work, then remove the directory — `kanban gc` drops
+  each entry (and its retained event) once the path is gone.
+  after gc -> registry entries: 1 | dir named by command: yes
+
+== S2: pre-upgrade preserved event on a DONE card -> gc adopts it ==
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+Registered preserved scratch workspaces (2):
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_arch
+    task t_60800e65: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_done
+    task t_9f5d1a15: pre-upgrade
+  Recover the work, then remove the directory — `kanban gc` drops
+  each entry (and its retained event) once the path is gone.
+  registry entries: 2 | event retained: 1
+
+== S3: registry row + unreadable parent (transient stat refusal) ==
+  before: entries= 3 events= 1
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+Registered preserved scratch workspaces (3):
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_arch
+    task t_60800e65: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_done
+    task t_9f5d1a15: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/transient
+    task t_f4ff6e26: unpushed work
+  Recover the work, then remove the directory — `kanban gc` drops
+  each entry (and its retained event) once the path is gone.
+  after : entries= 3 events= 1 | file intact: True
+  parent readable again -> GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+Registered preserved scratch workspaces (3):
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_arch
+    task t_60800e65: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_done
+    task t_9f5d1a15: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/transient
+    task t_f4ff6e26: unpushed work
+  Recover the work, then remove the directory — `kanban gc` drops
+  each entry (and its retained event) once the path is gone.
+entries= 3 events= 1
+
+== S4: operator removed the dir -> entry AND event forgotten ==
+GC complete: 0 workspace(s), 0 event row(s), 0 log file(s) removed
+Registered preserved scratch workspaces (2):
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_arch
+    task t_60800e65: pre-upgrade
+  /var/tmp/probe-home-t_e414a3cc/kanban/workspaces/legacy_done
+    task t_9f5d1a15: pre-upgrade
+  Recover the work, then remove the directory — `kanban gc` drops
+  each entry (and its retained event) once the path is gone.
+  entries= 2 events= 0
