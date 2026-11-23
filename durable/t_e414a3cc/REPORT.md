@@ -244,3 +244,30 @@ preserved-события в реестр (переиспользует `record()
 «Registered preserved scratch workspaces (N)». Причина: при нечитаемом родителе
 запись печатается (оператор должен знать о каталоге), но утверждать, что он
 «на диске», было бы догадкой — ровно тот класс ошибки, который закрывает Д3.1.
+
+## Финальный широкий прогон (после коммита `888d167994a`)
+
+`wide-suite-round2-final.txt` — `scripts/run_tests.sh` по всем 104
+`tests/hermes_cli/test_kanban_*.py`:
+
+```
+104 files, 759 passed, 29 failed, 4 skipped (13 of 104 files) in 176.5s
+```
+
+Сравнение с базой (`wide-suite-baseline.txt`, 103 файла / 24 failed) сделано
+программно по блоку `=== Failure output ===`, а не на глаз:
+
+* base failing files: 13, head failing files: 13;
+* **NEW in head: `[]`** — ни одного нового падающего файла;
+* fixed: `[]` — ни один предсуществующий не «починился» случайно;
+* прирост: +759−750 = +9 тестов проходит (9 тестов провенанса вместо 6 в раунде 1).
+
+Набор файлов совпадает дословно: `core_functionality`, `creator_origin`,
+`gateway_restart_handoff`, `managed_worker_loss`, `notify`, `resume_guard`,
+`worker_restart_wait`, `worker_session_source`, `worker_socket_recovery`,
+`worker_spawn_toolsets`, `worker_terminal_cwd`, `worker_terminal_scope`,
+`worktree_teardown`. Причина падений — окружение воркtree: `tests/home_io_guard.py`
+отвергает пути `<worktree>/.git/worktrees/...`, плюс нет user-D-Bus для
+systemd-scope. Правка этого предохранителя вне области Д3; пункт приёмки
+«широкий набор зелёный» закрыт как `manual_review` с доказанным нулевым
+приращением падений.
