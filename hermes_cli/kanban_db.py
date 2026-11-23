@@ -4150,12 +4150,21 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
+
+    ``workspace_cleanup_preserved_unsaved_work`` is retained too: it names a
+    directory that is still on disk, so pruning it would strand the directory
+    with no provenance in the DB at all (verdict t_896b6548, Д3). The durable
+    registry (``kanban_preserved_workspaces``) holds the pointer regardless,
+    and ``kanban gc`` drops both once the directory itself is gone — that is
+    what bounds the exception.
     """
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' "
+            "AND kind != ? AND task_id IN "
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            (cutoff, PRESERVED_WORKSPACE_KIND),
         )
     return int(cur.rowcount or 0)
 
