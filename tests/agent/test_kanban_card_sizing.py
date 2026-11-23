@@ -108,8 +108,9 @@ def test_estimate_minutes_is_calibrated_on_acceptance_items():
     # Every measured bucket round-trips exactly, so a drift in a constant is caught.
     for items, minutes in CALIBRATION_P80_MINUTES.items():
         assert estimate_minutes(items) == minutes
-    # Between measured points the figure is interpolated, never extrapolated.
-    assert estimate_minutes(1) == 67 and estimate_minutes(2) == 74
+    # Between measured points the figure is interpolated linearly, never extrapolated
+    # (61 → 81 over 0 → 3 items: 1 item → 68, 2 → 74).
+    assert estimate_minutes(1) == 68 and estimate_minutes(2) == 74
     # Above the last measured point (7, n=9) the figure is held at that point.
     assert estimate_minutes(12) == CALIBRATION_P80_MINUTES[7]
     assert estimate_minutes(3) >= CARD_MINUTE_TARGET
@@ -226,8 +227,10 @@ def test_both_axes_are_named_together_and_a_generous_wall_clears_the_advisory():
         estimate_card(body, budget=120, max_runtime_seconds=86_400), assignee="x",
     )
     assert generous_wall is not None
-    assert "мин" not in generous_wall   # only the iteration half is reported
+    # Only the iteration half: no wall figure, no minute-vs-wall clause.
+    assert "3600" not in generous_wall and "медиана" not in generous_wall
     assert "iterations vs 120" in generous_wall
+    assert "max_runtime_seconds" not in generous_wall
 
 
 def test_an_uncapped_card_is_silent_on_the_wall_axis():
