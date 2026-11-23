@@ -98,6 +98,11 @@ PATH_META = {"exists", "is_file", "is_dir", "is_symlink", "stat", "lstat",
 
 BLOCKING_MODULES = {"os", "shutil", "subprocess", "sqlite3", "socket",
                     "requests", "urllib", "fcntl", "msvcrt"}
+# CPU-класс: НЕ файловый ввод-вывод, но столько же блокирующий цикл, потому что
+# работает на размере тела (25 МиБ base64 = 125-230 мс, см. probes/body_ops.json).
+# Без этого класса перепись пропускала `base64.b64decode` в audio.py:107 и
+# `base64.b64encode` в files.py:509 — самые дорогие одиночные вызовы в цикле.
+CPU_MODULES = {"base64", "zipfile", "hashlib", "zlib", "gzip", "tarfile", "lzma", "bz2"}
 ASYNC_MODULES = {"asyncio", "anyio", "httpx", "websockets", "aiohttp", "trio",
                  "starlette", "fastapi"}
 BLOCKING_CALLS = {"time.sleep", "threading.Event.wait", "threading.Lock.acquire",
@@ -185,6 +190,13 @@ def classify(call: ast.Call) -> tuple[str, str] | None:
             return None
         if last in {"get", "post", "put", "delete", "request", "stream"} and "Client" in full:
             return ("blocking", full)  # httpx.Client — синхронный
+        return None
+    if root in CPU_MODULES:
+        if last in {"b64encode", "b64decode", "urlsafe_b64encode", "urlsafe_b64decode",
+                    "ZipFile", "is_zipfile", "extractall", "extract", "crc32",
+                    "compress", "decompress", "compressobj", "decompressobj", "open",
+                    "sha256", "sha1", "md5", "blake2b", "pbkdf2_hmac"}:
+            return ("blocking", full)
         return None
     if root in BLOCKING_MODULES:
         if last in {"Path", "PurePath", "str", "list", "dict", "fspath"}:

@@ -1,5 +1,5 @@
 {
-  "git_rev": "e8ee0fb7a24a647bdcfde5b8c08941e1717bb9bb",
+  "git_rev": "0dabefdc65e643b4635ddfb8959d80fa27fe0e27",
   "routers_dir": "hermes_cli/web_routers",
   "modules": 38,
   "stats": {
@@ -38,8 +38,42 @@
       "is_async": true,
       "calls": [
         [
+          107,
+          "base64.b64decode"
+        ],
+        [
           123,
           "tmp.write"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/audio.py",
+      "file_line": 299,
+      "handler": "speak_text",
+      "layer": "http_verb",
+      "route": "post /api/audio/speak",
+      "route_line": 298,
+      "is_async": true,
+      "calls": [
+        [
+          348,
+          "base64.b64encode"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 472,
+      "handler": "proxy_remote_media",
+      "layer": "http_verb",
+      "route": "get /api/media/proxy",
+      "route_line": 471,
+      "is_async": true,
+      "calls": [
+        [
+          509,
+          "base64.b64encode"
         ]
       ]
     },
@@ -82,6 +116,21 @@
         [
           1145,
           "tmp.unlink"
+        ]
+      ]
+    },
+    {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 1203,
+      "handler": "fs_read_data_url",
+      "layer": "http_verb",
+      "route": "get /api/fs/read-data-url",
+      "route_line": 1202,
+      "is_async": true,
+      "calls": [
+        [
+          1216,
+          "base64.b64encode"
         ]
       ]
     },
@@ -152,6 +201,10 @@
           "staging_dir.mkdir"
         ],
         [
+          684,
+          "zipfile.is_zipfile"
+        ],
+        [
           685,
           "target.unlink"
         ]
@@ -182,21 +235,6 @@
     }
   ],
   "meta_only_handlers": [
-    {
-      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/audio.py",
-      "file_line": 299,
-      "handler": "speak_text",
-      "layer": "http_verb",
-      "route": "post /api/audio/speak",
-      "route_line": 298,
-      "is_async": true,
-      "calls": [
-        [
-          328,
-          "os.path.isfile"
-        ]
-      ]
-    },
     {
       "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/dashboard_ui.py",
       "file_line": 409,
@@ -375,6 +413,24 @@
       "offloaded": true
     },
     {
+      "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/files.py",
+      "file_line": 1203,
+      "handler": "fs_read_data_url",
+      "layer": "http_verb",
+      "route": "get /api/fs/read-data-url",
+      "route_line": 1202,
+      "is_async": true,
+      "helper": "_render",
+      "line": 1233,
+      "calls": [
+        [
+          1234,
+          "base64.b64encode"
+        ]
+      ],
+      "offloaded": true
+    },
+    {
       "file": "/home/hermes/.hermes/hermes-agent/.worktrees/t_eca8cb15/hermes_cli/web_routers/ops.py",
       "file_line": 500,
       "handler": "get_memory_status",
@@ -488,6 +544,10 @@
         [
           1261,
           "soul_path.read_text"
+        ],
+        [
+          1274,
+          "hashlib.sha256"
         ],
         [
           1261,
