@@ -418,10 +418,35 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         with kbc.connect_closing() as conn:
             removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
     removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
+    preserved_paths = _reap_preserved_workspaces()
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed"
           + (f"; {preserved_ws} preserved for unsaved git work" if preserved_ws else ""))
+    if preserved_paths:
+        # A preserved dir is only recoverable if the operator can name it; the
+        # NSS counter above is not a path (verdict t_896b6548, Д3).
+        print(f"Preserved scratch workspaces still on disk ({len(preserved_paths)}):")
+        for entry in preserved_paths:
+            print(f"  {entry['path']}")
+            print(f"    task {entry['task_id']}: {entry['reason']}")
+        print("  Recover the work, then remove the directory — `kanban gc` drops")
+        print("  each entry (and its retained event) once the path is gone.")
     return 0
+
+
+def _reap_preserved_workspaces() -> list[dict]:
+    """Prune gone registry entries and return the ones still on disk (Д3/Д7)."""
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    try:
+        with kbc.connect_closing() as conn:
+            kpw.prune_gone(conn)
+            return kpw.entries(conn)
+    except (sqlite3.Error, OSError, ValueError, KeyError) as exc:
+        # A broken board must not fail the whole sweep; the directories are
+        # still on disk and the next run retries.
+        kb._log.warning("kanban gc: cannot read the preserved-workspace registry: %s", exc)
+        return []
 
 
 def _cmd_repair(args: argparse.Namespace) -> int:
