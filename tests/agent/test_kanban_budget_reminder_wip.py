@@ -301,7 +301,7 @@ def test_archive_retention_bounds_the_complete_pairs(card_env, monkeypatch):
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", f"run-{i}")
         (workspace / "a.txt").write_text(f"gen-{i}\n", encoding="utf-8")
         # A distinct mtime per generation: the fingerprint includes it by design.
-        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
+        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9, 1_700_000_000_000_000_000 + i * 10**9))
         out = kbc.preserve_wip_tree(task_id="t_probe")
         assert out.mode == "archive"
         written.append(Path(str(out.locator)).name)
@@ -381,18 +381,15 @@ def test_a_new_run_does_not_inherit_the_previous_runs_pinned_copies(card_env, mo
     from hermes_cli.kanban_db import task_attachments_dir
 
     workspace, _home = card_env
-    pinned = []
     for i in range(5):
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-old")
         (workspace / "a.txt").write_text(f"old-{i}\n", encoding="utf-8")
-        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
-        out = kbc.preserve_wip_tree(task_id="t_probe")
-        assert out.mode == "archive"
-        pinned.append(Path(str(out.locator)))
+        os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + i * 10**9, 1_700_000_000_000_000_000 + i * 10**9))
+        assert kbc.preserve_wip_tree(task_id="t_probe").mode == "archive"
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-new")
     (workspace / "a.txt").write_text("new\n", encoding="utf-8")
-    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + 99 * 10**9,) * 2)
+    os.utime(workspace / "a.txt", ns=(1_700_000_000_000_000_000 + 99 * 10**9, 1_700_000_000_000_000_000 + 99 * 10**9))
     fresh = kbc.preserve_wip_tree(task_id="t_probe")
     assert fresh.mode == "archive"
 
