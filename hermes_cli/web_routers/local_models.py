@@ -31,6 +31,7 @@ from starlette.concurrency import run_in_threadpool
 
 from hermes_cli import config as config_mod, web_deps
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, _config_profile_scope
+from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.local_runtime import (
     binaries, bootstrap, catalog, context_policy, estimator, growth, hardware, hf_browse,
     load_progress, presets, supervisor,
@@ -416,6 +417,12 @@ def _variant_files_on_disk(model_id: str) -> list[Path]:
     return files
 
 
+def _unlink_all(paths: list) -> None:
+    """Remove every path (missing ones are fine) — the sweep must be idempotent under retries."""
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 def _download_plan(entry, variant) -> list:
     """Everything a variant needs: split parts + mmproj/draft/MTP head assets, as (url, dest, bytes) tuples."""
     plan = [(_hf_url(entry.repo, a.path, a.revision), bootstrap.models_dir() / a.local_name, a.size_bytes)
@@ -796,11 +803,12 @@ async def local_models_download_resume(body: JobIdBody):
 async def local_models_delete(model_id: str):
     """Remove every split part plus private assets, then bounce the router off the request thread (deleting
     the active file mid-serve is exactly the stale state the refresh exists for)."""
-    files = _variant_files_on_disk(model_id)
+    # glob + exists + unlink over multi-GB split parts: the whole sweep is one worker hop so the
+    # existence check and the removal cannot interleave with another request's sweep.
+    files = await off_loop(_variant_files_on_disk, model_id)
     if not files:
         raise HTTPException(status_code=404, detail="model not found")
-    for path in files:
-        path.unlink(missing_ok=True)
+    await off_loop(_unlink_all, files)
     # Growth state dies with the model: a re-download starts back at its zero-spill window, not a stale grown one.
     _quiet(lambda: growth.clear_window_override(model_id), None, debug="window-override clear skipped")
     spawn_context_thread(_refresh_runtime, args=("post-delete runtime refresh skipped",),
@@ -1042,11 +1050,22 @@ async def local_models_sideload(body: SideloadBody):
     """Register a GGUF already on this machine: link it into the managed models dir (copy only when linking is
     impossible) and bounce the router. The original stays put; delete-from-Hermes removes only our link."""
     src = Path(body.path)
+    # is_file/exists/mkdir/link all touch the filesystem, and the model file is usually multi-GB
+    # on a mounted volume — the whole registration decision runs on a worker.
+    dest, already = await off_loop(_sideload_link, src)
+    if already:
+        return {"ok": True, "model_id": dest.stem, "already_present": True}
+    _refresh_runtime("post-sideload runtime refresh skipped")
+    return {"ok": True, "model_id": dest.stem}
+
+
+def _sideload_link(src: Path) -> tuple[Path, bool]:
+    """Validate ``src`` and link it into the managed models dir; returns (dest, already_present)."""
     if not src.is_file() or src.suffix.lower() != ".gguf":
         raise HTTPException(status_code=422, detail="Pick a .gguf model file")
     dest = bootstrap.models_dir() / src.name
     if dest.exists():
-        return {"ok": True, "model_id": dest.stem, "already_present": True}
+        return dest, True
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.link(src, dest)          # hardlink: instant, no extra disk
@@ -1054,6 +1073,5 @@ async def local_models_sideload(body: SideloadBody):
         try:
             os.symlink(src, dest)   # cross-volume fallback
         except OSError:
-            await run_in_threadpool(shutil.copyfile, src, dest)
-    _refresh_runtime("post-sideload runtime refresh skipped")
-    return {"ok": True, "model_id": dest.stem}
+            shutil.copyfile(src, dest)
+    return dest, False
