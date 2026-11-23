@@ -232,17 +232,26 @@ def _sub(task_id, platform, chat_id="chat-1", mode="notify+wake"):
 
 
 def _completed_task(summary="Готово", artifacts=None, *, parent_open=False, platform="telegram"):
+    """A card whose ``completed`` event is on the journal.
+
+    The event is appended directly: dependency gating refuses to complete a card that
+    still has an open parent, but the notifier's input is the journal, and a handoff can
+    land on a card whose parent was reopened afterwards — exactly the intermediate case
+    the policy must stay quiet about.
+    """
     conn = kbc.connect()
     try:
-        parent = None
         if parent_open:
             parent = kb.create_task(conn, title="parent card", assignee="worker")
         tid = kb.create_task(conn, title="child card", assignee="worker")
-        if parent:
+        if parent_open:
             kb.link_tasks(conn, parent_id=parent, child_id=tid)
         _sub(tid, platform)
-        payload_extra = {"artifacts": artifacts} if artifacts else {}
-        kb.complete_task(conn, tid, summary=summary, metadata=payload_extra or None)
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        payload = {"summary": summary} if summary else {}
+        if artifacts:
+            payload["artifacts"] = list(artifacts)
+        kb._append_event(conn, tid, "completed", payload)
         return tid
     finally:
         conn.close()
@@ -252,9 +261,9 @@ def _blocked_task(kind="needs_input", *, platform="telegram", reason="нужен
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked card", assignee="worker")
-        kb.claim_task(conn, tid)
         _sub(tid, platform)
-        kb.block_task(conn, tid, reason=reason, kind=kind)
+        conn.execute("UPDATE tasks SET status = 'blocked', block_kind = ? WHERE id = ?", (kind, tid))
+        kb._append_event(conn, tid, "blocked", {"kind": kind, "reason": reason})
         return tid
     finally:
         conn.close()
