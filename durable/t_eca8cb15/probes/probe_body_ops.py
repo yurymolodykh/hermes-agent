@@ -54,7 +54,7 @@ def bench(fn, repeats: int) -> dict:
     samples.sort()
 
     def pct(q: float) -> float:
-        idx = min(len(samples) - 1, max(0, int(round(q * (len(samples) - 1)))))
+        idx = min(len(samples) - 1, max(0, round(q * (len(samples) - 1))))
         return round(samples[idx], 4)
 
     return {"p50_ms": round(statistics.median(samples), 4), "p95_ms": pct(0.95),
@@ -87,10 +87,9 @@ def main() -> int:
         for j in range(10):
             (d / f"f{j}").write_text("x")
     logbig = work / "action.log"
+    block = b"2026-11-23 13:00:00 INFO padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n" * 500
     with open(logbig, "wb") as fh:
-        block = b"2026-11-23 13:00:00 INFO padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n" * 500
-        for _ in range((64 << 20) // len(block) + 1):
-            fh.write(block)
+        fh.writelines(block for _ in range((64 << 20) // len(block) + 1))
     zipbig = work / "archive.zip"
     with zipfile.ZipFile(zipbig, "w", zipfile.ZIP_STORED) as zf:
         zf.writestr("data.bin", b"x" * (50 << 20))
@@ -124,7 +123,7 @@ def main() -> int:
     text = tail_src.read_text(encoding="utf-8")
     start = text.find("def _tail_lines")
     end = text.find("\ndef _durable_completed_update_action_id")
-    exec(  # noqa: S102 — собственная копия функции из actions.py, константы подставлены
+    exec(  # собственная копия функции из actions.py, константы подставлены; не чужой ввод
         text[start:end]
         .replace("_ACTION_LOG_TAIL_MAX_BYTES", str(256 * 1024))
         .replace("_ACTION_LOG_TAIL_INITIAL_CHUNK_BYTES", str(8 * 1024))
@@ -187,7 +186,7 @@ def main() -> int:
     unlink8_sorted = sorted(unlink8_samples)
     unlink8_stats = {
         "p50_ms": round(statistics.median(unlink8_sorted), 4),
-        "p95_ms": round(unlink8_sorted[int(round(0.95 * (len(unlink8_sorted) - 1)))], 4),
+        "p95_ms": round(unlink8_sorted[round(0.95 * (len(unlink8_sorted) - 1))], 4),
         "max_ms": round(unlink8_sorted[-1], 4),
         "n": len(unlink8_sorted),
     }
