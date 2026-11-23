@@ -425,8 +425,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
           + (f"; {preserved_ws} preserved for unsaved git work" if preserved_ws else ""))
     if preserved_paths:
         # A preserved dir is only recoverable if the operator can name it; the
-        # NSS counter above is not a path (verdict t_896b6548, Д3).
-        print(f"Preserved scratch workspaces still on disk ({len(preserved_paths)}):")
+        # counter above is not a path (verdict t_896b6548, Д3). Header says
+        # "registered", not "on disk": an entry whose parent we cannot read is
+        # reported too, and claiming it exists would be a guess.
+        print(f"Registered preserved scratch workspaces ({len(preserved_paths)}):")
         for entry in preserved_paths:
             print(f"  {entry['path']}")
             print(f"    task {entry['task_id']}: {entry['reason']}")
