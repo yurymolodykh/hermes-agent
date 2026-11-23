@@ -1,82 +1,91 @@
 # PROGRESS — t_6c16a6cb (вынос блокирующих обработчиков из цикла событий)
 
-**Состояние: исполнение сделано, тесты профильных наборов зелёные (кроме пред-существующих
-провалов базы). Остаётся: замер «после» стендом и REPORT.md.**
+**Состояние: исполнение сделано, дефекты выноса найдены и закрыты, тесты прогнаны, REPORT.md
+написан. Осталось: повтор прогона `probe_sqlite_threads.py` и `scripts/iso-certify.py`
+(не поместились в бюджет), публикация — гейт оркестратора.**
 
-## Что сделано (проверено)
+Отчёт с таблицами до/после, списком тестов и процедурой отката:
+`durable/t_a61becbc/REPORT.md`.
 
-Шов: `hermes_cli/web_routers/handler_offload.py` — `HANDLER_OFFLOAD.install(app, workers=None)` /
-`.shutdown()` / `.reset()`, `off_loop(fn, *args, **kwargs)`, `offload_status()`.
-Приватный `ThreadPoolExecutor` (2×CPU, floor 8, cap 32), contextvars копируются в воркер
-(`_bind` → `contextvars.copy_context()`), поэтому профиль запроса не теряется.
-Выключатель: `dashboard.handler_offload: false` **или** env `HERMES_HANDLER_OFFLOAD=0` → всё
-исполняется inline на цикле (прежнее поведение). Режим логируется однократно при старте
-(`handler offload mode=threaded source=default workers=16`) и отдаётся в `/api/status` →
-`handler_offload: {mode, enabled, workers, submitted, inline, in_flight, queue_depth,
-max_queue_depth, avg_wait_ms}`.
+## Шов
 
-### Переведено off-loop (31 из 37 находок аудита)
+`hermes_cli/web_routers/handler_offload.py` — `HANDLER_OFFLOAD.install(app, workers=None)` /
+`.shutdown()` / `.reset()` / `.resolve()`, `off_loop()`, `offload_status()`.
+Приватный `ThreadPoolExecutor` (2×CPU, floor 8, cap 32), `contextvars.copy_context()` в воркер.
+Выключатель: `dashboard.handler_offload: false` **или** `HERMES_HANDLER_OFFLOAD=0` → inline
+на цикле (прежнее поведение, без правки файлов). Режим логируется однократно при старте и
+отдаётся в `/api/status` → `handler_offload: {mode, enabled, workers, submitted, inline,
+in_flight, queue_depth, max_queue_depth, avg_wait_ms}`.
 
-| файл | обработчик |
-|---|---|
-| `files.py` | `fs_write_text` (stat/is_dir/write_text/replace/unlink одним хопом), `upload_managed_file_stream` (mkdir + unlink временного), `fs_git_root` (stat, обход дерева), `get_media` (is_file+stat) |
-| `ops.py` | `run_backup` (mkdir), `download_dashboard_backup` (resolve+is_file), `run_import_upload` (isfile/mkdir/is_zipfile/unlink) |
-| `local_models.py` | `local_models_delete` (glob+exists+unlink), `local_models_sideload` (is_file/exists/mkdir/link/symlink/copy) |
-| `profiles.py` | `open_profile_terminal_endpoint` (stat+`which`+Popen×3), `import_profile_endpoint` (is_file) |
-| `status.py` | `get_logs` (exists) + новый `_handler_offload_view()` в ответе `/api/status` |
-| `dashboard_ui.py` | `serve_plugin_asset` (is_file) |
-| `chat_ws.py` | `_pty_channel_marker_state` (unlink) |
+## Переведено off-loop (29 из 37 аудита; 8 остальных — осознанно)
 
-### Осознанно НЕ переведено (решение по каждой)
+files.py (`fs_write_text`, `upload_managed_file_stream`, `fs_git_root`, `get_media`),
+ops.py (backup / download-backup / import), local_models.py (delete / sideload),
+profiles.py (open-terminal, import, is_file), status.py (`get_logs`), dashboard_ui.py
+(`serve_plugin_asset`), chat_ws.py (`_pty_channel_marker_state`).
 
-- `oauth.py:514/916` — `sleep` в ожидающих петлях, не блокирующая работа.
-- `audio.py:593` — `await asyncio.sleep(0)`, это yield, а не блокировка.
-- `webapp_relay_proxy.py` / `display.py:125` — `wait` на сокетах / WS.
-- `webapp_access.py:156` — `await asyncio.sleep()` в опросе блокировки.
-- `ops.py:207` — **ложное срабатывание** AST-аудита: `str.replace` над именем вебхука.
-- `messaging.py:start_whatsapp_onboarding` — **откатано осознанно**: перевод ломал контракт
-  собственных тестов (парный поток создаётся в контексте запроса, 21 тест
-  `test_whatsapp_dashboard_repair.py` краснел). Путь человеко-разовый (QR-сопряжение), на горячем
-  пути его нет. Причина записана комментарием в файле.
+Не переведён `messaging.py:start_whatsapp_onboarding` — перевод ломал 21 тест
+`test_whatsapp_dashboard_repair` (парный поток создаётся в контексте запроса); путь разовый (QR),
+причина записана комментарием в файле. Остальные 5 — не блокировки (`sleep` в ожидающих петлях,
+`await asyncio.sleep(0)`, `wait` на сокете, и ложное срабатывание AST-аудита `str.replace`).
 
-Итог аудита `durable/t_a61becbc/audit_blocking.py`: было `total=37 files=38`, стало
-`total=6 files=39` — и все 6 перечислены выше как осознанные.
+## Дефекты, которые породил сам вынос (исправлены, доказаны красными)
+
+1. **Гонка стейджа в `files.py:_fs_write_text_blocking`.** Имя `.<name>.hermes-tmp-<pid>`
+   постоянно для процесса; в пуле два сейва одного файла берут ОДИН путь → второй падает ENOENT
+   и в `except` удаляет файл победителя. Замер: 8 одновременных 8-МиБ сейвов — **6 из 8 по 500**;
+   доказательство `.probe-tmp/proof_concurrent_save.py` (`ok=2 failed=6`). Фикс: `token_hex(6)`.
+   Тест `tests/hermes_cli/test_fs_write_text_offload.py`.
+2. **Счётчики пула отдавались из TTL-кэша `/api/status`** (TTL 1,5 с) — при всплеске 64
+   запросов отдавалось `max_queue_depth: 0`, хотя очередь была. Фикс: поле подмешивается после
+   кэша. Тест `tests/hermes_cli/test_status_offload_live.py`; красное доказательство
+   `.probe-tmp/proof_status_cache.py` (`2 failed`).
 
 ## Тесты
 
 Раннер: `HERMES_PYTHON=/home/hermes/.hermes/hermes-agent/.venv/bin/python HOME=/tmp/t6c
 scripts/run_tests.sh …` (иначе `run-in-hermes-env` ищет bootstrap-Python и падает).
 
-- `tests/hermes_cli/test_handler_offload.py` — **новый, 11 тестов, зелёные.** Пинует: работа уходит
-  с потока цикла; args/kwargs; выключатель env → inline; выключатель конфига → inline;
-  contextvars доходят и НЕ утекают обратно; HTTPException едет через границу с тем же статусом;
-  переполнение пула ставит в очередь, а не роняет; `/api/status` отдаёт режим и число воркеров;
-  shutdown идемпотентен; в inline-режиме пул не нужен.
-- 100 тестов зелёные: `test_web_profiles_off_loop`, `test_web_messaging_platform_profile_scope`,
-  `test_web_server_messaging_posture`, `test_local_models_routes`, `test_web_routers_status_health`,
-  `test_backup_path_errors`, `test_dashboard_admin_endpoints`.
-- `test_whatsapp_dashboard_repair` + `test_whatsapp_onboarding` — 27 зелёных после отката.
-- **Пред-существующие провалы базы (проверено на распакованном `4489b127681` в
-  `…/scratch/bv2`):** 2 теста `test_web_server_files.py::test_download_resolves_paths_in_the_originating_profile_session`
-  (503 «Session store is not initialized»), 1 провал + 2 ошибки в `test_webapp_uploads`/
-  `test_webapp_upload_security`, 1 провал ledger-теста на маршрут
-  `POST /api/profiles/{name}/soul/apply-questionnaire` (маршрут есть в базе, строки в
-  `serve_handler_ledger.json` нет). Ни один из них моей правкой не вызван.
+- 19 файлов: **351 passed, 1 failed, 11 skipped**. Провал — `test_status_probe_off_loop`
+  («async def functions are not natively supported»), **тот же провал на базе** `dde0f0befbc`.
+- Пред-существующие провалы подтверждены прогоном в `.probe-tmp/base-tree` (detached
+  `dde0f0befbc`): `test_serve_handler_ledger` 1 failed, `test_webapp_uploads` 1 failed,
+  `test_webapp_upload_security` 2 errors — ровно те же на базе.
+- Новые этой карточкой: `test_handler_offload.py` (11), `test_fs_write_text_offload.py` (1),
+  `test_status_offload_live.py` (2).
 
-## Осталось
+## Замеры (файлы в `durable/t_a61becbc/`)
 
-1. Замер «после»: `bench_curve.py --out curve-after.json`, `bench_loop.py --out loop-after.json`,
-   `bench_scenarios.py --label after` в `durable/t_a61becbc/`.
-2. `durable/t_a61becbc/REPORT.md`: таблица до/после по трём сценариям, список тестов,
-   `git show --stat`, процедура отката.
-3. Публикация — гейт оркестратора.
+- `probe_handler_lag.py` — прямой замер предмета: max разрыв цикла inline **110,9 / 795,7 мс**
+  против threaded **78,8 / 38,6 мс**; в inline тикер просыпается ОДИН раз за всплеск.
+- `probe_pool.py` — 64 запроса на пул из 16: 64×200, `max_queue_depth=24`, очередь работает,
+  таймаутов нет.
+- `probe_blocking_write.py` — A/B 8 МиБ×8: threaded 8×200, inline 8×200; остаток лага ~140 мс —
+  разбор JSON-тела на цикле, не вынесенное тело.
+- `ab_offload.py` + `ab-curve.json` / `ab-loop.json` — A/B с переключением выключателя, 2 повтора.
+  **Выигрыша в латентности на sessions/search нет** (разброс повторов больше разницы режимов):
+  эти маршруты уже читают БД через `to_thread`. Лаг цикла был мал и до правки (0 превышений
+  50 мс в обоих режимах).
+- `curve-after.json` / `after.json` сняты, но с `curve-before.json` **несравнимы**: разное время,
+  разная посторонняя нагрузка (load average 3,2–4,6 на 8 ядрах). Сравнивать надо по `ab-*.json`.
 
-## Процедура аварийного отката (одна команда)
+## Осталось (не выполнено, честно)
 
-```bash
-# в config.yaml профиля: dashboard.handler_offload: false   (или в юните: HERMES_HANDLER_OFFLOAD=0)
-hermes serve --restart   # либо systemctl --user restart hermes-gateway
+1. `probe_sqlite_threads.py` **не поднялся** — сервер не отдал `READY` в отведённое время,
+   проба вышла «server failed». Сквозного подтверждения «нет `ProgrammingError: created in a
+   thread`» на этом стенде нет; правило в коде соблюдено (`_with_db` открывает и закрывает
+   соединение внутри воркера, объект `db` границу потока не пересекает).
+2. Сценарий (в) `scripts/iso-certify.py --duration-s 120` не прогонялся — бюджет исчерпан.
+3. Публикация — гейт оркестратора; выкатка/рестарт — за оркестратором.
+
+## Процедура аварийного отката (одна команда, без правки файлов)
+
+```yaml
+dashboard:
+  handler_offload: false      # ~/.hermes/config.yaml
 ```
-Правки файлов не нужны: `off_loop` начинает исполнять вызовы inline на цикле, то есть ровно
-прежнее однопроцессное поведение. В журнале при старте будет
-`handler offload mode=inline (single-process) source=…`, `/api/status` → `handler_offload.mode = "inline"`.
+```bash
+hermes serve --restart        # либо: systemctl --user restart hermes-gateway
+# эквивалент без правки конфига: Environment=HERMES_HANDLER_OFFLOAD=0 в юните
+```
+В журнале: `handler offload mode=inline (single-process)`; `/api/status` → `mode = "inline"`.
