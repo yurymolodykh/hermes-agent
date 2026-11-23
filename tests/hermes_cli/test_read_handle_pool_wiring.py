@@ -286,3 +286,76 @@ def test_transient_probe_failure_is_not_memoized(seeded_home, monkeypatch):
         assert calls["n"] >= 2, "the unknown journal mode was not re-probed"
     finally:
         db.close()
+
+
+# --- concurrent acquire/release: the pool's own bookkeeping must be thread-safe ---------------
+
+def test_concurrent_acquire_release_never_raises_and_leaks_no_descriptors(seeded_home, monkeypatch):
+    """8 threads against 3 keys for >1 s: no exception, no descriptor growth, handles preserved.
+
+    Regression for the reviewed defect where ``acquire()`` counted idle entries OUTSIDE ``self._lock``
+    (as a logging argument) while iterating the live ``_idle`` dict that ``release()``,
+    ``_pop_oldest_locked()`` and ``clear()`` mutate under that lock: ``RuntimeError: dictionary
+    changed size during iteration`` flew on the hot path between the pop of the picked entry and the
+    return, so the handle was neither handed out nor given back (25 of 25 lost in the reviewer's repro).
+
+    Handles are pre-parked so every iteration is a pool HIT: this test is about the pool's own
+    bookkeeping, not about connect cost. A lost handle shows up as a falling live count and as
+    descriptors that no longer come back.
+    """
+    import threading
+    import time
+
+    from hermes_cli.read_handle_pool import _ReadOnlyHandlePool
+    from hermes_state_readpool import _open_fd_count
+    from hermes_state import SessionDB
+
+    pool = _ReadOnlyHandlePool()
+    keys = [str(seeded_home), str(seeded_home) + ".b", str(seeded_home) + ".c"]
+    identity = ("dev", "ino")  # identical and constant: every parked handle stays valid
+    parked = []
+    for key in keys:
+        db = SessionDB(db_path=seeded_home, read_only=True)
+        parked.append(db)
+        assert pool.release(key, db, identity) is True
+
+    fd_before = _open_fd_count()
+    errors: list[BaseException] = []
+    hits = {"n": 0}
+    stop = threading.Event()
+
+    def worker(key: str) -> None:
+        try:
+            while not stop.is_set():
+                db = pool.acquire(key, identity)
+                if db is None:
+                    continue
+                hits["n"] += 1
+                pool.release(key, db, identity)
+        except BaseException as exc:  # noqa: BLE001 - the assertion below reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(keys[i % len(keys)],), daemon=True)
+               for i in range(8)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        time.sleep(0.02)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors, f"{len(errors)} exceptions on the hot path, first: {errors[0]!r}"
+    assert hits["n"] > 0, "no pool hits at all — the stress loop never exercised reuse"
+
+    # Every parked handle is back in the pool exactly where it started (nothing lost, nothing leaked).
+    idle = [entry.db for group in pool._idle.values() for entry in group]
+    assert len(idle) == len(parked), f"pool lost handles: {len(idle)} of {len(parked)}"
+    assert all(db._conn is not None for db in idle), "a closed handle was parked back in the pool"
+
+    fd_after = _open_fd_count()
+    if fd_before is not None and fd_after is not None:
+        assert fd_after <= fd_before, f"descriptor count grew {fd_before} -> {fd_after}"
+
+    pool.clear()
