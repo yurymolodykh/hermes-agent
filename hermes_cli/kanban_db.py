@@ -1309,6 +1309,11 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    # The hard wall belongs to the card and is written into its row: an explicit value
+    # always wins, and a card created before this default keeps its own NULL (uncapped),
+    # because nothing downstream reads this as a dispatcher-wide fallback.
+    if max_runtime_seconds is None:
+        max_runtime_seconds = DEFAULT_MAX_RUNTIME_SECONDS
     if not title or not title.strip():
         raise ValueError("title is required")
     # Fuse (t_e0c9e1ce): a card with NO author and no named owner is the exact
