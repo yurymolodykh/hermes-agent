@@ -1,25 +1,29 @@
 {
-  "tmpdir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-whatsapp-py3zq9zy",
+  "tmpdir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/probe-whatsapp-_og3saok",
   "ops": {
     "str_replace_on_isoformat": {
       "p50_ms": 0.0003,
       "max_ms": 0.0019
     },
     "creds_json_exists": {
-      "p50_ms": 0.0083,
-      "max_ms": 0.0226
+      "p50_ms": 0.0099,
+      "max_ms": 0.0377
     },
     "creds_json_read_text": {
-      "p50_ms": 0.022,
-      "max_ms": 0.0451
+      "p50_ms": 0.0263,
+      "max_ms": 0.0555
     },
     "lstat_plus_isdir_plus_iterdir": {
-      "p50_ms": 0.016,
-      "max_ms": 0.0496
+      "p50_ms": 0.0193,
+      "max_ms": 0.0641
     },
     "write_and_unlink_lock_file": {
-      "p50_ms": 0.074,
-      "max_ms": 0.2092
+      "p50_ms": 0.1018,
+      "max_ms": 0.2289
+    },
+    "session_rename_plus_mkdir": {
+      "p50_ms": 0.1914,
+      "max_ms": 0.2698
     }
   }
 }

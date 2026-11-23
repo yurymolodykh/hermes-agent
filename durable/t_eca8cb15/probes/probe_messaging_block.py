@@ -54,6 +54,20 @@ def main() -> int:
         lambda: (session.lstat(), session.is_dir(), next(session.iterdir(), None)))
     out["ops"]["write_and_unlink_lock_file"] = bench(
         lambda: ((lock_dir / "x.lock").write_text("{}") or (lock_dir / "x.lock").unlink()), 20)
+
+    # что реально стоит в теле: подготовка сессии к переспариванию (`_backup_whatsapp_session`)
+    def _backup_once() -> None:
+        src = tmp / "bk-src"
+        src.mkdir(exist_ok=True)
+        (src / "creds.json").write_text("{}")
+        dst = tmp / f"bk-{time.perf_counter_ns()}"
+        src.rename(dst)
+        src.mkdir(mode=0o700)
+        for child in dst.iterdir():
+            child.unlink()
+        dst.rmdir()
+
+    out["ops"]["session_rename_plus_mkdir"] = bench(_backup_once, 20)
     text = json.dumps(out, ensure_ascii=False, indent=2)
     pathlib.Path(__file__).with_name("messaging_block.json").write_text(text + "\n",
                                                                        encoding="utf-8")
