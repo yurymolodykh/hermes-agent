@@ -229,11 +229,48 @@ def test_create_tool_response_reports_minutes_and_the_written_wall(monkeypatch, 
     }))
 
     assert d["ok"] is True
-    assert d["estimated_minutes"] == 30
+    # 3 items → the measured p80 of that bucket (81 min), not the retired 30-minute line.
+    assert d["estimated_minutes"] == 81
     assert d["max_runtime_seconds"] == 3600
+    # 81 min against the 3600 s wall is over it, and the iteration budget (130 ≤ 300)
+    # is not: the wall alone must carry the advisory.
+    assert "sizing_warning" in d and "81 мин" in d["sizing_warning"]
 
     explicit = json.loads(kt._handle_create({
         "title": "narrow wall", "assignee": "03-software-engineer",
         "body": body, "workspace_kind": "scratch", "max_runtime_seconds": 900,
     }))
     assert explicit["max_runtime_seconds"] == 900
+    assert "900" in explicit["sizing_warning"] and "81 мин" in explicit["sizing_warning"]
+
+
+def test_create_response_is_silent_for_a_card_that_fits_both_axes(monkeypatch, tmp_path):
+    """A card with no declared criteria gets the minute figure but no advisory, and a
+    wide explicit wall clears the advisory the default wall would have raised."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.kanban_card_sizing.assignee_iteration_budget", lambda assignee: 400,
+    )
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    from tools import kanban_tools as kt
+
+    quiet = json.loads(kt._handle_create({
+        "title": "no criteria", "assignee": "03-software-engineer",
+        "body": "just make it work\n", "workspace_kind": "scratch",
+    }))
+    assert quiet["ok"] is True and "sizing_warning" not in quiet
+    assert quiet["estimated_minutes"] == 61
+
+    body = "## Приёмка\n" + "".join(f"- критерий {i}\n" for i in range(4))
+    wide = json.loads(kt._handle_create({
+        "title": "wide wall", "assignee": "03-software-engineer",
+        "body": body, "workspace_kind": "scratch", "max_runtime_seconds": 14_400,
+    }))
+    assert wide["max_runtime_seconds"] == 14_400
+    assert "sizing_warning" not in wide, "160 iterations ≤ 400 and 79 min ≤ 240 min"
+    assert wide["estimated_minutes"] == 79
