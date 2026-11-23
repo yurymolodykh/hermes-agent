@@ -24,13 +24,25 @@ from hermes_cli import kanban_db_schedule as kbsch
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB (same shape as test_kanban_db)."""
+    """Isolated HERMES_HOME with an empty kanban DB (same shape as test_kanban_db).
+
+    The profile timezone is pinned to ``Europe/Moscow`` through ``HERMES_TIMEZONE``
+    because the isolated home carries no ``config.yaml``: without it the module
+    would fall back to server-local time and "Moscow wall clock" assertions would
+    only hold when the host happened to be in MSK. Pinning it also proves the
+    contract that deadlines do not depend on the host zone.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Moscow")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    hermes_time.reset_cache()
     kb.init_db()
-    return home
+    try:
+        yield home
+    finally:
+        hermes_time.reset_cache()
 
 
 def _park(conn, *, until=None, title="wait", assignee="a"):
