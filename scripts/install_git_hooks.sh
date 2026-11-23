@@ -24,13 +24,17 @@ fi
 
 lefthook install
 
-for hook in pre-commit pre-push; do
-  target="$hooks_dir/$hook"
-  if [ ! -x "$target" ]; then
-    echo "Отказ: хук $target не установлен или не исполняем после lefthook install." >&2
-    exit 1
-  fi
-done
+# lefthook only writes the hooks lefthook.yml declares, so verify exactly those:
+# pre-commit carries the card-artifact gate.
+target="$hooks_dir/pre-commit"
+if [ ! -x "$target" ]; then
+  echo "Отказ: хук $target не установлен или не исполняем после lefthook install." >&2
+  exit 1
+fi
+if ! grep -q 'guard card artifacts' lefthook.yml; then
+  echo "Отказ: lefthook.yml не содержит задания 'guard card artifacts' — гейт не подключён." >&2
+  exit 1
+fi
 
-printf 'Хуки lefthook установлены: %s/{pre-commit,pre-push}\n' "$hooks_dir"
-printf 'Проверка служебных артефактов карточек активна (обход: %s=1 git commit ...).\n' ALLOW_ARTIFACT_COMMIT
+printf 'Хук установлен: %s (lefthook). Проверка служебных артефактов карточек активна.\n' "$target"
+printf 'Обход — только явным флагом: %s=1 git commit ...\n' ALLOW_ARTIFACT_COMMIT

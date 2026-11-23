@@ -197,8 +197,14 @@ ruff +files:
     scripts/hermes-python -m scripts.code_health.ruff_runner check --config ruff.pre-commit.toml "$@"
 
 # Pre-commit: refuse card service artifacts (PROGRESS*, durable/, evidence-*, REPORT-*.md)
+[group('hooks')]
 artifact-guard:
     bash scripts/check_card_artifacts.sh
+
+# Install the versioned lefthook hooks into this clone (`.git/hooks/` is not versioned)
+[group('hooks')]
+hooks-install:
+    bash scripts/install_git_hooks.sh
 
 # Pre-commit: eslint on the given files, from the calling workspace
 [group('hooks')]
