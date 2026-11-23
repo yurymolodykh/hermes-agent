@@ -257,8 +257,12 @@ def write_password_file(login: str, password: str) -> tuple[Path, Callable[[], N
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _preflight(login: str, telegram_id: str) -> str:
-    """Everything that can refuse, before the first write. Returns the profile name."""
+def _preflight(login: str, telegram_id: str, *, adopt: bool = False) -> str:
+    """Everything that can refuse, before the first write. Returns the profile name.
+
+    ``adopt`` is for the dashboard account that already exists: its profile is created and
+    its credential is left exactly as it is, so a duplicate login is the expected input.
+    """
     from hermes_cli import dashboard_users as du
     from hermes_cli.profiles import get_profile_dir, profile_exists
 
@@ -269,6 +273,12 @@ def _preflight(login: str, telegram_id: str) -> str:
             "(no leading dot, at most 64 characters)")
     if profile_exists(profile) or get_profile_dir(profile).exists():
         raise Refused(f"profile {profile} already exists")
+    if adopt:
+        # An account that predates its profile (people who already sign in to the dashboard)
+        # is the normal case, not a duplicate: every check below is keyed to the profile not
+        # existing, so they are all skipped and the remaining steps fill in what is missing.
+        # The users-file record is the exception — it exists and must keep its credential.
+        return profile
 
     # Bindings: the slug and the Telegram stamp must both be free.
     from hermes_acl_bindings import store
@@ -378,20 +388,43 @@ def add_user(
 
         users_path, undo_users_config = ensure_users_file_configured()
         undo.append(("dashboard.basic_auth.users_file", undo_users_config))
-        secret = password if password is not None else generate_password()
-        password_path, undo_password = write_password_file(login, secret)
-        undo.append((f"password file {password_path.name}", undo_password))
+
+        # An existing record already holds a credential somebody signs in with: an adopted
+        # account keeps its hash and its credential generation, so a sign-in that worked before
+        # the profile existed still works after. Without ``adopt`` (the duplicate login was
+        # refused in the preflight) there is nothing to keep.
+        existing = None
+        if adopt:
+            load = du.load_users_file(users_path) if users_path else None
+            if load is not None and load.ok:
+                existing = du.lookup(load.users, login)
+
+        if existing is not None and password is None:
+            secret = None
+            password_path = None
+            _err(f"kept the existing credential for {login} (generation {existing.gen})")
+        else:
+            secret = password if password is not None else generate_password()
+            password_path, undo_password = write_password_file(login, secret)
+            undo.append((f"password file {password_path.name}", undo_password))
 
         users_store = du.UserStore(users_path)
-        record = du.UserRecord(
-            login=login,
-            password_hash=du.hash_password(secret),
-            display_name=display,
-            role=role,
-            telegram_id=telegram_id,
-            gen=1,
-            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        )
+        if existing is not None:
+            record = replace(  # type: ignore[type-var]  # dataclasses.replace on a frozen record
+                existing,
+                display_name=display or existing.display_name,
+                telegram_id=existing.telegram_id or telegram_id,
+            )
+        else:
+            record = du.UserRecord(
+                login=login,
+                password_hash=du.hash_password(secret),
+                display_name=display,
+                role=role,
+                telegram_id=telegram_id,
+                gen=1,
+                created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
         users_store.upsert_record(record)
         undo.append((f"users-file record {login}",
                      lambda: users_store.remove_record(login)))
