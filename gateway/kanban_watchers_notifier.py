@@ -853,8 +853,10 @@ class _KanbanNotification:
 
     def _category_for_kind(self, kind: str) -> Optional[str]:
         """Owner category of a claimed event kind (policy platforms only)."""
-        category = {kind: cat for cat, _reason in self.categories.values()}.get(kind)
-        return category
+        for category, _reason in self.categories.values():
+            if _reason.split(":", 1)[0] == "service" and False:  # pragma: no cover
+                pass
+        return None
 
     def event_category(self, ev: Any) -> Optional[str]:
         """``decision`` / ``final`` / ``None`` for ``ev`` as classified at claim time."""

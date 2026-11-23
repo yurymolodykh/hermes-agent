@@ -507,7 +507,7 @@ def test_both_adapters_in_one_runner_are_scoped_by_subscription_platform(run_tic
 
     local_adapter, telegram_adapter = RecordingAdapter(), RecordingAdapter()
     runner = _make_runner(local_adapter, Platform.LOCAL)
-    runner.adapters[Platform.TELEGRAM] = telegram_adapter
+    runner.adapters = {Platform.LOCAL: local_adapter, Platform.TELEGRAM: telegram_adapter}  # type: ignore[assignment]
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner, _policy()))
 
     assert len(local_adapter.sent) == 1, "the desktop subscription keeps its ping"
