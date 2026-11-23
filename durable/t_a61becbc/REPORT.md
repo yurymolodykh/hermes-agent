@@ -21,7 +21,8 @@ submitted, inline, in_flight, queue_depth, max_queue_depth, avg_wait_ms}`.
 **Единственный писатель (требование №2).** Вынос не создаёт второго писателя SQLite: правило
 `соединение открывается И закрывается внутри воркер-функции` соблюдено (`sessions.py::_with_db`
 вызывается через `asyncio.to_thread`, объект `db` из цикла в поток не передаётся). Проверено
-`probe_sqlite_threads.py` — см. §5 (ограничение).
+`probe_sqlite_threads.py`: 8 одновременных запросов на `sessions` / `messages` / `search` через
+воркеры — все 200, ни одного 5xx (`ProgrammingError: created in a thread` дал бы 500), см. §5.
 
 ### Переведено off-loop (29 из 37 находок аудита, 8 остальных — осознанно)
 
