@@ -342,6 +342,12 @@ _SPECS = [
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _arg("--until", dest="until", metavar="WHEN",
+             help="Come back automatically at this time: ISO-8601 "
+                  "('2026-11-25T04:40') or epoch seconds. A value without an offset is "
+                  "read as wall-clock time in the profile's timezone (Europe/Moscow). "
+                  "Omitting it parks the card until a human unblocks it, which the board "
+                  "reports as a deadline-less park."),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [

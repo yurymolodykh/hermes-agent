@@ -61,6 +61,14 @@ def profile_tz():
     return _hermes_time().get_timezone()
 
 
+def timezone_name() -> str:
+    """Name of the zone deadlines are read and rendered in (``Europe/Moscow`` here)."""
+    tz = profile_tz()
+    if tz is None:
+        return "server-local time"
+    return str(getattr(tz, "key", None) or tz.tzname(None) or "the profile timezone")
+
+
 def format_local(epoch: Optional[int]) -> str:
     """``2026-11-25 04:40 MSK`` — the profile-local rendering used in comments/events."""
     if not epoch:
@@ -350,5 +358,6 @@ __all__ = [
     "profile_tz",
     "resolve_deadline",
     "set_scheduled_until",
+    "timezone_name",
     "wake_due_tasks",
 ]

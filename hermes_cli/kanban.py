@@ -18,6 +18,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_schedule as kbschedule
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
@@ -1162,11 +1163,30 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     ids = _bulk_ids(args)
+    raw_until = _stripped_or_none(getattr(args, "until", None))
+    until = None
+    if raw_until is not None:
+        until = kbschedule.parse_until(raw_until)
+        if until is None:
+            return _err(
+                f"cannot read --until {raw_until!r}: pass ISO-8601 "
+                f"(2026-11-25T04:40) or epoch seconds; a value without an offset is "
+                f"read in {kbschedule.timezone_name()} "
+            )
+    note = reason
+    when = ""
+    if until is not None:
+        when = kbschedule.format_local(until)
+        note = f"{reason} SCHEDULED_UNTIL={when}" if reason else f"SCHEDULED_UNTIL={when}"
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, note, author, "SCHEDULED", lambda tid: kb.schedule_task(
+            conn, tid, reason=note, expected_run_id=_worker_run_id_for(tid), until=until))
+        label = (
+            (lambda tid: f"Scheduled {tid}{suffix} — wakes {when}")
+            if until is not None else (lambda tid: f"Scheduled {tid}{suffix}")
+        )
+        return _bulk_apply(ids, op, label, lambda tid: f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
