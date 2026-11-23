@@ -27,7 +27,7 @@ os.environ["HERMES_TEST_ISOLATION"] = "1"
 os.environ.setdefault("HERMES_STATE_DB_GUARD_BYPASS", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hermes_state import SessionDB  # noqa: E402
+from hermes_state import SessionDB
 
 
 def _free_port() -> int:
