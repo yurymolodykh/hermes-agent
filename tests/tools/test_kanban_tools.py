@@ -1293,6 +1293,38 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_records_the_requester_subject_for_delivery(monkeypatch, worker_env):
+    """The subscription row carries WHO ordered the work, resolved through the ACL identity.
+
+    Delivery used to stop at the hosting orchestrator profile, so the person who asked never
+    received the artifact. The requester's subject is now stamped into the row's delivery
+    metadata next to the chat, which is what a notifier needs to attribute the delivery.
+    """
+    from tools import kanban_tools as kt
+    import hermes_acl_identity as ident
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "tg:555")
+    monkeypatch.setattr(ident, "resolve_subject", lambda value, **kw: "person/olga")
+
+    out = kt._handle_create({"title": "ordered by olga", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["delivery_metadata"]["requester_subject"] == "person/olga"
+
+
+def test_requester_subject_is_blank_when_the_identity_does_not_resolve(monkeypatch):
+    """No resolvable person -> no invented name: the field stays absent, the rest works."""
+    from tools import kanban_tools as kt
+
+    assert kt._requester_subject("") == ""
+    assert kt._requester_subject("tg:555") == ""
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent
