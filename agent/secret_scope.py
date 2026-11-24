@@ -466,10 +466,16 @@ def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
 def _is_process_home(hermes_home: Path) -> bool:
     """Is *hermes_home* the profile this process serves as its own? Same launch-home identity as
     ``serves_routed_profile()``: a host that mirrors a served profile into ``HERMES_HOME`` would
-    otherwise seed the launch profile's bridged allow-all grant into that profile's scope."""
-    from hermes_constants import get_routing_process_hermes_home
+    otherwise seed the launch profile's bridged allow-all grant into that profile's scope.
+
+    Compared through :func:`hermes_constants.hermes_home_key`, not two ``Path.resolve()`` calls:
+    this runs on every scope build — dispatch, the hosted-room watcher's 1 s cycle, cron fires —
+    and ``resolve()`` is four ``realpath`` syscalls per side. The key is memoised per path (see
+    ``_HOME_KEY_CACHE``), so a repeat build costs a dict lookup instead of the filesystem walk.
+    """
+    from hermes_constants import get_routing_process_hermes_home, hermes_home_key
     try:
-        return Path(hermes_home).resolve() == get_routing_process_hermes_home().resolve()
+        return hermes_home_key(hermes_home) == hermes_home_key(get_routing_process_hermes_home())
     except OSError:
         return False
 
