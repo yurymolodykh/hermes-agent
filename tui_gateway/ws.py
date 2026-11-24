@@ -308,7 +308,8 @@ class WSTransport:
             while self._send_queue:
                 lines, is_current, unguarded_prefix, done = self._send_queue.popleft()
                 try:
-                    await self._write_batch(lines, is_current=is_current, unguarded_prefix=unguarded_prefix)
+                    async with self._send_lock:
+                        await self._write_batch(lines, is_current=is_current, unguarded_prefix=unguarded_prefix)
                 finally:
                     if not done.done():
                         done.set_result(None)
