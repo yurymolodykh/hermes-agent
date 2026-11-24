@@ -5,6 +5,7 @@ docs of config.yaml.
 """
 
 from hermes_cli.config_defaults_auxiliary import _aux
+from hermes_cli.config_defaults_kanban import owner_delivery_policy_default
 
 #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
@@ -1884,9 +1885,9 @@ DEFAULT_CONFIG = {
         # context (bare shell, cron, worker without subscribers): "platform:chat_id".
         # Empty = fall back to the caller's own session context only.
         "default_notify_chat": "",
-        # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
-        # not own notification subscriptions to avoid an idle five-second board probe.
+        # Deliver Kanban subscriptions from this gateway; false stops the idle board probe.
         "notify_in_gateway": True,
+        "owner_delivery_policy": owner_delivery_policy_default(),
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
@@ -1939,8 +1940,7 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
-        # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
-        # decompose <id>` or the dashboard's Decompose button.
+        # Decompose Triage tasks every tick; false = manual (`hermes kanban decompose`).
         "auto_decompose": True,
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.

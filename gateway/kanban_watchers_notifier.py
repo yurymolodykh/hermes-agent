@@ -18,6 +18,12 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from gateway.owner_delivery_policy import (
+    OwnerDeliveryConfig,
+    classify_kanban_event,
+    filter_artifacts,
+    record_suppressed,
+)
 from gateway.wake import session_owned_by_profile
 
 
@@ -76,6 +82,45 @@ _REOPEN_EVENT_KINDS = (
     "created", "promoted", "unblocked", "claimed", "spawned", "worker_bound",
     "scheduled", "review_requested", "changes_requested", "respawn_guarded",
 )
+
+
+_CLOSED_ANCESTOR_STATUSES = frozenset({"done", "archived"})
+# Bound for the recursive ancestor walk: a malformed (cyclic) link graph must not hang a tick.
+_ANCESTOR_WALK_LIMIT = 200
+
+
+def has_open_ancestor(conn: Any, task_id: str) -> bool:
+    """Whether any transitive ancestor of ``task_id`` is still open (not done/archived).
+
+    A card finished under an open parent is an intermediate step of a bigger card, so
+    its completion is machine flow for the owner, not a deliverable. Cycle-safe and
+    never raises: an unreadable graph counts as "open" (the conservative side — better
+    to stay quiet in Telegram than to page the owner for a sub-step).
+    """
+    try:
+        seen: set[str] = {task_id}
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop()
+            rows = conn.execute(
+                "SELECT p.id, p.status FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ?",
+                (current,),
+            ).fetchall()
+            for row in rows:
+                parent_id = row["id"] if hasattr(row, "keys") else row[0]
+                status = row["status"] if hasattr(row, "keys") else row[1]
+                if parent_id in seen:
+                    continue
+                if str(status) not in _CLOSED_ANCESTOR_STATUSES:
+                    return True
+                if len(seen) >= _ANCESTOR_WALK_LIMIT:
+                    return True
+                seen.add(parent_id)
+                frontier.append(parent_id)
+    except Exception:  # health: allow BLE001 -- a graph read must never break delivery
+        return True
+    return False
 
 
 def _epochs_for(conn: Any, task_id: str, kinds: tuple) -> list[int]:
@@ -342,6 +387,35 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     return primary if profile == primary_profile else None
 
 
+def _policy_artifact_payload(event_payload: Any, extensions) -> Optional[dict]:
+    """Payload narrowed to whitelisted artifact paths, or ``None`` when nothing survives.
+
+    The shared ``_deliver_kanban_artifacts`` also harvests paths mentioned in the summary
+    and in ``task.result``; under the owner policy those prose mentions are dropped too,
+    otherwise a ``.md``/``.py`` referenced in prose would still ride out as a file.
+    """
+    raw = (event_payload or {}).get("artifacts") if isinstance(event_payload, dict) else None
+    kept = filter_artifacts(raw if isinstance(raw, (list, tuple)) else (), extensions)
+    return {"artifacts": kept} if kept else None
+
+
+def _owner_delivery_config() -> OwnerDeliveryConfig:
+    """``kanban.owner_delivery_policy`` from the active profile's effective config.
+
+    Read once per tick (not at import) so flipping ``enabled`` is a live rollback: the
+    next tick delivers the old way. An unreadable config keeps the shipped defaults.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    except Exception as exc:  # health: allow BLE001 -- config read is optional; defaults apply
+        logger.debug("kanban notifier: cannot read owner delivery policy (%s); using defaults", exc)
+        kanban_cfg = {}
+    return OwnerDeliveryConfig.from_config(kanban_cfg)
+
+
 # --- Collection (runs in a worker thread) ---
 
 
@@ -355,6 +429,10 @@ class _Collector:
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
         self.deliveries: list[dict] = []
+        # Owner delivery policy (default: Telegram gets decisions and final deliverables only).
+        # Read per tick and matched against each subscription's platform, so desktop/local,
+        # api_server and cron keep the pre-policy behaviour byte for byte.
+        self.owner_policy = _owner_delivery_config()
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
         self.notifier_profiles = {notifier_profile}
@@ -467,9 +545,54 @@ class _Collector:
         if not kept:
             return None
         events = kept
+        events, categories = self._apply_owner_policy(conn, sub, platform, events)
+        if not events:
+            return None
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "categories": categories,
+                "owner_policy": self.owner_policy}
+
+    def _apply_owner_policy(self, conn: Any, sub: dict, platform: str, events: list):
+        """Keep only owner-facing events for a covered platform; journal every drop.
+
+        The claim already advanced the cursor, so a dropped event never comes back — the
+        suppression journal is what keeps that from being a silent loss. Every other
+        platform (desktop ``local``, api_server, cron) returns the events untouched.
+        """
+        if not self.owner_policy.covers(platform):
+            return events, {}
+        task_id = sub["task_id"]
+        task = self.kb.get_task(conn, task_id)
+        open_ancestor = has_open_ancestor(conn, task_id)
+        categories: dict = {}
+        kept: list = []
+        for ev in events:
+            category, reason = classify_kanban_event(
+                kind=ev.kind,
+                payload=getattr(ev, "payload", None),
+                task=task,
+                has_open_ancestor=open_ancestor,
+                extensions=self.owner_policy.artifact_extensions,
+            )
+            if category is None:
+                record_suppressed(
+                    task_id=task_id,
+                    event_kind=ev.kind,
+                    platform=platform,
+                    chat_id=sub.get("chat_id") or "",
+                    reason=reason,
+                )
+                continue
+            categories[ev.id] = (category, reason)
+            kept.append(ev)
+        if len(kept) != len(events):
+            logger.debug(
+                "kanban notifier: owner policy suppressed %d/%d event(s) for %s on %s",
+                len(events) - len(kept), len(events), task_id, platform,
+            )
+        return kept, categories
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -679,6 +802,11 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        # Owner delivery policy: set by the collector for covered platforms only.
+        # Absent → ``enabled=False`` → every path below behaves exactly as before.
+        self.categories: dict = d.get("categories") or {}
+        self.owner_policy = d.get("owner_policy") or OwnerDeliveryConfig(enabled=False)
+        self.policy_active = self.owner_policy.covers(self.platform_str)
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -723,6 +851,20 @@ class _KanbanNotification:
 
     # -- formatting --
 
+    def _category_for_kind(self, kind: str) -> Optional[str]:
+        """Owner category of a claimed event kind (policy platforms only)."""
+        for ev in self.d["events"]:
+            if ev.kind == kind:
+                category = self.event_category(ev)
+                if category:
+                    return category
+        return None
+
+    def event_category(self, ev: Any) -> Optional[str]:
+        """``decision`` / ``final`` / ``None`` for ``ev`` as classified at claim time."""
+        entry = self.categories.get(getattr(ev, "id", None))
+        return entry[0] if entry else None
+
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
         formatter = _EVENT_FORMATTERS.get(ev.kind)
@@ -733,12 +875,37 @@ class _KanbanNotification:
             self.wake_handoff = handoff
         if review_detail is not None:
             self.wake_review_detail = review_detail
+        if self.policy_active:
+            msg = self._owner_facing_text(ev, msg)
+        return msg
+
+    def _owner_facing_text(self, ev: Any, msg: str) -> str:
+        """A policy message must carry its own substance: the deliverable's summary or the
+        decision's question. A bare "✅" or "статус: blocked" is the noise the policy removes."""
+        category = self.event_category(ev)
+        payload = getattr(ev, "payload", None) or {}
+        if category == "final":
+            summary = str(payload.get("summary") or "").strip()
+            if not summary and self.task is not None:
+                summary = str(getattr(self.task, "result", "") or "").strip()
+            if summary and summary[:60] not in msg:
+                msg += "\n" + _first_line(summary, 400)
+        elif category == "decision":
+            reason = str(payload.get("reason") or "").strip()
+            if reason and reason[:40] not in msg:
+                msg += "\n" + t("gateway.kanban.ping.reason_suffix", reason=reason[:400])
         return msg
 
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
         self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        if self.policy_active:
+            # Only a decision justifies spending a turn of the creator's session: a final
+            # deliverable is delivered passively (text + files), and service events never
+            # reached this point at all. Without this, every suppressed-looking event still
+            # produced a second message — the agent's own reply to the wake.
+            self.wake_kinds = {k for k in self.wake_kinds if self._category_for_kind(k) == "decision"}
         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return
@@ -863,10 +1030,18 @@ class _KanbanNotification:
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
         if ev.kind in ("completed", "review_requested"):
+            event_payload = getattr(ev, "payload", None)
+            if self.policy_active:
+                # Owner policy: only deliverable file types reach the chat. Filtering happens
+                # HERE, at the call site, so the shared delivery path keeps its full set for
+                # desktop/local, api_server and cron.
+                event_payload = _policy_artifact_payload(event_payload, self.owner_policy.artifact_extensions)
+                if event_payload is None:
+                    return True
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
-                    event_payload=getattr(ev, "payload", None), task=self.task,
+                    event_payload=event_payload, task=None if self.policy_active else self.task,
                 )
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)

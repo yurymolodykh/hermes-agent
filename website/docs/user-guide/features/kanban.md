@@ -836,7 +836,47 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to the root task's assignee, else the active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
+| `owner_delivery_policy` | see below | Which Kanban events the notifier may turn into an **owner-facing** message on the listed platforms. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+
+#### Owner delivery policy
+
+`kanban.owner_delivery_policy` decides what the notifier is allowed to say to the owner on a
+given platform. On a covered platform only two categories get through:
+
+* **decision** — a card cannot move without the owner: `blocked` with block kind `needs_input` or
+  `capability`, the same pair arriving as a `status` event, and `block_loop_detected` with kind
+  `needs_input`. The message carries the card's own reason, and this is the only category that
+  wakes the creating session.
+* **final** — a `completed` card that has no open ancestor (an intermediate step of a bigger card
+  is not a deliverable) and either at least one whitelisted artifact or a non-empty summary. It is
+  delivered passively (text with the summary plus the files) and does not spend a turn of the
+  creator's session.
+
+Everything else — `crashed`, `timed_out`, `gave_up`, `commented`, `review_requested`,
+`changes_requested`, `status` (not a decision block), `archived`, `unblocked` — stays on the board.
+A suppressed event is never lost silently: it is appended to
+`<HERMES_HOME>/logs/delivery-policy-suppressed.log` as one JSON line
+(`ts`, `task_id`, `event_kind`, `platform`, `chat_id`, `reason`), and the subscription cursor still
+advances so it cannot come back.
+
+Artifacts are filtered by extension: `.pdf .docx .doc .xlsx .pptx .html .htm .png .jpg .jpeg .svg
+.webp .zip .csv .txt` reach the chat; `.md`, `.json`, `.py`, `.log`, `.diff`, `.jsonl` and `.out` are
+evidence for the board and stay on disk.
+
+```yaml
+kanban:
+  owner_delivery_policy:
+    enabled: true            # false restores the previous behaviour verbatim
+    platforms: [telegram]    # the ONLY place the scope is set
+    artifact_extensions: [.pdf, .docx, .doc, .xlsx, .pptx, .html, .htm,
+                          .png, .jpg, .jpeg, .svg, .webp, .zip, .csv, .txt]
+```
+
+Platforms not listed — notably the desktop channel `local`, `api_server` and cron — keep the
+previous behaviour exactly: every terminal kind is pinged, the creator is woken, and artifacts are
+delivered without an extension filter. Adding `local` to `platforms` is an explicit owner decision,
+never a default.
 
 And the two auxiliary LLM slots:
 
