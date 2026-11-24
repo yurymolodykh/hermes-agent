@@ -179,6 +179,29 @@ def _ticket_principal(request: Request) -> tuple[dict, str | None]:
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _require_profile_for_principal(request: Request, identity: dict, profile: str) -> None:
+    """``hermes_acl_profiles.require_visible`` for the identity the ticket will CARRY.
+
+    Not for ``request.state``: on the unauthenticated loopback bind ``_ticket_principal``
+    synthesises ``SESSION_TOKEN_OWNER`` and never touches the request, so a check against the bare
+    request would read an anonymous caller — and ``require_visible`` refuses an identity-less
+    caller with a 404, i.e. it would lock the OWNER out of their own tab. The principal is handed
+    to the gate in the shape it reads (``request.state.session``), one field per credential.
+    """
+    from types import SimpleNamespace
+
+    from hermes_acl_profiles import require_visible
+
+    state = SimpleNamespace(
+        session=SimpleNamespace(user_id=identity.get("user_id", ""),
+                                provider=identity.get("provider", ""),
+                                issuer=identity.get("issuer", "") or ""),
+        # A native grant's subject outranks the login shape and is already on the request; the
+        # ticket path only reaches here with a login, so this stays None in practice.
+        native_http_principal=getattr(getattr(request, "state", None), "native_http_principal", None))
+    require_visible(SimpleNamespace(state=state), profile)
+
+
 def mint_socket_ticket(identity: dict, socket: str, *, session_token: str | None = None,
                        sign_in: str | None = None, profile_home: str | None = None) -> str:
     """A one-use ticket that opens only *socket* (``web_session_sockets.GATEWAY_SOCKET``,
@@ -245,6 +268,11 @@ async def issue_socket_ticket(request: Request, socket: str = "", profile: str |
     identity, session_token = _ticket_principal(request)
     profile_home = None
     if checks_profile:
+        if profile:
+            # The tab asks for a profile's socket while the ticket it will carry is minted here: a
+            # ticket for a profile this principal may not SEE opens a socket on it (one login's tab
+            # answering for another person's profile). Same gate, same 404 as the REST routes.
+            _require_profile_for_principal(request, identity, profile)
         _name, home = _cron_profile_home(profile)
         if socket == GATEWAY_SOCKET and profile:
             profile_home = str(home)
