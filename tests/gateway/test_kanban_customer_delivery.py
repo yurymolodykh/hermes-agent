@@ -81,7 +81,7 @@ def _card_owned_by_anna() -> str:
 def test_customer_subscription_delivers_into_the_customers_chat(runner, caplog):
     task_id = _card_owned_by_anna()
 
-    with caplog.at_level(logging.DEBUG, logger="gateway.kanban_watchers_notifier"):
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         rows = _notifier_collect(runner, kb, notifier_profile="01-orchestrator", gc_due=False, gc_retention_days=30)
         assert [row["task"].id for row in rows] == [task_id], "the customer sub must be claimed"
         for row in rows:
