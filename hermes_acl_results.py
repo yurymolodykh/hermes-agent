@@ -391,15 +391,62 @@ def memory_dirs_for(request: Any, all_dirs: Sequence[Path]) -> list[Path]:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Card attachments (ownership by CARD, never by attachment id)
+# Card materials — TEAM by default, ownership only gates CHANGES
 # ────────────────────────────────────────────────────────────────────────────
+#
+# The rule from the owner: what the team produced belongs to the team. A card, its comments, its
+# log and its attachments are the team's working material — a file a document producer made on a
+# card must be downloadable by the person who ordered it, by the reviewer, by anyone. Only two
+# things stay private: correspondence (sessions, gated in hermes_acl_scope) and the personal
+# profile (hermes_acl_profiles). So the READ boundary here is "is this a real caller at all",
+# and ownership only decides who may CHANGE somebody's card.
+
+
+def personal_contour_of(task: Any) -> str:
+    """The subject a card is PRIVATE to, or ``""`` when it is team material.
+
+    Opt-in and explicit: a card enters the personal contour only by carrying a
+    ``tenant="personal:<subject>"`` marker. Nothing sets it today, so every existing card stays
+    team material; the marker exists so a future personal to-do list has a gate instead of a
+    comment saying "do not show this".
+    """
+    tenant = str(getattr(task, "tenant", "") or "").strip()
+    if not tenant.startswith(PERSONAL_TENANT_PREFIX):
+        return ""
+    return tenant[len(PERSONAL_TENANT_PREFIX):].strip()
 
 
 def task_visible(request: Any, task: Any) -> bool:
-    """Whether the request's person owns *task* (owner: every card; unscoped: every card)."""
+    """Whether the request's person may READ *task* and its materials.
+
+    Team material (the default): readable by any verified caller — owner, or any subject that
+    resolves. Unscoped (multi_user off / host owner): everything, exactly as before. Personal
+    contour: only the person the card is marked for.
+    """
     if not scoped(request):
         return True
-    marks = stamps(request_subject(request))
+    subject = request_subject(request)
+    if not str(subject or "").strip():
+        return False
+    private_to = personal_contour_of(task)
+    if not private_to:
+        return True
+    if private_to == str(subject).strip():
+        return True
+    return bool(stamps(subject) & {private_to})
+
+
+def task_writable(request: Any, task: Any) -> bool:
+    """Whether the request's person may CHANGE *task*: its owner (creator or assignee) only.
+
+    A team card is still one person's work order. Reading is shared; moving its status, uploading
+    into it, deleting it are the holder's decision, so the ownership stamps are compared exactly
+    as the read boundary used to.
+    """
+    if not scoped(request):
+        return True
+    subject = request_subject(request)
+    marks = stamps(subject)
     if not marks:
         return False
     row = {getattr(task, "created_by", None), getattr(task, "assignee", None)}
@@ -407,10 +454,44 @@ def task_visible(request: Any, task: Any) -> bool:
 
 
 def require_task(request: Any, task: Any, task_id: Any = "") -> None:
-    """Refuse a foreign card with the SAME 404 an absent id gets (no id oracle)."""
+    """Refuse an unreadable card with the SAME 404 an absent id gets (no id oracle).
+
+    Reads, not writes: a card and its attachments are team material, so this refuses only an
+    anonymous call or a personal-contour card. Write routes call :func:`require_task_write`.
+    """
     if task is not None and task_visible(request, task):
         return
     from fastapi import HTTPException
 
     logger.info("acl results: refusing card %r for this caller", str(task_id))
     raise HTTPException(status_code=404, detail=TASK_NOT_FOUND)
+
+
+def require_task_write(request: Any, task: Any, task_id: Any = "") -> None:
+    """Refuse a CHANGE to a card the caller does not hold (403, not 404: it is readable).
+
+    A 404 here would be a lie — the caller can read the card a line earlier — and the id is
+    already known to them, so nothing is leaked by naming the refusal.
+    """
+    if task is not None and task_writable(request, task):
+        return
+    from fastapi import HTTPException
+
+    logger.info("acl results: refusing write to card %r for this caller", str(task_id))
+    raise HTTPException(status_code=403, detail=TASK_NOT_YOURS)
+
+
+def delivery_targets(subject: Any) -> tuple[str, ...]:
+    """Every address that reaches the person owning *subject*, for a notify subscription.
+
+    The notifier's own route: it matches a subscription's ``user_id`` against the owning
+    person's stamps, so handing back the full stamp set is what makes a created-from-the-UI card
+    reach the person who ordered it instead of only the orchestrator profile that hosted the turn.
+    """
+    marks = stamps(subject)
+    out: list[str] = []
+    for mark in (str(subject or "").strip(), *sorted(marks)):
+        if mark and mark not in out:
+            out.append(mark)
+    return tuple(out)
+
