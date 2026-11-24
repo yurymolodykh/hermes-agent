@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import time
 from typing import Callable
 
 
@@ -14,23 +15,78 @@ class PruneError(RuntimeError):
 
 GC_PENDING_NAME = ".gc-pending"
 
+# How long a snapshot waits for the per-profile store lock before giving up. A checkpoint is the
+# rollback insurance of a whole run, so it waits: measured on a live store, one snapshot holds the
+# lock 0.6-0.75 s, and two workers of one profile racing lost HALF of their snapshots when the
+# acquisition refused instantly (24 refusals / 16 attempts, board evidence 22-24.11.2026: 108
+# "store is busy" card notices). Five seconds covers a queue of snapshots with room to spare; a
+# refusal after that is a real outage (maintenance's ``git gc`` on a 150-180 MB store) and is
+# reported with the holder's pid instead of only the store path.
+STORE_LOCK_TIMEOUT_SECONDS = 5.0
+
 
 def store_lock_path(base: Path) -> Path:
     base = base.resolve()
     return base.with_name(f".{base.name}.lock")
 
 
+def store_lock_paths(base: Path) -> list[Path]:
+    """Every lock file guarding ``base``, current name first.
+
+    ``.checkpoints.lock`` beside the base is the live one (outside base, so ``clear_all`` cannot
+    replace its inode). ``<base>/.store.lock`` is the name earlier builds used and the one found
+    abandoned on a live profile for 9.5 hours; it is still swept so an old debris file cannot
+    outlive the upgrade.
+    """
+    base = Path(base).resolve()
+    return [store_lock_path(base), base / LEGACY_STORE_LOCK_NAME]
+
+
+def lock_holder_hint(lock: Path) -> str:
+    """Who to blame when ``lock`` could not be taken: the live holder, or that none is visible.
+
+    ``hermes_cli._early_recovery._held_open`` is the one authority on "does a running process
+    still own this path" (on Linux it reads every process's fds through /proc, on macOS/BSD it
+    asks ``lsof``); a third probe must not grow here. Every answer is honest: a visible holder is
+    named with its pid and command line, an unknown one is reported as unknown, and neither is
+    invented.
+    """
+    try:
+        from hermes_cli._early_recovery import _held_open
+
+        verdict = _held_open(Path(lock))
+    except Exception:  # a diagnostic must never replace the failure it explains
+        return "holder unknown (probe unavailable)"
+    if verdict is True or verdict is None:
+        return "holder unknown (the platform could not inspect open files)"
+    if verdict is False:
+        return "no live process holds a descriptor on the lock file"
+    return f"held by {verdict}"
+
+
 @contextmanager
-def store_lock(base: Path):
-    """Serialize whole operations, including GC and clear, across processes."""
-    from hermes_cli.runtime_state import _lock
+def store_lock(base: Path, *, timeout: float | None = STORE_LOCK_TIMEOUT_SECONDS):
+    """Serialize whole operations, including GC and clear, across processes.
+
+    Waits up to ``timeout`` seconds for the lock (``None`` waits forever, ``0`` tries once) —
+    contending snapshots queue instead of being dropped, which is what the silent "store is
+    busy" refusal cost every run that lost one. ``pm.filesystem.lock_path`` does the waiting and
+    also re-checks that the held descriptor is still the file at the path, so a lock file removed
+    while held cannot hand two processes the same lock.
+    """
+    from pm.filesystem import lock_path
 
     base.parent.mkdir(parents=True, exist_ok=True)
     # Outside base so clear_all and legacy migration cannot replace its inode.
-    fd = os.open(store_lock_path(base), os.O_CREAT | os.O_RDWR, 0o600)
+    lock = store_lock_path(base)
+    started = time.monotonic()
+    fd = lock_path(lock, timeout=timeout, create_dir=True)
+    if fd is None:
+        waited = time.monotonic() - started
+        raise PruneError(
+            f"checkpoint store is busy: {base} — {lock_holder_hint(lock)}; "
+            f"gave up after {waited:.1f}s of waiting ({lock})")
     try:
-        if not _lock(fd, wait=False):
-            raise PruneError(f"checkpoint store is busy: {base}")
         yield
     finally:
         os.close(fd)
