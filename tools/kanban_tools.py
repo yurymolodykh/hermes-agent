@@ -1251,6 +1251,24 @@ def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
         return session_key
 
 
+def _requester_subject(raw_user_id: str) -> str:
+    """The ACL person behind this session's platform user id, or ``""`` when unknown.
+
+    ``HERMES_SESSION_USER_ID`` is the platform account (``tg:…`` for Telegram), which is what the
+    ACL registry keys people by. Resolving it through the same :func:`hermes_acl_identity.resolve_subject`
+    the gates use keeps one notion of "who" across the board and the subscription row.
+    """
+    text = str(raw_user_id or "").strip()
+    if not text:
+        return ""
+    try:
+        import hermes_acl_identity as _ident
+
+        return str(_ident.resolve_subject(text) or "")
+    except Exception:
+        return ""
+
+
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
     """``kanban_db.add_notify_sub`` kwargs for the calling session, or None (CLI/cron/tests).
     Gateway sessions: ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` ContextVars. TUI/desktop:
@@ -1281,6 +1299,13 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
             ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
         ) if v}
+    # WHO ORDERED THE WORK. The subscription row is the delivery address of this card, and the
+    # person who asked for it is the requester in this session — not the profile hosting the turn.
+    # Recording the subject lets the notifier attribute and route to that person, and it survives
+    # into the card so a later hand-off does not have to re-derive it.
+    requester_subject = _requester_subject(env("HERMES_SESSION_USER_ID", ""))
+    if requester_subject:
+        delivery_metadata["requester_subject"] = requester_subject
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
         delivery_metadata["telegram_dm_topic_reply_fallback"] = True
