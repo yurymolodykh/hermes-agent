@@ -42,70 +42,39 @@
 
 ## Скрипт (полный, воспроизводится одной командой)
 
-```python
-import datetime as dt, math, sqlite3, sys
-sys.path.insert(0, "<hermes-agent checkout>")          # чтобы импортировать agent.*
-from agent.kanban_card_sizing import count_acceptance_items
-
-LO_S, HI_S = "2026-11-17 00:00", "2026-11-23 21:30"     # UTC, обе границы закрыты
-
-def ts(s):
-    return int(dt.datetime.strptime(s, "%Y-%m-%d %H:%M")
-               .replace(tzinfo=dt.timezone.utc).timestamp())
-
-SQL = """SELECT tr.started_at, tr.ended_at, t.body
-  FROM task_runs AS tr
-  JOIN tasks AS t ON t.id = tr.task_id
- WHERE tr.started_at >= :lo
-   AND tr.started_at <  :hi
-   AND tr.ended_at IS NOT NULL
-   AND tr.ended_at <= :hi
-   AND tr.ended_at - tr.started_at > 0"""
-
-con = sqlite3.connect("file:/home/hermes/.hermes/kanban.db?mode=ro", uri=True)
-rows = list(con.execute(SQL, {"lo": ts(LO_S), "hi": ts(HI_S)}))
-
-def pct(values, p):
-    ordered = sorted(values)
-    return ordered[max(1, math.ceil(p / 100.0 * len(ordered))) - 1]
-
-def whole(x):
-    return int(math.floor(x / 60.0 + 0.5))
-
-buckets = {}
-for started, ended, body in rows:
-    buckets.setdefault(count_acceptance_items(body), []).append(ended - started)
-
-allv = [x for v in buckets.values() for x in v]
-print(f"n={len(rows)} median={whole(pct(allv,50))} p80={whole(pct(allv,80))} "
-      f">60={100*sum(x>3600 for x in allv)/len(allv):.0f}% "
-      f">50={100*sum(x>3000 for x in allv)/len(allv):.0f}%")
-for items in sorted(buckets):
-    v = buckets[items]
-    print(f"{items}: n={len(v)} p50={pct(v,50)}s={pct(v,50)/60:.4f}->{whole(pct(v,50))} "
-          f"p80={pct(v,80)}s={pct(v,80)/60:.4f}->{whole(pct(v,80))} "
-          f">60={100*sum(x>3600 for x in v)/len(v):.0f}%")
-b7 = [x for k, v in buckets.items() if k >= 7 for x in v]
-print(f"7+: n={len(b7)} p50={pct(b7,50)/60:.1f} p80={pct(b7,80)/60:.1f}")
-```
-
-## Вывод (фактический, n=766)
+Скрипт лежит рядом с модулем — `measure-card-sizing-calibration.py` в корне рабочего
+дерева, а не копией в этом отчёте: копия расходится с кодом, скрипт — нет. Он же
+печатает сверку с константами модуля и падает с кодом 1 при расхождении.
 
 ```
-n=766 median=39 p80=77 >60=30% >50=40%
-0: n=223 p50=1379s=22.9833->23 p80=3643s=60.7167->61 >60=21%
-2: n=4   p50=2432s=40.5333->41 p80=4303s=71.7167->72 >60=25%
-3: n=53  p50=2522s=42.0333->42 p80=4881s=81.3500->81 >60=30%
-4: n=234 p50=2529s=42.1500->42 p80=4739s=78.9833->79 >60=31%
-5: n=170 p50=2733s=45.5500->46 p80=5416s=90.2667->90 >60=36%
-6: n=55  p50=3553s=59.2167->59 p80=5160s=86.0000->86 >60=49%
-7: n=9   p50=2866s=47.7667->48 p80=7093s=118.2167->118 >60=44%
-8: n=18  p50=1290s=21.5000->22 p80=4317s=71.9500->72 >60=22%
-7+: n=27 p50=37.9 p80=74.7
+python3 measure-card-sizing-calibration.py
+# -> window 2026-11-17 00:00 .. 2026-11-23 21:30 UTC, both ends closed, n=766
+#    row-set sha1 0e2b5d358ad2fba0
+#    ... таблица ... all quoted buckets match the module constants
 ```
 
-Вся выборка: n=766, медиана 39 мин (38.5), p80 77 мин (77.0), 30 % дольше 60 мин,
-40 % дольше 50 мин.
+Верхняя граница проверяется на «быть в прошлом»: при `--hi` в будущем скрипт
+отказывается считать (код 2) — открытое окно невоспроизводимо по определению.
+
+## Вывод (фактический, дословно из скрипта)
+
+```
+window 2026-11-17 00:00 .. 2026-11-23 21:30 UTC, both ends closed, n=766
+row-set sha1 0e2b5d358ad2fba0
+whole sample: median 39 min, p80 77 min, >60 30 %, >50 40 %
+items | n   | p50 s | p50 min | p80 s | p80 min | >60 % | module p50/p80
+    0 | 223 |  1379 |      23 |  3643 |      61 |   21% | 23/61
+    2 |   4 |  2432 |      41 |  4303 |      72 |   25% | -/-
+    3 |  53 |  2522 |      42 |  4881 |      81 |   30% | 42/81
+    4 | 234 |  2529 |      42 |  4739 |      79 |   31% | 42/79
+    5 | 170 |  2733 |      46 |  5416 |      90 |   36% | 46/90
+    6 |  55 |  3553 |      59 |  5160 |      86 |   49% | 59/86
+    7 |   9 |  2866 |      48 |  7093 |     118 |   44% | -/-
+    8 |  18 |  1290 |      22 |  4317 |      72 |   22% | -/-
+7+: n=27 p50=37.9 p80=74.7 (held at the six-item point on purpose: fan-out parents measure lower)
+
+all quoted buckets match the module constants
+```
 
 ## Вошедшие в модуль точки
 
@@ -143,12 +112,17 @@ n=766 median=39 p80=77 >60=30% >50=40%
    число строк объяснено шагами (882 → 766).
 2. **Не было самого запроса**, только его описание, поэтому проверка не
    воспроизводилась. Запрос выше — дословный текст, та же формулировка продублирована
-   в docstring модуля; добавлен sha1 набора строк.
+   в docstring модуля; исполняемая версия — `measure-card-sizing-calibration.py`,
+   добавлен sha1 набора строк, чтобы повторный запуск сверялся побайтово.
 
-Расхождение с числом 869 из пересчёта оркестратора объясняется тем же фильтром:
-869 — это `started_at` в окне и `ended_at <= HI` **без** отбрасывания нулевой
-длительности и удалённых задач. При фильтре операции (766) бакеты совпадают
-по процентилям в пределах 0–1 мин, что и требовалось.
+Про число 869 из пересчёта оркестратора: это `started_at` в окне и `ended_at <= HI`
+**без** отбрасывания нулевой длительности и удалённых задач, снятое в свой момент.
+Тот же предикат на текущей базе даёт 882 (за время разбора докончились ещё прогоны) —
+то есть 869/873/882 растут от одного и того же незакреплённого правила, и именно
+поэтому метка окна в прошлом плюс полный фильтр обязательны. На закреплённом окне
+(21:30, все 4 условия из запроса) набор фиксирован: 766 строк, sha1
+`0e2b5d358ad2fba0` при повторном запуске, и бакеты совпадают с константами модуля
+(сверка печатается самим скриптом).
 
 `CALIBRATION_P80_MINUTES[4] = 79` сверено дважды: на закреплённом окне 766 строк
 p80 бакета = 78.98 мин → 79. Значение 80 появляется только при сдвиге HI к 22:00

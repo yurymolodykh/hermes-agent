@@ -29,9 +29,13 @@ the sorted durations)::
        AND tr.ended_at IS NOT NULL
        AND tr.ended_at <= :hi                       -- same upper bound, closed
        AND tr.ended_at - tr.started_at > 0
+     ORDER BY tr.id                     -- makes the row-set sha1 stable
 
 ``:lo``/``:hi`` are unix timestamps; ``count_acceptance_items(body)`` gives the bucket;
-percentile rank is ``max(1, ceil(p/100 × n))``. Recheck: ``calibration-report.md``.
+percentile rank is ``max(1, ceil(p/100 × n))``. Recheck: ``python3
+measure-card-sizing-calibration.py`` (it re-runs this statement, prints the table, and
+fails when a quoted bucket no longer matches the constants), and ``calibration-report.md``
+for the derivation.
 The window is pinned at *both* ends, and the upper bound sits in the past (21:30 UTC,
 ~2 h before the measurement at 23:41 UTC), because the board is live: an open or future
 upper bound lets a run still in flight at the edge join the sample on a later
@@ -100,8 +104,9 @@ SAFETY_MARGIN = 1.0
 # on the shared board, ``ended_at − started_at`` in seconds, runs that started in and
 # ended within 17.11.2026 00:00 – 23.11.2026 21:30 UTC (both bounds closed and in the
 # past; 766 runs after the documented filter), acceptance items counted by
-# ``count_acceptance_items`` on the task body, percentiles by nearest rank. The full
-# script, its output, and the sha1 pin of the row set are in ``calibration-report.md``.
+# ``count_acceptance_items`` on the task body, percentiles by nearest rank. The runnable
+# statement is ``measure-card-sizing-calibration.py``; its output, the row count and the
+# sha1 pin of the row set are in ``calibration-report.md``.
 # The window is pinned at both ends so the table is reproducible: an open or future upper
 # bound lets an in-flight run join later (observed 754 → 763 → 766 → 776 in two hours).
 # Recheck with ``tests/agent/test_kanban_card_sizing.py``'s ``CALIBRATION_*``
