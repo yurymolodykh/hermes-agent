@@ -57,9 +57,11 @@ def runner(tmp_path, monkeypatch):
 
     r = GatewayRunner.__new__(GatewayRunner)
     r.adapters = {Platform.TELEGRAM: RecordingAdapter()}
-    r._profile_adapters = {"01-orchestrator": {}}
-    r._primary_profile_name = "default"
-    r._kanban_notifier_profile = "default"
+    # In this deployment the orchestrator profile IS the gateway that serves Telegram (its
+    # subscriptions are the ones stamped notifier_profile=01-orchestrator), so it is primary.
+    r._profile_adapters = {}
+    r._primary_profile_name = "01-orchestrator"
+    r._kanban_notifier_profile = "01-orchestrator"
     r._kanban_dispatcher_lock_handle = object()
     r.config = GatewayConfig(multiplex_profiles=True, profile_routes=[])
     return r
@@ -80,7 +82,7 @@ def test_customer_subscription_delivers_into_the_customers_chat(runner, caplog):
     task_id = _card_owned_by_anna()
 
     with caplog.at_level(logging.DEBUG, logger="gateway.kanban_watchers_notifier"):
-        rows = _notifier_collect(runner, kb, notifier_profile="default", gc_due=False, gc_retention_days=30)
+        rows = _notifier_collect(runner, kb, notifier_profile="01-orchestrator", gc_due=False, gc_retention_days=30)
         assert [row["task"].id for row in rows] == [task_id], "the customer sub must be claimed"
         for row in rows:
             asyncio.run(_KanbanNotification(runner, row, platform_cls=Platform, sub_fail_counts={}).deliver())
@@ -92,5 +94,5 @@ def test_customer_subscription_delivers_into_the_customers_chat(runner, caplog):
     assert "kanban notifier: delivered" in caplog.text
 
     # The cursor advanced: the same event is not re-delivered on the next tick.
-    assert _notifier_collect(runner, kb, notifier_profile="default",
+    assert _notifier_collect(runner, kb, notifier_profile="01-orchestrator",
                              gc_due=False, gc_retention_days=30) == []
