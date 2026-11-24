@@ -523,13 +523,20 @@ _ANONYMOUS_PLACEHOLDER_ASSIGNEES = frozenset({"", "default"})
 
 
 def known_profile_names() -> Optional[frozenset[str]]:
-    """Lowercased ids of the profiles this install can actually spawn, or ``None``.
+    """LOWERCASED ids of the profiles this install can spawn, or ``None`` when unknowable.
 
-    ``None`` means *unknowable* — the profile store could not be read, or it
-    lists nothing at all — and every caller must then behave as if the roster
-    imposed no constraint. A fuse that fails closed on a broken roster would
-    refuse legitimate cards on an install whose profiles are simply not mounted
-    (containers, portable trees), which is worse than the incident it guards.
+    ``None`` means *no roster worth trusting*, and every caller must then behave
+    as if the roster imposed no constraint. Two cases produce it:
+
+    * the profile store cannot be read (import cycle, broken/missing tree);
+    * the store lists **no named profile** beyond ``default`` — a single-profile
+      install, or a test/probe sandbox whose ``HERMES_HOME`` is a bare tempdir.
+      In both, "names a profile" carries no signal: the real answer to "is
+      ``worker`` a route?" is not knowable from an empty roster, and refusing on
+      it would break every legitimate throwaway board.
+
+    A fuse that fails closed on those would refuse valid cards on a healthy
+    single-profile install, which is worse than the incident it guards.
     """
     try:
         from hermes_cli.profiles import list_profile_names
@@ -538,7 +545,9 @@ def known_profile_names() -> Optional[frozenset[str]]:
     except Exception:  # pragma: no cover - defensive: import cycle / broken store
         return None
     roster = frozenset(n.strip().lower() for n in names or () if n and n.strip())
-    return roster or None
+    if not roster - {"default"}:
+        return None
+    return roster
 
 
 def names_no_real_profile(assignee: Optional[str]) -> bool:

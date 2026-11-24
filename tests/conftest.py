@@ -730,6 +730,44 @@ _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
 @pytest.fixture(autouse=True)
+def _kanban_board_is_isolated(_hermetic_environment, request):
+    """Fail closed: no test may run with the board pointing at the operator's root.
+
+    ``_hermetic_environment`` above pins ``HERMES_KANBAN_HOME`` per test, and the
+    ``_kanban_write_guard`` below patches ``connect``. Both are *mechanisms*; this
+    fixture is the *assertion* that the mechanisms worked. Without it a regression
+    in either one (a pin that stops applying, a module-global that memoized the
+    real root before the pin) silently resumes writing probe cards to the live
+    board — exactly the t_e0c9e1ce / t_37c3fd9a failure mode, which is invisible
+    until a human notices 24 empty cards in the dispatcher queue.
+
+    Checks the path the code will actually open (``kanban_db_path()``, which
+    honours an inherited ``HERMES_KANBAN_DB`` ahead of the root pin) rather than
+    the pin itself. Tests that deliberately point the board at the real root to
+    prove a guard fires opt out with ``allow_real_home_io``.
+    """
+    if request.node.get_closest_marker("allow_real_home_io"):
+        return
+    _kdb = sys.modules.get("hermes_cli.kanban_db")
+    if _kdb is None or getattr(_kdb, "kanban_db_path", None) is None:
+        return
+    try:
+        resolved = _kdb.kanban_db_path().expanduser().resolve()
+    except Exception:  # pragma: no cover - defensive: a broken resolver is not a leak
+        return
+    try:
+        if resolved.is_relative_to(_REAL_KANBAN_ROOT):
+            pytest.fail(
+                f"test board is NOT isolated: kanban_db_path() resolved to {resolved}, "
+                f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
+                f"A card created here would land on the operator's live board. "
+                f"Pin HERMES_KANBAN_HOME (and drop HERMES_KANBAN_DB) in the fixture."
+            )
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return
+
+
+@pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
 
