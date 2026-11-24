@@ -173,19 +173,38 @@ def test_unknown_budget_stays_silent(kanban_home: Path, monkeypatch: pytest.Monk
         assert _sizing_comments(conn, tid) == []
 
 
-def test_create_writes_the_default_hard_wall_into_the_row(kanban_home: Path) -> None:
-    """A card created without ``max_runtime_seconds`` carries 3600 in its own row:
-    the wall belongs to the card, and the dispatcher has no global default."""
+def test_create_writes_the_default_hard_wall_into_the_row(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card created without ``max_runtime_seconds`` carries the board's default wall
+    in its own row: the wall belongs to the card, and the dispatcher has no global
+    default.
+
+    The expected figure comes from ``DEFAULT_MAX_RUNTIME_SECONDS`` — the single source of
+    the policy — so the owner moving the limit is not itself a red test. The constant is
+    then *substituted* (below the live value): if ``create_task`` ever stopped reading it
+    and wrote a literal instead, the substituted card would keep the real number and this
+    check would catch it, which a comparison against the constant alone cannot do.
+    """
     from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
 
-    assert DEFAULT_MAX_RUNTIME_SECONDS == 3600
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unstated wall", assignee="03-software-engineer")
-        assert kb.get_task(conn, tid).max_runtime_seconds == 3600
+        assert kb.get_task(conn, tid).max_runtime_seconds == DEFAULT_MAX_RUNTIME_SECONDS
         row = conn.execute(
             "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
-        assert row[0] == 3600, "the value must be in the row, not a read-time default"
+        assert row[0] == DEFAULT_MAX_RUNTIME_SECONDS, (
+            "the value must be in the row, not a read-time default"
+        )
+
+        # Substitute the policy with a figure no implementation literal can contain: the
+        # created row must follow the constant, not a copy of yesterday's number.
+        monkeypatch.setattr(kb, "DEFAULT_MAX_RUNTIME_SECONDS", 5_555)
+        moved = kb.create_task(
+            conn, title="unstated wall, moved policy", assignee="03-software-engineer",
+        )
+        assert kb.get_task(conn, moved).max_runtime_seconds == 5_555
 
 
 def test_explicit_max_runtime_beats_the_default(kanban_home: Path) -> None:
@@ -208,8 +227,15 @@ def test_preexisting_null_row_stays_uncapped(kanban_home: Path) -> None:
 
 
 def test_create_tool_response_reports_minutes_and_the_written_wall(monkeypatch, tmp_path):
-    """The ``kanban_create`` answer carries the minute estimate always and the wall
-    the row actually got, so a creator sees 3600 when it passed nothing."""
+    """The ``kanban_create`` answer carries the minute estimate always and the wall the
+    row actually got — read from the policy constant, never a literal.
+
+    Two claims are kept apart on purpose. The default wall is wider than the 3-item
+    estimate (81 min), so under the default the answer must carry the estimate and NO
+    advisory; the advisory for the minute axis is checked on an explicitly *narrow* wall.
+    Bundling both under one 3600 s default is exactly what made this check a copy of the
+    policy instead of a check of it.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -221,23 +247,35 @@ def test_create_tool_response_reports_minutes_and_the_written_wall(monkeypatch, 
     kb.init_db()
 
     from tools import kanban_tools as kt
+    from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
 
-    body = "## Приёмка\n" + "".join(f"- критерий {i}\n" for i in range(3))
+    body = "## Приёмка\n" + "".join(
+        f"- критерий {i}\n" for i in range(3)
+    )
     d = json.loads(kt._handle_create({
         "title": "three criteria", "assignee": "03-software-engineer",
         "body": body, "workspace_kind": "scratch",
     }))
 
     assert d["ok"] is True
-    # 3 items → the measured p80 of that bucket (81 min), not the retired 30-minute line.
+    # 3 items -> the measured p80 of that bucket (81 min), not the retired 30-minute line.
     assert d["estimated_minutes"] == 81
-    assert d["max_runtime_seconds"] == 3600
-    # 81 min against the 3600 s wall is over it, and the iteration budget (130 ≤ 300)
-    # is not: the wall alone must carry the advisory.
-    assert "sizing_warning" in d and "81 мин" in d["sizing_warning"]
+    assert d["max_runtime_seconds"] == DEFAULT_MAX_RUNTIME_SECONDS
+    # Default wall wider than the estimate and the iteration budget (130 <= 300) not
+    # exceeded: no advisory, but the minute figure is still reported.
+    assert "sizing_warning" not in d, d.get("sizing_warning")
+
+    # An explicitly narrow wall (3600 s = 60 min) is under the 81-minute estimate: the
+    # advisory must name both numbers, and the row keeps the wall the creator named.
+    narrow = json.loads(kt._handle_create({
+        "title": "narrow wall", "assignee": "03-software-engineer",
+        "body": body, "workspace_kind": "scratch", "max_runtime_seconds": 3600,
+    }))
+    assert narrow["max_runtime_seconds"] == 3600
+    assert "3600" in narrow["sizing_warning"] and "81 мин" in narrow["sizing_warning"]
 
     explicit = json.loads(kt._handle_create({
-        "title": "narrow wall", "assignee": "03-software-engineer",
+        "title": "narrower wall", "assignee": "03-software-engineer",
         "body": body, "workspace_kind": "scratch", "max_runtime_seconds": 900,
     }))
     assert explicit["max_runtime_seconds"] == 900

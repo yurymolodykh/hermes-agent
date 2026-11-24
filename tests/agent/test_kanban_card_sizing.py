@@ -247,12 +247,22 @@ def test_an_uncapped_card_is_silent_on_the_wall_axis():
     assert sizing_warning(estimate, assignee="x") is None
 
 
-def test_default_wall_is_read_from_the_db_constant():
+def test_default_wall_is_read_from_the_db_constant(monkeypatch):
     """The wall the rule assumes when the creator names none is ``create_task``'s own
-    default, read from its single source rather than duplicated as a literal."""
-    from agent.kanban_card_sizing import default_wall_seconds
-    from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
+    default, read from its single source rather than duplicated as a literal.
 
-    assert default_wall_seconds() == DEFAULT_MAX_RUNTIME_SECONDS == 3600
+    The value is taken from the constant (the owner moves that policy), and the constant
+    is then substituted: if ``default_wall_seconds`` ever fell back to its own literal —
+    or cached the number at import — the substituted read would not follow it.
+    """
+    from agent.kanban_card_sizing import default_wall_seconds
+    from hermes_cli import kanban_db as kb
+
+    assert default_wall_seconds() == kb.DEFAULT_MAX_RUNTIME_SECONDS
+
+    monkeypatch.setattr(kb, "DEFAULT_MAX_RUNTIME_SECONDS", 5_555)
+    assert default_wall_seconds() == 5_555, (
+        "the rule must read the policy constant on each call, not a copied literal"
+    )
 
 
