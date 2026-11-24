@@ -507,17 +507,9 @@ class TestKanbanAttachmentRoutes:
         assert response.content == b"bob's private notes"
 
     def test_an_anonymous_attachment_fetch_is_refused(self, multi_user, registry, kanban_home, board):
-        class _NoIdentity:
-            def __init__(self, user_id="", provider="", issuer=""):
-                self.user_id, self.provider, self.issuer = user_id, provider, issuer
-
+        # No verified identity at all (no session stamped, no native grant): the read boundary
+        # refuses with the absent-id miss. A *verified* caller, by contrast, is admitted above.
         app = FastAPI()
-
-        @app.middleware("http")
-        async def _stamp(request, call_next):
-            request.state.session = _NoIdentity()
-            return await call_next(request)
-
         app.include_router(_load_kanban_router(), prefix="/api/plugins/kanban")
         response = TestClient(app).get(
             f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
