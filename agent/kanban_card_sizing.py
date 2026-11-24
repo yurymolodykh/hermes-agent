@@ -17,10 +17,33 @@ The iteration axis is deliberately coarse; the minute axis is calibrated on the 
 own history rather than on a linear guess. Both are stated in work items the card
 already names: its acceptance criteria.
 
-Measured on the shared board (``task_runs`` joined to ``tasks``, duration =
-``ended_at − started_at``, runs that both started and ended inside the pinned window
-17.11.2026 00:00 – 23.11.2026 23:00 UTC: 766 runs, percentiles by nearest rank on the
-sorted durations):
+Measured on the shared board with the statement below (``task_runs`` joined to
+``tasks``, duration = ``ended_at − started_at`` seconds, percentiles by nearest rank on
+the sorted durations)::
+
+    SELECT tr.started_at, tr.ended_at, t.body
+      FROM task_runs AS tr
+      JOIN tasks AS t ON t.id = tr.task_id
+     WHERE tr.started_at >= :lo                     -- 2026-11-17 00:00 UTC
+       AND tr.started_at <  :hi                     -- 2026-11-23 21:30 UTC
+       AND tr.ended_at IS NOT NULL
+       AND tr.ended_at <= :hi                       -- same upper bound, closed
+       AND tr.ended_at - tr.started_at > 0
+
+``:lo``/``:hi`` are unix timestamps; ``count_acceptance_items(body)`` gives the bucket;
+percentile rank is ``max(1, ceil(p/100 × n))``. Recheck: ``calibration-report.md``.
+The window is pinned at *both* ends, and the upper bound sits in the past (21:30 UTC,
+~2 h before the measurement at 23:41 UTC), because the board is live: an open or future
+upper bound lets a run still in flight at the edge join the sample on a later
+re-measurement — observed drift 754 → 763 → 766 → 776 over two hours, moving the 3- and
+4-item p80 by 1–3 min.
+
+The filter is stated in full because it is what makes 766 reproducible: inside the
+window ``task_runs`` holds 882 rows; 3 still open (no ``ended_at``), 7 ended after the
+bound, 97 with zero duration (a run that was claimed and closed in the same second —
+scheduled, spawn_failed, blocked), and 9 whose ``tasks`` row was since deleted (so the
+INNER JOIN drops them). 882 − 3 − 7 − 97 − 9 = 766, and the joined row set is byte-for-byte
+stable on re-run (``sha1`` of the rows is pinned in ``calibration-report.md``).
 
 ===========  =======  ======  ======  ==========
 acceptance   runs     p50     p80     share > 60
@@ -32,10 +55,6 @@ items       (n)       min     min     min
 5            170      46      90      36 %
 6            55       59      86      49 %
 ===========  =======  ======  ======  ==========
-
-The window is pinned at *both* ends because the board is live: an open upper bound would
-let a run still in flight at the edge join the sample on a later re-measurement, and the
-6-item bucket (~55 runs) moves p80 by several minutes on a single finished run.
 
 Above six items the figure is held at the six-item point. The 7+ bucket (27 runs) measures
 *lower* — p50 38, p80 75 — because those cards are mostly fan-out parents whose wall clock
@@ -77,12 +96,14 @@ SAFETY_MARGIN = 1.0
 # percentiles, rounded to whole minutes. Interpolated linearly between points and
 # clamped to the last point above it — no point is extrapolated from a formula.
 #
-# Source: ``task_runs`` JOIN ``tasks`` on the shared board, ``ended_at − started_at``
-# in seconds, runs that both started and ended inside 17.11.2026 00:00 – 23.11.2026
-# 23:00 UTC (766 runs), acceptance items counted by ``count_acceptance_items`` on the
-# task body, percentiles by nearest rank. The window is pinned at both ends so the table
-# is reproducible: an open upper bound lets an in-flight run join later, and one finished
-# run moves the 6-item bucket (~55 runs) by ~5 min.
+# Source: the statement quoted in the module docstring — ``task_runs`` INNER JOIN ``tasks``
+# on the shared board, ``ended_at − started_at`` in seconds, runs that started in and
+# ended within 17.11.2026 00:00 – 23.11.2026 21:30 UTC (both bounds closed and in the
+# past; 766 runs after the documented filter), acceptance items counted by
+# ``count_acceptance_items`` on the task body, percentiles by nearest rank. The full
+# script, its output, and the sha1 pin of the row set are in ``calibration-report.md``.
+# The window is pinned at both ends so the table is reproducible: an open or future upper
+# bound lets an in-flight run join later (observed 754 → 763 → 766 → 776 in two hours).
 # Recheck with ``tests/agent/test_kanban_card_sizing.py``'s ``CALIBRATION_*``
 # round-trip; the docstring table is the same measurement.
 CALIBRATION_P50_MINUTES = {0: 23, 3: 42, 4: 42, 5: 46, 6: 59}
