@@ -248,6 +248,11 @@ def directory_is_gone(path: str) -> bool:
     try:
         with os.scandir(parent):
             return True
+    except FileNotFoundError:
+        # The parent itself is missing: nothing can bring the child back, so
+        # this is the reliable negative the docs promise ("once the path is
+        # gone"), not the unreadable-ancestor case below.
+        return True
     except OSError:
         return False  # absent from a parent we cannot list is still "cannot tell"
 
