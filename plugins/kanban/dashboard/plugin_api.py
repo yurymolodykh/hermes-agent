@@ -141,9 +141,9 @@ def _requester_stamp(request: Optional[Request]) -> str:
     honest "it came from the UI".
     """
     try:
-        from hermes_acl_results import request_subject
+        from hermes_acl_results import verified_subject
 
-        subject = str(request_subject(request) or "").strip()
+        subject = verified_subject(request)
     except Exception:  # health: allow BLE001 -- an unreadable identity must not fail a create
         subject = ""
     return subject or "dashboard"

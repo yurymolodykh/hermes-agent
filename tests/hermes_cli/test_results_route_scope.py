@@ -529,6 +529,7 @@ class TestKanbanAttachmentRoutes:
 
     def test_deleting_a_neighbours_attachment_is_refused_and_the_blob_survives(
             self, multi_user, registry, kanban_home, board):
+        # Reading is shared; deleting destroys the owner's deliverable, so it stays with the holder.
         response = _kanban_app("alice").delete(
             f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
         assert response.status_code == 404
@@ -543,6 +544,42 @@ class TestKanbanAttachmentRoutes:
         response = _kanban_app("alice").get(
             f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
         assert response.status_code == 200
+
+
+class TestTeamMaterialStaysOpen:
+    """The owner's rule: what the team produced belongs to the team; only people stay separate."""
+
+    def test_the_board_is_not_narrowed_by_the_requesting_person(
+            self, multi_user, registry, kanban_home, board):
+        """A colleague's board must show the same cards as the owner's — measured, not assumed."""
+        alice = _kanban_app("alice").get("/api/plugins/kanban/board").json()
+        owner = _kanban_app(OWNER_LOGIN).get("/api/plugins/kanban/board").json()
+
+        def count(payload):
+            return sum(len(column["tasks"]) for column in payload["columns"])
+
+        assert count(alice) == count(owner) == 2
+
+    def test_a_created_card_records_the_real_requester(self, multi_user, registry, kanban_home, board):
+        """``created_by`` is the person, never the constant "dashboard": it is the delivery address."""
+        response = _kanban_app("alice").post(
+            "/api/plugins/kanban/tasks", json={"title": "ordered by alice"})
+        assert response.status_code == 200
+        task_id = response.json()["task"]["id"]
+        conn = kbc.connect(db_path=kb.kanban_db_path())
+        try:
+            stored = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+        assert stored is not None
+        assert stored.created_by == ALICE
+
+    def test_delivery_targets_reach_the_person_and_their_login(
+            self, multi_user, registry, kanban_home):
+        """The subscription address list starts with the subject and carries their stamps."""
+        targets = results_acl.delivery_targets(ALICE)
+        assert targets[0] == ALICE
+        assert ALICE_ROOT in targets
 
 
 # ---------------------------------------------------------------------------

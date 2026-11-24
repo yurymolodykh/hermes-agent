@@ -416,6 +416,34 @@ def personal_contour_of(task: Any) -> str:
     return tenant[len(PERSONAL_TENANT_PREFIX):].strip()
 
 
+def _verified(subject: str) -> bool:
+    """Whether *subject* names somebody: a login or a loginless native grant — not "unbound".
+
+    :func:`gateway.session_identity.authenticated_subject` namespaces every dashboard identity as
+    ``auth:v1:[provider, issuer, user]`` and fills the user with ``unbound`` when the session
+    carried none. That string is non-empty, so an "is there a subject at all" test would treat an
+    anonymous tab as a colleague; this asks what the user slot actually says.
+    """
+    text = str(subject or "").strip()
+    if not text:
+        return False
+    try:
+        from gateway.session_identity import parse_authenticated_subject
+
+        parsed = parse_authenticated_subject(text)
+    except Exception:  # health: allow BLE001 -- an unparsable form is judged by its text alone
+        parsed = None
+    if parsed is not None:
+        return str(parsed[2] or "").strip() not in {"", "unbound"}
+    return True
+
+
+def verified_subject(request: Any) -> str:
+    """The request's subject when it names a real person, else ``""`` (anonymous tab, no grant)."""
+    subject = request_subject(request)
+    return str(subject).strip() if _verified(subject) else ""
+
+
 def task_visible(request: Any, task: Any) -> bool:
     """Whether the request's person may READ *task* and its materials.
 
@@ -426,7 +454,7 @@ def task_visible(request: Any, task: Any) -> bool:
     if not scoped(request):
         return True
     subject = request_subject(request)
-    if not str(subject or "").strip():
+    if not _verified(subject):
         return False
     private_to = personal_contour_of(task)
     if not private_to:
