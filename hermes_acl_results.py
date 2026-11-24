@@ -20,8 +20,18 @@ This module is the ONE policy those surfaces ask, in the same spirit as ``hermes
   orchestrator root, and a named profile must be one step 5 already let them use.
 * **the memory buckets** — :func:`memory_dirs_for`: per-subject memory lives in
   ``memories/u/<subject>``; a person sees their own bucket, never a neighbour's.
-* **card attachments** — :func:`task_visible` / :func:`require_task`: ownership is the card's
-  ``created_by`` (or its ``assignee``) matched against the person's stamps, never the attachment id.
+* **card materials** — :func:`task_visible` / :func:`require_task` (read) and
+  :func:`task_writable` / :func:`require_task_write` (change). A card, its comments, its log and
+  its attachments are TEAM material: any verified subject of the installation may read them, and
+  only an anonymous call is refused. Ownership (``created_by``/``assignee`` against the person's
+  stamps) gates the operations that CHANGE the card — a status transition, an upload, a delete —
+  so one person cannot rewrite another's work without holding it. Delivery addresses
+  (:func:`delivery_targets`) come from the same registry: a person's own stamps are the route the
+  notifier already uses.
+* **what stays private** — sessions (``hermes_acl_scope``) and the personal profile
+  (``hermes_acl_profiles``). A card that belongs to the PERSONAL contour (explicit
+  ``personal:`` tenant marker, see :func:`personal_contour_of`) is private to its person; no such
+  card exists today, and the marker is the only way one becomes private.
 
 **The switch.** ``acl.multi_user`` — the flag step 3 turned on for persons and step 5 reuses for
 profiles; a results boundary is a boundary between PEOPLE, so the same flag. With it off every
@@ -48,6 +58,12 @@ logger = logging.getLogger(__name__)
 OUTSIDE_ROOT = "Path is outside the caller's allowed roots"
 #: The miss a foreign card gets — byte-identical to an absent task id (no id oracle).
 TASK_NOT_FOUND = "Task not found"
+#: A card owned by somebody else: naming it would confirm the id exists, so a write on a foreign
+#: card answers 403 with the same generic text the read boundary uses for other people's data.
+TASK_NOT_YOURS = "Task belongs to another person"
+#: The tenant prefix that puts a card in the PERSONAL contour. A card with
+#: ``tenant="personal:<subject>"`` is private to that person; every other card is team material.
+PERSONAL_TENANT_PREFIX = "personal:"
 
 
 def _multi_user() -> bool:
