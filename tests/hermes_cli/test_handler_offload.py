@@ -46,15 +46,23 @@ def test_off_loop_runs_the_call_off_the_event_loop_thread(monkeypatch):
     monkeypatch.setenv("HERMES_HANDLER_OFFLOAD", "1")
     ho.HANDLER_OFFLOAD.install(None)
 
-    loop_thread = threading.get_ident()
     seen: dict[str, int] = {}
 
     def _blocking():
-        seen["thread"] = threading.get_ident()
+        seen["call_thread"] = threading.get_ident()
         return "done"
 
-    assert _run(ho.off_loop(_blocking)) == "done"
-    assert seen["thread"] != loop_thread, "off_loop ran the blocking call on the event loop thread"
+    async def _main():
+        # Ident of the thread the coroutine actually runs on. ``asyncio.run`` runs it on the
+        # calling thread, but the ident is taken inside the loop so the comparison cannot
+        # depend on that assumption.
+        seen["loop_thread"] = threading.get_ident()
+        return await ho.off_loop(_blocking)
+
+    assert _run(_main()) == "done"
+    assert seen["call_thread"] != seen["loop_thread"], (
+        "off_loop ran the blocking call on the event loop thread"
+    )
 
 
 def test_off_loop_passes_args_and_kwargs(monkeypatch):
@@ -76,15 +84,20 @@ def test_switch_off_runs_inline_on_the_loop(monkeypatch):
     seen: dict[str, int] = {}
 
     def _blocking():
-        seen["thread"] = threading.get_ident()
+        seen["call_thread"] = threading.get_ident()
         return "inline"
 
     async def _main():
+        seen["loop_thread"] = threading.get_ident()
         return await ho.off_loop(_blocking)
 
     assert _run(_main()) == "inline"
-    # asyncio.run executes the coroutine on its own thread; inline means the SAME thread.
-    assert seen["thread"] is not None
+    # "Inline" means the blocking call ran on the SAME thread as the event loop. Comparing two
+    # idents taken in this process is what makes the assertion capable of failing: a mere
+    # ``is not None`` would hold even if the call had been handed to a worker.
+    assert seen["call_thread"] == seen["loop_thread"], (
+        "rollback switch is off but the call did not run inline on the event loop thread"
+    )
     view = ho.offload_status()
     assert view["enabled"] is False
     assert view["mode"] == "inline"
