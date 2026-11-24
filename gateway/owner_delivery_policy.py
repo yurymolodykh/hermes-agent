@@ -128,7 +128,13 @@ def classify_kanban_event(
     if kind == "blocked":
         if block_kind in _DECISION_BLOCK_KINDS:
             return "decision", f"blocked:{block_kind}"
-        return None, f"service:blocked:{block_kind or 'untyped'}"
+        if not block_kind:
+            # Untyped block (legacy generic ``kanban_block()``): nothing auto-continues it.
+            # Only ``dependency`` is re-queued by the core (``_route_block`` in
+            # hermes_cli/kanban_db.py sends it back to ``todo``); every other block —
+            # including one with no kind at all — waits for a human. That is a decision.
+            return "decision", "blocked:untyped"
+        return None, f"service:blocked:{block_kind}"
     if kind == "block_loop_detected":
         if block_kind == "needs_input":
             return "decision", "block_loop_detected:needs_input"
@@ -138,7 +144,15 @@ def classify_kanban_event(
         if status == "blocked" and block_kind in _DECISION_BLOCK_KINDS:
             return "decision", f"status:blocked:{block_kind}"
         return None, f"service:status:{status or 'unknown'}"
-    if kind in {"crashed", "timed_out", "gave_up"}:
+    if kind == "gave_up":
+        if payload.get("sticky") is True:
+            # A sticky give-up is parked on purpose (``bounded_continue`` writes
+            # ``sticky`` when it applied its own policy) and ``recompute_ready`` holds it
+            # for an operator forever. ``spawn_auto_blocked`` lands here too. Nobody
+            # resumes it automatically — the owner has to.
+            return "decision", "gave_up:sticky_park"
+        return None, "service:gave_up"
+    if kind in {"crashed", "timed_out"}:
         return None, f"service:{kind}"
     if kind == "completed":
         if has_open_ancestor:

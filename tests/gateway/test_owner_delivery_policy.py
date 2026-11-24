@@ -93,6 +93,28 @@ def test_blocked_dependency_is_service():
     assert category is None
 
 
+def test_blocked_without_kind_is_a_decision():
+    """An untyped block waits for a human: nothing auto-continues it (only ``dependency``)."""
+    category, reason = classify_kanban_event(kind="blocked", payload={"reason": "нет доступа"})
+    assert category == "decision"
+    assert reason == "blocked:untyped"
+
+
+def test_gave_up_parked_sticky_is_a_decision():
+    category, reason = classify_kanban_event(
+        kind="gave_up", payload={"error": "budget", "sticky": True},
+    )
+    assert category == "decision"
+    assert reason == "gave_up:sticky_park"
+
+
+def test_gave_up_without_sticky_stays_service():
+    for payload in ({"error": "budget"}, {"error": "budget", "sticky": False}):
+        category, reason = classify_kanban_event(kind="gave_up", payload=payload)
+        assert category is None
+        assert reason == "service:gave_up"
+
+
 def test_block_loop_detected_needs_input_is_decision():
     category, _ = classify_kanban_event(
         kind="block_loop_detected",
