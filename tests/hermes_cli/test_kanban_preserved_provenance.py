@@ -444,6 +444,49 @@ def test_gc_adopts_a_pre_registry_preserved_event(kanban_home, capsys):
         assert [e["path"] for e in kpw_entries(conn)] == [str(ws)]
 
 
+def test_gc_reaps_a_preserved_event_whose_registry_entry_never_existed(
+    kanban_home, capsys
+):
+    """An event with no registry row must not outlive its directory.
+
+    ``adopt()`` skipped an event whose directory was already gone (nothing to
+    migrate) and ``prune_gone()`` only walks registry entries, so a preserved
+    event written before the registry existed — directory deleted meanwhile —
+    was reaped by no branch at all, while retention exempts that kind forever
+    (verdict t_12e58882, Д-нов-4).
+    """
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="pre-registry, dir gone")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        ws = Path(kbw.resolve_workspace(task))
+        ws.mkdir(parents=True, exist_ok=True)
+        _legacy_preserved_event(conn, task_id, ws)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        # The directory goes while the parent (the board's scratch root) stays
+        # listable, which is the reliable negative.
+        ws.rmdir()
+        from hermes_cli import kanban_preserved_workspaces as kpw
+
+        assert kpw.directory_is_gone(str(ws)) is True
+        reg = kpw.registry_path(conn)
+        assert reg is not None and not reg.exists(), "precondition: no registry row"
+
+    for _ in range(3):
+        assert _gc() == 0
+        capsys.readouterr()
+
+    with kbc.connect_closing() as conn:
+        assert _events(conn, task_id) == [], (
+            "a preserved event whose directory and registry row are both gone "
+            "survived every sweep"
+        )
+        from hermes_cli import kanban_preserved_workspaces as kpw
+
+        assert kpw.entries(conn) == []
+
+
 def kpw_registry(conn):
     from hermes_cli import kanban_preserved_workspaces as kpw
 

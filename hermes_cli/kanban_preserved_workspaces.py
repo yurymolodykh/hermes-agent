@@ -298,6 +298,44 @@ def adopt(conn: sqlite3.Connection, task_id: Optional[str] = None) -> int:
     return adopted
 
 
+def reap_orphan_events(conn: sqlite3.Connection) -> int:
+    """Drop preserved events whose directory is gone and has no registry line.
+
+    ``adopt`` cannot help here: it skips exactly the events whose directory is
+    already gone (there is nothing left to migrate), and ``prune_gone`` only
+    walks registry entries. An event written before the registry existed, for a
+    directory deleted since, was therefore reaped by no branch — and retention
+    exempts :data:`PRESERVED_KIND` forever (verdict t_12e58882, Д-нов-4).
+
+    Deliberately conservative: only a *reliable* negative
+    (:func:`directory_is_gone`) with no entry naming the same path goes, so a
+    live directory or one reported by the registry never loses its pointer.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, task_id, payload FROM task_events WHERE kind = ?",
+            (PRESERVED_KIND,),
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    known = {(e["task_id"], e["path"]) for e in entries(conn)}
+    orphan_ids = [
+        row[0]
+        for row in rows
+        if (str(row[1]), _payload_path(row[2])) not in known
+        and _payload_path(row[2])
+        and directory_is_gone(_payload_path(row[2]))
+    ]
+    if not orphan_ids:
+        return 0
+    with contextlib.suppress(sqlite3.Error):
+        conn.executemany(
+            "DELETE FROM task_events WHERE id = ?", [(row_id,) for row_id in orphan_ids]
+        )
+        return len(orphan_ids)
+    return 0
+
+
 def _payload_path(payload) -> str:
     try:
         parsed = json.loads(payload or "{}")

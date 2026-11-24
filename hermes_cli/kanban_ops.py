@@ -449,6 +449,10 @@ def _reap_preserved_workspaces() -> list[dict]:
             # registry twin).
             kpw.adopt(conn)
             kpw.prune_gone(conn)
+            # An event `adopt` could not migrate (its directory is already
+            # gone) has no registry row, and `prune_gone` only walks rows —
+            # without this sweep it outlives retention forever (Д-нов-4).
+            kpw.reap_orphan_events(conn)
             return kpw.entries(conn)
     except (sqlite3.Error, OSError, ValueError, KeyError) as exc:
         # A broken board must not fail the whole sweep; the directories are
