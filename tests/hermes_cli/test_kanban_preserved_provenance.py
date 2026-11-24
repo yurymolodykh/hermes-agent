@@ -282,6 +282,51 @@ def test_unreadable_parent_keeps_registry_entry_and_event(kanban_home, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Д3.3 — a directory gone together with every ancestor is reliably gone
+# ---------------------------------------------------------------------------
+
+
+def test_missing_parent_chain_counts_as_gone(kanban_home, capsys):
+    """No directory AND no parent is a reliable negative, not "cannot tell".
+
+    ``kanban.md`` promises the entry is dropped "once the path is gone"; with
+    only the parent's ``ENOENT`` swallowed by the generic ``OSError`` branch it
+    read as "unknown" and the entry survived forever (verdict t_12e58882,
+    Д-нов-1). A vanished workspace root is the ordinary end state when the
+    scratch tree is wiped, so the sweep must reap on it.
+    """
+    import shutil
+
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    with kbc.connect_closing() as conn:
+        task_id, ws = _ws_with_unpushed_repo(conn)
+        assert kb.complete_task(conn, task_id, result="done")
+        assert kb.archive_task(conn, task_id)
+        assert [e["path"] for e in kpw.entries(conn)] == [str(ws)]
+
+    # The directory and its parent (the board's workspace root) both vanish.
+    shutil.rmtree(ws)
+    shutil.rmtree(ws.parent)
+    assert not ws.parent.exists()
+
+    assert kpw.directory_is_gone(str(ws)) is True, (
+        "a path whose parent is missing too is reliably gone, not unknown"
+    )
+
+    assert _gc() == 0
+    out = capsys.readouterr().out
+    assert str(ws) not in out, f"a vanished root must not be advertised:\n{out}"
+    with kbc.connect_closing() as conn:
+        assert [e["path"] for e in kpw.entries(conn)] == [], (
+            "the registry entry of a path gone with its parent was never dropped"
+        )
+        assert _events(conn, task_id) == [], (
+            "the retained event of a path gone with its parent was never dropped"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Д3.2 — a card preserved BEFORE the registry existed still survives a delete
 # ---------------------------------------------------------------------------
 
