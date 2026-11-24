@@ -580,8 +580,9 @@ def download_attachment(
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
-        # Ownership is the CARD's, resolved from the blob's task — never the raw attachment id,
-        # which would let a signed-in neighbour walk the integer sequence (МПД Т6).
+        # Read boundary is the CARD's, resolved from the blob's task — never the raw attachment id
+        # on its own. The card is team material, so any verified caller downloads it; an anonymous
+        # call and a personal-contour card answer with the absent-id miss (МПД Т6 + team sharing).
         _require_owned_task(conn, att.task_id, request, not_found="attachment not found")
         # Defense in depth against a tampered DB row: the blob must still live under the board's attachments root.
         root = kanban_db.attachments_root(board=board).resolve()
@@ -1341,11 +1342,11 @@ def get_assignees(board: Optional[str] = Query(None)):
 
 
 @router.get("/tasks/{task_id}/log")
-def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_000), board: Optional[str] = Query(None)):
+def get_task_log(task_id: str, request: Request, tail: Optional[int] = Query(None, ge=1, le=2_000_000), board: Optional[str] = Query(None)):
     """Worker stdout/stderr log. ``tail`` caps the response bytes; 404 if the
     task never spawned. On-disk log rotates at 2 MiB with one ``.log.1`` kept."""
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        _require_owned_task(conn, task_id, request)
     content = kanban_db.read_worker_log(task_id, tail_bytes=tail, board=board)
     log_path = kanban_db.worker_log_path(task_id, board=board)
     size = log_path.stat().st_size if log_path.exists() else 0
