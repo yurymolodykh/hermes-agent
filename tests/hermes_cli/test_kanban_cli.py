@@ -72,10 +72,17 @@ def test_run_slash_stats_text_includes_review_lane(kanban_home):
     assert json.loads(kc.run_slash("stats --json"))["by_status"].get("review") == 1
 
 
-def test_kanban_show_json_includes_runtime_limit(kanban_home):
-    """An explicit cap is shown verbatim; an omitted one still lands as the 3600 s
-    hard wall ``create_task`` writes into the row (see DEFAULT_MAX_RUNTIME_SECONDS) —
-    the default is a created-row value, never a read-time fallback."""
+def test_kanban_show_json_includes_runtime_limit(kanban_home, monkeypatch):
+    """An explicit cap is shown verbatim; an omitted one still lands as the hard wall
+    ``create_task`` writes into the row (see DEFAULT_MAX_RUNTIME_SECONDS) — the default
+    is a created-row value, never a read-time fallback.
+
+    The expected default is the policy constant rather than a copy of it, and the
+    constant is then substituted: a row that ignored the policy and kept an old literal
+    would not follow the substitution, so the check still catches that regression.
+    """
+    from hermes_cli.kanban_db import DEFAULT_MAX_RUNTIME_SECONDS
+
     with kbc.connect() as conn:
         bounded_id = kb.create_task(
             conn, title="bounded task", max_runtime_seconds=2700
@@ -86,7 +93,15 @@ def test_kanban_show_json_includes_runtime_limit(kanban_home):
     defaulted = json.loads(kc.run_slash(f"show {defaulted_id} --json"))
 
     assert bounded["task"]["max_runtime_seconds"] == 2700
-    assert defaulted["task"]["max_runtime_seconds"] == 3600
+    assert defaulted["task"]["max_runtime_seconds"] == DEFAULT_MAX_RUNTIME_SECONDS
+
+    # Same claim under a substituted policy: the row must follow the constant, not a
+    # literal that happens to equal today's value.
+    monkeypatch.setattr(kb, "DEFAULT_MAX_RUNTIME_SECONDS", 5_555)
+    with kbc.connect() as conn:
+        moved_id = kb.create_task(conn, title="moved policy task")
+    moved = json.loads(kc.run_slash(f"show {moved_id} --json"))
+    assert moved["task"]["max_runtime_seconds"] == 5_555
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
