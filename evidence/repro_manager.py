@@ -16,10 +16,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-import tools.checkpoint_manager as C  # noqa: E402
+import tools.checkpoint_manager as C
 
 
-def _manager(base: Path) -> "C.CheckpointManager":
+def _manager(base: Path) -> C.CheckpointManager:
     C.CHECKPOINT_BASE = base
     return C.CheckpointManager(enabled=True, max_snapshots=5, max_total_size_mb=0)
 
