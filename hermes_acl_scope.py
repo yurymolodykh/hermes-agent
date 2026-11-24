@@ -109,11 +109,38 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
             stamps.append(user)
     for stamp in list(stamps):
         stamps.extend(_binding_stamps(stamp))
+    # A gateway stores a messaging row under the BARE platform id (``241213869``) while the
+    # registry names the same person ``tg:241213869``; the two forms must scope the same rows or the
+    # owner's own Telegram chats stay hidden from them. Deriving the bare id ONLY from a stamp the
+    # registry itself recorded keeps this exact (no prefix match) and, just as importantly, leaves
+    # an identity the registry does not name holding nothing but itself — an unknown stamp must not
+    # conjure a second one from its own form.
+    for stamp in list(stamps):
+        for recorded in _binding_stamps(stamp):
+            bare = _bare_platform_id(recorded)
+            if bare:
+                stamps.append(bare)
     seen: list[str] = []
     for stamp in stamps:
         if stamp and stamp not in seen:
             seen.append(stamp)
     return seen
+
+
+def _bare_platform_id(stamp: str) -> str:
+    """The bare id a ``tg:<id>`` stamp also owns (``tg:125805788`` → ``125805788``); ``''`` otherwise.
+
+    Only the Telegram prefix is folded: it is the form this install's registry records
+    (``telegram_subject``) while the gateway stamps the raw id on the row. A sticker id is emitted
+    only when the remainder is entirely digits, so an ``auth:v1:...`` or ``uid:1001`` stamp never
+    contributes a second, unrelated stamp.
+    """
+    text = (stamp or "").strip()
+    prefix, _, rest = text.partition(":")
+    if prefix.strip().lower() != "tg":
+        return ""
+    candidate = rest.strip()
+    return candidate if candidate.isdigit() else ""
 
 
 def _identity_subject_stamps(identity: str) -> list[str]:
