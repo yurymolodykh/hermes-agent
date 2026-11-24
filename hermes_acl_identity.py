@@ -61,9 +61,45 @@ _SLUG_ALLOWED = re.compile(r"[^a-z0-9._-]")
 LOGIN_PROVIDERS = frozenset({"basic"})
 
 
+def _flag_from_user_layer(config_path) -> Optional[bool]:
+    """``acl.multi_user`` from ONE config file's user layer, or ``None`` when the file is silent.
+
+    The user layer (not the merged config) is what distinguishes "off" from "unset": the shipped
+    ``DEFAULT_CONFIG`` already carries the ``acl`` section, so a merged read answers ``False`` for
+    every home that simply never mentioned it.
+    """
+    from hermes_cli.config_effective import load_user_config_effective
+
+    layer = load_user_config_effective(config_path)
+    section = layer.get(FLAG_SECTION) if isinstance(layer, dict) else None
+    if not isinstance(section, dict) or FLAG_KEY not in section:
+        return None
+    return bool(section.get(FLAG_KEY))
+
+
 def multi_user_enabled() -> bool:
-    """Whether multi-user identity is ON (``acl.multi_user``). Absent/false = legacy behaviour."""
+    """Whether multi-user identity is ON (``acl.multi_user``). Absent/false = legacy behaviour.
+
+    The flag is a deployment decision, so a profile home that does not set it inherits the ROOT
+    one — like the binding registry it gates (``hermes_acl_bindings.bindings_path``). Reading only
+    the process home reported "off" inside every per-profile process (a profile-scoped socket, an
+    ``owner_scope``d worker), silently disabling the whole multi-user layer exactly where it has to
+    hold: the served profile's own ``config.yaml`` has no ``acl`` section.
+    """
     try:
+        from hermes_cli.config import get_config_path
+
+        own = get_config_path()
+        flag = _flag_from_user_layer(own)
+        if flag is not None:
+            return flag
+        from hermes_constants import get_default_hermes_root
+
+        root_config = get_default_hermes_root() / "config.yaml"
+        if root_config != own:
+            inherited = _flag_from_user_layer(root_config)
+            if inherited is not None:
+                return inherited
         from hermes_cli.config import cfg_get, load_config
 
         return bool(cfg_get(load_config(), FLAG_SECTION, FLAG_KEY, default=False))
