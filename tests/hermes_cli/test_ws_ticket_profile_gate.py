@@ -79,6 +79,14 @@ def serving(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: True)
     monkeypatch.setattr(prof_acl, "multi_user_enabled", lambda: True)
+
+    # The step-3 login→subject rule, stubbed so no users file is needed: ``alice`` is a person,
+    # everything else keeps the caller's legacy (owner) answer.
+    def _resolve(value, fallback=""):
+        login = str(value or "").strip()
+        return f"person/{login}" if login else fallback
+
+    monkeypatch.setattr(hermes_acl_identity, "resolve_subject", _resolve)
     hb.reset_cache()
     try:
         yield SimpleNamespace(client=TestClient(server.app, base_url="http://127.0.0.1"),
