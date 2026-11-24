@@ -34,6 +34,7 @@ from hermes_cli import kanban_workflow
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_customer
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
@@ -454,6 +455,25 @@ class CreateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
+
+
+def _subscribe_customer(conn: sqlite3.Connection, task_id: str, created_by: str) -> None:
+    """Subscribe the card's customer to its own terminal events, when they are reachable.
+
+    A card's ``created_by`` may now be a person's subject (``person/<login>``); the bindings
+    registry knows the chats that person holds, so the notifier has a destination. The
+    orchestrator's subscription is written separately by the caller's session path and is never
+    replaced: this is an ADDITIONAL address, and a card whose creator is a surface label
+    (``"dashboard"``, a profile name) resolves to no address at all — today's behaviour.
+
+    Best-effort by contract: a bookkeeping failure must never fail the create that already
+    committed.
+    """
+    try:
+        for target in kanban_customer.notify_targets(created_by):
+            kbn.add_notify_sub(conn, task_id=task_id, **target)
+    except Exception:
+        log.warning("kanban dashboard: customer subscription failed for %s", task_id, exc_info=True)
 
 
 @router.post("/tasks")
