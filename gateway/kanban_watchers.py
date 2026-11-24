@@ -215,10 +215,11 @@ class GatewayKanbanWatchersMixin:
         verdict, reason = "delivered", "no-card-context"
         if card is not None:
             verdict, reason = kanban_delivery.verdict_for(recipient, card)
-        kanban_delivery.record_delivery(
-            task_id=task_id, platform=platform_str, chat_id=chat_id, verdict=verdict,
-            reason=reason, subject=recipient, event_kind=event_kind, artifacts=len(candidates))
         if verdict != kanban_delivery.VERDICT_DELIVERED:
+            # A refusal is a ROW: "nothing arrived" must never be the whole story.
+            kanban_delivery.record_delivery(
+                task_id=task_id, platform=platform_str, chat_id=chat_id, verdict=verdict,
+                reason=reason, subject=recipient, event_kind=event_kind, artifacts=len(candidates))
             logger.info("kanban notifier: artifact handoff for %s to %s refused (%s)",
                         task_id or "?", chat_id, reason)
             return
@@ -228,12 +229,14 @@ class GatewayKanbanWatchersMixin:
         # Images ride one send_multiple_images call (batch uploads on Signal/Slack).
         image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
+        failed = 0
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
                 await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
             except Exception as exc:
                 logger.warning("kanban notifier: image batch upload failed: %s", exc)
+                failed += len(image_paths)
         for path in other_paths:
             try:
                 if Path(path).suffix.lower() in _VIDEO_EXTS:
@@ -242,6 +245,15 @@ class GatewayKanbanWatchersMixin:
                     await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
             except Exception as exc:
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
+                failed += 1
+        # The row records what actually happened, not what was attempted: a transport
+        # failure downgrades the verdict instead of leaving a "delivered" line for a file
+        # that never arrived.
+        kanban_delivery.record_delivery(
+            task_id=task_id, platform=platform_str, chat_id=chat_id,
+            verdict=kanban_delivery.VERDICT_FAILED if failed else verdict,
+            reason=(f"upload-failed:{failed}/{len(candidates)}" if failed else reason),
+            subject=recipient, event_kind=event_kind, artifacts=len(candidates))
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.

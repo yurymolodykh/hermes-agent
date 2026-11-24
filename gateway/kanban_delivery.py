@@ -36,6 +36,8 @@ _JOURNAL_NAME = "notify-delivery.jsonl"
 #: ``refused`` is one that did not, and always carries the reason it did not.
 VERDICT_DELIVERED = "delivered"
 VERDICT_REFUSED = "refused"
+#: A handoff that was attempted and failed in transport — the file did not arrive.
+VERDICT_FAILED = "failed"
 
 
 def journal_path() -> Path:

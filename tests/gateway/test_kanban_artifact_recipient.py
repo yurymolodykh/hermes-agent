@@ -155,6 +155,24 @@ def test_withholding_shared_materials_refuses_with_a_journalled_reason(board, re
     assert row["chat_id"] == "555000222"
 
 
+def test_a_transport_failure_is_journalled_as_failed_not_delivered(board, registry, tmp_path):
+    """The row records what happened: a failed upload must not leave a "delivered" line."""
+    _task_id, task = _card()
+    artifact = tmp_path / "report.pdf"
+    artifact.write_bytes(b"%PDF-1.4 report")
+
+    class _FailingAdapter(_RecordingAdapter):
+        async def send_document(self, *, chat_id, file_path, metadata=None):
+            raise OSError("telegram upload failed")
+
+    _deliver(_FailingAdapter(), task, chat_id="555000111", artifact=artifact, subject="person/anna")
+
+    (row,) = _journals(board)
+    assert row["verdict"] == kdel.VERDICT_FAILED, "a file that did not arrive is not 'delivered'"
+    assert row["reason"] == "upload-failed:1/1"
+    assert row["chat_id"] == "555000111"
+
+
 def test_an_acl_off_installation_records_the_legacy_answer(board, registry, tmp_path, monkeypatch):
     import hermes_acl_results as hr
 
