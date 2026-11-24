@@ -51,18 +51,18 @@ def _safe_prefix(prefix: str) -> str:
     return safe
 
 
-def cache_path(kind: str, prefix: str, extension: str) -> Path:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    short = uuid.uuid4().hex[:8]
-    return cache_dir(kind) / f"{_safe_prefix(prefix)}_{ts}_{short}.{extension}"
-
-
 def cache_dir(kind: str) -> Path:
     """Return ``$HERMES_HOME/cache/<kind>/``, creating parents as needed."""
     from hermes_constants import get_hermes_home
     path = get_hermes_home() / "cache" / kind
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def cache_path(kind: str, prefix: str, extension: str) -> Path:
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    short = uuid.uuid4().hex[:8]
+    return cache_dir(kind) / f"{_safe_prefix(prefix)}_{ts}_{short}.{extension}"
 
 
 def save_bytes(kind: str, raw: bytes, *, prefix: str, extension: str) -> Path:
