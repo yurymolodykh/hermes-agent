@@ -320,16 +320,22 @@ def prune_gone(conn: sqlite3.Connection) -> list[dict]:
     if registry is None:
         return []
     with _registry_lock(registry) as locked:
+        if not locked:
+            # The registry cannot be rewritten without the lock, so dropping
+            # the events here would publish a path whose only pointer is gone —
+            # `adopt` cannot restore an event. Nothing is reaped; the next
+            # sweep retries once the holder is done (Д-нов-2).
+            return []
         current = _read(registry)
-        gone = [e for e in current if directory_is_gone(e["path"])]
+        gone_keys = {
+            (e["task_id"], e["path"]) for e in current if directory_is_gone(e["path"])
+        }
+        gone = [e for e in current if (e["task_id"], e["path"]) in gone_keys]
         if not gone:
             return []
-        if locked:
-            keep = [e for e in current if not directory_is_gone(e["path"])]
-            with contextlib.suppress(OSError):
-                _write(registry, keep)
-        elif not registry.exists():
-            return []
+        keep = [e for e in current if (e["task_id"], e["path"]) not in gone_keys]
+        with contextlib.suppress(OSError):
+            _write(registry, keep)
     for entry in gone:
         with contextlib.suppress(sqlite3.Error):
             _forget_events(conn, entry["task_id"], entry["path"])

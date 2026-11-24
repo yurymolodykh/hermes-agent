@@ -327,6 +327,58 @@ def test_missing_parent_chain_counts_as_gone(kanban_home, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Д3.4 — a sweep that cannot take the registry lock drops nothing
+# ---------------------------------------------------------------------------
+
+
+def test_gc_under_a_held_registry_lock_forgets_no_event(kanban_home, capsys, monkeypatch):
+    """Dropping events without the lock leaves a printed path with no pointer.
+
+    ``prune_gone`` used to delete the retained events even when the lock was
+    never taken (so the registry could not be rewritten). The window prints a
+    path whose event is already gone, and ``adopt`` cannot restore it — the
+    event is the source. A process killed in that window leaves a registry
+    entry with no event forever (verdict t_12e58882, Д-нов-2).
+    """
+    import shutil
+
+    from hermes_cli import kanban_preserved_workspaces as kpw
+
+    with kbc.connect_closing() as conn:
+        task_id, ws = _ws_with_unpushed_repo(conn)
+        assert kb.complete_task(conn, task_id, result="done")
+        assert kb.archive_task(conn, task_id)
+        registry = kpw.registry_path(conn)
+        assert registry is not None and registry.exists()
+    shutil.rmtree(ws)
+
+    lock_path = registry.with_name(registry.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    assert kpw._lock_handle(handle), "precondition: the lock is held by the test"
+    monkeypatch.setattr(kpw, "_LOCK_TIMEOUT_SECONDS", 0.0)
+    try:
+        assert _gc() == 0
+    finally:
+        kpw._unlock_handle(handle)
+        handle.close()
+
+    with kbc.connect_closing() as conn:
+        assert len(_events(conn, task_id)) == 1, (
+            "events were dropped while the registry lock was never taken"
+        )
+        assert [e["path"] for e in kpw.entries(conn)] == [str(ws)], (
+            "precondition: the entry is still there, so the sweep was partial"
+        )
+
+    # Once the lock is free the same sweep completes consistently.
+    assert _gc() == 0
+    with kbc.connect_closing() as conn:
+        assert _events(conn, task_id) == []
+        assert kpw.entries(conn) == []
+
+
+# ---------------------------------------------------------------------------
 # Д3.2 — a card preserved BEFORE the registry existed still survives a delete
 # ---------------------------------------------------------------------------
 
