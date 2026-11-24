@@ -566,6 +566,9 @@ class TestTeamMaterialStaysOpen:
             "/api/plugins/kanban/tasks", json={"title": "ordered by alice"})
         assert response.status_code == 200
         task_id = response.json()["task"]["id"]
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
         conn = kbc.connect(db_path=kb.kanban_db_path())
         try:
             stored = kb.get_task(conn, task_id)
