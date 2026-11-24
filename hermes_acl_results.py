@@ -247,15 +247,16 @@ def _profile_home(name: str) -> Optional[Path]:
         return None
 
 
-def _own_card_dirs(subject: Any) -> list[Path]:
-    """``kanban/workspaces/<id>`` and ``kanban/attachments/<id>`` of the cards *subject* owns.
+def _team_card_dirs(subject: Any) -> list[Path]:
+    """``kanban/workspaces/<id>`` and ``kanban/attachments/<id>`` of the cards TEAM may read.
 
-    Read from the board itself (the same database the dashboard serves): a task is the person's
-    when its ``created_by`` or ``assignee`` carries one of their stamps. A read failure yields no
-    card directories — a catalogue that cannot be read must not widen the root.
+    What the team produced belongs to the team: a card's folder and its attachments are reachable
+    by any verified person, which is what makes a producer's deliverable openable by whoever needs
+    it. The one exclusion is a PERSONAL-contour card (:func:`personal_contour_of`): it is the
+    person's own business, so its folders stay theirs alone. An unreadable board yields no card
+    directories — a catalogue that cannot be read must not widen the root.
     """
-    marks = stamps(subject)
-    if not marks:
+    if not _verified(subject):
         return []
     rows = _owned_task_rows()
     if not rows:
@@ -267,10 +268,13 @@ def _own_card_dirs(subject: Any) -> list[Path]:
     except Exception:  # health: allow BLE001 -- a board whose roots cannot be named grants nothing
         logger.debug("acl results: kanban roots unavailable for card roots", exc_info=True)
         return []
+    marks = stamps(subject)
     out: list[Path] = []
-    for task_id, stamps_on_row in rows:
-        if not task_id or not (stamps_on_row & marks):
-            continue
+    for row in rows:
+        task_id = row["id"]
+        private_to = _personal_contour_of_row(row)
+        if private_to and not (row["stamps"] & marks or private_to == str(subject).strip()):
+            continue  # somebody else's personal card
         for base in bases:
             if base is None:
                 continue
@@ -282,12 +286,13 @@ def _own_card_dirs(subject: Any) -> list[Path]:
     return out
 
 
-def _owned_task_rows() -> list[tuple[str, set[Any]]]:
-    """``[(task_id, {created_by, assignee}), ...]`` for the whole board; ``[]`` if unreadable.
+def _owned_task_rows() -> list[dict]:
+    """``[{"id", "stamps", "tenant"}, ...]`` for the whole board; ``[]`` if unreadable.
 
-    Deliberately board-wide and unfiltered: the ownership test needs the person's full stamp set,
-    which is a Python-side policy, so the query stays a plain read and the filter runs in
-    :func:`_own_card_dirs`. An unreadable board (missing, corrupt, wrong schema) is no cards.
+    Deliberately board-wide and unfiltered: the visibility test needs the person's full stamp set
+    and the card's personal-contour marker, both Python-side policy, so the query stays a plain
+    read and the filter runs in the callers. An unreadable board (missing, corrupt, wrong schema)
+    is no cards.
     """
     try:
         from hermes_cli import kanban_db as kb
@@ -298,20 +303,31 @@ def _owned_task_rows() -> list[tuple[str, set[Any]]]:
         logger.debug("acl results: kanban board unavailable for card roots", exc_info=True)
         return []
     try:
-        raw = conn.execute("SELECT id, created_by, assignee FROM tasks").fetchall()
+        raw = conn.execute("SELECT id, created_by, assignee, tenant FROM tasks").fetchall()
     except Exception:  # health: allow BLE001 -- an unreadable table is no cards, not every card
         logger.debug("acl results: tasks unreadable for card roots", exc_info=True)
         return []
     finally:
         with suppress(Exception):
             conn.close()
-    rows: list[tuple[str, set[Any]]] = []
+    rows: list[dict] = []
     for row in raw:
-        task_id = row["id"] if "id" in row.keys() else None
+        keys = row.keys()
+        task_id = row["id"] if "id" in keys else None
         if not task_id:
             continue
-        rows.append((str(task_id), {row["created_by"], row["assignee"]}))
+        rows.append({"id": str(task_id),
+                     "stamps": {row["created_by"], row["assignee"]},
+                     "tenant": row["tenant"] if "tenant" in keys else None})
     return rows
+
+
+def _personal_contour_of_row(row: dict) -> str:
+    """The subject a board ROW is private to, from its ``tenant`` marker (else ``""``)."""
+    tenant = str(row.get("tenant") or "")
+    if not tenant.startswith(PERSONAL_TENANT_PREFIX):
+        return ""
+    return tenant[len(PERSONAL_TENANT_PREFIX):].strip()
 
 
 def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
@@ -328,7 +344,7 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
         home = _profile_home(name)
         if home is not None and home not in roots:
             roots.append(home)
-    for path in _own_card_dirs(subject):
+    for path in _team_card_dirs(subject):
         if path not in roots:
             roots.append(path)
     return tuple(roots)
