@@ -31,6 +31,7 @@ DEFAULT_ARTIFACT_EXTENSIONS = (
 _DECISION_BLOCK_KINDS = frozenset({"needs_input", "capability"})
 
 _SUPPRESSION_LOG_NAME = "delivery-policy-suppressed.log"
+_DELIVERY_LOG_NAME = "delivery-journal.log"
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,13 @@ def _string_tuple(value: Any, default: Sequence[str], *, normalize_ext: bool = F
 
 
 def filter_artifacts(paths: Iterable[Any], extensions: Optional[Sequence[str]] = None) -> list[str]:
-    """Keep only deliverable paths whose extension is whitelisted; order preserved."""
+    """Keep only deliverable paths whose extension is whitelisted; order preserved.
+
+    A DIAGNOSTIC, not a gate: :func:`classify_kanban_event` and the notifier no longer discard a
+    card's artifact because of its suffix (a producer's ``.py`` script is a result like a PDF).
+    This stays so the caller can name, in the delivery journal, exactly which files the owner's
+    extension list would have dropped.
+    """
     allowed = {ext.lower() for ext in (extensions if extensions is not None else DEFAULT_ARTIFACT_EXTENSIONS)}
     kept: list[str] = []
     for path in paths or ():
@@ -93,6 +100,28 @@ def filter_artifacts(paths: Iterable[Any], extensions: Optional[Sequence[str]] =
         if suffix in allowed and path not in kept:
             kept.append(path)
     return kept
+
+
+def artifact_paths(paths: Iterable[Any]) -> list[str]:
+    """Every usable artifact path, unfiltered by extension (order preserved, de-duplicated).
+
+    The board's deliverable rule is about WHO the work belongs to, not about suffixes: a card's
+    script, log, JSON or archive is team material exactly as a PDF is.
+    """
+    out: list[str] = []
+    for path in paths or ():
+        if not isinstance(path, str) or not path.strip():
+            continue
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def offlist_artifacts(paths: Iterable[Any], extensions: Optional[Sequence[str]] = None) -> list[str]:
+    """The paths the owner's extension whitelist would have dropped — journalled, never hidden."""
+    raw = artifact_paths(paths)
+    kept = set(filter_artifacts(raw, extensions))
+    return [path for path in raw if path not in kept]
 
 
 def _payload_value(payload: Optional[Mapping[str, Any]], *keys: str) -> str:
@@ -162,13 +191,24 @@ def classify_kanban_event(
             # Accept the paths straight off the event payload: that is where the handoff
             # writes them, and a caller that has the payload must not also have to unwrap it.
             raw_artifacts = (payload or {}).get("artifacts") or ()
-        kept = filter_artifacts(
-            raw_artifacts if isinstance(raw_artifacts, (list, tuple)) else (), extensions)
+        # An artifact's SUFFIX is not a delivery gate: the card's script/log/JSON is team
+        # material exactly as a PDF is. The owner's extension list no longer decides whether a
+        # completion carries a deliverable; it only annotates the journal (:func:`offlist_artifacts`).
+        kept = artifact_paths(
+            raw_artifacts if isinstance(raw_artifacts, (list, tuple)) else ())
         summary = _payload_value(payload, "summary")
         if not summary and task is not None:
             summary = str(getattr(task, "result", "") or "").strip()
         if kept:
-            return "final", f"final:{len(kept)}_artifact(s)"
+            offlist = offlist_artifacts(raw_artifacts if isinstance(raw_artifacts, (list, tuple)) else (),
+                                        extensions)
+            reason = f"final:{len(kept)}_artifact(s)"
+            if offlist:
+                # Not a drop — the file still rides out — but the journal should say that the
+                # owner's "deliverables only" list would have hidden it, so a future tightening
+                # has the evidence rather than silence.
+                reason = f"{reason}:offlist={len(offlist)}"
+            return "final", reason
         if summary:
             return "final", "final:summary"
         return None, "service:empty_completed"

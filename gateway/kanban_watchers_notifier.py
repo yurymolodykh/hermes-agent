@@ -20,8 +20,10 @@ from agent.i18n import t
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 from gateway.owner_delivery_policy import (
     OwnerDeliveryConfig,
+    artifact_paths,
     classify_kanban_event,
     filter_artifacts,
+    offlist_artifacts,
     record_suppressed,
 )
 from gateway.wake import session_owned_by_profile
@@ -388,15 +390,38 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
 
 
 def _policy_artifact_payload(event_payload: Any, extensions) -> Optional[dict]:
-    """Payload narrowed to whitelisted artifact paths, or ``None`` when nothing survives.
+    """The payload handed to the shared delivery path under the owner policy.
 
-    The shared ``_deliver_kanban_artifacts`` also harvests paths mentioned in the summary
-    and in ``task.result``; under the owner policy those prose mentions are dropped too,
-    otherwise a ``.md``/``.py`` referenced in prose would still ride out as a file.
+    Every artifact the card names rides out: a producer's ``.py`` script, log or JSON archive is a
+    result of the mission, not a lesser file, so the owner's *deliverable* extension list no longer
+    narrows this payload. It still annotates the delivery journal (:func:`_journal_offlist`), so a
+    future tightening has the evidence instead of a silent disappearance.
+
+    ``None`` is returned only for a payload that carries NO artifact at all — the caller then skips
+    artifact delivery (the text ping already went) without pretending a file was sent.
     """
     raw = (event_payload or {}).get("artifacts") if isinstance(event_payload, dict) else None
-    kept = filter_artifacts(raw if isinstance(raw, (list, tuple)) else (), extensions)
+    kept = artifact_paths(raw if isinstance(raw, (list, tuple)) else ())
     return {"artifacts": kept} if kept else None
+
+
+def _journal_offlist(task_id: str, platform: str, chat_id: str, event_payload: Any,
+                     extensions) -> None:
+    """Record, per artifact the owner's list would have hidden, that it rode out anyway.
+
+    The journal is not a suppression log here — the file IS delivered — so the row names the
+    extension gate as the would-be reason. Without it a later "why did this .py never arrive?"
+    has no trail.
+    """
+    raw = (event_payload or {}).get("artifacts") if isinstance(event_payload, dict) else None
+    for path in offlist_artifacts(raw if isinstance(raw, (list, tuple)) else (), extensions):
+        record_suppressed(
+            task_id=task_id,
+            event_kind="completed",
+            platform=platform,
+            chat_id=chat_id,
+            reason=f"delivered_despite_extension_list:{Path(path).suffix.lower() or '<none>'}",
+        )
 
 
 def _owner_delivery_config() -> OwnerDeliveryConfig:
@@ -1032,9 +1057,11 @@ class _KanbanNotification:
         if ev.kind in ("completed", "review_requested"):
             event_payload = getattr(ev, "payload", None)
             if self.policy_active:
-                # Owner policy: only deliverable file types reach the chat. Filtering happens
-                # HERE, at the call site, so the shared delivery path keeps its full set for
-                # desktop/local, api_server and cron.
+                # Owner policy: the artifact set is NOT narrowed by extension any more — a card's
+                # ``.py``/log/JSON is a result like a PDF. The extension list is journalled when it
+                # would have hidden a file, so nothing disappears without a trace.
+                _journal_offlist(self.task_id, self.platform_str, sub["chat_id"],
+                                 event_payload, self.owner_policy.artifact_extensions)
                 event_payload = _policy_artifact_payload(event_payload, self.owner_policy.artifact_extensions)
                 if event_payload is None:
                     return True

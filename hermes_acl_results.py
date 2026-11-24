@@ -11,8 +11,10 @@ This module is the ONE policy those surfaces ask, in the same spirit as ``hermes
 (sessions) and ``hermes_acl_profiles`` (profiles):
 
 * **the subject's file root** — :func:`file_roots`: the person's own orchestrator home(s) from
-  the registry, plus the directories of the CARDS they own (``kanban/workspaces/<id>``,
-  ``kanban/attachments/<id>``). Everything else on the host is outside the root and refused by
+  the registry, plus the directories of the TEAM's material — every card folder
+  (``kanban/workspaces/<id>``, ``kanban/attachments/<id>``) except a PERSONAL-contour card's, and
+  the working directories of the SHARED profiles (:func:`_shared_work_dirs`), where a producer's
+  scripts actually land. Everything else on the host is outside the root and refused by
   :func:`require_path`, after the path has been fully resolved by the caller (``..``, symlinks and
   ``/proc/self/root`` collapse there; a string check is never the input).
 * **the effective profile** — :func:`resolve_profile`: with no ``?profile=`` the dashboard served
@@ -286,6 +288,67 @@ def _team_card_dirs(subject: Any) -> list[Path]:
     return out
 
 
+def _shared_work_dirs() -> list[Path]:
+    """The working directories of the SHARED profiles — where the team's own work lands.
+
+    A script written by the software-engineering profile lives in that profile's
+    ``terminal.cwd`` (``/home/hermes/workspaces/03-software-engineer`` by default), not inside
+    any card folder. Since that profile is shared, what it produced is team material and every
+    verified person must be able to open it — otherwise "the team's code is shared" stops at the
+    card attachment and the producer's own working tree stays unreachable.
+
+    Only registry-declared SHARED profiles contribute (:meth:`BindingsRegistry.shared_profiles`),
+    never a personal one: ``01-<login>`` keeps its root to its owner. A profile whose home or
+    config cannot be read contributes nothing — an unreadable registry or config must not widen
+    the boundary. Same-directory and sub-directory results are de-duplicated by the caller.
+    """
+    try:
+        registry = _registry()
+    except _registry_errors():
+        return []
+    if registry is None:
+        return []
+    try:
+        shared = registry.shared_profiles()
+    except _registry_errors() as exc:
+        logger.warning("acl results: bindings registry unusable — no shared work dirs (%s)", exc)
+        return []
+    out: list[Path] = []
+    for name in shared:
+        home = _profile_home(name)
+        if home is None:
+            continue
+        cwd = _profile_work_dir(home)
+        if cwd is not None and cwd not in out:
+            out.append(cwd)
+    return out
+
+
+def _profile_work_dir(home: Path) -> Optional[Path]:
+    """A profile's ``terminal.cwd`` as an absolute directory, or ``None``.
+
+    Read EXACTLY as written (``read_user_config_raw``): the value is a plain path, and the
+    defaults/expansion of ``load_config()`` would both materialise a home and turn a relative
+    ``"."`` into the process's cwd — the launch profile's own tree, which is not this profile's.
+    """
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        data = read_user_config_raw(Path(home) / "config.yaml")
+    except Exception:  # health: allow BLE001 -- an unreadable config grants nothing
+        logger.debug("acl results: shared profile config unreadable under %s", home, exc_info=True)
+        return None
+    terminal = data.get("terminal") if isinstance(data, dict) else None
+    raw = terminal.get("cwd") if isinstance(terminal, dict) else None
+    text = str(raw or "").strip()
+    if not text or not Path(text).is_absolute():
+        return None
+    resolved = _real(text)
+    if resolved is None or not resolved.is_dir():
+        return None
+    return resolved
+
+
 def _owned_task_rows() -> list[dict]:
     """``[{"id", "stamps", "tenant"}, ...]`` for the whole board; ``[]`` if unreadable.
 
@@ -345,6 +408,9 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
         if home is not None and home not in roots:
             roots.append(home)
     for path in _team_card_dirs(subject):
+        if path not in roots:
+            roots.append(path)
+    for path in _shared_work_dirs():
         if path not in roots:
             roots.append(path)
     return tuple(roots)

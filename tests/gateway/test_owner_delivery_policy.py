@@ -67,14 +67,20 @@ def test_root_completion_with_summary_only_is_final():
     assert category == "final"
 
 
-def test_source_only_artifacts_do_not_make_a_completion_final():
+def test_source_only_artifacts_still_make_a_completion_final():
+    """A card's script/log/JSON is a mission result, exactly as a PDF is.
+
+    The owner's extension list used to reject these outright (``service:empty_completed``), so a
+    software engineer's ``.py`` deliverable never left the disk. The list now only annotates the
+    journal; the completion carries the files.
+    """
     category, reason = classify_kanban_event(
         kind="completed",
         payload={"artifacts": ["/tmp/a.md", "/tmp/b.py", "/tmp/c.log"]},
         has_open_ancestor=False,
     )
-    assert category is None
-    assert reason == "service:empty_completed"
+    assert category == "final"
+    assert reason == "final:3_artifact(s):offlist=3"
 
 
 @pytest.mark.parametrize("block_kind", ["needs_input", "capability"])
