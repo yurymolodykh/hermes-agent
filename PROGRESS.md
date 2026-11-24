@@ -34,15 +34,22 @@
 
 ## 2. Замеры «до/после» (инструментом)
 
-| Сценарий | База `f39aaeffe232` | Правка `63a679321f60` |
+| Сценарий | База `f39aaeffe232` | Правка `1e1cd6e78812` |
 |---|---|---|
-| `repro_profile_race.py race 6` | **ok=6 refused=6** | **ok=12 refused=0** |
-| `repro_manager.py race 8` | 24 отказа | 0 отказов |
+| `repro_profile_race.py race 6` (у каждого воркера свой каталог проекта) | **ok=6 refused=6** | **ok=12 refused=0**, nothing_to_snapshot=0 (`evidence/after-profile-race.log`) |
+| `repro_manager.py race 8` (два воркера в ОДНОМ каталоге) | ok=8 refused=24 | **ok=8 refused=0**, `failure=None` у проигравших (`evidence/after-mgr.log`) |
 | latency отказа | **0,027 с** (первый `_lock(wait=False)`) | — |
 | успешный чекпойнт держит лок | 0,6–0,75 с | 0,6–0,75 с |
 | новый тест-файл | **4 failed**, 1 passed, 1 skipped (`evidence/red-on-base.log`) | **6 passed** |
 | регресс (8 модулей чекпойнтов) | — | **111 passed** (`evidence/after-regression.log`) |
 | code health vs базы | — | **0 blocking, 0 advisory** |
+
+**Важно про «ok=16»:** в приёмке дочерней карточки `t_00e47644` ожидалось `ok=16 refused=0` для
+`race 8`. Это недостижимо по существу: два воркера пишут в **один** каталог проекта, второй
+берёт лок уже после первого и видит неизменившееся дерево → `ok=False, failure=None`
+(«нечего снимать», `refused=0`). Отказов действительно ноль. Чтобы получить 16 из 16 снятий,
+воркерам нужны раздельные каталоги — тогда `race 6` даёт **12/12 ok, 0 отказов**.
+Старое `ok=8 refused=24` отличалось именно наличием `PruneError`, а он исчез.
 
 Реальный двойной прогон после правки: 2 воркера одного профиля → оба `ok=true`, в сторе два
 ref'а с записями `race pA` / `race pB` (`git log` по обоим показал новую запись).
