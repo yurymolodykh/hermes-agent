@@ -1,0 +1,13 @@
+{"tag": "r0p0", "ok": true, "ms": 939.8, "failure": null}
+{"tag": "r0p1", "ok": true, "ms": 1680.8, "failure": null}
+{"tag": "r1p0", "ok": true, "ms": 672.4, "failure": null}
+{"tag": "r1p1", "ok": true, "ms": 1460.3, "failure": null}
+{"tag": "r2p0", "ok": true, "ms": 1874.2, "failure": null}
+{"tag": "r2p1", "ok": true, "ms": 767.2, "failure": null}
+{"tag": "r3p0", "ok": true, "ms": 1026.5, "failure": null}
+{"tag": "r3p1", "ok": true, "ms": 2079.5, "failure": null}
+{"tag": "r4p0", "ok": true, "ms": 2337.7, "failure": null}
+{"tag": "r4p1", "ok": true, "ms": 1067.1, "failure": null}
+{"tag": "r5p0", "ok": true, "ms": 2732.1, "failure": null}
+{"tag": "r5p1", "ok": true, "ms": 1242.3, "failure": null}
+RESULT rounds=6 takes=12 ok=12 refused=0 nothing_to_snapshot=0

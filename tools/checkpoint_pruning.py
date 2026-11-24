@@ -37,7 +37,8 @@ def lock_holder_hint(lock: Path) -> str:
     still own this path" (on Linux it reads every process's fds through /proc, on macOS/BSD it
     asks ``lsof``); a third probe must not grow here. Every answer is honest: a visible holder is
     named with its pid and command line, an unknown one is reported as unknown, and neither is
-    invented.
+    invented. The label is folded to one line and clipped — a worker's argv can be a whole script,
+    and the failure line ends up in a card comment.
     """
     try:
         from hermes_cli._early_recovery import _held_open
@@ -49,7 +50,8 @@ def lock_holder_hint(lock: Path) -> str:
         return "holder unknown (the platform could not inspect open files)"
     if verdict is False:
         return "no live process holds a descriptor on the lock file"
-    return f"held by {verdict}"
+    label = " ".join(str(verdict).split())
+    return f"held by {label[:120]}{'…' if len(label) > 120 else ''}"
 
 
 @contextmanager

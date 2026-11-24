@@ -1,0 +1,13 @@
+{"tag": "r0p0", "ok": true, "ms": 799.1, "failure": null}
+{"tag": "r0p1", "ok": false, "ms": 15.1, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-1", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490424.578147}}
+{"tag": "r1p0", "ok": true, "ms": 1077.3, "failure": null}
+{"tag": "r1p1", "ok": false, "ms": 10.9, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-1", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490425.648245}}
+{"tag": "r2p0", "ok": true, "ms": 905.8, "failure": null}
+{"tag": "r2p1", "ok": false, "ms": 11.1, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-1", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490427.0218024}}
+{"tag": "r3p0", "ok": false, "ms": 10.5, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-0", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490428.1569545}}
+{"tag": "r3p1", "ok": true, "ms": 726.5, "failure": null}
+{"tag": "r4p0", "ok": true, "ms": 820.7, "failure": null}
+{"tag": "r4p1", "ok": false, "ms": 7.5, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-1", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490429.0854297}}
+{"tag": "r5p0", "ok": false, "ms": 10.7, "failure": {"working_dir": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/proj-0", "stage": "store", "error": "PruneError: checkpoint store is busy: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/tmp.mbuPVrc5aF/base", "ts": 1795490430.2239032}}
+{"tag": "r5p1", "ok": true, "ms": 1182.2, "failure": null}
+RESULT rounds=6 takes=12 ok=6 refused=6 nothing_to_snapshot=0
