@@ -517,21 +517,67 @@ def _conn_db_path(conn: sqlite3.Connection) -> Optional[Path]:
 
 #: Assignee values that name no specific owner: ``None``/empty (dispatcher falls
 #: back to ``kanban.default_assignee``) and the ``default`` single-profile profile.
+#: This is the exception the single-profile install keeps: ``default`` stays a
+#: placeholder even though ``list_profile_names()`` always lists it.
 _ANONYMOUS_PLACEHOLDER_ASSIGNEES = frozenset({"", "default"})
 
 
-def is_anonymous_placeholder_card(assignee: Optional[str], created_by: Optional[str]) -> bool:
-    """A card with no author AND no named owner — the shape every probe leaves behind.
+def known_profile_names() -> Optional[frozenset[str]]:
+    """Lowercased ids of the profiles this install can actually spawn, or ``None``.
 
-    Field incident (t_e0c9e1ce): scratch scripts created ``assignee="default"``
-    cards with no ``created_by``; they entered the operator's live queue and
-    crash-looped until a human archived them. A real card always carries an
-    author (the CLI/tool/dashboard/swarm paths all set one) and, on a multi-profile
-    install, a specific assignee.
+    ``None`` means *unknowable* — the profile store could not be read, or it
+    lists nothing at all — and every caller must then behave as if the roster
+    imposed no constraint. A fuse that fails closed on a broken roster would
+    refuse legitimate cards on an install whose profiles are simply not mounted
+    (containers, portable trees), which is worse than the incident it guards.
+    """
+    try:
+        from hermes_cli.profiles import list_profile_names
+
+        names = list_profile_names()
+    except Exception:  # pragma: no cover - defensive: import cycle / broken store
+        return None
+    roster = frozenset(n.strip().lower() for n in names or () if n and n.strip())
+    return roster or None
+
+
+def names_no_real_profile(assignee: Optional[str]) -> bool:
+    """True when *assignee* names no profile in this install's roster.
+
+    Fail-open by construction: an unreadable/empty roster (``None``) never
+    reports a name as unknown, so the fuse cannot fire on a missing store.
+    """
+    name = (assignee or "").strip().lower()
+    if not name:
+        return True
+    roster = known_profile_names()
+    if roster is None:
+        return False
+    return name not in roster
+
+
+def is_anonymous_placeholder_card(assignee: Optional[str], created_by: Optional[str]) -> bool:
+    """A card with no author AND no owner any real profile can execute — the shape
+    every ad-hoc probe leaves behind.
+
+    Field incidents: ``t_e0c9e1ce`` (scratch scripts created ``assignee="default"``
+    cards with no ``created_by``) and ``t_37c3fd9a`` (probe scripts created 24
+    ``assignee="worker"`` cards with no author, which entered the operator's live
+    dispatcher queue and the board-graph report). The first case is a placeholder
+    id; the second names a generic noun that no profile directory carries, so the
+    card can never spawn — it only crash-loops or sits in ``skipped_nonspawnable``
+    forever, paging a human either way.
+
+    A real card always carries an author (the CLI, model tool, dashboard and swarm
+    paths all set one), so any author disarms the fuse — that keeps control-plane
+    lanes (``claim_task`` pullers such as ``orion-cc``) and every dispatcher-owned
+    path working unchanged.
     """
     if (created_by or "").strip():
         return False
-    return (assignee or "").strip().lower() in _ANONYMOUS_PLACEHOLDER_ASSIGNEES
+    if (assignee or "").strip().lower() in _ANONYMOUS_PLACEHOLDER_ASSIGNEES:
+        return True
+    return names_no_real_profile(assignee)
 
 
 def boards_root() -> Path:
@@ -1333,16 +1379,19 @@ def create_task(
         max_runtime_seconds = DEFAULT_MAX_RUNTIME_SECONDS
     if not title or not title.strip():
         raise ValueError("title is required")
-    # Fuse (t_e0c9e1ce): a card with NO author and no named owner is the exact
-    # shape every ad-hoc probe leaves behind, and on the operator's live board it
-    # enters the dispatcher queue, crash-loops and pages a human. Refuse it there
-    # — a throwaway board (tests, probes that pinned HERMES_KANBAN_HOME) still
-    # accepts one so fixtures keep working.
+    # Fuse (t_e0c9e1ce, t_37c3fd9a): a card with NO author and no assignee any
+    # real profile can execute is the exact shape every ad-hoc probe leaves
+    # behind — a placeholder id ("default") or a generic noun ("worker"). On the
+    # operator's live board it enters the dispatcher queue, can never spawn, and
+    # pages a human. Refuse it there; a throwaway board (tests, probes that
+    # pinned HERMES_KANBAN_HOME) still accepts one so fixtures keep working.
     if is_anonymous_placeholder_card(assignee, created_by) and path_is_live_board(_conn_db_path(conn)):
         raise ValueError(
-            "refusing a card with no author and no named assignee on the live board: "
-            "pass created_by= (who filed it) and a concrete assignee profile; "
-            "probes and tests must pin HERMES_KANBAN_HOME to a temporary directory"
+            "refusing a card with no author and no assignee a real profile can run "
+            f"({assignee or 'no assignee'!r} names no profile in this install) on the "
+            "live board: pass created_by= (who filed it) and a concrete assignee "
+            "profile; probes and tests must pin HERMES_KANBAN_HOME to a temporary "
+            "directory"
         )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
