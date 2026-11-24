@@ -309,6 +309,13 @@ def _suppression_rows(tmp_path):
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
+def _delivery_rows(tmp_path):
+    log = tmp_path / "home" / "logs" / "delivery-journal.log"
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
 @pytest.fixture
 def run_tick(tmp_path, monkeypatch):
     """Run one notifier tick against a temp board + temp log dir, returning the suppression rows."""
@@ -347,7 +354,9 @@ def test_intermediate_completed_under_open_parent_is_suppressed_and_journalled(r
 def test_final_completion_sends_summary_passively_without_wake(run_tick, tmp_path):
     pdf = tmp_path / "report.pdf"
     pdf.write_bytes(b"%PDF-1.4")
-    tid = _completed_task(summary="Отчёт по конкурсу готов", artifacts=[str(pdf), "/tmp/notes.md"])
+    notes = tmp_path / "notes.md"
+    notes.write_text("notes", encoding="utf-8")
+    tid = _completed_task(summary="Отчёт по конкурсу готов", artifacts=[str(pdf), str(notes)])
     adapter = RecordingAdapter()
     run_tick(adapter, _policy())
 
@@ -356,8 +365,10 @@ def test_final_completion_sends_summary_passively_without_wake(run_tick, tmp_pat
     assert tid in text
     assert "Отчёт по конкурсу готов" in text, "a final ping must carry the task summary, not just ✅"
     assert adapter.handled == [], "a final deliverable is passive: no wake turn"
-    assert adapter.documents == [str(pdf)], "only the whitelisted .pdf is uploaded"
-    assert run_tick.rows() == []
+    # Both files ride out: a card's `.md` note is mission material, not a lesser file. The old
+    # whitelist dropped it silently; the delivery journal now names it instead.
+    assert sorted(adapter.documents) == sorted([str(pdf), str(notes)])
+    assert run_tick.rows() == [], "nothing was suppressed — a delivered file is not a hidden event"
 
 
 def test_completed_without_summary_or_artifacts_sends_nothing(run_tick):
@@ -366,6 +377,27 @@ def test_completed_without_summary_or_artifacts_sends_nothing(run_tick):
     run_tick(adapter, _policy())
     assert adapter.sent == []
     assert [r["reason"] for r in run_tick.rows()] == ["service:empty_completed"]
+
+
+def test_a_py_script_artifact_reaches_the_chat_and_is_journalled(run_tick, tmp_path):
+    """Acceptance #5: a card whose only artifact is a ``.py`` script delivers that file.
+
+    The owner's extension list must not decide what the team's work is worth — a software
+    engineer's script is the deliverable. The journal keeps a row saying the list would have
+    hidden it, so a rejection is visible rather than silent.
+    """
+    script = tmp_path / "fix_bug.py"
+    script.write_text("print('done')\n", encoding="utf-8")
+    tid = _completed_task(summary="Скрипт-фикс готов", artifacts=[str(script)])
+    adapter = RecordingAdapter()
+    run_tick(adapter, _policy())
+
+    assert adapter.documents == [str(script)], "the .py must ride out as a real attachment"
+    assert run_tick.rows() == [], "it was delivered, so it is not a suppressed event"
+    rows = _delivery_rows(tmp_path)
+    assert [(r["task_id"], r["reason"]) for r in rows] == [
+        (tid, "delivered_despite_extension_list:.py"),
+    ], "the extension list's would-be rejection must leave a trace"
 
 
 def test_blocked_needs_input_is_delivered_with_reason_and_wakes_once(run_tick, monkeypatch):

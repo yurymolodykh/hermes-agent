@@ -236,6 +236,59 @@ class TestFileRoots:
         assert results_acl.file_roots(_anonymous_request()) == ()
 
 
+class TestTeamWorkDirs:
+    """Acceptance #6: the team's OWN working trees — not just card folders — are shared.
+
+    A producer's script lands in its profile's ``terminal.cwd`` (for 03, a real directory off the
+    kanban tree), which no card folder contains. Without this root "the team's code is shared"
+    stops at card attachments.
+    """
+
+    def _give_shared_profile_a_workdir(self, profile_homes, tmp_path):
+        """Point a SHARED profile's ``terminal.cwd`` at a real directory holding one file."""
+        shared_home = profile_homes[SHARED[1]]
+        work = tmp_path / "workspaces" / SHARED[1]
+        work.mkdir(parents=True)
+        script = work / "harvest.py"
+        script.write_text("print('team material')\n", encoding="utf-8")
+        (shared_home / "config.yaml").write_text(
+            f"terminal:\n  cwd: {work}\n", encoding="utf-8")
+        return work, script
+
+    def test_a_shared_profiles_work_dir_is_a_team_root(self, multi_user, registry,
+                                                       profile_homes, tmp_path):
+        work, script = self._give_shared_profile_a_workdir(profile_homes, tmp_path)
+        roots = results_acl.file_roots(_request_as("alice"))
+        assert work.resolve() in roots, "03's working tree must be in every person's root"
+        assert results_acl.path_allowed(_request_as("alice"), script) is True
+
+    def test_a_personal_profiles_work_dir_is_never_a_team_root(self, multi_user, registry,
+                                                               profile_homes, tmp_path):
+        # A personal profile is not in shared_profiles(): its work dir must not leak in even
+        # when it names one, so the boundary is the registry, not the presence of a config.
+        bob_home = profile_homes[BOB_ROOT]
+        work = tmp_path / "workspaces" / BOB_ROOT
+        work.mkdir(parents=True)
+        (work / "private.py").write_text("x", encoding="utf-8")
+        (bob_home / "config.yaml").write_text(f"terminal:\n  cwd: {work}\n", encoding="utf-8")
+        assert results_acl.path_allowed(_request_as("alice"), work / "private.py") is False
+
+    def test_a_shared_profiles_home_files_stay_out_even_with_a_work_dir(self, multi_user, registry,
+                                                                       profile_homes, tmp_path):
+        # The work tree is shared; the profile's own home (SOUL, .env) is not a work product.
+        self._give_shared_profile_a_workdir(profile_homes, tmp_path)
+        private = profile_homes[SHARED[1]] / "secret.txt"
+        assert results_acl.path_allowed(_request_as("alice"), private) is False
+
+    def test_a_relative_or_missing_work_dir_grants_nothing(self, multi_user, registry,
+                                                           profile_homes):
+        # "." is the LAUNCH profile's cwd, not this profile's: an unset work dir is no root.
+        (profile_homes[SHARED[1]] / "config.yaml").write_text(
+            "terminal:\n  cwd: .\n", encoding="utf-8")
+        assert results_acl._shared_work_dirs() == [] or all(
+            p != Path.cwd().resolve() for p in results_acl._shared_work_dirs())
+
+
 class TestPathContainment:
     def test_own_file_is_allowed(self, multi_user, registry, profile_homes):
         own = profile_homes[ALICE_ROOT] / "secret.txt"

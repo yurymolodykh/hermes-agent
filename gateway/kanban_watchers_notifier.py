@@ -24,6 +24,7 @@ from gateway.owner_delivery_policy import (
     classify_kanban_event,
     filter_artifacts,
     offlist_artifacts,
+    record_delivered,
     record_suppressed,
 )
 from gateway.wake import session_owned_by_profile
@@ -409,13 +410,13 @@ def _journal_offlist(task_id: str, platform: str, chat_id: str, event_payload: A
                      extensions) -> None:
     """Record, per artifact the owner's list would have hidden, that it rode out anyway.
 
-    The journal is not a suppression log here — the file IS delivered — so the row names the
-    extension gate as the would-be reason. Without it a later "why did this .py never arrive?"
-    has no trail.
+    The DELIVERY journal, not the suppression one — the file IS delivered — so the row names the
+    extension gate as the would-be reason. Without it a later "why did this .py never arrive?" has
+    no trail, and the "how much did we hide" figure stays honest.
     """
     raw = (event_payload or {}).get("artifacts") if isinstance(event_payload, dict) else None
     for path in offlist_artifacts(raw if isinstance(raw, (list, tuple)) else (), extensions):
-        record_suppressed(
+        record_delivered(
             task_id=task_id,
             event_kind="completed",
             platform=platform,

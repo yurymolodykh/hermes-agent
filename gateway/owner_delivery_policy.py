@@ -227,6 +227,51 @@ def suppression_log_path() -> Path:
     return get_hermes_home() / "logs" / _SUPPRESSION_LOG_NAME
 
 
+def delivery_log_path() -> Path:
+    """``<HERMES_HOME>/logs/delivery-journal.log`` — what WAS delivered, and why.
+
+    Separate from the suppression log on purpose: a file that rode out is not a suppressed event,
+    and counting it as one would make the "how much did we hide" figure a lie.
+    """
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "logs" / _DELIVERY_LOG_NAME
+
+
+def record_delivered(
+    *,
+    task_id: str,
+    event_kind: str,
+    platform: str,
+    chat_id: str,
+    reason: str,
+    path: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> bool:
+    """Append one jsonl row to the DELIVERY journal; never raises.
+
+    Same shape as :func:`record_suppressed` so one reader can scan both, and the same rule: a
+    journal failure is a logging problem, never a delivery problem.
+    """
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time())),
+        "task_id": task_id,
+        "event_kind": event_kind,
+        "platform": platform,
+        "chat_id": chat_id,
+        "reason": reason,
+    }
+    try:
+        target = Path(path) if path is not None else delivery_log_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+    except OSError as exc:
+        logger.debug("kanban owner policy: cannot append delivery journal: %s", exc)
+        return False
+
+
 def record_suppressed(
     *,
     task_id: str,
