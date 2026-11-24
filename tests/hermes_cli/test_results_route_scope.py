@@ -423,6 +423,7 @@ class TestCardOwnership:
             private = kb.get_task(conn, board["bob"]["task"])
         finally:
             conn.close()
+        assert private is not None
         private.tenant = f"{results_acl.PERSONAL_TENANT_PREFIX}{BOB}"
         assert results_acl.task_visible(_request_as("alice"), private) is False
         assert results_acl.task_visible(_request_as("bob"), private) is True
