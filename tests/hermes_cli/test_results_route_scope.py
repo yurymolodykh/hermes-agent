@@ -456,11 +456,13 @@ class TestCardOwnership:
             conn.close()
         assert results_acl.task_visible(_owner_request(), foreign) is True
 
-    def test_owning_card_dirs_extend_the_file_root(self, multi_user, registry, kanban_home, board, profile_homes):
-        """A person's card workspace/attachments are inside their root, a neighbour's are not."""
+    def test_card_folders_are_readable_team_material(self, multi_user, registry, kanban_home, board, profile_homes):
+        """A card's workspace/attachments are TEAM material: a neighbour's folders are in the
+        root too, because the deliverable has to be openable by whoever needs it. The private
+        island is a PERSONAL-contour card, asserted separately below."""
         roots = results_acl.file_roots(_request_as("alice"))
         assert board["alice"]["path"].parent.resolve() in roots
-        assert board["bob"]["path"].parent.resolve() not in roots
+        assert board["bob"]["path"].parent.resolve() in roots
 
 
 # ---------------------------------------------------------------------------
