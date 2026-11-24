@@ -787,7 +787,11 @@ class SessionAuthority:
 
     async def receipt(self, actor, ref, admission_id):
         self.authorize(actor, ref, 'session:submit')
-        row = get_session_admission(self.db, admission_id=admission_id)
+        # The admission row is a durable SQLite read on every RPC a client sends (webapp/Desktop poll
+        # receipts), and ``dispatch`` runs it on the gateway loop: the read pool's checkout also counts
+        # fds and may open/evict connections, so a busy store parked the loop for the whole dispatch.
+        # Off-load at this await boundary; ``receipt`` stays async and its contract is unchanged.
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
         from gateway.owner_identity import same_owner
