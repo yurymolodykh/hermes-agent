@@ -390,6 +390,31 @@ def task_visible(request: Any, task: Any) -> bool:
     return bool(row & marks)
 
 
+def card_verdict(subject: Any, task: Any) -> str:
+    """How *subject* relates to *task*, for the delivery path to name out loud.
+
+    ``"unscoped"`` — multi-user is off, so no relation is enforceable (legacy behaviour);
+    ``"owner"`` — the host owner, who reaches every card;
+    ``"member"`` — the person's stamps match the card's ``created_by``/``assignee``;
+    ``"foreign"`` — nobody this card knows (an unknown subject lands here too: an establishable
+    person is the only thing that can be a member, so "cannot tell" is not "belongs").
+
+    This is :func:`task_visible` asked with a SUBJECT instead of an HTTP request: the gateway
+    delivery path holds a subscription (platform + chat), not a request object, and must reach
+    the same answer without inventing a second policy.
+    """
+    if not _multi_user():
+        return "unscoped"
+    text = str(subject or "").strip()
+    if _is_owner(text):
+        return "owner"
+    marks = stamps(text)
+    if not marks:
+        return "foreign"
+    row = {getattr(task, "created_by", None), getattr(task, "assignee", None)}
+    return "member" if row & marks else "foreign"
+
+
 def require_task(request: Any, task: Any, task_id: Any = "") -> None:
     """Refuse a foreign card with the SAME 404 an absent id gets (no id oracle)."""
     if task is not None and task_visible(request, task):
