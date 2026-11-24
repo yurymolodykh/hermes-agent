@@ -483,7 +483,7 @@ class SessionUsageMixin:
         row = self._read_one(f"""
             SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
                    COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
-              FROM sessions
+              FROM sessions s
              WHERE {' AND '.join(where)}
             """, params)
         return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}

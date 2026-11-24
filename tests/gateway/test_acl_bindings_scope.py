@@ -125,6 +125,26 @@ class TestScopeExpansion:
         assert hermes_acl_scope.request_owner_scope(_Request(OWNER_PERSON)) is None
         assert hermes_acl_scope.caller_owner_scope() is None
 
+    def test_a_registry_telegram_subject_also_scopes_the_bare_id_rows(self, acl_on, _explicit_registry_path):
+        """The live shape: the registry records ``tg:<id>`` (what ``user_admin.telegram_subject``
+        writes) while the gateway stamps the messaging ROW with the bare id. Both must reach the
+        scope, or a person's own Telegram chats stay invisible to them."""
+        store = hb.BindingStore(_explicit_registry_path)
+        store.bind(OWNER_PERSON, profiles=["01-orchestrator"], subjects=["uid:1001", "tg:125805788"])
+        hb.reset_cache()
+        scope = hermes_acl_scope.owner_stamps(OWNER_PERSON)
+        assert "125805788" in scope
+        assert "tg:125805788" in scope
+
+    def test_the_bare_id_form_keeps_working(self, acl_on, registry):
+        """The other recorded shape (a bare id, as this file's fixture binds it) is unchanged."""
+        scope = hermes_acl_scope.owner_stamps(OWNER_PERSON)
+        assert "125805788" in scope
+
+    def test_a_non_telegram_stamp_gains_no_bare_id(self, acl_on, registry):
+        """Only the Telegram prefix is folded; an unrelated id must not leak into the scope."""
+        assert "1001" not in hermes_acl_scope.owner_stamps(OWNER_PERSON)
+
 
 # ---------------------------------------------------------------------------
 # 2. THE CRITERION: a broken registry DENIES
