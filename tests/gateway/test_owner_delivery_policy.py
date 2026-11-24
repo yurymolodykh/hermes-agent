@@ -10,6 +10,7 @@ Two layers under test:
 
 import asyncio
 import json
+from typing import Optional
 
 import pytest
 
@@ -279,13 +280,17 @@ def _completed_task(summary="Готово", artifacts=None, *, parent_open=False
         conn.close()
 
 
-def _blocked_task(kind="needs_input", *, platform="telegram", reason="нужен пароль"):
+def _blocked_task(kind: Optional[str] = "needs_input", *, platform="telegram", reason="нужен пароль"):
+    """A blocked card + its journalled event; ``kind=None`` is the legacy untyped block."""
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked card", assignee="worker")
         _sub(tid, platform)
         conn.execute("UPDATE tasks SET status = 'blocked', block_kind = ? WHERE id = ?", (kind, tid))
-        kb._append_event(conn, tid, "blocked", {"kind": kind, "reason": reason})
+        payload = {"reason": reason}
+        if kind:
+            payload["kind"] = kind
+        kb._append_event(conn, tid, "blocked", payload)
         return tid
     finally:
         conn.close()
@@ -386,6 +391,54 @@ def test_blocked_dependency_is_suppressed(run_tick):
     assert adapter.sent == []
     assert adapter.handled == []
     assert [r["reason"] for r in run_tick.rows()] == ["service:blocked:dependency"]
+
+
+def test_blocked_untyped_is_delivered_and_wakes(run_tick):
+    """A legacy untyped block cannot move without the owner, so it must reach him."""
+    tid = _blocked_task(None, reason="ждёт решения владельца")
+    adapter = RecordingAdapter()
+    run_tick(adapter, _policy())
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "ждёт решения владельца" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1, "a decision hands the turn back to the creator"
+    assert run_tick.rows() == [], "a decision is delivered, not journalled as suppressed"
+
+
+def test_sticky_gave_up_is_delivered_and_wakes(run_tick):
+    """A sticky park is held for an operator: nobody resumes it automatically."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="parked card", assignee="worker")
+        _sub(tid, "telegram")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(
+            conn, tid, "gave_up",
+            {"error": "бюджет итераций исчерпан", "failures": 3, "sticky": True},
+        )
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+    run_tick(adapter, _policy())
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1, "the owner has to unstick it: wake the creator"
+    assert run_tick.rows() == []
+
+
+def test_non_sticky_gave_up_is_still_only_a_wake(run_tick):
+    """Without ``sticky`` the card is auto-continuable: keep it off the owner's chat."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="flaky card", assignee="worker")
+        _sub(tid, "telegram")
+        kb._append_event(conn, tid, "gave_up", {"error": "boom", "failures": 3})
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+    run_tick(adapter, _policy())
+    assert adapter.sent == []
+    assert [r["event_kind"] for r in run_tick.rows()] == ["gave_up"]
 
 
 @pytest.mark.parametrize("kind", ["crashed", "timed_out", "gave_up"])
