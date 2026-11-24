@@ -1111,7 +1111,9 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
-def _card_sizing(assignee: str, body: Any) -> tuple[Optional[str], Optional[int]]:
+def _card_sizing(
+    assignee: str, body: Any, max_runtime_seconds: Optional[int] = None,
+) -> tuple[Optional[str], Optional[int]]:
     """``(advisory, estimated_minutes)`` for a card about to be created.
 
     Never raises and never blocks: a sizing heuristic must not be able to fail a
@@ -1119,22 +1121,33 @@ def _card_sizing(assignee: str, body: Any) -> tuple[Optional[str], Optional[int]
     that only appears on overrun would never let a creator author to the 30–50
     minute target); the advisory itself stays None whenever the rule has nothing
     to say.
+
+    Two axes are judged: the assignee's iteration budget and the card's own wall
+    clock (``max_runtime_seconds``, or the value ``create_task`` is about to write
+    when the creator named none). The wall is what actually kills runs on this
+    board — two cards went ``timed_out`` at 3600 s on 23.11.2026 while the rule,
+    measuring only iterations, reported them as fitting.
     """
     try:
         from agent.kanban_card_sizing import (
-            assignee_iteration_budget, estimate_card, sizing_warning,
+            assignee_iteration_budget, default_wall_seconds, estimate_card, sizing_warning,
         )
         budget = assignee_iteration_budget(assignee)
-        estimate = estimate_card(body if isinstance(body, str) else None, budget)
+        wall = max_runtime_seconds if max_runtime_seconds is not None else default_wall_seconds()
+        estimate = estimate_card(
+            body if isinstance(body, str) else None, budget, max_runtime_seconds=wall,
+        )
         return sizing_warning(estimate, assignee=assignee), estimate.estimated_minutes
     except Exception:
         logger.debug("card sizing estimate failed for assignee %s", assignee, exc_info=True)
         return None, None
 
 
-def _card_sizing_warning(assignee: str, body: Any) -> Optional[str]:
+def _card_sizing_warning(
+    assignee: str, body: Any, max_runtime_seconds: Optional[int] = None,
+) -> Optional[str]:
     """The advisory alone (kept for callers/probes that only want the text)."""
-    return _card_sizing(assignee, body)[0]
+    return _card_sizing(assignee, body, max_runtime_seconds)[0]
 
 
 @_kanban_handler("kanban_create")
@@ -1159,7 +1172,10 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    sizing_note, estimated_minutes = _card_sizing(str(assignee), args.get("body"))
+    requested_wall = _opt_int(args.get("max_runtime_seconds"))
+    sizing_note, estimated_minutes = _card_sizing(
+        str(assignee), args.get("body"), requested_wall,
+    )
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1188,7 +1204,7 @@ def _handle_create(args: dict, **kw) -> str:
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
-            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            max_runtime_seconds=requested_wall, skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
