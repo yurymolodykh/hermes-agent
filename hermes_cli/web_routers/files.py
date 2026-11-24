@@ -808,7 +808,7 @@ async def issue_file_ticket(payload: FileTicketRequest, request: Request):
         # may be outside that home, but the ticket must still die with its owner.
         owner = await asyncio.to_thread(owner_home)
         # Before the backend is chosen: an SSH profile's ticket checks its session too.
-        session = await _fs_owned_session(payload.session_id, payload.profile)
+        session = await _fs_owned_session(payload.session_id, payload.profile, request)
         if payload.route == "download":
             authority = await _fs_download_authority(
                 request, payload.path, payload.profile, payload.session_id, owner, session,
@@ -865,7 +865,7 @@ async def stream_managed_file(
     ticket route does. An SSH profile's clip streams from its SSH machine
     (``_remote_fs_backend``, the rule download uses), one Range at a time.
     Every request checks its ``session_id`` first, a ticketed one included."""
-    session = await _fs_owned_session(session_id, profile)
+    session = await _fs_owned_session(session_id, profile, request)
     authority = getattr(request.state, "file_ticket_authority", None)
     if authority is not None and authority.workspace is not None:
         target, size = await _ticketed_remote_target(authority, _remote_stream_target)
@@ -1056,7 +1056,7 @@ async def fs_list(path: str, request: Request, profile: Optional[str] = None):
 async def fs_read_text(
     path: str, request: Request = None, profile: Optional[str] = None, session_id: Optional[str] = None,
 ):
-    session = await _fs_owned_session(session_id, profile)
+    session = await _fs_owned_session(session_id, profile, request)
     # A staged paste or pick previews from this host, as read-data-url reads it back to send.
     backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
     if backend is not None:
@@ -1115,7 +1115,7 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
     file saves to the same place it was read from.
     """
     text = payload.content or ""
-    session = await _fs_owned_session(payload.session_id, profile)
+    session = await _fs_owned_session(payload.session_id, profile, request)
     # Save where read-text read: a staged paste or pick on this host, all else on the SSH machine.
     backend = await asyncio.to_thread(_remote_fs_backend, payload.path, profile)
     if backend is not None:
@@ -1211,7 +1211,9 @@ async def _fs_download_path(
     return _agent_fs_path(path, profile_home=profile_home, decode_fallback=decode_fallback)
 
 
-async def _fs_owned_session(session_id: Optional[str], profile: Optional[str]) -> Optional[dict]:
+async def _fs_owned_session(
+    session_id: Optional[str], profile: Optional[str], request: Optional[Request] = None,
+) -> Optional[dict]:
     """The session *session_id* names, looked up in *profile*'s own sessions, or None when the
     request names none. A blank id, or one that profile does not own, is 404. A route that takes a
     ``session_id`` calls this before it picks a backend, so an SSH profile refuses the same
@@ -1222,7 +1224,7 @@ async def _fs_owned_session(session_id: Optional[str], profile: Optional[str]) -
 
     if not session_id.strip():
         raise HTTPException(status_code=404, detail="Session not found")
-    return await get_session_detail(session_id, profile)
+    return await get_session_detail(session_id, request, profile)
 
 
 def _fs_profile_home(profile: Optional[str]) -> Optional[Path]:
@@ -1242,7 +1244,7 @@ async def fs_read_data_url(
     path: str, request: Request, profile: Optional[str] = None, session_id: Optional[str] = None,
 ):
     from hermes_cli.web_server import _FS_DATA_URL_MAX_BYTES
-    session = await _fs_owned_session(session_id, profile)
+    session = await _fs_owned_session(session_id, profile, request)
     backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
     if backend is not None:
         try:
@@ -1404,7 +1406,7 @@ async def fs_download(
 ):
     """A workspace file as an attachment: from the profile's SSH workspace when it has one, else
     from this host. A browser download link authenticates with a path-bound ``?ticket=``."""
-    session = await _fs_owned_session(session_id, profile)
+    session = await _fs_owned_session(session_id, profile, request)
     authority = getattr(getattr(request, "state", None), "file_ticket_authority", None)
     if authority is not None:
         return await _ticketed_fs_download(request, authority, profile)
