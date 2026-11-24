@@ -59,8 +59,10 @@ def store_lock(base: Path, *, timeout: float | None = NONBLOCKING, purpose: str 
     try:
         started = time.monotonic()
         if timeout is None:
-            # Explicitly unbounded: a caller that must eventually run (a nested snapshot inside an
-            # operation that already holds the store for its own reason) waits as long as it takes.
+            # Explicitly unbounded: a caller that is obliged to run sooner or later waits without a
+            # limit. Re-entrant use is NOT supported — flock lives on the open file description, so
+            # a second os.open() in the same process contends with the first exactly like another
+            # process would, and the inner call waits on a lock only it could release.
             held = _lock(fd, wait=True)
         elif timeout > 0:
             held = _lock(fd, wait=True, timeout=timeout)
