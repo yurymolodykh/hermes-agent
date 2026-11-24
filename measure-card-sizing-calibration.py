@@ -61,7 +61,7 @@ def pct(values: list[int], p: int) -> int:
 
 def whole_minutes(seconds: int) -> int:
     """Seconds to whole minutes, half up."""
-    return int(math.floor(seconds / 60.0 + 0.5))
+    return math.floor(seconds / 60.0 + 0.5)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,8 +112,10 @@ def main(argv: list[str] | None = None) -> int:
             f"{CALIBRATION_P80_MINUTES.get(items, '-')}"
         )
         quoted = items in CALIBRATION_P50_MINUTES
-        if quoted and (p50m != CALIBRATION_P50_MINUTES[items]
-                       or p80m != CALIBRATION_P80_MINUTES[items]):
+        if quoted and (
+            p50m != CALIBRATION_P50_MINUTES[items]
+            or p80m != CALIBRATION_P80_MINUTES[items]
+        ):
             drift += 1
             module += "  <- MISMATCH"
         print(
@@ -127,7 +129,9 @@ def main(argv: list[str] | None = None) -> int:
             "(held at the six-item point on purpose: fan-out parents measure lower)"
         )
     if drift:
-        print(f"\n{drift} quoted bucket(s) disagree with the module — update the constants")
+        print(
+            f"\n{drift} quoted bucket(s) disagree with the module — update the constants"
+        )
         return 1
     print("\nall quoted buckets match the module constants")
     return 0

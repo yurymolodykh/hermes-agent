@@ -81,6 +81,7 @@ legitimately be bigger than the profile and be split by its creator.
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 from dataclasses import dataclass
@@ -126,7 +127,7 @@ _ACCEPTANCE_HEADING = re.compile(
 _ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+\S")
 
 
-def _interpolate_minutes(table: "dict[int, int]", acceptance_items: int) -> int:
+def _interpolate_minutes(table: dict[int, int], acceptance_items: int) -> int:
     """The table's figure for this item count: linear between points, clamped at both ends."""
     items = max(0, acceptance_items)
     points = sorted(table)
@@ -137,11 +138,11 @@ def _interpolate_minutes(table: "dict[int, int]", acceptance_items: int) -> int:
         # buckets are fan-out parents whose wall clock falls back (7+ measures *lower*),
         # so a fitted slope would predict a bigger card as faster.
         return table[points[-1]]
-    for lower, upper in zip(points, points[1:]):
+    for lower, upper in itertools.pairwise(points):
         if lower <= items <= upper:
             span = upper - lower
             frac = (items - lower) / span
-            return int(round(table[lower] + (table[upper] - table[lower]) * frac))
+            return round(table[lower] + (table[upper] - table[lower]) * frac)
     return table[points[-1]]
 
 
@@ -166,7 +167,7 @@ def wall_minutes(max_runtime_seconds: Optional[int]) -> Optional[int]:
     """The wall expressed in whole minutes (rounded up), or None when the card has none."""
     if max_runtime_seconds is None:
         return None
-    return int(math.ceil(max(0, max_runtime_seconds) / 60))
+    return math.ceil(max(0, max_runtime_seconds) / 60)
 
 
 @dataclass(frozen=True)
