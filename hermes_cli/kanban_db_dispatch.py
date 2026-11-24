@@ -126,7 +126,8 @@ class DispatchResult:
     misfiled task waiting for routing)."""
     skipped_anonymous: list[str] = field(default_factory=list)
     """Ready/review task ids refused on the LIVE board because they carry no
-    author and only a placeholder assignee (``default``). The creation fuse
+    author and only an assignee no real profile can run (a placeholder such as
+    ``default``, or a generic noun such as ``worker``). The creation fuse
     (``create_task``) stops new ones; this bucket covers rows that predate it —
     probe leftovers that would otherwise crash-loop the queue and page a human.
     Never operator-actionable as work: the card must be archived or given a
