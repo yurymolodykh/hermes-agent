@@ -288,6 +288,12 @@ def _team_card_dirs(subject: Any) -> list[Path]:
     return out
 
 
+#: ``(path, mtime_ns, size) -> terminal.cwd`` for the shared work-dir lookup. ``file_roots`` runs
+#: on EVERY file listing, and parsing thirteen 89-key config files there cost ~700 ms a call; the
+#: stamp re-reads only when a config actually changed. Bounded by the number of shared profiles.
+_work_dir_cache: dict[tuple[str, int, int], Optional[Path]] = {}
+
+
 def _shared_work_dirs() -> list[Path]:
     """The working directories of the SHARED profiles — where the team's own work lands.
 
@@ -330,22 +336,38 @@ def _profile_work_dir(home: Path) -> Optional[Path]:
     Read EXACTLY as written (``read_user_config_raw``): the value is a plain path, and the
     defaults/expansion of ``load_config()`` would both materialise a home and turn a relative
     ``"."`` into the process's cwd — the launch profile's own tree, which is not this profile's.
+
+    Memoised on ``(path, mtime_ns, size)``: parsing thirteen full configs on every file listing is
+    ~700 ms, while a config that has not changed cannot have a different ``cwd``. The first call
+    in a process pays that once (~770 ms), every later one ~3 ms; a ``touch`` re-reads one file.
     """
+    config_path = Path(home) / "config.yaml"
+    try:
+        stat = config_path.stat()
+        key = (str(config_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+    if key in _work_dir_cache:
+        return _work_dir_cache[key]
     try:
         from hermes_cli.config import read_user_config_raw
 
-        data = read_user_config_raw(Path(home) / "config.yaml")
+        data = read_user_config_raw(config_path)
     except Exception:  # health: allow BLE001 -- an unreadable config grants nothing
         logger.debug("acl results: shared profile config unreadable under %s", home, exc_info=True)
+        _work_dir_cache[key] = None
         return None
     terminal = data.get("terminal") if isinstance(data, dict) else None
     raw = terminal.get("cwd") if isinstance(terminal, dict) else None
     text = str(raw or "").strip()
-    if not text or not Path(text).is_absolute():
-        return None
-    resolved = _real(text)
-    if resolved is None or not resolved.is_dir():
-        return None
+    resolved: Optional[Path] = None
+    if text and Path(text).is_absolute():
+        candidate = _real(text)
+        if candidate is not None and candidate.is_dir():
+            resolved = candidate
+    _work_dir_cache[key] = resolved
+    if len(_work_dir_cache) > 256:  # a long-lived process seeing many temp homes (tests, probes)
+        _work_dir_cache.pop(next(iter(_work_dir_cache)))
     return resolved
 
 
