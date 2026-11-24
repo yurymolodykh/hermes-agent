@@ -826,7 +826,7 @@ class SessionAuthority:
         except RuntimeStoreError as exc:
             if exc.reason != 'stale_generation':
                 raise
-        row = get_session_admission(self.db, admission_id=admission_id)
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         if row is None or row['status'] != 'started':
             raise RuntimeStoreError('stale_generation')
         return row
