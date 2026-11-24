@@ -22,6 +22,13 @@ from starlette.websockets import WebSocketDisconnect
 
 import hermes_acl_identity
 import hermes_acl_profiles as prof_acl
+# Imported at module level on purpose: importing from inside a test body runs
+# ``hermes_bootstrap._settle_interrupted_update`` after the autouse HomeIOGuard
+# is installed, and its ``interrupted_pull_marker`` stat resolves the worktree's
+# git dir under the real home (TEST BUG, not a code defect). Module-level imports
+# happen during collection, before the guard.
+import hermes_cli.web_server  # noqa: F401
+import tui_gateway.ws  # noqa: F401
 
 _TOKEN = "d" * 43
 ALICE = "person/alice"
