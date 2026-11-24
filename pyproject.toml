@@ -265,7 +265,7 @@ piper = [
 modal = ["modal==1.6.2"]
 daytona = ["daytona==0.225.0"]
 vercel = ["vercel==0.12.0"]
-google-meet = ["playwright==1.64.0; sys_platform != 'android'", "websockets==15.0.1; sys_platform != 'android'"]
+google-meet = ["playwright==1.65.2; sys_platform != 'android'", "websockets==15.0.1; sys_platform != 'android'"]
 messaging = [
   "python-telegram-bot[webhooks]==22.8",
   "discord.py[voice]==2.7.1",
@@ -405,6 +405,29 @@ documents = [
 documents-pdf = [
   "pdfplumber==0.11.10",
   "pypdfium2==5.14.0",
+]
+# Runtime dependencies of shared-skills/creative/infographic-poster-pipeline.
+# The skill drives a real Chromium through Playwright (A2 geometry/contrast,
+# A3 raster contrast, A4 fonts), reads the produced PDF with PyMuPDF (A6
+# text layer, mediabox) and, when the plan has a table, exports data.xlsx with
+# openpyxl. All three are imported lazily by the scripts, so a missing module
+# only surfaced as a mid-run failure with no advance warning — declare them
+# here and gate the run with scripts/igp_preflight.py instead.
+# `documents` already pins openpyxl==3.1.5; the same version is repeated here
+# so the extra is self-sufficient (test_extras_pin_each_package_at_one_version
+# forbids cross-extra drift, so keep the pins equal).
+# Playwright is pinned to 1.65.2 deliberately: its bundled browser revision is
+# chromium-1255, which is what ~/.cache/ms-playwright already holds. 1.64.x
+# wants revision 1248 and would trigger a fresh ~130 MB browser download.
+# Only the Python module is declared — never run `playwright install`.
+# Deliberately NOT platform-gated as a whole extra: openpyxl and PyMuPDF are
+# portable, so the extra stays installable everywhere (the `[voice]` precedent
+# — playwright itself carries the android marker, and pm.extras.available()
+# simply reports the extra absent on a machine whose anchor cannot import).
+infographic = [
+  "playwright==1.65.2; sys_platform != 'android'",
+  "pymupdf==1.28.2",
+  "openpyxl==3.1.5",
 ]
 trace-upload = ["huggingface-hub==1.33.0"]
 # Cloud memory providers are opt-in PM extras. They stay outside [all]
@@ -567,6 +590,10 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  # Skill dependency set (policy above: "skill deps that dev environments
+  # need"). The poster pipeline must be runnable right after a rebuild, so
+  # its three imports are proved at sync time instead of failing mid-run.
+  "hermes-agent[infographic]",
 ]
 
 [dependency-groups]
