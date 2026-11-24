@@ -8,6 +8,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -347,10 +348,69 @@ async def _receipt(client, claim):
     return await client.rpc('prompt.receipt', session_id=claim.session_id, admission_id=claim.admission_id)
 
 
+def _install_stop_handler():
+    """Name the cause of an external stop from inside the worker, then exit.
+
+    A dispatcher reclaim, an archive or a shutdown SIGTERMs this process. Without a handler that
+    death is invisible: no trailer, no event, and the owner's side reads only ``EOFError`` where
+    the frame stream ended. The handler reads the reason the stopper wrote BEFORE signalling
+    (``hermes_cli.kanban_stop_reason``), appends a durable ``worker_stopping`` event to the card
+    and prints the exit trailer, so the log and the board both say WHY.
+
+    Never raises and never blocks the stop: an unknown reason still exits, with the trailer, and
+    the board then reads ``unknown`` — which is exactly a SIGKILL's meaning.
+    """
+    import signal
+
+    def _on_stop(signum, frame):  # noqa: ARG001 - signal handler signature
+        reason, detail = "unknown", ""
+        try:
+            from hermes_cli import kanban_stop_reason as ksr
+            payload = ksr.read_reason_for_workspace(os.environ.get("HERMES_KANBAN_WORKSPACE"))
+            if payload:
+                reason, detail = payload.get("reason", "unknown"), payload.get("detail", "")
+            _record_stopping(reason, detail, signum)
+        except BaseException:
+            pass
+        finally:
+            try:
+                from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+                print(f'\n{KANBAN_WORKER_EXIT_TRAILER}1', file=sys.stderr, flush=True)
+                print(f'KANBAN_WORKER_STOPPED reason={reason} detail={detail}', file=sys.stderr, flush=True)
+            except BaseException:
+                pass
+            # A half-written frame on the socket must not hold the process open.
+            os._exit(1)
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            with contextlib.suppress(ValueError, OSError, RuntimeError):
+                signal.signal(sig, _on_stop)
+
+
+def _record_stopping(reason, detail, signum):
+    """Append the durable ``worker_stopping`` event for this attempt (best effort)."""
+    task_id, run_id, db_path = (os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID"),
+                                os.environ.get("HERMES_KANBAN_DB"))
+    if not (task_id and run_id and db_path):
+        return
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli import kanban_db as kb
+    from pathlib import Path
+    payload = {"reason": reason, "detail": str(detail or "")[:200], "signal": int(signum), "pid": os.getpid()}
+    with connect_closing(Path(db_path)) as conn, kb.write_txn(conn):
+        row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if row is None or row[1] != int(run_id):
+            return  # the attempt already moved on: this note would describe a later run
+        kb._append_event(conn, task_id, 'worker_stopping', payload, run_id=int(run_id))
+
+
 def main():
     # The dead-worker sweep books this process's exit from the trailer in its log (it never
     # reaps us), so every exit path writes it — the same contract as a quiet one-shot worker.
     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+    _install_stop_handler()
     rc = 1
     try:
         rc = _submit()

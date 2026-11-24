@@ -339,6 +339,12 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
     Never raises: the caller's own loss handling must not depend on the board write.
+
+    ``reason`` arrives as the transport failure that ended the frame stream (``EOFError`` when the
+    worker was SIGTERMed, which says nothing about WHY). The stopper writes the cause to the card's
+    stop-reason file before signalling, so it is read here and replaced by the real one
+    (``limit_exceeded``/``reassigned``/``archived``/``shutdown``); with no record the text stays
+    ``unknown`` — a SIGKILL leaves no file and must not claim a cause it cannot know.
     """
     try:
         context = json.loads(policy.kanban_json or 'null')
@@ -347,15 +353,20 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli import kanban_db as kb
         run_id = int(context['run_id'])
+        from hermes_cli import kanban_stop_reason as ksr
+        stop = ksr.read_reason_for_workspace(context.get('workspace'))
+        reason_text = ksr.describe(stop, fallback=f'unknown ({reason})')
         with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
             row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?',
                                (context['task_id'],)).fetchone()
             if row is None or row[0] != 'running' or row[1] != run_id:
                 return
-            kb._append_event(conn, context['task_id'], 'worker_lost',
-                             {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
-                             run_id=run_id)
+            payload = {'reason': reason_text[:200], 'transport_error': str(reason)[:80],
+                       'claim_lock': context['claim_lock'], 'run_id': run_id, 'pid': pid,
+                       'bound': bool(bound)}
+            if stop:
+                payload['stop_reason'] = stop.get('reason')
+            kb._append_event(conn, context['task_id'], 'worker_lost', payload, run_id=run_id)
     except Exception:
         import logging
         logging.getLogger(__name__).exception('kanban worker_lost record failed')

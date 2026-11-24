@@ -2532,7 +2532,7 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, workspace_path "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -2554,6 +2554,8 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            stop_reason="reassigned", task_id=row["id"], workspace=row["workspace_path"],
+            stop_detail="остановлен: карточка перепризначена, попытка освобождена",
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2582,6 +2584,7 @@ def release_stale_claims(
             run_id = _record_reclaim(
                 conn, row["id"], termination,
                 error=error,
+                reason="reassigned",
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
@@ -2615,14 +2618,27 @@ def release_stale_claims(
 
 def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
+    reason: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-    (payload merged with the termination report). Caller holds the txn."""
+    (payload merged with the termination report). Caller holds the txn.
+
+    ``reason`` is the stop cause (``reassigned`` for a reclaim). It is copied into BOTH the
+    event payload and ``task_runs.metadata``: the workspace and its reason file are deleted when
+    the card is archived or completed, so the board itself has to carry why the worker died.
+    """
     run_id = _end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
     )
     payload.update(termination)
+    if reason:
+        payload.setdefault("stop_reason", reason)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    if reason and run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (_json_or_null({**(termination or {}), "stop_reason": reason}), run_id),
+        )
     return run_id
 
 
@@ -2662,7 +2678,7 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, worker_started_at, workspace_path FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -2671,7 +2687,10 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"],
+        stop_reason="reassigned", task_id=task_id, workspace=row["workspace_path"],
+        stop_detail="остановлен: карточка перепризнана, попытка освобождена",
+    )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -4034,13 +4053,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        prev_workspace = row["workspace_path"]
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -4052,10 +4072,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
+            metadata={"stop_reason": "archived"} if was_running else None,
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", {"stop_reason": "archived"} if was_running else None,
+                      run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+            stop_reason="archived", task_id=task_id, workspace=prev_workspace,
+            stop_detail="остановлен: карточка архивирована",
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
