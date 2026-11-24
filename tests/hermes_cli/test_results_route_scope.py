@@ -604,6 +604,34 @@ class TestKanbanAttachmentRoutes:
 class TestTeamMaterialStaysOpen:
     """The owner's rule: what the team produced belongs to the team; only people stay separate."""
 
+    def test_private_conversation_stays_closed_while_cards_open(
+            self, multi_user, registry, kanban_home, board):
+        """Acceptance #2: opening the board must not have opened anybody's dialog.
+
+        The kanban change is measured first — a neighbour's card and its file ARE visible — and
+        then the session gate is asked the same question and still says no. Without this pair the
+        "we only opened materials" claim has no counter-example.
+        """
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli.web_routers import _session_acl as session_acl
+
+        conn = kbc.connect(db_path=kb.kanban_db_path())
+        try:
+            foreign_card = kb.get_task(conn, board["bob"]["task"])
+        finally:
+            conn.close()
+        assert results_acl.task_visible(_request_as("alice"), foreign_card) is True
+
+        # A session row owned by bob: alice's scope must not match it.
+        alice_scope = session_acl.session_scope(_request_as("alice"))
+        assert alice_scope is not None, "multi-user mode must scope the session surface"
+        bob_row = {"user_id": f"person/bob", "session_id": "20261125_000000_bob"}
+        assert session_acl.row_outside(bob_row, alice_scope) is True
+        with pytest.raises(Exception) as caught:
+            session_acl.require_row(bob_row, alice_scope)
+        assert getattr(caught.value, "status_code", None) == 404, "a foreign dialog is a 404, not a 403"
+
     def test_the_board_is_not_narrowed_by_the_requesting_person(
             self, multi_user, registry, kanban_home, board):
         """A colleague's board must show the same cards as the owner's — measured, not assumed."""
