@@ -4,7 +4,9 @@ generation provider ABCs.
 Several backends return *ephemeral* delivery URLs that expire before a downstream
 consumer (Telegram ``send_photo``, browser fetch) can resolve them, so providers
 materialise the bytes locally at tool-completion time. Filenames are
-``<prefix>_<YYYYMMDD_HHMMSS>_<uuid8>.<ext>``.
+``<prefix>_<YYYYMMDD_HHMMSS>_<uuid8>.<ext>``, where ``prefix`` is sanitised to
+``[A-Za-z0-9._-]`` (a provider model id such as ``vendor/model`` would otherwise
+nest the path into a subdirectory that does not exist).
 """
 
 from __future__ import annotations
@@ -39,9 +41,9 @@ def _safe_prefix(prefix: str) -> str:
     """Map *prefix* onto ``[A-Za-z0-9._-]`` for use in a cache filename.
 
     Safe values pass through unchanged (the sanitiser is idempotent), so existing
-    filenames keep their shape. Runs of unsafe characters (``/``, spaces, ``\\``,
-    quotes, ...) collapse to a single ``_``. A prefix that sanitises to nothing or to
-    a bare dot-run (``.``/``..``/``...``) becomes ``_`` — never a traversal token.
+    filenames keep their shape. Every unsafe character (``/``, space, ``\\``, quotes,
+    ...) becomes a single ``_``. A prefix that sanitises to nothing or to a bare
+    dot-run (``.``/``..``/``...``) becomes ``_`` — never a traversal token.
     """
     safe = _UNSAFE_PREFIX_CHARS.sub("_", str(prefix))
     if not safe.strip("."):
