@@ -457,10 +457,15 @@ class CreateTaskBody(BaseModel):
 
 
 @router.post("/tasks")
-def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+def create_task(payload: CreateTaskBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
         # CreateTaskBody field names match create_task's keyword parameters.
-        task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
+        # ``created_by`` names the PERSON who ordered the card, not the surface that made it:
+        # with multi-user identity on, the request's verified subject; otherwise the legacy
+        # literal, so turning the flag off restores the old row byte for byte.
+        created_by = kanban_customer.creator_label(kanban_customer.LEGACY_DASHBOARD_LABEL, request)
+        task_id = kanban_db.create_task(conn, created_by=created_by, board=board, **payload.model_dump())
+        _subscribe_customer(conn, task_id, created_by)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(
             task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
