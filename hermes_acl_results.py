@@ -307,8 +307,16 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
     if not scoped(request):
         return None
     subject = request_subject(request)
+    # A signed-in dashboard subject is a composite (``auth:v1:[provider, issuer, user_id]``), which
+    # the bindings registry does not key profiles by: resolving it to the person's stamps first is
+    # what makes the roots non-empty for a cookie login. A bare stamp still answers as before.
+    names: list[str] = []
+    for mark in sorted(stamps(subject)):
+        for name in profile_names(mark):
+            if name not in names:
+                names.append(name)
     roots: list[Path] = []
-    for name in profile_names(subject):
+    for name in names:
         home = _profile_home(name)
         if home is not None and home not in roots:
             roots.append(home)
