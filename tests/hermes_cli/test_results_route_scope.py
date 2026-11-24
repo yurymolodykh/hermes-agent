@@ -409,9 +409,25 @@ class TestCardOwnership:
             foreign = kb.get_task(conn, board["bob"]["task"])
         finally:
             conn.close()
-        assert results_acl.task_visible(_request_as("alice"), foreign) is False
+        # Reading is TEAM: a neighbour's card and its materials are visible to any verified caller.
+        assert results_acl.task_visible(_request_as("alice"), foreign) is True
+        # Changing it is not: alice does not hold bob's work order.
+        assert results_acl.task_writable(_request_as("alice"), foreign) is False
 
-    def test_require_task_refuses_a_neighbours_card_with_the_absent_id_miss(
+    def test_a_personal_contour_card_stays_private(self, multi_user, registry, kanban_home, board):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        conn = kbc.connect(db_path=kb.kanban_db_path())
+        try:
+            private = kb.get_task(conn, board["bob"]["task"])
+        finally:
+            conn.close()
+        private.tenant = f"{results_acl.PERSONAL_TENANT_PREFIX}{BOB}"
+        assert results_acl.task_visible(_request_as("alice"), private) is False
+        assert results_acl.task_visible(_request_as("bob"), private) is True
+
+    def test_require_task_refuses_a_change_to_a_neighbours_card(
             self, multi_user, registry, kanban_home, board):
         from fastapi import HTTPException
 
@@ -423,9 +439,10 @@ class TestCardOwnership:
             foreign = kb.get_task(conn, board["bob"]["task"])
         finally:
             conn.close()
+        results_acl.require_task(_request_as("alice"), foreign, board["bob"]["task"])  # read: allowed
         with pytest.raises(HTTPException) as caught:
-            results_acl.require_task(_request_as("alice"), foreign, board["bob"]["task"])
-        assert caught.value.status_code == 404
+            results_acl.require_task_write(_request_as("alice"), foreign, board["bob"]["task"])
+        assert caught.value.status_code == 403
 
     def test_the_owner_sees_every_card(self, multi_user, registry, kanban_home, board):
         from hermes_cli import kanban_db as kb
@@ -481,15 +498,35 @@ class TestKanbanAttachmentRoutes:
         assert response.content == b"alice's private notes"
 
     def test_a_neighbours_attachment_by_id_is_refused(self, multi_user, registry, kanban_home, board):
+        # TEAM material: the file a producer made on bob's card must reach the person who needs
+        # it, so a verified non-owner downloads it (this is the owner's headline requirement).
         response = _kanban_app("alice").get(
             f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
+        assert response.status_code == 200
+        assert response.content == b"bob's private notes"
+
+    def test_an_anonymous_attachment_fetch_is_refused(self, multi_user, registry, kanban_home, board):
+        class _NoIdentity:
+            def __init__(self, user_id="", provider="", issuer=""):
+                self.user_id, self.provider, self.issuer = user_id, provider, issuer
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def _stamp(request, call_next):
+            request.state.session = _NoIdentity()
+            return await call_next(request)
+
+        app.include_router(_load_kanban_router(), prefix="/api/plugins/kanban")
+        response = TestClient(app).get(
+            f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
         assert response.status_code == 404
-        assert "bob" not in response.text
 
     def test_a_neighbours_attachment_listing_is_refused(self, multi_user, registry, kanban_home, board):
         response = _kanban_app("alice").get(
             f"/api/plugins/kanban/tasks/{board['bob']['task']}/attachments")
-        assert response.status_code == 404
+        assert response.status_code == 200
+        assert [a["filename"] for a in response.json()["attachments"]] == ["note.txt"]
 
     def test_own_attachment_listing_works(self, multi_user, registry, kanban_home, board):
         response = _kanban_app("alice").get(

@@ -133,22 +133,60 @@ def _require_task(conn: sqlite3.Connection, task_id: str) -> kanban_db.Task:
     return _require(kanban_db.get_task, conn, task_id, "task")
 
 
+def _requester_stamp(request: Optional[Request]) -> str:
+    """The verified subject behind a dashboard request, for ``created_by`` / ``uploaded_by``.
+
+    Falls back to ``"dashboard"`` only when the request carries no identity at all (an
+    unauthenticated local backend, unit tests): storing a fake person would be worse than the
+    honest "it came from the UI".
+    """
+    try:
+        from hermes_acl_results import request_subject
+
+        subject = str(request_subject(request) or "").strip()
+    except Exception:  # health: allow BLE001 -- an unreadable identity must not fail a create
+        subject = ""
+    return subject or "dashboard"
+
+
 def _require_owned_task(
         conn: sqlite3.Connection, task_id: str, request: Optional[Request],
         *, not_found: Optional[str] = None) -> kanban_db.Task:
-    """The task, if THIS caller may touch its attachments (МПД Т6).
+    """The task, if THIS caller may READ it and its materials (МПД Т6 + team sharing).
 
-    Attachment ids are small integers, so "download by id" was a walk over every card on the
-    board. Ownership is decided by :func:`hermes_acl_results.require_task` — the same policy the
-    file and memory surfaces use — against the card's ``created_by``/``assignee``. A foreign card
-    answers with the miss an absent id gets, so the sequence is not an enumeration oracle. With
-    ``acl.multi_user`` off (or for the host owner) every card is allowed, as before.
+    Attachment ids are small integers, so "download by id" must not be a walk over every card on
+    the board — but the card's MATERIALS are the team's: a file a producer made on a card has to
+    be downloadable by the person who ordered it, by the reviewer, by anyone. The read boundary is
+    :func:`hermes_acl_results.require_task`: it refuses an anonymous call and a personal-contour
+    card, and admits every other verified caller. With ``acl.multi_user`` off (or for the host
+    owner) everything is allowed, exactly as before.
     """
     task = _require_task(conn, task_id)
     from hermes_acl_results import require_task
 
     try:
         require_task(request, task, task_id)
+    except HTTPException:
+        if not_found:
+            raise HTTPException(status_code=404, detail=not_found) from None
+        raise
+    return task
+
+
+def _require_held_task(
+        conn: sqlite3.Connection, task_id: str, request: Optional[Request],
+        *, not_found: Optional[str] = None) -> kanban_db.Task:
+    """The task, if THIS caller may CHANGE it (its creator or assignee).
+
+    Reading is shared, changing is not: moving a card's status, deleting it or deleting its
+    attachment rewrites somebody else's work order, so the ownership stamps decide (403 — the
+    caller can read the card a line earlier, so a 404 would be a lie). Same switch as above.
+    """
+    task = _require_task(conn, task_id)
+    from hermes_acl_results import require_task_write
+
+    try:
+        require_task_write(request, task, task_id)
     except HTTPException:
         if not_found:
             raise HTTPException(status_code=404, detail=not_found) from None
@@ -403,6 +441,7 @@ async def get_board_endpoint(
 @router.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
+    request: Request,
     board: Optional[str] = Query(None),
     run_state_type: Optional[str] = Query(None, description="With run_state_name: filter runs by column 'status' or 'outcome'"),
     run_state_name: Optional[str] = Query(None, description="With run_state_type: exact value for that run column")):
@@ -411,7 +450,7 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type and run_state_name must be passed together or omitted")
         if run_state_type not in (None, "status", "outcome"):
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
-        task = _require_task(conn, task_id)
+        task = _require_owned_task(conn, task_id, request)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
         task_d = _task_dict(
             task, latest_summary=kanban_db.latest_summary(conn, task_id),
@@ -457,10 +496,14 @@ class CreateTaskBody(BaseModel):
 
 
 @router.post("/tasks")
-def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+def create_task(payload: CreateTaskBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
-        # CreateTaskBody field names match create_task's keyword parameters.
-        task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
+        # CreateTaskBody field names match create_task's keyword parameters. ``created_by`` is the
+        # REAL caller, never the constant "dashboard": the person who ordered the work is the
+        # address the finished artifact has to reach, and a card stamped "dashboard" has no owner
+        # to deliver to (the whole board shipped 18 such rows).
+        task_id = kanban_db.create_task(
+            conn, created_by=_requester_stamp(request), board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(
             task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
@@ -503,7 +546,9 @@ async def upload_task_attachment(
     """Store an upload under ``attachments_root(board)/<task_id>/`` (sanitised,
     collision-resolved name; ``_safe_attachment_name`` ValueError → 400) and record it."""
     with _board_conn(board) as (board, conn), _value_error_400():
-        _require_owned_task(conn, task_id, request)
+        # Adding a file writes into the card's folder, so the holder decides (the assignee is in
+        # that set: a producer dropping its deliverable onto its own card is the normal case).
+        _require_held_task(conn, task_id, request)
         safe_name = _safe_attachment_name(file.filename or "")
         dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -523,7 +568,7 @@ async def upload_task_attachment(
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
         att_id = kanban_db.add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
-            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"))
+            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or _requester_stamp(request)))
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
 
@@ -557,7 +602,9 @@ def remove_attachment(
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
-        _require_owned_task(conn, att.task_id, request, not_found="attachment not found")
+        # Reading a teammate's file is allowed; DELETING it destroys their deliverable, so the
+        # card's holder decides.
+        _require_held_task(conn, att.task_id, request, not_found="attachment not found")
         if kanban_db.delete_attachment(conn, attachment_id) is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
@@ -725,9 +772,10 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(task_id: str, payload: UpdateTaskBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        # A status transition / reassignment rewrites somebody's work order: the holder decides.
+        _require_held_task(conn, task_id, request)
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
@@ -752,8 +800,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, board: Optional[str] = Query(None)):
+def delete_task(task_id: str, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
+        _require_held_task(conn, task_id, request)
         if not kanban_db.delete_task(conn, task_id):
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
@@ -835,12 +884,14 @@ class CommentBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/comments")
-def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
+def add_comment(task_id: str, payload: CommentBody, request: Request, board: Optional[str] = Query(None)):
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+        # A comment on a team card is team material: any verified caller may add one, but the
+        # author recorded is the real person, so a thread stays attributable.
+        _require_owned_task(conn, task_id, request)
+        kanban_db.add_comment(conn, task_id, author=payload.author or _requester_stamp(request), body=payload.body)
         return {"ok": True}
 
 
@@ -1110,10 +1161,10 @@ def estimate_text_endpoint(payload: EstimateBody):
 
 
 @router.post("/tasks/{task_id}/estimate")
-def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
+def estimate_task_endpoint(task_id: str, request: Request, board: Optional[str] = Query(None)):
     """Estimate for an existing task; ``{ok, est_tokens, complexity, rationale, model}``."""
     with _board_conn(board) as (board, conn):
-        task = _require_task(conn, task_id)
+        task = _require_owned_task(conn, task_id, request)
     return _run_estimate(task.title, task.body, task_id=task_id)
 
 
@@ -1244,7 +1295,7 @@ def get_home_channels(task_id: Optional[str] = Query(None), board: Optional[str]
 
 
 @router.post("/tasks/{task_id}/home-subscribe/{platform}")
-def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
+def subscribe_home(task_id: str, platform: str, request: Request, board: Optional[str] = Query(None)):
     """Subscribe *task_id* to *platform*'s home channel. Idempotent at the DB
     layer; 404 when the platform has no home or the task doesn't exist."""
     home = _home_for_platform(
@@ -1253,7 +1304,8 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         f"Set one from the messenger via /sethome, or configure "
         f"gateway.platforms.{platform}.home_channel in config.yaml.")
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        # Subscribing a card to a chat decides where its work gets ANNOUNCED: the holder's call.
+        _require_held_task(conn, task_id, request)
         kbn.add_notify_sub(
             conn, task_id=task_id, platform=platform, chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name())
@@ -1261,10 +1313,11 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
 
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
-def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
+def unsubscribe_home(task_id: str, platform: str, request: Request, board: Optional[str] = Query(None)):
     """Remove any notify subscription on *task_id* matching *platform*'s home."""
     home = _home_for_platform(platform, f"No home channel configured for platform {platform!r}.")
     with _board_conn(board) as (board, conn):
+        _require_held_task(conn, task_id, request)
         kbn.remove_notify_sub(
             conn, task_id=task_id, platform=platform, chat_id=home["chat_id"], thread_id=home["thread_id"] or None)
         return {"ok": True, "task_id": task_id, "home_channel": home}
