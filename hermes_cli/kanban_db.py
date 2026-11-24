@@ -346,14 +346,20 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 DEFAULT_BOARD = "default"
 
 # Hard wall-clock fuse written into every card created without an explicit
-# ``max_runtime_seconds``. POLICY (owner decision, 23.11.2026): one hour per card is
-# a TARGET, not a ceiling. The board's median run is ~37 min, ~30 % of runs exceed
-# 60 min and 15 % exceed 90 — so a limit AT the target kills cards the planner merely
-# underestimated. The fuse therefore sits at 2x the target: it only stops runaway
-# work, never a card that is close to done. The soft signal is separate and earlier:
-# ``agent.run_budget_seconds: 5400`` injects a one-time "wrap up and deliver" notice
-# at 80 % of that (≈72 min), which is a nudge, not a kill.
-DEFAULT_MAX_RUNTIME_SECONDS = 7200
+# ``max_runtime_seconds``. POLICY (owner decision, 23.11.2026 — «3 часа ставь лимит»):
+# three hours is the ceiling of patience; ONE hour stays the planning TARGET, not a
+# limit. The board's median run is ~37 min, ~30 % of runs exceed 60 min and 15 % exceed
+# 90 — so a fuse AT the target kills cards the planner merely underestimated. The fuse
+# only stops runaway work, never a card that is close to done.
+#
+# INVARIANT — the hard fuse must be >= the soft budget, or the soft signal is dead code:
+# the wrap-up notice fires at 80 % of ``agent.run_budget_seconds``
+# (``_maybe_inject_run_budget_wrapup``) and the dispatcher kills the run at this fuse.
+# With the 3-hour budget the live pair is 10800 s soft / 8640 s notice / 10800 s fuse —
+# reachable, and the notice arrives ~36 min before the kill. Keep any ``run_budget_seconds``
+# (main config: 10800; profile overrides may be lower, e.g. 5400 -> notice at 4320) below
+# this fuse; a budget above it makes the notice unreachable and the run is simply killed.
+DEFAULT_MAX_RUNTIME_SECONDS = 10800
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override", default=None,
 )

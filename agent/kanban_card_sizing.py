@@ -116,9 +116,10 @@ CALIBRATION_P50_MINUTES = {0: 23, 3: 42, 4: 42, 5: 46, 6: 59}
 CALIBRATION_P80_MINUTES = {0: 61, 3: 81, 4: 79, 5: 90, 6: 86}
 # The owner's target for one run: a card is authored to close in 30–50 minutes.
 CARD_MINUTE_TARGET = 50
-# Wall-clock cap written into a card that names none (``hermes_cli.kanban_db``'s own
-# default). Read lazily so this module keeps importing without the CLI package.
-FALLBACK_MAX_RUNTIME_SECONDS = 3600
+# Wall-clock cap assumed when a card names none and ``hermes_cli.kanban_db`` cannot be
+# imported (the CLI package is optional for this module). It is a last-resort stand-in,
+# never the policy: the live value is read from the DB constant on each call.
+FALLBACK_MAX_RUNTIME_SECONDS = 10800
 
 _ACCEPTANCE_HEADING = re.compile(
     r"(?im)^\s*(?:#+\s*)?(?:\*\*)?\s*(?:приёмка|приемка|acceptance|критерии|"

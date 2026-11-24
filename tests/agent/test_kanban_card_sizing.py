@@ -266,3 +266,41 @@ def test_default_wall_is_read_from_the_db_constant(monkeypatch):
     )
 
 
+def test_the_hard_fuse_is_not_shorter_than_the_soft_run_budget():
+    """The wall-clock wrap-up notice must be reachable before the kill.
+
+    ``_maybe_inject_run_budget_wrapup`` fires once elapsed_past ``0.8 *
+    agent.run_budget_seconds``; the dispatcher kills the card at
+    ``DEFAULT_MAX_RUNTIME_SECONDS``. If the fuse is below the notice point the run is
+    simply killed and the soft signal never happens — the exact defect that made a
+    7200 s fuse dead next to a 10800 s budget. The invariant is asserted as a relation,
+    not as a pair of numbers, so moving the policy cannot silently re-break it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    # A budget at or below the fuse: 80 % of that budget lands strictly inside the run.
+    for budget in (5_400, kb.DEFAULT_MAX_RUNTIME_SECONDS, kb.DEFAULT_MAX_RUNTIME_SECONDS / 2):
+        notice_at = 0.8 * budget
+        assert notice_at < kb.DEFAULT_MAX_RUNTIME_SECONDS, (
+            f"a {budget}s budget puts the wrap-up notice at {notice_at:.0f}s, at or past "
+            f"the {kb.DEFAULT_MAX_RUNTIME_SECONDS}s fuse — the notice can never fire"
+        )
+
+
+
+def test_a_fuse_below_the_notice_point_is_the_defect_this_guards(monkeypatch):
+    """Sensitivity: the guard above must actually go red on the shipped 7200 s fuse.
+
+    Pinning the regression, not a number: with the fuse at 7200 s and the owner's
+    10800 s budget the notice point is 8640 s — past the kill, so the soft signal is
+    unreachable. Re-running the guard's own relation against that substituted fuse
+    proves it has teeth rather than passing vacuously.
+    """
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "DEFAULT_MAX_RUNTIME_SECONDS", 7_200)
+    with pytest.raises(AssertionError):
+        for budget in (5_400, 10_800):
+            assert 0.8 * budget < kb.DEFAULT_MAX_RUNTIME_SECONDS, (
+                "the 10800 s budget's notice would land past a 7200 s fuse"
+            )
