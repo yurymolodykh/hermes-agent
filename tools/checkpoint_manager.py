@@ -987,7 +987,10 @@ class CheckpointManager(LockHygiene):
             digest = _hash_file(path)
             if digest is None:
                 return
-            with store_lock(_resolve_checkpoint_base()):
+            # ``timeout=0``: this runs once per file Hermes writes, so it must never queue. A
+            # busy store only costs one ledger entry (``logger.debug``), while a wait here would
+            # stall the turn behind a maintenance gc (measured: 116 s on a 134 MB store).
+            with store_lock(_resolve_checkpoint_base(), timeout=0):
                 store = _store_path()
                 dir_hash = self._ledger_key(str(path))
                 ledger = _load_ledger(store, dir_hash)

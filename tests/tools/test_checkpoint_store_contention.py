@@ -68,6 +68,7 @@ import tools.checkpoint_manager as C
 base, project, go, tag = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
 C.CHECKPOINT_BASE = base
 mgr = C.CheckpointManager(enabled=True, max_snapshots=5, max_total_size_mb=0)
+(project / "ready").touch()            # the parent releases both children together
 while not go.exists():
     time.sleep(0.001)
 (project / (tag + ".txt")).write_text(tag, encoding="utf-8")
@@ -107,6 +108,8 @@ def test_waiter_joins_a_held_store_lock(base, tmp_path):
 
 def test_two_concurrent_snapshots_of_one_profile_both_land(base, tmp_path):
     """Two cards of one profile snapshot at the same moment: neither may lose its checkpoint."""
+    from tests.waiting import wait_until
+
     go = tmp_path / "go"
     projects = [tmp_path / f"proj-{i}" for i in range(2)]
     for project in projects:
@@ -115,7 +118,8 @@ def test_two_concurrent_snapshots_of_one_profile_both_land(base, tmp_path):
         _spawn(_RACE_CODE, str(base), str(project), str(go), f"p{i}")
         for i, project in enumerate(projects)
     ]
-    time.sleep(0.2)
+    # Both children announce readiness by touching their own file: no clock is involved.
+    wait_until(lambda: all((p / "ready").exists() for p in projects), timeout=120)
     go.touch()
     results = []
     for proc in procs:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import time
@@ -44,7 +45,10 @@ def lock_holder_hint(lock: Path) -> str:
         from hermes_cli._early_recovery import _held_open
 
         verdict = _held_open(Path(lock))
-    except Exception:  # a diagnostic must never replace the failure it explains
+    except (ImportError, OSError) as exc:
+        # A diagnostic must never replace the failure it explains; log it so a broken probe is
+        # visible rather than silently reported as "unknown".
+        logging.getLogger(__name__).debug("checkpoint lock holder probe failed: %s", exc, exc_info=True)
         return "holder unknown (probe unavailable)"
     if verdict is True or verdict is None:
         return "holder unknown (the platform could not inspect open files)"
