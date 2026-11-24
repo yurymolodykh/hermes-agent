@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 
 class PruneError(RuntimeError):
@@ -14,6 +18,24 @@ class PruneError(RuntimeError):
 
 GC_PENDING_NAME = ".gc-pending"
 
+# How long a *snapshot* waits for the store lock before giving up. The holder is another
+# process's snapshot, and one snapshot is not atomic: measured on a 24k-file tree, a single
+# ``ensure_checkpoint`` holds the lock for ~15 s and ``git add -A`` alone is ~12 s of it. A second
+# taker must therefore be able to WAIT through a sibling snapshot instead of being refused at
+# t=0 (t_312ea8d7/t_977db51b/t_33063b55 lost every checkpoint of a run to that refusal). The
+# bound stays finite so a wedged holder still surfaces as a visible failure, never a hang.
+SNAPSHOT_LOCK_TIMEOUT_SECONDS = 120.0
+
+# Destructive maintenance (clear, clear_legacy) and the periodic prune must NOT queue behind a
+# live writer: they are grab-or-skip operations whose refusal is the documented contract.
+NONBLOCKING = 0.0
+
+# A best-effort ledger append is bounded far tighter than a snapshot: it runs before every
+# write_file/patch, and stalling a turn to record a hash is worse than losing it. Two seconds is
+# enough to wait out a sibling ledger write; anything longer is a snapshot, which will finish on
+# its own and the ledger mark can be dropped.
+LEDGER_LOCK_TIMEOUT_SECONDS = 2.0
+
 
 def store_lock_path(base: Path) -> Path:
     base = base.resolve()
@@ -21,16 +43,41 @@ def store_lock_path(base: Path) -> Path:
 
 
 @contextmanager
-def store_lock(base: Path):
-    """Serialize whole operations, including GC and clear, across processes."""
+def store_lock(base: Path, *, timeout: float | None = NONBLOCKING, purpose: str = "operation"):
+    """Serialize whole operations, including GC and clear, across processes.
+
+    ``timeout`` is how long to wait for a holder before failing. ``NONBLOCKING`` (0) keeps the
+    original grab-or-refuse behaviour for destructive callers; a positive value lets an
+    interactive snapshot ride out a sibling snapshot. ``None`` waits forever and is reserved for
+    callers that must eventually run.
+    """
     from hermes_cli.runtime_state import _lock
 
     base.parent.mkdir(parents=True, exist_ok=True)
     # Outside base so clear_all and legacy migration cannot replace its inode.
     fd = os.open(store_lock_path(base), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        if not _lock(fd, wait=False):
-            raise PruneError(f"checkpoint store is busy: {base}")
+        started = time.monotonic()
+        if timeout is None:
+            # Explicitly unbounded: a caller that must eventually run (a nested snapshot inside an
+            # operation that already holds the store for its own reason) waits as long as it takes.
+            held = _lock(fd, wait=True)
+        elif timeout > 0:
+            held = _lock(fd, wait=True, timeout=timeout)
+        else:
+            held = _lock(fd, wait=False)
+        waited = time.monotonic() - started
+        if not held:
+            raise PruneError(
+                f"checkpoint store is busy: {base} "
+                f"(waited {waited:.1f}s for {purpose}; another process holds {store_lock_path(base)})"
+            )
+        if waited >= 0.5:
+            # Honest record: a snapshot that took 12 s of someone else's ``git add`` is a fact the
+            # operator needs, not a silent success.
+            logger.info(
+                "checkpoint store lock: waited %.1fs for %s on %s", waited, purpose, base
+            )
         yield
     finally:
         os.close(fd)

@@ -4512,8 +4512,12 @@ def _start_gateway_housekeeping(
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
+        # Per served profile: the store, its ``auto_prune`` flag, ``retention_days`` and the
+        # ``.last_prune`` marker are all the profile's own. Unscoped, only the launch profile's
+        # store was ever maintained while every other profile grew without limit (09 at 154 MB
+        # against its own 150 MB cap, no ``.last_prune`` anywhere but the launch home).
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
-        (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune)]
+        (1, "Checkpoint prune tick", profile_scoped_chore(runner, _housekeeping_checkpoint_prune))]
 
     # Between ticks the queue file is watched so a worker's send goes out when it is queued,
     # not up to ``interval`` later (#117307); the tick's drain above remains the fallback.

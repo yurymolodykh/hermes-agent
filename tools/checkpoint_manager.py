@@ -981,20 +981,26 @@ class CheckpointManager(LockHygiene):
         if not self.enabled:
             return
         try:
-            from tools.checkpoint_pruning import store_lock
+            from tools.checkpoint_pruning import LEDGER_LOCK_TIMEOUT_SECONDS, store_lock
 
             path = _normalize_path(file_path)
             digest = _hash_file(path)
             if digest is None:
                 return
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(),
+                            timeout=LEDGER_LOCK_TIMEOUT_SECONDS,
+                            purpose=f"agent-write ledger for {path}"):
                 store = _store_path()
                 dir_hash = self._ledger_key(str(path))
                 ledger = _load_ledger(store, dir_hash)
                 ledger[str(path)] = {"sha256": digest, "ts": time.time()}
                 _save_ledger(store, dir_hash, ledger)
         except Exception as exc:
-            logger.debug("record_agent_write failed for %s: %s", file_path, exc)
+            # The ledger is best-effort, but a lost mark is visible: without it `restore` in safe
+            # mode cannot tell "Hermes wrote this" from "the user edited it" for this path.
+            logger.warning(
+                "record_agent_write lost the ledger mark for %s (%s: %s) — safe restore will treat "
+                "it as hand-edited", file_path, type(exc).__name__, exc)
 
     def _safe_restore_plan(self, working_dir: str, commit_hash: str) -> dict:
         """Classify files changed since ``commit_hash`` for a safe restore.
@@ -1098,9 +1104,11 @@ class CheckpointManager(LockHygiene):
             sweep_failure = f"{type(sweep_error).__name__}: {sweep_error}"
 
         try:
-            from tools.checkpoint_pruning import store_lock
+            from tools.checkpoint_pruning import SNAPSHOT_LOCK_TIMEOUT_SECONDS, store_lock
 
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(),
+                            timeout=SNAPSHOT_LOCK_TIMEOUT_SECONDS,
+                            purpose=f"snapshot of {abs_dir}"):
                 taken = self._take(abs_dir, reason)
                 if not taken and self._last_failure:
                     self._notify(self._failure_message())
@@ -1202,10 +1210,13 @@ class CheckpointManager(LockHygiene):
 
     def diff(self, working_dir: str, commit_hash: str) -> dict:
         """Show diff between a checkpoint and the current working tree."""
-        from tools.checkpoint_pruning import PruneError, store_lock
+        from tools.checkpoint_pruning import (
+            PruneError, SNAPSHOT_LOCK_TIMEOUT_SECONDS, store_lock)
 
         try:
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(),
+                            timeout=SNAPSHOT_LOCK_TIMEOUT_SECONDS,
+                            purpose=f"diff against {working_dir}"):
                 return self._diff(working_dir, commit_hash)
         except (PruneError, OSError) as exc:
             return {"success": False, "error": str(exc)}
@@ -1311,10 +1322,13 @@ class CheckpointManager(LockHygiene):
         them from every checkpoint, and — only when a delete failed —
         ``failed_deletes`` listing paths that could not be removed.
         """
-        from tools.checkpoint_pruning import PruneError, store_lock
+        from tools.checkpoint_pruning import (
+            PruneError, SNAPSHOT_LOCK_TIMEOUT_SECONDS, store_lock)
 
         try:
-            with store_lock(_resolve_checkpoint_base()):
+            with store_lock(_resolve_checkpoint_base(),
+                            timeout=SNAPSHOT_LOCK_TIMEOUT_SECONDS,
+                            purpose=f"restore of {working_dir}"):
                 return self._restore(working_dir, commit_hash, file_path, safe)
         except (PruneError, OSError) as exc:
             return {"success": False, "error": str(exc)}
