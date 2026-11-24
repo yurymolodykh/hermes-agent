@@ -453,7 +453,7 @@ class TestCardOwnership:
             conn.close()
         assert results_acl.task_visible(_request_as("alice"), own) is True
 
-    def test_a_person_does_not_see_a_neighbours_card(self, multi_user, registry, kanban_home, board):
+    def test_a_neighbours_card_is_visible_but_not_writable(self, multi_user, registry, kanban_home, board):
         from hermes_cli import kanban_db as kb
         from hermes_cli import kanban_db_connect as kbc
 
@@ -553,7 +553,7 @@ class TestKanbanAttachmentRoutes:
         assert response.status_code == 200
         assert response.content == b"alice's private notes"
 
-    def test_a_neighbours_attachment_by_id_is_refused(self, multi_user, registry, kanban_home, board):
+    def test_a_neighbours_attachment_by_id_is_shared(self, multi_user, registry, kanban_home, board):
         # TEAM material: the file a producer made on bob's card must reach the person who needs
         # it, so a verified non-owner downloads it (this is the owner's headline requirement).
         response = _kanban_app("alice").get(
@@ -570,7 +570,7 @@ class TestKanbanAttachmentRoutes:
             f"/api/plugins/kanban/attachments/{board['bob']['attachment']}")
         assert response.status_code == 404
 
-    def test_a_neighbours_attachment_listing_is_refused(self, multi_user, registry, kanban_home, board):
+    def test_a_neighbours_attachment_listing_is_shared(self, multi_user, registry, kanban_home, board):
         response = _kanban_app("alice").get(
             f"/api/plugins/kanban/tasks/{board['bob']['task']}/attachments")
         assert response.status_code == 200
