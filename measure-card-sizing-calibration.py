@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Re-measure the minute calibration behind ``agent/kanban_card_sizing.py``.
 
 The rule's p50/p80 tables are constants on purpose (no DB read at runtime), so the only
@@ -27,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from agent.kanban_card_sizing import (  # noqa: E402
+from agent.kanban_card_sizing import (
     CALIBRATION_P50_MINUTES,
     CALIBRATION_P80_MINUTES,
     count_acceptance_items,
@@ -50,11 +49,8 @@ SQL = """SELECT tr.started_at, tr.ended_at, t.body
 
 def unix(stamp: str) -> int:
     """'YYYY-MM-DD HH:MM' read as UTC."""
-    return int(
-        dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M")
-        .replace(tzinfo=dt.timezone.utc)
-        .timestamp()
-    )
+    moment = dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M").replace(tzinfo=dt.UTC)
+    return int(moment.timestamp())
 
 
 def pct(values: list[int], p: int) -> int:
@@ -76,11 +72,11 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     lo, hi = unix(args.lo), unix(args.hi)
-    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    if hi >= now:
+    now = dt.datetime.now(dt.UTC)
+    if hi >= now.timestamp():
         print(
             f"refusing: upper bound {args.hi} UTC is not in the past "
-            f"(now {dt.datetime.fromtimestamp(now, dt.timezone.utc):%Y-%m-%d %H:%M} UTC); "
+            f"(now {now:%Y-%m-%d %H:%M} UTC); "
             "an open window is not reproducible",
             file=sys.stderr,
         )
@@ -99,14 +95,11 @@ def main(argv: list[str] | None = None) -> int:
     unrealised = [x for v in buckets.values() for x in v]
     print(f"window {args.lo} .. {args.hi} UTC, both ends closed, n={len(rows)}")
     print(f"row-set sha1 {hashlib.sha1(repr(rows).encode('utf-8')).hexdigest()[:16]}")
+    over_60 = round(100 * sum(x > 3600 for x in unrealised) / len(unrealised))
+    over_50 = round(100 * sum(x > 3000 for x in unrealised) / len(unrealised))
     print(
-        "whole sample: median %d min, p80 %d min, >60 %d %%, >50 %d %%"
-        % (
-            whole_minutes(pct(unrealised, 50)),
-            whole_minutes(pct(unrealised, 80)),
-            round(100 * sum(x > 3600 for x in unrealised) / len(unrealised)),
-            round(100 * sum(x > 3000 for x in unrealised) / len(unrealised)),
-        )
+        f"whole sample: median {whole_minutes(pct(unrealised, 50))} min, "
+        f"p80 {whole_minutes(pct(unrealised, 80))} min, >60 {over_60} %, >50 {over_50} %"
     )
     print("items | n   | p50 s | p50 min | p80 s | p80 min | >60 % | module p50/p80")
     drift = 0
