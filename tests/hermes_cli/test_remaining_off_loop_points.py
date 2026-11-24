@@ -13,6 +13,7 @@ frozen loop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from pathlib import Path
@@ -48,14 +49,13 @@ def test_transcribe_decode_and_stage_runs_off_the_loop(monkeypatch, tmp_path):
     _arm(monkeypatch, True)
     loop_thread = threading.get_ident()
     seen: list[int] = []
-    staged = tmp_path / "voice.webm"
 
-    def _fake_stage(encoded, suffix):
+    def _fake_stage(encoded, path):
         seen.append(threading.get_ident())
-        staged.write_bytes(b"x")
-        return str(staged)
+        Path(path).write_bytes(b"x")
 
     monkeypatch.setattr(audio_router, "_decode_and_stage", _fake_stage)
+    monkeypatch.setattr(audio_router, "_create_stage_path", lambda suffix: str(tmp_path / "voice.webm"))
 
     async def _fake_scoped(profile, fn):
         return {"success": True, "transcript": "hi", "provider": "p"}
@@ -77,14 +77,13 @@ def test_transcribe_decode_and_stage_is_inline_when_the_switch_is_off(monkeypatc
     _arm(monkeypatch, False)
     loop_thread = threading.get_ident()
     seen: list[int] = []
-    staged = tmp_path / "voice.webm"
 
-    def _fake_stage(encoded, suffix):
+    def _fake_stage(encoded, path):
         seen.append(threading.get_ident())
-        staged.write_bytes(b"x")
-        return str(staged)
+        Path(path).write_bytes(b"x")
 
     monkeypatch.setattr(audio_router, "_decode_and_stage", _fake_stage)
+    monkeypatch.setattr(audio_router, "_create_stage_path", lambda suffix: str(tmp_path / "voice.webm"))
 
     async def _fake_scoped(profile, fn):
         return {"success": True, "transcript": "", "provider": None}
@@ -110,6 +109,93 @@ def test_invalid_audio_payload_still_answers_400(monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         _run(audio_router.transcribe_audio_upload(payload))
     assert excinfo.value.status_code == 400
+
+
+def test_successful_transcribe_removes_the_staged_file(monkeypatch, tmp_path):
+    """D-1, success half: the staged upload does not outlive a completed request."""
+    from hermes_cli.web_routers import audio as audio_router
+
+    _arm(monkeypatch, True)
+    staged = tmp_path / "voice.webm"
+    written: list[str] = []
+    real_stage = audio_router._decode_and_stage
+
+    def _spy_stage(encoded, path):
+        real_stage(encoded, path)
+        written.append(path)
+        # "AAAA" is three NUL bytes once decoded — proof the worker wrote THIS path.
+        assert Path(path).read_bytes() == base64.b64decode("AAAA")
+
+    def _create(suffix):
+        staged.touch()
+        return str(staged)
+
+    async def _fake_scoped(profile, fn):
+        return {"success": True, "transcript": "hi", "provider": "p"}
+
+    monkeypatch.setattr(audio_router, "_create_stage_path", _create)
+    monkeypatch.setattr(audio_router, "_decode_and_stage", _spy_stage)
+    monkeypatch.setattr(audio_router, "_run_config_scoped", _fake_scoped)
+
+    payload = audio_router.AudioTranscriptionRequest(
+        data_url="data:audio/webm;base64,AAAA", mime_type="audio/webm"
+    )
+    _run(audio_router.transcribe_audio_upload(payload))
+
+    assert written == [str(staged)], "the decoded bytes were not written to the created path"
+    assert not staged.exists(), "the staged upload outlived the request"
+
+
+def test_cancelled_transcribe_leaves_no_staged_file(monkeypatch, tmp_path):
+    """D-1: cancelling the request while the worker still runs must not leak the upload.
+
+    The worker starts on the offload pool and blocks; the request task is cancelled while it
+    blocks. The bytes it then writes must be gone once the worker settles.
+    """
+    from hermes_cli.web_routers import audio as audio_router
+    from tests.waiting import async_wait_until
+
+    _arm(monkeypatch, True)
+    staged = tmp_path / "voice.webm"
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_stage(encoded, path):
+        started.set()
+        assert release.wait(10), "test worker was never released"
+        Path(path).write_bytes(b"AAAA")
+
+    async def _unreachable_scoped(profile, fn):  # pragma: no cover - cancellation wins
+        raise AssertionError("transcription must not run after cancellation")
+
+    def _create(suffix):
+        staged.touch()
+        return str(staged)
+
+    monkeypatch.setattr(audio_router, "_create_stage_path", _create)
+    monkeypatch.setattr(audio_router, "_decode_and_stage", _slow_stage)
+    monkeypatch.setattr(audio_router, "_run_config_scoped", _unreachable_scoped)
+
+    payload = audio_router.AudioTranscriptionRequest(
+        data_url="data:audio/webm;base64,AAAA", mime_type="audio/webm"
+    )
+
+    async def _scenario():
+        task = asyncio.ensure_future(audio_router.transcribe_audio_upload(payload))
+        await async_wait_until(started.is_set, what="the staging worker started")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The file exists (created on the loop) and the worker is still blocked on it.
+        assert staged.exists(), "the path must exist before the worker finishes"
+        release.set()
+        await async_wait_until(lambda: not staged.exists(), what="the staged upload removed")
+
+    try:
+        _run(_scenario())
+    finally:
+        release.set()
+    assert not staged.exists(), "a cancelled request leaked the staged upload"
 
 
 # ── №3-tail audio.py speak_text: base64 encode ───────────────────────────────────
@@ -307,15 +393,14 @@ def test_action_status_tails_inline_when_the_switch_is_off(monkeypatch, tmp_path
 
 
 def _count_transcribe(monkeypatch, tmp_path, audio, files, actions):
-    def _stage(encoded, suffix):
-        staged = tmp_path / "voice.webm"
-        staged.write_bytes(b"x")
-        return str(staged)
+    def _stage(encoded, path):
+        Path(path).write_bytes(b"x")
 
     async def _scoped(profile, fn):
         return {"success": True, "transcript": "hi", "provider": "p"}
 
     monkeypatch.setattr(audio, "_decode_and_stage", _stage)
+    monkeypatch.setattr(audio, "_create_stage_path", lambda suffix: str(tmp_path / "voice.webm"))
     monkeypatch.setattr(audio, "_run_config_scoped", _scoped)
     _run(audio.transcribe_audio_upload(
         audio.AudioTranscriptionRequest(data_url="data:audio/webm;base64,AAAA", mime_type="audio/webm")
