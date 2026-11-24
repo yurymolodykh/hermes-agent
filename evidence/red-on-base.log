@@ -1,0 +1,158 @@
+/home/hermes/t72venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:299: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+FFFF.s                                                                   [100%]
+=================================== FAILURES ===================================
+_____________________ test_waiter_joins_a_held_store_lock ______________________
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_waiter_joins_a_held_store0/checkpoints')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_waiter_joins_a_held_store0')
+
+    def test_waiter_joins_a_held_store_lock(base, tmp_path):
+        """A snapshot arriving while the lock is held waits for it instead of being refused."""
+>       holder = _holder_at_least(base, tmp_path / "held", 1.5)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/tools/test_checkpoint_store_contention.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_waiter_joins_a_held_store0/checkpoints')
+mark = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_waiter_joins_a_held_store0/held')
+hold_seconds = 1.5
+
+    def _holder_at_least(base: Path, mark: Path, hold_seconds: float) -> subprocess.Popen:
+        holder = _spawn(_HOLD_CODE, str(base), str(mark), str(hold_seconds))
+        deadline = time.monotonic() + 60
+        while not mark.exists():
+>           assert holder.poll() is None, holder.stderr.read()
+E           AssertionError: Traceback (most recent call last):
+E               File "<string>", line 7, in <module>
+E                 with store_lock(base, timeout=60):
+E                      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 305, in helper
+E                 return _GeneratorContextManager(func, args, kwds)
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 109, in __init__
+E                 self.gen = func(*args, **kwds)
+E                            ~~~~^^^^^^^^^^^^^^^
+E             TypeError: store_lock() got an unexpected keyword argument 'timeout'
+E             
+E           assert 1 is None
+E            +  where 1 = poll()
+E            +    where poll = <Popen: returncode: 1 args: ['/home/hermes/t72venv/bin/python', '-c', '\nimp...>.poll
+
+tests/tools/test_checkpoint_store_contention.py:87: AssertionError
+____________ test_two_concurrent_snapshots_of_one_profile_both_land ____________
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0/checkpoints')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0')
+
+    def test_two_concurrent_snapshots_of_one_profile_both_land(base, tmp_path):
+        """Two cards of one profile snapshot at the same moment: neither may lose its checkpoint."""
+        from tests.waiting import wait_until
+    
+        go = tmp_path / "go"
+        projects = [tmp_path / f"proj-{i}" for i in range(2)]
+        for project in projects:
+            project.mkdir()
+        procs = [
+            _spawn(_RACE_CODE, str(base), str(project), str(go), f"p{i}")
+            for i, project in enumerate(projects)
+        ]
+        # Both children announce readiness by touching their own file: no clock is involved.
+        wait_until(lambda: all((p / "ready").exists() for p in projects), timeout=120)
+        go.touch()
+        results = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=180)
+            assert proc.returncode == 0, err
+            results.append(json.loads(out.strip().splitlines()[-1]))
+        # A refusal would arrive as a ``store`` failure record; neither take may carry one.
+        assert results[0]["failure"] is None, results[0]
+>       assert results[1]["failure"] is None, results[1]
+E       AssertionError: {'ok': False, 'failure': {'working_dir': '/tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0/proj-1', 'st...store is busy: /tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0/checkpoints', 'ts': 1795491174.0836127}}
+E       assert {'working_dir': '/tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0/proj-1', 'stage': 'store', 'error': '... store is busy: /tmp/pytest-of-hermes/pytest-96/test_two_concurrent_snapshots_0/checkpoints', 'ts': 1795491174.0836127} is None
+
+tests/tools/test_checkpoint_store_contention.py:129: AssertionError
+_______________ test_timeout_still_refuses_and_names_the_holder ________________
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_timeout_still_refuses_and0/checkpoints')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_timeout_still_refuses_and0')
+
+    def test_timeout_still_refuses_and_names_the_holder(base, tmp_path):
+        """Past the wait the snapshot is refused — but the message says who held the lock."""
+>       holder = _holder_at_least(base, tmp_path / "held", 8.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/tools/test_checkpoint_store_contention.py:135: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_timeout_still_refuses_and0/checkpoints')
+mark = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_timeout_still_refuses_and0/held')
+hold_seconds = 8.0
+
+    def _holder_at_least(base: Path, mark: Path, hold_seconds: float) -> subprocess.Popen:
+        holder = _spawn(_HOLD_CODE, str(base), str(mark), str(hold_seconds))
+        deadline = time.monotonic() + 60
+        while not mark.exists():
+>           assert holder.poll() is None, holder.stderr.read()
+E           AssertionError: Traceback (most recent call last):
+E               File "<string>", line 7, in <module>
+E                 with store_lock(base, timeout=60):
+E                      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 305, in helper
+E                 return _GeneratorContextManager(func, args, kwds)
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 109, in __init__
+E                 self.gen = func(*args, **kwds)
+E                            ~~~~^^^^^^^^^^^^^^^
+E             TypeError: store_lock() got an unexpected keyword argument 'timeout'
+E             
+E           assert 1 is None
+E            +  where 1 = poll()
+E            +    where poll = <Popen: returncode: 1 args: ['/home/hermes/t72venv/bin/python', '-c', '\nimp...>.poll
+
+tests/tools/test_checkpoint_store_contention.py:87: AssertionError
+____________ test_zero_timeout_refuses_immediately_without_waiting _____________
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_zero_timeout_refuses_imme0/checkpoints')
+tmp_path = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_zero_timeout_refuses_imme0')
+
+    def test_zero_timeout_refuses_immediately_without_waiting(base, tmp_path):
+        """``timeout=0`` keeps the fail-fast shape for callers that must not queue."""
+>       holder = _holder_at_least(base, tmp_path / "held", 8.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/tools/test_checkpoint_store_contention.py:151: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+base = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_zero_timeout_refuses_imme0/checkpoints')
+mark = PosixPath('/tmp/pytest-of-hermes/pytest-96/test_zero_timeout_refuses_imme0/held')
+hold_seconds = 8.0
+
+    def _holder_at_least(base: Path, mark: Path, hold_seconds: float) -> subprocess.Popen:
+        holder = _spawn(_HOLD_CODE, str(base), str(mark), str(hold_seconds))
+        deadline = time.monotonic() + 60
+        while not mark.exists():
+>           assert holder.poll() is None, holder.stderr.read()
+E           AssertionError: Traceback (most recent call last):
+E               File "<string>", line 7, in <module>
+E                 with store_lock(base, timeout=60):
+E                      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 305, in helper
+E                 return _GeneratorContextManager(func, args, kwds)
+E               File "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/contextlib.py", line 109, in __init__
+E                 self.gen = func(*args, **kwds)
+E                            ~~~~^^^^^^^^^^^^^^^
+E             TypeError: store_lock() got an unexpected keyword argument 'timeout'
+E             
+E           assert 1 is None
+E            +  where 1 = poll()
+E            +    where poll = <Popen: returncode: 1 args: ['/home/hermes/t72venv/bin/python', '-c', '\nimp...>.poll
+
+tests/tools/test_checkpoint_store_contention.py:87: AssertionError
+=========================== short test summary info ============================
+FAILED tests/tools/test_checkpoint_store_contention.py::test_waiter_joins_a_held_store_lock
+FAILED tests/tools/test_checkpoint_store_contention.py::test_two_concurrent_snapshots_of_one_profile_both_land
+FAILED tests/tools/test_checkpoint_store_contention.py::test_timeout_still_refuses_and_names_the_holder
+FAILED tests/tools/test_checkpoint_store_contention.py::test_zero_timeout_refuses_immediately_without_waiting
+4 failed, 1 passed, 1 skipped in 3.63s
