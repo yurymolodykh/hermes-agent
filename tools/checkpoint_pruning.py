@@ -30,18 +30,6 @@ def store_lock_path(base: Path) -> Path:
     return base.with_name(f".{base.name}.lock")
 
 
-def store_lock_paths(base: Path) -> list[Path]:
-    """Every lock file guarding ``base``, current name first.
-
-    ``.checkpoints.lock`` beside the base is the live one (outside base, so ``clear_all`` cannot
-    replace its inode). ``<base>/.store.lock`` is the name earlier builds used and the one found
-    abandoned on a live profile for 9.5 hours; it is still swept so an old debris file cannot
-    outlive the upgrade.
-    """
-    base = Path(base).resolve()
-    return [store_lock_path(base), base / LEGACY_STORE_LOCK_NAME]
-
-
 def lock_holder_hint(lock: Path) -> str:
     """Who to blame when ``lock`` could not be taken: the live holder, or that none is visible.
 
