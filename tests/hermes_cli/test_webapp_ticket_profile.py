@@ -16,8 +16,8 @@ from fastapi.testclient import TestClient
 # runs ``hermes_bootstrap._settle_interrupted_update`` after the autouse
 # HomeIOGuard is installed, and its pull-marker stat resolves this worktree's git
 # dir under the real home. Collection-time imports happen before the guard.
-import hermes_cli.web_server  # noqa: F401
-import tui_gateway.ws  # noqa: F401
+import hermes_cli.web_server
+import tui_gateway.ws
 
 _TOKEN = "b" * 43
 

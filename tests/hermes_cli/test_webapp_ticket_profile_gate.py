@@ -39,7 +39,7 @@ def webapp_home(monkeypatch, tmp_path):
     """A loopback Webapp over ``<root>`` with two named profiles behind it."""
     import hermes_acl_bindings as hb
     from hermes_cli import web_server as server
-    from hermes_cli.web_routers.webapp import router  # noqa: F401  (imports the module under test)
+    from hermes_cli.web_routers.webapp import router  # imports the module under test
 
     root = tmp_path / "hermes"
     root.mkdir()

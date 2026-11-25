@@ -27,8 +27,8 @@ import hermes_acl_profiles as prof_acl
 # is installed, and its ``interrupted_pull_marker`` stat resolves the worktree's
 # git dir under the real home (TEST BUG, not a code defect). Module-level imports
 # happen during collection, before the guard.
-import hermes_cli.web_server  # noqa: F401
-import tui_gateway.ws  # noqa: F401
+import hermes_cli.web_server
+import tui_gateway.ws
 
 _TOKEN = "d" * 43
 ALICE = "person/alice"
@@ -133,8 +133,6 @@ def test_a_foreign_profile_ticket_closes_the_socket(serving):
 
 
 def test_own_profile_ticket_still_serves(serving):
-    from hermes_cli.web_session_sockets import GATEWAY_SOCKET  # noqa: F401
-
     with _open(serving.client, {"user_id": "alice", "provider": "basic"},
                serving.homes[ALICE_HOME]) as ws:
         ws.send_json({"jsonrpc": "2.0", "id": "ask", "method": "runtime.describe", "params": {}})
