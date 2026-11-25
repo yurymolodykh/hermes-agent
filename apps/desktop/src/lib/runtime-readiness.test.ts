@@ -154,6 +154,7 @@ describe('transport classification on a fallback round', () => {
       runtime: { ok: true },
       runtimeError: null
     })
+
     const verdict = interpretRuntimeReadiness({
       setup: { provider_configured: false },
       setupError: null,

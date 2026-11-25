@@ -75,6 +75,5 @@ export const zhOnboarding: TranslationOverrides['onboarding'] = {
   docs: provider => `${provider} 文档`,
   runtimeConnecting: '正在连接 Hermes 后端…… 它启动时可能需要一点时间。',
   runtimeNotReadyTitle: '运行时尚未就绪',
-  runtimeNotReadyBody:
-    'Hermes Desktop 无法连接后端。它可能已停止；应用会继续检查并自动恢复。'
+  runtimeNotReadyBody: 'Hermes Desktop 无法连接后端。它可能已停止；应用会继续检查并自动恢复。'
 }
