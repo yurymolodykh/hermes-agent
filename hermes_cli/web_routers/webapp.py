@@ -51,6 +51,11 @@ async def host_terminal_ws(ws: WebSocket) -> None:
     if not web_host_terminal.request_allowed():
         await ws.close(code=4403, reason="host terminal requires authenticated Webapp")
         return
+    if _terminal_profile_refused(ws):
+        # Before accept and before any PTY exists: the same 4403 a foreign host/origin gets.
+        _log.warning("host terminal refused: profile not visible to this principal")
+        await ws.close(code=4403, reason="profile not visible")
+        return
     await ws.accept()
     _log.info("host terminal accepted peer=%s mode=%s cred=%s", peer, mode, cred)
     if not _PTY_BRIDGE_AVAILABLE:
@@ -58,6 +63,31 @@ async def host_terminal_ws(ws: WebSocket) -> None:
             ws, PtyUnavailableError("Pseudo-terminal support is not installed on this host."), surface="Terminal")
         return
     await host_terminal(ws)
+
+
+def _terminal_profile_refused(ws: WebSocket) -> bool:
+    """Whether the shell this dial asks for lives in a profile its principal may not use.
+
+    The ticket only proves WHO the caller is. ``?profile=`` (and no ``profile``, which means the
+    gateway's launch home) names the home the PTY chdirs into, and ``HostTerminalRegistry.create``
+    resolves it with no ACL of its own — so this gate runs on the identity the ticket stamped
+    (``ws._hermes_auth_identity``), before a shell exists. Same policy and same refusal as the REST
+    ``?profile=`` routes: ``hermes_acl_profiles.allows``; the host owner and multi-user-off keep
+    every profile, unchanged.
+    """
+    from hermes_acl_profiles import allows
+    from hermes_constants import profile_name_for_home
+    from gateway.owner_identity import principal_subject
+    from hermes_cli.web_host_terminal_sessions import _request_home
+
+    identity = getattr(ws, "_hermes_auth_identity", None) or {}
+    if not identity.get("user_id"):
+        return False  # the route has already refused a credential-less dial (4401)
+    home = _request_home(ws.query_params.get("profile"))
+    name = profile_name_for_home(home)
+    if not name:
+        return True  # a home that names no profile cannot be scoped — refuse rather than guess
+    return not allows(principal_subject(identity), name)
 
 
 def _mint_handoff_ticket(state, ttl: float, *, launch: bool) -> str:
@@ -241,7 +271,9 @@ def _socket_ticket_response(request: Request, identity: dict, socket: str, sessi
 #: its profile is gone there rather than from a socket that keeps closing.
 SOCKET_TICKETS: dict[str, tuple[str, bool]] = {
     GATEWAY_SOCKET: ("gateway_ticket", True),
-    HOST_TERMINAL_SOCKET: ("host_terminal", False),
+    # A host shell runs IN a profile's home: a ticket for a profile its principal may not see would
+    # hand that person's terminal and files to whoever minted it. Same gate, same 404 as ``gateway``.
+    HOST_TERMINAL_SOCKET: ("host_terminal", True),
     SPEAK_STREAM_SOCKET: ("gateway_ticket", False),
     TRANSCRIBE_STREAM_SOCKET: ("gateway_ticket", False),
     RELAY_SOCKET: ("gateway_connections", False),
