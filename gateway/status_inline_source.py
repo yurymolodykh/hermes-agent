@@ -141,13 +141,14 @@ def _bootstrap_entry(source: str, argv: list[str]) -> list[str] | None:
     key = (source, tuple(argv))
     with _bootstrap_cache_lock:
         if key in _bootstrap_cache:
-            return _bootstrap_cache[key]
+            hit = _bootstrap_cache[key]
+            return None if hit is None else list(hit)
     result = _bootstrap_entry_uncached(source, argv)
     with _bootstrap_cache_lock:
         if len(_bootstrap_cache) >= _BOOTSTRAP_CACHE_MAX:
             _bootstrap_cache.pop(next(iter(_bootstrap_cache)), None)
         _bootstrap_cache[key] = result
-    return result
+    return None if result is None else list(result)
 
 
 def _bootstrap_entry_uncached(source: str, argv: list[str]) -> list[str] | None:

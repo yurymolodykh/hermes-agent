@@ -577,13 +577,19 @@ def _connect(db_path: DbPath) -> sqlite3.Connection:
 
 
 class _SharedReadConn:
-    """One reused read connection for a database file, serialized by its own lock."""
+    """One reused read connection for a database file, serialized by its own lock.
 
-    __slots__ = ("conn", "lock")
+    ``identity`` is the ``(st_dev, st_ino)`` of the file the live connection was opened
+    against, so a store replaced under the process (a restore, a move, an atomic swap) is
+    detected by one cheap ``stat`` instead of being read through the dead inode.
+    """
+
+    __slots__ = ("conn", "identity", "lock")
 
     def __init__(self) -> None:
         self.conn: sqlite3.Connection | None = None
         self.lock = threading.Lock()
+        self.identity: tuple[int, int] | None = None
 
 
 _shared_read_conns: dict[str, _SharedReadConn] = {}
@@ -638,8 +644,33 @@ def _close_quietly(entry: _SharedReadConn) -> None:
             except sqlite3.Error:
                 logger.debug("closing a replaced read connection failed", exc_info=True)
             entry.conn = None
+            entry.identity = None
     finally:
         entry.lock.release()
+
+
+def _file_identity_pair(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of *path* without following the path through realpath.
+
+    One ``stat`` is what lets a reused connection notice the file it holds was replaced;
+    ``None`` when the stat fails (the caller then treats the handle as unverifiable).
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _discard_entry_connection(entry: _SharedReadConn, why: str) -> None:
+    """Close and clear a slot's connection IN PLACE (caller holds ``entry.lock``)."""
+    if entry.conn is not None:
+        try:
+            entry.conn.close()
+        except sqlite3.Error:
+            logger.debug("closing a %s failed", why, exc_info=True)
+        entry.conn = None
+    entry.identity = None
 
 
 def _forget_read_connection(path: Path) -> None:
@@ -678,17 +709,20 @@ def _read_connection_ctx(db_path: DbPath) -> Iterator[sqlite3.Connection]:
         return
     entry = _read_connection_entry(path)
     with entry.lock:
+        if entry.conn is not None and entry.identity != _file_identity_pair(path):
+            # The file behind the path was replaced (restore/move/atomic swap): the live
+            # handle still reads the DEAD inode, which would serve rows the store no
+            # longer has. One stat per read is the price of reusing the connection.
+            _discard_entry_connection(entry, "replaced read connection")
         if entry.conn is None:
             entry.conn = _open_shared_sqlite(path)
+            entry.identity = _file_identity_pair(path)
         if not _store_ready(entry.conn, path):
             # The schema is behind: let the writable connector migrate, then reopen.
-            try:
-                entry.conn.close()
-            except sqlite3.Error:
-                logger.debug("closing a stale read connection failed", exc_info=True)
-            entry.conn = None
+            _discard_entry_connection(entry, "stale read connection")
             _connect(path).close()
             entry.conn = _open_shared_sqlite(path)
+            entry.identity = _file_identity_pair(path)
         yield entry.conn
 
 
