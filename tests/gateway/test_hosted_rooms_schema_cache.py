@@ -12,6 +12,7 @@ The behaviour the store promises is unchanged: a database whose schema is behind
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -87,7 +88,7 @@ def test_ddl_change_is_detected_on_the_next_open(tmp_path):
         # The cache entry now names the NEW version, so the verdict is fresh, not inherited.
         identity = hosted_rooms._file_identity(db)
         assert identity is not None
-        assert hosted_rooms._schema_cache[identity][0] == version_after
+        assert hosted_rooms._schema_cache[identity[0]][1] == version_after
     finally:
         conn.close()
 
@@ -166,10 +167,55 @@ def test_read_path_still_lists_rooms_after_the_cache(tmp_path):
     assert [row["room_id"] for row in rows] == ["room-1"]
 
 
-def test_schema_cache_is_bounded(tmp_path, monkeypatch):
-    """The memo cannot grow without bound when many database files are probed."""
-    monkeypatch.setattr(hosted_rooms, "_SCHEMA_CACHE_MAX_FILES", 3)
-    for index in range(6):
+def test_fleet_larger_than_the_old_ceiling_keeps_every_entry(tmp_path, monkeypatch):
+    """A fleet of 41 databases stays fully memoised: pass 1 scans, passes 2-3 do not.
+
+    Regression for the live fleet (41 databases): with the old ``_SCHEMA_CACHE_MAX_FILES = 16``
+    ceiling, every pass evicted the entries the previous pass had just written, so 123 of 123
+    probes over three passes ran the full ``PRAGMA table_info`` scan (~2928 then ~656 µs each).
+    """
+    fleet = 41
+    dbs = []
+    for index in range(fleet):
+        db = tmp_path / f"db-{index}.db"
+        hosted_rooms.create_room(
+            db, room_id=f"room-{index}", name=f"Room {index}",
+            members=[{"profile": "default", "handle": "hermes"}],
+            authority_gateway_id="gateway-a")
+        dbs.append(db)
+    hosted_rooms.clear_schema_cache()
+    hosted_rooms.clear_identity_cache()
+
+    scans = []
+    real = hosted_rooms._schema_is_current
+    monkeypatch.setattr(hosted_rooms, "_schema_is_current",
+                        lambda conn: (scans.append(1), real(conn))[1])
+
+    conns = [(db, hosted_rooms.open_sqlite(db)) for db in dbs]
+    try:
+        per_pass = []
+        for _ in range(3):
+            scans.clear()
+            for db, conn in conns:
+                assert hosted_rooms._schema_is_current_cached(conn, db) is True
+            per_pass.append(len(scans))
+    finally:
+        for _, conn in conns:
+            conn.close()
+
+    assert per_pass == [fleet, 0, 0], f"full scans per pass {per_pass}, expected [{fleet}, 0, 0]"
+    metrics = hosted_rooms.schema_cache_metrics()
+    assert metrics["evictions"] == 0, metrics
+    assert metrics["entries"] == fleet, metrics
+
+
+def test_metrics_report_entries_and_evictions_instead_of_silently_trimming(tmp_path, monkeypatch):
+    """The ceiling is an observable bound: evictions are counted and logged, never a silent trim."""
+    monkeypatch.setattr(hosted_rooms, "_SCHEMA_CACHE_MAX_FILES", 2)
+    hosted_rooms.clear_schema_cache()
+    hosted_rooms.clear_identity_cache()
+    before = hosted_rooms.schema_cache_metrics()["evictions"]
+    for index in range(4):
         db = tmp_path / f"db-{index}.db"
         hosted_rooms.create_room(
             db, room_id=f"room-{index}", name=f"Room {index}",
@@ -180,4 +226,41 @@ def test_schema_cache_is_bounded(tmp_path, monkeypatch):
             assert hosted_rooms._store_ready(conn, db) is True
         finally:
             conn.close()
-    assert len(hosted_rooms._schema_cache) <= 3
+    metrics = hosted_rooms.schema_cache_metrics()
+    assert metrics["ceiling"] == 2
+    assert metrics["entries"] <= 2
+    assert metrics["evictions"] == before + 2, metrics
+    assert metrics["scans"] >= 4
+
+
+def test_changed_mtime_ns_invalidates_the_entry(tmp_path, monkeypatch):
+    """A rewrite that keeps the inode (and the schema) must be re-probed: mtime_ns is part of the key.
+
+    The stat identity in the key is what catches a file replaced *in place* — same ``st_dev``/
+    ``st_ino``, but a new ``st_mtime_ns`` — which a (dev, ino) key alone would answer from stale state.
+    """
+    db = _make_store(tmp_path)
+    conn = hosted_rooms.open_sqlite(db)
+    try:
+        assert hosted_rooms._schema_is_current_cached(conn, db) is True
+        first = hosted_rooms._file_identity(db)
+        assert first is not None
+    finally:
+        conn.close()
+
+    scans = []
+    real = hosted_rooms._schema_is_current
+    monkeypatch.setattr(hosted_rooms, "_schema_is_current",
+                        lambda c: (scans.append(1), real(c))[1])
+
+    stat = os.stat(db)
+    os.utime(db, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    conn = hosted_rooms.open_sqlite(db)
+    try:
+        assert hosted_rooms._schema_is_current_cached(conn, db) is True
+        second = hosted_rooms._file_identity(db)
+        assert second is not None and second[1:] != first[1:], "the stat identity did not move"
+    finally:
+        conn.close()
+    assert scans, "a changed mtime_ns left the entry valid — mtime_ns is not in the key"
