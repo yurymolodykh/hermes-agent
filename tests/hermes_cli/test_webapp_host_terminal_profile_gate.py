@@ -37,8 +37,9 @@ FOREIGN = "01-bob"
 def webapp_home(monkeypatch, tmp_path):
     import hermes_acl_bindings as bindings
     from hermes_cli import web_server as server
-    from hermes_cli.web_routers.webapp import router  # noqa: F401 — imports the module under test
+    from hermes_cli.web_routers import webapp as _webapp_module
 
+    assert _webapp_module.router  # the module under test is imported
     root = tmp_path / "hermes"
     root.mkdir()
     (root / "config.yaml").write_text("{}\n", encoding="utf-8")
