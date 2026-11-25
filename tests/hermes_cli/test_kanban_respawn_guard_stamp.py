@@ -89,7 +89,7 @@ def test_latest_run_order_breaks_same_second_ties(kanban_home, monkeypatch):
     that superseded it. The newest *inserted* run must win."""
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
 
     with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
@@ -102,19 +102,26 @@ def test_latest_run_order_breaks_same_second_ties(kanban_home, monkeypatch):
 
         claimed = kb.claim_task(conn, tid, claimer=f"{host}:w1")
         assert claimed is not None
+        stamp_ended_at = conn.execute(
+            "SELECT ended_at FROM task_runs WHERE task_id=? AND outcome='rate_limited'", (tid,),
+        ).fetchone()["ended_at"]
+        assert kb.request_review(
+            conn, tid, summary="done", reviewer="r",
+            expected_run_id=claimed.current_run_id,
+        )
+        # Force a same-second collision: both runs end at the identical stamp.
         with kb.write_txn(conn):
-            # Force a same-second collision: both runs end at the identical stamp.
-            row = conn.execute(
-                "SELECT ended_at FROM task_runs WHERE task_id=? AND outcome='rate_limited'", (tid,),
-            ).fetchone()
-            assert kb.request_review(
-                conn, tid, summary="done", reviewer="r",
-                expected_run_id=claimed.current_run_id,
-            )
             conn.execute(
                 "UPDATE task_runs SET ended_at=? WHERE task_id=? AND outcome='review_requested'",
-                (row["ended_at"], tid),
+                (stamp_ended_at, tid),
             )
+        ended = {
+            row["outcome"]: row["ended_at"]
+            for row in conn.execute(
+                "SELECT outcome, ended_at FROM task_runs WHERE task_id=?", (tid,),
+            )
+        }
+        assert ended["rate_limited"] == ended["review_requested"], "tie was not forced"
 
         assert kb.get_task(conn, tid).last_failure_error  # stamp still present
         assert kbd.check_respawn_guard(conn, tid) is None
