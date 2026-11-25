@@ -9,7 +9,6 @@ follows the disk once the profile is reset/renamed.
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import pytest
