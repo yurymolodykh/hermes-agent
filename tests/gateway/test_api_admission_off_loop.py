@@ -9,6 +9,7 @@ no amount of noise can hide. The first, request-path-warming round is paid befor
 imports and the first sqlite open are a boot cost, not a per-admission stall.
 """
 import asyncio
+import math
 import sqlite3
 import threading
 import time
@@ -62,8 +63,7 @@ def _door_headers(headers, suffix):
 async def _sample_gaps(seconds):
     """Owner-loop tick gaps over a window with no request in flight — the host's own noise."""
     gaps, last = [], time.monotonic()
-    deadline = last + seconds
-    while time.monotonic() < deadline:
+    for _ in range(math.ceil(seconds / POLL_S)):
         await asyncio.sleep(POLL_S)
         now = time.monotonic()
         gaps.append(now - last)
