@@ -455,6 +455,12 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
         home = _profile_home(name)
         if home is not None and home not in roots:
             roots.append(home)
+        # A profile's own working tree (``~/workspaces/<profile>``) is where its sessions write and
+        # what its owner asks to download; the home alone is not enough — files produced before the
+        # cwd was pinned live there, and refusing them back to their AUTHOR is a dead end.
+        work = _profile_workspace(name)
+        if work is not None and work not in roots:
+            roots.append(work)
     for path in _team_card_dirs(subject):
         if path not in roots:
             roots.append(path)
