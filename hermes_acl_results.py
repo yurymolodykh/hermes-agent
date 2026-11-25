@@ -746,13 +746,13 @@ def record_exchange_authorship(request: Any, target: Any) -> None:
         return
     try:
         import json
-        from datetime import datetime, timezone
+        from datetime import UTC, datetime
 
         journal.parent.mkdir(parents=True, exist_ok=True)
         row = {
             "path": str(resolved),
             "subject": subject,
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         with open(journal, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
