@@ -591,6 +591,68 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
     )]
 
 
+def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Trailing ``respawn_guarded`` events with no claim/run since: the
+    dispatcher keeps declining to spawn this card and nothing in the board UI
+    said why. Fires for the *current* streak only — any later ``claimed`` /
+    ``promoted`` / ``respawned`` event resets the streak, so a guard that
+    already cleared is not reported forever.
+
+    This is the operator-facing half of the requeue-stamp defect (#119070): the
+    card sat in ``ready`` with ``consecutive_failures`` 0, the breaker could not
+    trip, and neither log nor board explained it. ``data.guard_reason`` /
+    ``data.first_guarded_at`` / ``data.last_guarded_at`` name the reason and the
+    stamp age so a stuck card is visible without reading task events."""
+    if _task_field(task, "status") in ("done", "archived"):
+        return []
+    guarded = [ev for ev in events if _event_kind(ev) == "respawn_guarded"]
+    if not guarded:
+        return []
+    # A claim (or a resume of any kind) after the last guard means the card got
+    # spawned again; the streak is over even if old guard events remain.
+    last_guard_ts = max(_event_ts(ev) for ev in guarded)
+    if any(
+        _event_kind(ev) in {"claimed", "promoted", "reclaimed", "unblocked", "respawned"}
+        and _event_ts(ev) >= last_guard_ts
+        for ev in events
+    ):
+        return []
+    # Only the trailing streak of guards, not the lifetime count.
+    streak: list[Any] = []
+    for ev in reversed(list(events)):
+        if _event_kind(ev) == "respawn_guarded":
+            streak.append(ev)
+        elif _event_kind(ev) in {"claimed", "promoted", "reclaimed", "unblocked", "respawned"}:
+            break
+    if not streak:
+        return []
+    reason = str(_parse_payload(streak[0]).get("reason") or "unknown")
+    first_guard_ts = min(_event_ts(ev) for ev in streak)
+    age_seconds = max(0, now - first_guard_ts)
+    age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
+    guard_reasons = sorted({str(_parse_payload(ev).get("reason") or "unknown") for ev in streak})
+    return [Diagnostic(
+        kind="respawn_guarded", severity="warning" if age_seconds < 3600 else "error",
+        title=f"Dispatcher has refused to spawn this card for {age_str} ({reason})",
+        detail=(
+            f"The respawn guard has blocked this card {len(streak)} time(s) since "
+            f"{age_str} ago, most recently with reason {reason!r}. The card stays in its lane "
+            f"and its failure counter does not move, so the circuit breaker never trips and "
+            f"nothing auto-recovers. Reasons: 'rate_limit_cooldown' / 'infrastructure_cooldown' "
+            f"clear themselves when the provider accepts work again; 'blocker_auth' means the "
+            f"persisted error looks like a quota/auth wall that a retry cannot fix — check the "
+            f"assignee's credentials, then unblock or reclaim the card."
+        ),
+        actions=[_cli_hint("See every guard event", f"hermes kanban log {_task_field(task, 'id')}",
+                           suggested=True)]
+                + _generic_recovery_actions(task, running=_is_running(task)),
+        first_seen_at=first_guard_ts, last_seen_at=last_guard_ts, count=len(streak),
+        data={"guard_reason": reason, "guard_reasons": guard_reasons,
+              "guard_count": len(streak), "first_guarded_at": first_guard_ts,
+              "last_guarded_at": last_guard_ts, "age_seconds": int(age_seconds)},
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
