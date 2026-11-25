@@ -19,18 +19,29 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_acl_identity
 import hermes_acl_scope
-from gateway.config import Platform
+# Imported at module level on purpose. Importing this chain from inside a test body runs
+# ``hermes_bootstrap._settle_interrupted_update`` AFTER the autouse HomeIOGuard is
+# installed; its pull-marker stat resolves this worktree's git dir under the real home and
+# the guard refuses it (a leaking test, not a code defect). Collection-time imports happen
+# before the guard.
+from gateway import run
+from gateway import session_subject_scope
+from gateway.config import GatewayConfig, Platform
 from gateway.owner_identity import host_owner_subject
-from gateway.session import SessionSource
-from gateway.session_authority import LiveSession, SessionAuthority
-from gateway.session_contract import SessionActor
+from gateway.session import SessionSource, SessionStore
+from gateway.session_authority import LiveSession, SessionAuthority, initialize_session_authority
+from gateway.session_contract import SessionActor, SessionRef
 from gateway.session_controls import AuthorityConnection
+from gateway.session_local import create_local_session
+from gateway.session_subject_scope import actor_stamps, foreign_session_in_multi_user, session_stamp
+from hermes_cli.web_routers.chat_ws import socket_operator
 from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
 
@@ -58,8 +69,6 @@ def _multi_user(monkeypatch):
 @pytest.fixture
 def authority(tmp_path, monkeypatch):
     """One profile's store with three mounted messaging rows: alice's, bob's, and an unowned one."""
-    from pathlib import Path
-
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -112,8 +121,6 @@ def _identity(login):
 
 
 def _connect(authority, login, journal, label):
-    from hermes_cli.web_routers.chat_ws import socket_operator
-
     identity = dict(_identity(login), profile_id=authority.profile_id)
     conn = AuthorityConnection(authority, Recorder(label, journal), identity,
                                operator=socket_operator(identity))
@@ -137,19 +144,13 @@ def _wait_for(journal, predicate, timeout=2.0):
 
 class TestScopeModule:
     def test_actor_stamps_are_the_subjects_own_stamps(self):
-        from gateway.session_subject_scope import actor_stamps
-
         assert actor_stamps(SimpleNamespace(subject=ALICE)) == hermes_acl_scope.owner_stamps(ALICE)
 
     def test_an_actor_without_a_subject_matches_nothing(self):
         """Fail closed: an unestablished subject must not widen to the whole store."""
-        from gateway.session_subject_scope import actor_stamps
-
         assert actor_stamps(SimpleNamespace(subject="")) == []
 
     def test_an_unusable_registry_is_a_refusal_not_an_exception(self, monkeypatch):
-        from gateway import session_subject_scope
-
         def _broken(_identity):
             raise RuntimeError("registry unreadable")
 
@@ -157,47 +158,33 @@ class TestScopeModule:
         assert session_subject_scope.actor_stamps(SimpleNamespace(subject=ALICE)) == []
 
     def test_the_live_source_names_the_owner_before_the_stored_row(self, authority):
-        from gateway.session_subject_scope import session_stamp
-
         assert session_stamp(authority, "bob-chat", SimpleNamespace(user_id=BOB)) == BOB
 
     def test_a_cold_row_falls_back_to_its_stored_stamp(self, authority):
-        from gateway.session_subject_scope import session_stamp
-
         assert session_stamp(authority, "bob-chat", None) == BOB
 
     def test_the_flag_off_answers_no_foreign_row_at_all(self, authority, monkeypatch):
         """The single-user contract step 3 shipped: nothing changes while the mode is off."""
-        from gateway.session_subject_scope import foreign_session_in_multi_user
-
         monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: False)
         alice = SessionActor(ALICE, authority.profile_id, frozenset({"session:read"}), "t")
         assert foreign_session_in_multi_user(authority, alice, "bob-chat", None) is False
 
     def test_the_host_owner_keeps_the_whole_store(self, authority):
-        from gateway.session_subject_scope import foreign_session_in_multi_user
-
         owner = SessionActor(host_owner_subject(), authority.profile_id,
                              frozenset({"session:read"}), "t")
         for sid in ("alice-chat", "bob-chat", "unowned-chat"):
             assert foreign_session_in_multi_user(authority, owner, sid, None) is False
 
     def test_an_own_row_is_inside_the_scope(self, authority):
-        from gateway.session_subject_scope import foreign_session_in_multi_user
-
         alice = SessionActor(ALICE, authority.profile_id, frozenset({"session:read"}), "t")
         assert foreign_session_in_multi_user(authority, alice, "alice-chat", None) is False
 
     def test_a_foreign_row_is_outside_the_scope(self, authority):
-        from gateway.session_subject_scope import foreign_session_in_multi_user
-
         alice = SessionActor(ALICE, authority.profile_id, frozenset({"session:read"}), "t")
         assert foreign_session_in_multi_user(authority, alice, "bob-chat", None) is True
 
     def test_an_unowned_row_is_refused_too(self, authority):
         """An owner-scoped surface never discloses a transcript whose owner is unstated."""
-        from gateway.session_subject_scope import foreign_session_in_multi_user
-
         alice = SessionActor(ALICE, authority.profile_id, frozenset({"session:read"}), "t")
         assert foreign_session_in_multi_user(authority, alice, "unowned-chat", None) is True
 
@@ -236,8 +223,6 @@ class TestSocketSurface:
         """``attach`` is the subscribe path: the refusal has to happen before the join."""
         alice = _connect(authority, "alice", [], "A")
         try:
-            from gateway.session_contract import SessionRef
-
             with pytest.raises(RuntimeStoreError, match="not_found"):
                 await authority.attach(alice.actor, SessionRef(authority.profile_id, "bob-chat"))
             with pytest.raises(RuntimeStoreError, match="not_found"):
@@ -252,8 +237,6 @@ class TestSocketSurface:
             reply = await owner.dispatch({"id": 1, "method": "session.list", "params": {}})
             assert {row["id"] for row in reply["result"]["sessions"]} == {
                 "alice-chat", "bob-chat", "unowned-chat"}
-            from gateway.session_contract import SessionRef
-
             snapshot = await authority.attach(
                 owner.actor, SessionRef(authority.profile_id, "bob-chat"))
             assert snapshot.history[0]["content"] == "needle bob-chat"
@@ -262,8 +245,6 @@ class TestSocketSurface:
 
     @pytest.mark.asyncio
     async def test_a_second_person_is_not_a_host_operator(self, authority):
-        from hermes_cli.web_routers.chat_ws import socket_operator
-
         assert socket_operator(dict(_identity("alice"), profile_id=authority.profile_id)) is False
         assert socket_operator(dict(_identity(OWNER_LOGIN), profile_id=authority.profile_id)) is True
 
@@ -278,9 +259,7 @@ class TestEventStream:
     async def test_a_foreign_sessions_event_never_reaches_the_socket(self, authority, journal):
         alice = _connect(authority, "alice", journal, "A")
         try:
-            await authority.attach(alice.actor,
-                                   __import__("gateway.session_contract", fromlist=["SessionRef"])
-                                   .SessionRef(authority.profile_id, "alice-chat"))
+            await authority.attach(alice.actor, SessionRef(authority.profile_id, "alice-chat"))
             journal.clear()
             authority.sessions["bob-chat"].event_stream.publish(
                 "bob-chat", {"text": "bob live"}, event_type="message.complete")
@@ -297,8 +276,6 @@ class TestEventStream:
     async def test_the_owner_socket_still_receives_the_rows_it_owns(self, authority, journal):
         owner = _connect(authority, OWNER_LOGIN, journal, "owner")
         try:
-            from gateway.session_contract import SessionRef
-
             await authority.attach(owner.actor, SessionRef(authority.profile_id, "bob-chat"))
             journal.clear()
             authority.sessions["bob-chat"].event_stream.publish(
@@ -317,12 +294,6 @@ class TestEventStream:
 async def test_a_second_person_cannot_open_a_canonical_local_session(tmp_path, monkeypatch,
                                                                      journal):
     """The same rule on a session that exists as a receipt, not just as a mounted row."""
-    from gateway import run
-    from gateway.config import GatewayConfig
-    from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
-    from gateway.session_local import create_local_session
-
     monkeypatch.setattr(run, "_load_gateway_config", lambda: {"platform_toolsets": {"cli": []}})
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={},
@@ -343,8 +314,6 @@ async def test_a_second_person_cannot_open_a_canonical_local_session(tmp_path, m
         def _ident(login):
             return {"user_id": login, "provider": "basic", "profile_id": str(tmp_path),
                     "instance_id": "fixture"}
-
-        from hermes_cli.web_routers.chat_ws import socket_operator
 
         alice = AuthorityConnection(authority, Recorder("A", journal), _ident("alice"),
                                     operator=socket_operator(_ident("alice")))
@@ -377,12 +346,6 @@ async def test_a_second_person_cannot_open_a_canonical_local_session(tmp_path, m
 @pytest.mark.asyncio
 async def test_the_flag_off_keeps_the_single_user_socket(tmp_path, monkeypatch):
     """Regression guard: with ``acl.multi_user`` off one person owns the host, as before."""
-    from gateway import run
-    from gateway.config import GatewayConfig
-    from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
-    from gateway.session_local import create_local_session
-
     monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: False)
     monkeypatch.setattr(run, "_load_gateway_config", lambda: {"platform_toolsets": {"cli": []}})
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
@@ -399,8 +362,6 @@ async def test_the_flag_off_keeps_the_single_user_socket(tmp_path, monkeypatch):
     try:
         identity = {"user_id": "uid:1000", "provider": "local", "profile_id": str(tmp_path),
                     "instance_id": "fixture"}
-        from hermes_cli.web_routers.chat_ws import socket_operator
-
         connection = AuthorityConnection(authority, Recorder("socket", []), identity,
                                          operator=socket_operator(identity))
         reply = await connection.dispatch({"id": 1, "method": "session.resume",
