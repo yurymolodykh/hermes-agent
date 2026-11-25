@@ -153,7 +153,8 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
         stalled = _median(p95s)
     # The bound follows the loop's own measured noise, so neighbouring load moves it instead of
     # breaking the test; an admission on the loop would stall for the whole hold and blow past it.
-    ceiling = max(noise * NOISE_FACTOR, noise + NOISE_FLOOR_S)
+    # Capped at half the hold: a bound above that could no longer tell a stall from noise.
+    ceiling = min(max(noise * NOISE_FACTOR, noise + NOISE_FLOOR_S), HOLD_S / 2)
     assert stalled <= ceiling, (
         f'{name}: owner loop stalled {stalled:.3f}s behind the admission write '
         f'(median p95 of {REPETITIONS} holds; control noise {noise:.3f}s, ceiling {ceiling:.3f}s)')
