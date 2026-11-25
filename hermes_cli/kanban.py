@@ -1332,6 +1332,16 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(f"\n{sched_line}")
         for card in stats.get("next_wakeups") or []:
             print(f"  {card['id']}  {card['scheduled_until_local']}  {card['title']}")
+    guarded = stats.get("respawn_guarded_total") or 0
+    if guarded:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted((stats.get("respawn_guarded_by_reason") or {}).items())
+        )
+        oldest = stats.get("respawn_guarded_oldest_age_seconds")
+        oldest_str = f", oldest {int(oldest)}s" if oldest is not None else ""
+        print(f"\nRespawn-guarded (dispatcher declining to spawn): {guarded} ({reasons}{oldest_str})")
+        print("  see: hermes kanban diagnostics")
     return 0
 
 
