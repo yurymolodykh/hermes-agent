@@ -1,0 +1,44 @@
+file: plugins/kanban/dashboard/plugin_api.py
+
+  CARD-GATE   DELETE /attachments/{attachment_id}                  remove_attachment
+  CARD-GATE   DELETE /links                                        delete_link
+  CARD-GATE   DELETE /tasks/{task_id}                              delete_task
+  CARD-GATE   DELETE /tasks/{task_id}/home-subscribe/{platform}    unsubscribe_home
+  CARD-GATE   PATCH  /tasks/{task_id}                              update_task
+  CARD-GATE   POST   /links                                        add_link
+  CARD-GATE   POST   /runs/{run_id}/terminate                      terminate_run_endpoint
+  CARD-GATE   POST   /tasks/bulk                                   bulk_update
+  CARD-GATE   POST   /tasks/{task_id}/attachments                  upload_task_attachment
+  CARD-GATE   POST   /tasks/{task_id}/decompose                    decompose_task_endpoint
+  CARD-GATE   POST   /tasks/{task_id}/home-subscribe/{platform}    subscribe_home
+  CARD-GATE   POST   /tasks/{task_id}/reassign                     reassign_task_endpoint
+  CARD-GATE   POST   /tasks/{task_id}/reclaim                      reclaim_task_endpoint
+  CARD-GATE   POST   /tasks/{task_id}/specify                      specify_task_endpoint
+  OWNER-GATE  DELETE /boards/{slug}                                delete_board
+  OWNER-GATE  PATCH  /boards/{slug}                                rename_board
+  OWNER-GATE  PATCH  /profiles/{profile_name}                      update_profile_description
+  OWNER-GATE  POST   /boards                                       create_board_endpoint
+  OWNER-GATE  POST   /boards/import                                import_board_endpoint
+  OWNER-GATE  POST   /boards/{slug}/export                         export_board_endpoint
+  OWNER-GATE  POST   /boards/{slug}/switch                         switch_board
+  OWNER-GATE  POST   /dispatch                                     dispatch
+  OWNER-GATE  POST   /estimate                                     estimate_text_endpoint
+  OWNER-GATE  POST   /profiles/{profile_name}/describe-auto        auto_describe_profile
+  OWNER-GATE  PUT    /orchestration                                set_orchestration_settings
+  READ-GATE   POST   /tasks/{task_id}/comments                     add_comment
+              ↳ a comment is team material: any verified caller may add one and the author recorded is the real person (attributable thread). No card field changes.
+  READ-GATE   POST   /tasks/{task_id}/estimate                     estimate_task_endpoint
+              ↳ reads title/body to ask the aux model for a token estimate; nothing on the card changes.
+  OPEN        POST   /tasks                                        create_task
+              ↳ creating a card is work, not somebody else's: the row records the caller as created_by, so the new card belongs to whoever made it.
+
+mutating routes total: 28
+  card-gated (_require_held_task): 14
+  owner-gated (_require_owner): 11
+  read-gated by design:     2 (declared: 2)
+  open by design:           1 (declared: 1)
+  ungated:                  0
+  stale excuse:             0
+
+mutating routes with {task_id}: 16
+  of which ungated:            0
