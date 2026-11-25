@@ -72,5 +72,9 @@ export const zhOnboarding: TranslationOverrides['onboarding'] = {
   price: (input, output) => `${input} 输入 / ${output} 输出每 Mtok`,
   change: '更改',
   startChatting: '开始',
-  docs: provider => `${provider} 文档`
+  docs: provider => `${provider} 文档`,
+  runtimeConnecting: '正在连接 Hermes 后端…… 它启动时可能需要一点时间。',
+  runtimeNotReadyTitle: '运行时尚未就绪',
+  runtimeNotReadyBody:
+    'Hermes Desktop 无法连接后端。它可能已停止；应用会继续检查并自动恢复。'
 }

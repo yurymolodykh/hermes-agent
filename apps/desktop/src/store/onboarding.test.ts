@@ -92,6 +92,49 @@ function fallbackTimeoutGateway(): OnboardingContext['requestGateway'] {
   }
 }
 
+/** A closed port: the transport refuses the dial, so no probe reached a server. */
+function refusedPortGateway(): OnboardingContext['requestGateway'] {
+  return async method => {
+    if (method === 'setup.status' || method === 'setup.runtime_check') {
+      throw new Error(`connect ECONNREFUSED 127.0.0.1:9 (${method})`)
+    }
+
+    throw new Error(`unexpected gateway method: ${method}`)
+  }
+}
+
+/** Answers `timeouts` rounds with a request timeout, then the keyless custom
+ *  runtime_check — a backend that was busy and then came up. */
+function busyThenReadyGateway(timeouts: number): OnboardingContext['requestGateway'] {
+  let rounds = 0
+
+  return async method => {
+    if (method === 'setup.status') {
+      rounds += 1
+
+      if (rounds <= timeouts) {
+        throw new Error('request timed out after 30s: setup.status')
+      }
+
+      return { provider_configured: true } as never
+    }
+
+    if (method === 'setup.runtime_check') {
+      return { ok: true, provider: 'custom' } as never
+    }
+
+    throw new Error(`unexpected gateway method: ${method}`)
+  }
+}
+
+/** With fake timers: let one `refreshOnboarding` round walk its whole backoff
+ *  ladder, then read the result. */
+async function settleBackoff(pending: Promise<boolean>): Promise<boolean> {
+  await vi.advanceTimersByTimeAsync(60_000)
+
+  return pending
+}
+
 describe('refreshOnboarding', () => {
   it('keeps onboarding work in its initiating lifetime and profile', async () => {
     const { startManualOnboarding, startProviderOAuth, saveOnboardingApiKey, closeManualOnboarding } =

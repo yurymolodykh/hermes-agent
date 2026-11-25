@@ -95,5 +95,9 @@ export const esOnboarding: TranslationOverrides['onboarding'] = {
   price: (input, output) => `${input} entrada / ${output} salida por Mtok`,
   change: 'Cambiar',
   startChatting: 'Empezar',
-  docs: provider => `Docs de ${provider}`
+  docs: provider => `Docs de ${provider}`,
+  runtimeConnecting: 'Conectando con el backend de Hermes… puede tardar un momento mientras arranca.',
+  runtimeNotReadyTitle: 'Runtime no preparado',
+  runtimeNotReadyBody:
+    'Hermes Desktop no pudo contactar con el backend. Puede que se haya detenido; la app seguirá comprobando y se recuperará sola.'
 }

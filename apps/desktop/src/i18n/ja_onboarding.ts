@@ -78,5 +78,9 @@ export const jaOnboarding: TranslationOverrides['onboarding'] = {
   price: (input, output) => `${input} 入力 / ${output} 出力 per Mtok`,
   change: '変更',
   startChatting: '始める',
-  docs: provider => `${provider} ドキュメント`
+  docs: provider => `${provider} ドキュメント`,
+  runtimeConnecting: 'Hermes バックエンドに接続しています… 起動中のため少し時間がかかることがあります。',
+  runtimeNotReadyTitle: 'ランタイムの準備ができていません',
+  runtimeNotReadyBody:
+    'Hermes Desktop はバックエンドに接続できませんでした。停止している可能性があります。アプリは確認を続け、自動的に復旧します。'
 }
