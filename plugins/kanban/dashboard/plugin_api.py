@@ -1227,8 +1227,11 @@ class EstimateBody(BaseModel):
 
 
 @router.post("/estimate")
-def estimate_text_endpoint(payload: EstimateBody):
+def estimate_text_endpoint(payload: EstimateBody, request: Request):
     """Estimate from raw title/body (create dialog, before a task exists)."""
+    # Spends aux-model tokens on free text with no card to hold: the create dialog belongs to
+    # whoever may create cards, and the knob set is installation-wide.
+    _require_owner(request, "kanban_estimate_admin")
     return _run_estimate(payload.title, payload.body, task_id=None)
 
 
@@ -1760,9 +1763,11 @@ def update_profile_description(profile_name: str, payload: DescribeBody, request
 
 
 @router.post("/profiles/{profile_name}/describe-auto")
-def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
+def auto_describe_profile(profile_name: str, payload: DescribeAutoBody, request: Request):
     """``hermes profile describe <name> --auto``: persist with ``description_auto: true``.
     Non-OK outcomes are NOT HTTP errors — the UI renders the reason inline."""
+    # Same write as PATCH /profiles/{name}, plus aux-model tokens: admin only, before the spend.
+    _require_owner(request, "kanban_profile_admin")
     with _errors_to_500("describer crashed"):
         from hermes_cli import profile_describer
         outcome = profile_describer.describe_profile(profile_name, overwrite=bool(payload.overwrite))
@@ -1854,9 +1859,11 @@ def _validated_profile_name(raw: Optional[str], profiles_mod) -> str:
 
 
 @router.put("/orchestration")
-def set_orchestration_settings(payload: OrchestrationSettingsBody):
+def set_orchestration_settings(payload: OrchestrationSettingsBody, request: Request):
     """Update orchestration knobs in config.yaml. Only fields explicitly passed
     are written; empty profile strings clear the override."""
+    # Orchestration knobs decide who runs everybody's cards: installation-wide, admin only.
+    _require_owner(request, "kanban_orchestration_admin")
     with _errors_to_500("failed to load config"):
         from hermes_cli.config import load_config, save_config
         cfg = load_config() or {}
