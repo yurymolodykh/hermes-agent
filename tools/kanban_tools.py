@@ -1222,7 +1222,8 @@ def _handle_create(args: dict, **kw) -> str:
                    **({"estimated_minutes": estimated_minutes}
                       if estimated_minutes is not None else {}),
                    max_runtime_seconds=kb.get_task(conn, new_tid).max_runtime_seconds,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid),
+                   customer_subscribed=_subscribe_card_customer(conn, new_tid))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1351,6 +1352,49 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, target["platform"] if target else "", bool(target and target["chat_id"]))
         return False
+
+
+def _session_customer_subject() -> str:
+    """The subject of the person driving THIS session (``HERMES_SESSION_ACTOR_ID``).
+
+    A gateway turn binds the sending user there; the tool path persists ``created_by`` as the
+    profile label (a board record must not be forgeable from args), so the *person* is read
+    from the session variables instead. Empty for CLI/cron, where there is nobody to serve.
+    """
+    try:
+        from gateway.session_context import get_session_env as env
+
+        return str(env("HERMES_SESSION_ACTOR_ID", "") or "").strip()
+    except Exception:  # health: allow BLE001 -- no gateway context is "no subject"
+        return ""
+
+
+def _subscribe_card_customer(conn: Any, task_id: str) -> int:
+    """Additionally subscribe the card's CUSTOMER to it; the number of rows written.
+
+    The calling session's subscription (above) is the working profile's address and stays
+    untouched; this adds the person who ordered the work — the session's actor subject, with
+    the row's ``created_by`` as the fallback for a card that already names a person. A profile
+    label resolves to no address, so nothing is written. Two rows on one card are two
+    destinations, not two mechanisms: the composite key is (task, platform, chat, thread).
+
+    Best-effort: the create already committed, so a booking failure is logged, never raised.
+    """
+    written = 0
+    try:
+        from hermes_cli import kanban_customer, kanban_db as _kb, kanban_db_notify as _kbn
+        subject = _session_customer_subject()
+        if not subject:
+            task = _kb.get_task(conn, task_id)
+            subject = str(getattr(task, "created_by", "") or "").strip()
+        if not subject:
+            return 0
+        for customer_target in kanban_customer.notify_targets(subject):
+            _kbn.add_notify_sub(conn, task_id=task_id, **customer_target)
+            written += 1
+    except Exception as _exc:
+        logger.warning("_subscribe_card_customer failed for %s: %r", task_id, _exc)
+    return written
 
 
 @_kanban_handler("kanban_unblock")

@@ -1070,6 +1070,10 @@ class _KanbanNotification:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
                     event_payload=event_payload, task=None if self.policy_active else self.task,
+                    # The relation check needs the card even when the owner policy dropped it
+                    # from the payload: "is this recipient on this card?" is a fact about the
+                    # card, not about the narrowed artifact list.
+                    relation_task=self.task, event_kind=str(getattr(ev, "kind", "") or ""),
                 )
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)

@@ -149,14 +149,35 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
+    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task,
+                                        relation_task=None, event_kind: str = "") -> None:
         """Upload artifact files referenced by a completed kanban task.
 
         Sources, in priority order: ``event_payload['artifacts']``,
         ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
         deduplicated, missing files are skipped (may be mentioned for
         reference only), and upload errors are logged, never raised.
+
+        Every handoff is journalled (``<HERMES_HOME>/logs/notify-delivery.jsonl``) with the
+        recipient and the relation verdict, and a refusal is a JOURNAL ROW — the point of the
+        check is that "nothing arrived" is never the whole story. The relation itself is
+        :func:`hermes_acl_results.card_verdict`; by the owner's standing decision card
+        materials are shared, so a recipient outside the card's row is still served
+        (``reason: materials-shared``) unless ``kanban.shared_card_materials`` says otherwise.
         """
+        from gateway import kanban_delivery
+
+        platform_str = str(getattr(getattr(adapter, "platform", ""), "value", "") or "")
+        # ``relation_task`` is the card the RECIPIENT is checked against, passed even when
+        # ``task`` is None (the owner delivery policy narrows the payload but still knows
+        # which card it belongs to).
+        card = relation_task if relation_task is not None else task
+        recipient = ""
+        if isinstance(metadata, dict):
+            recipient = str(metadata.get("customer_subject") or "").strip()
+        if not recipient and card is not None:
+            recipient = str(getattr(card, "created_by", "") or "").strip()
+        task_id = str(getattr(card, "id", "") or "") if card is not None else ""
         raw_paths: list[str] = []
         prose_paths: list[str] = []
         if isinstance(event_payload, dict):
@@ -186,17 +207,36 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
+        # Who is this file going to, and does that recipient have anything to do with the
+        # card? The answer is journalled either way: a refusal that leaves no record is
+        # indistinguishable from a lost message. ``task`` is None when the owner delivery
+        # policy narrowed the payload (the caller passes it for the shared path), so fall
+        # back to the payload's own task id and deliver as before rather than inventing a row.
+        verdict, reason = "delivered", "no-card-context"
+        if card is not None:
+            verdict, reason = kanban_delivery.verdict_for(recipient, card)
+        if verdict != kanban_delivery.VERDICT_DELIVERED:
+            # A refusal is a ROW: "nothing arrived" must never be the whole story.
+            kanban_delivery.record_delivery(
+                task_id=task_id, platform=platform_str, chat_id=chat_id, verdict=verdict,
+                reason=reason, subject=recipient, event_kind=event_kind, artifacts=len(candidates))
+            logger.info("kanban notifier: artifact handoff for %s to %s refused (%s)",
+                        task_id or "?", chat_id, reason)
+            return
+
         from urllib.parse import quote as _quote
 
         # Images ride one send_multiple_images call (batch uploads on Signal/Slack).
         image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
+        failed = 0
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
                 await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
             except Exception as exc:
                 logger.warning("kanban notifier: image batch upload failed: %s", exc)
+                failed += len(image_paths)
         for path in other_paths:
             try:
                 if Path(path).suffix.lower() in _VIDEO_EXTS:
@@ -205,6 +245,15 @@ class GatewayKanbanWatchersMixin:
                     await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
             except Exception as exc:
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
+                failed += 1
+        # The row records what actually happened, not what was attempted: a transport
+        # failure downgrades the verdict instead of leaving a "delivered" line for a file
+        # that never arrived.
+        kanban_delivery.record_delivery(
+            task_id=task_id, platform=platform_str, chat_id=chat_id,
+            verdict=kanban_delivery.VERDICT_FAILED if failed else verdict,
+            reason=(f"upload-failed:{failed}/{len(candidates)}" if failed else reason),
+            subject=recipient, event_kind=event_kind, artifacts=len(candidates))
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.

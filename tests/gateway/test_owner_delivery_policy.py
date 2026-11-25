@@ -523,11 +523,12 @@ def test_local_platform_completion_delivers_as_before(run_tick, platform, enum):
     delivered = {}
     real = GatewayRunner._deliver_kanban_artifacts
 
-    async def spy(self, *, adapter, chat_id, metadata, event_payload, task):
+    async def spy(self, *, adapter, chat_id, metadata, event_payload, task, relation_task=None, event_kind=""):
         delivered["payload"] = event_payload
         delivered["task"] = task
         return await real(self, adapter=adapter, chat_id=chat_id, metadata=metadata,
-                          event_payload=event_payload, task=task)
+                          event_payload=event_payload, task=task,
+                          relation_task=relation_task, event_kind=event_kind)
 
     GatewayRunner._deliver_kanban_artifacts = spy
     try:

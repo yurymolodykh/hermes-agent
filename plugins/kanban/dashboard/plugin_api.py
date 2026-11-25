@@ -34,6 +34,7 @@ from hermes_cli import kanban_workflow
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_customer
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
@@ -495,15 +496,35 @@ class CreateTaskBody(BaseModel):
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
 
 
+def _subscribe_customer(conn: sqlite3.Connection, task_id: str, created_by: str) -> None:
+    """Subscribe the card's customer to its own terminal events, when they are reachable.
+
+    A card's ``created_by`` may now be a person's subject (``person/<login>``); the bindings
+    registry knows the chats that person holds, so the notifier has a destination. The
+    orchestrator's subscription is written separately by the caller's session path and is never
+    replaced: this is an ADDITIONAL address, and a card whose creator is a surface label
+    (``"dashboard"``, a profile name) resolves to no address at all — today's behaviour.
+
+    Best-effort by contract: a bookkeeping failure must never fail the create that already
+    committed.
+    """
+    try:
+        for target in kanban_customer.notify_targets(created_by):
+            kbn.add_notify_sub(conn, task_id=task_id, **target)
+    except Exception:
+        log.warning("kanban dashboard: customer subscription failed for %s", task_id, exc_info=True)
+
+
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
-        # CreateTaskBody field names match create_task's keyword parameters. ``created_by`` is the
-        # REAL caller, never the constant "dashboard": the person who ordered the work is the
-        # address the finished artifact has to reach, and a card stamped "dashboard" has no owner
-        # to deliver to (the whole board shipped 18 such rows).
-        task_id = kanban_db.create_task(
-            conn, created_by=_requester_stamp(request), board=board, **payload.model_dump())
+        # CreateTaskBody field names match create_task's keyword parameters.
+        # ``created_by`` names the PERSON who ordered the card, not the surface that made it:
+        # with multi-user identity on, the request's verified subject; otherwise the legacy
+        # literal, so turning the flag off restores the old row byte for byte.
+        created_by = kanban_customer.creator_label(kanban_customer.LEGACY_DASHBOARD_LABEL, request)
+        task_id = kanban_db.create_task(conn, created_by=created_by, board=board, **payload.model_dump())
+        _subscribe_customer(conn, task_id, created_by)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(
             task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
