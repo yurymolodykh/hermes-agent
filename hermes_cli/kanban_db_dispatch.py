@@ -75,6 +75,21 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
+# Terminal run outcomes that prove the card got past whatever the persisted
+# ``last_failure_error`` text describes. A requeue stamp (rate-limit / gateway
+# restart / owner lost) is written without counting a failure, so once a later
+# run ends in one of these the leftover text is stale context: it must not park
+# the card in ``blocker_auth`` forever (#119070).
+_RESPAWN_BLOCKER_SUPERSEDED_OUTCOMES = frozenset(
+    {"completed", "review_requested", "changes_requested", "crashed"}
+)
+
+# Newest-run ordering. ``ended_at`` has one-second resolution, so two runs that
+# end inside the same second tie and an arbitrary row used to win — a
+# rate-limited run could shadow the normal run that superseded it. The
+# (ended_at, id) pair is the only trustworthy "latest run" order.
+_LATEST_RUN_ORDER = "ORDER BY ended_at DESC, id DESC LIMIT 1"
+
 # Cooldown after a rate-limited (quota-wall) requeue before re-spawning. Without
 # it the task would re-spawn on the very next tick and bounce off the same quota
 # wall, burning a worker slot every tick for hours. Overridable via
@@ -1841,7 +1856,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        + _LATEST_RUN_ORDER,
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
@@ -1866,9 +1881,22 @@ def check_respawn_guard(
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
+    #
+    # The stamp is evidence only while no *normal* run supersedes it. A
+    # rate-limit / gateway-restart / owner-lost requeue writes a stamp whose
+    # text matches this pattern (``quota``, ``rate-limited``) without counting a
+    # failure; once a later run reached a normal terminal outcome
+    # (``review_requested`` / ``changes_requested`` / ``completed``) the card
+    # demonstrably got past that wall, so leftover text must not park it in
+    # ``blocker_auth`` forever — the breaker could never trip either, because
+    # ``consecutive_failures`` stayed 0 (#119070).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and latest_outcome not in _RESPAWN_BLOCKER_SUPERSEDED_OUTCOMES
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
