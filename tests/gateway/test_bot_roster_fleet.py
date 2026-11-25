@@ -225,3 +225,33 @@ async def test_the_roster_and_group_seating_read_one_set_of_local_bots(fleet):
     assert set(refused) == {'delta'}
     rows = (await fleet.call(fleet.connect('default', scope='host'), 'profiles.list'))['profiles']
     assert {row['path'] for row in rows} >= {str(bot.home) for bot in bots.values()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fleet', [('delta',)], indirect=True)
+async def test_the_roster_snapshot_is_remembered_while_the_served_set_holds(fleet, monkeypatch):
+    """The roster poll must not re-resolve every served home's name each time: the sibling snapshot
+    is reused while the served set is unchanged and recomputed the moment it moves."""
+    from gateway import session_group_controls as controls
+    from gateway import session_authorities as authorities
+
+    calls = []
+    real = authorities.local_bots
+
+    def counting(runner):
+        calls.append(runner)
+        return real(runner)
+
+    monkeypatch.setattr(authorities, 'local_bots', counting)
+    controls._BOTS_MEMO = ()
+    try:
+        first = controls._served_bots(fleet.runner)
+        assert controls._served_bots(fleet.runner) is first
+        assert len(calls) == 1
+        assert {bot.name for bot in first} == {'default', 'alpha', 'beta', 'gamma', 'delta'}
+        # Every serve/unserve bumps the registry counter: the next read rebuilds the snapshot.
+        fleet.runner.session_authorities.version += 1
+        controls._served_bots(fleet.runner)
+        assert len(calls) == 2
+    finally:
+        controls._BOTS_MEMO = ()

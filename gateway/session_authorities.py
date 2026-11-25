@@ -34,6 +34,9 @@ class SessionAuthorities:
         # A multiplexing runtime (configured, or one that ever served a second home) keeps the
         # scoped-lookup contract after its secondaries are removed: an unserved home is None.
         self.multiplexed = bool(multiplexed)
+        # Bumped by every serve/unserve, so a reader that memoizes what this registry holds (the
+        # Bots roster) can tell an unchanged served set from a rebuilt one.
+        self.version = 0
 
     def add(self, home, authority, name=None) -> None:
         key = hermes_home_key(home)
@@ -45,6 +48,7 @@ class SessionAuthorities:
             self._starting[key] = asyncio.Event()
         if key != self.launch_key:
             self.multiplexed = True
+        self.version += 1
 
     def replace(self, home, authority) -> None:
         """Fill the slot reserved by ``add(home, None, name=...)`` once the authority exists."""
@@ -52,6 +56,7 @@ class SessionAuthorities:
         if key not in self._by_key or self._by_key[key] is not None:
             raise RuntimeError(f'no reserved session authority slot for {home}')
         self._by_key[key] = authority
+        self.version += 1
         self._end_start(key)
 
     def remove(self, home):
@@ -62,7 +67,9 @@ class SessionAuthorities:
             raise RuntimeError('the launch session authority cannot be removed')
         self._names.pop(key, None)
         self._end_start(key)
-        return self._by_key.pop(key, None)
+        dropped = self._by_key.pop(key, None)
+        self.version += 1
+        return dropped
 
     def _end_start(self, key) -> None:
         started = self._starting.pop(key, None)
@@ -162,18 +169,24 @@ def local_bots(runner) -> list[LocalBot]:
     registry = getattr(runner, 'session_authorities', None)
     if registry is None:
         authority = getattr(runner, 'session_authority', None)
-        pairs = [(served_profile_name(authority.profile_id), authority)] if authority is not None else []
+        pairs = [(authority, None)] if authority is not None else []
     else:
         # A snapshot: hosted-room coordinator threads read the served set while the loop hot-serves.
-        pairs = [(registry.profile_name(a) or served_profile_name(a.profile_id), a)
-                 for a in list(registry._by_key.values()) if a is not None]
-    counts = Counter(name for name, _ in pairs)
+        pairs = [(a, registry.profile_name(a)) for a in list(registry._by_key.values()) if a is not None]
+    # One ``served_profile_name`` per authority (the registry's reserved name when it has one): the
+    # canonical name is what the ``problem`` check compares against, so resolving it twice per bot
+    # spent two ``realpath`` syscalls per bot on every ``profiles.list`` poll.
+    resolved = []
+    for authority, reserved in pairs:
+        canonical = served_profile_name(authority.profile_id)
+        resolved.append((authority, reserved if reserved is not None else canonical, canonical))
+    counts = Counter(name for _, name, _ in resolved)
     bots = []
-    for name, authority in pairs:
+    for authority, name, canonical in resolved:
         problem = None
         if counts[name] > 1:
             problem = 'two served homes answer to that name'
-        elif name != served_profile_name(authority.profile_id):
+        elif name != canonical:
             problem = 'a linked profile home is not supported yet'
         bots.append(LocalBot(name, Path(authority.profile_id), authority, problem,
                              bool(getattr(authority, 'retiring', False))))

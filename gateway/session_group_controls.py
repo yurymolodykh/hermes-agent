@@ -362,6 +362,29 @@ _LOCAL_CHAT = "(chat_id LIKE 'local-%' OR EXISTS (SELECT 1 FROM state_meta WHERE
 # Weak, so an unserved profile drops out with its authority and a re-served one (a new authority)
 # is warned again.
 _DEGRADED = weakref.WeakSet()
+# The last ``local_bots`` answer, with the registry state it was computed from. The roster is polled
+# every 5 s per connection and its spelling costs a home resolve per bot; the served set only moves
+# when the owner loop serves or unserve-retires a profile. The key is that served set: slot
+# identities plus their retiring flag, both read without any filesystem call.
+_BOTS_MEMO: tuple = ()
+
+
+def _served_bots(runner) -> list:
+    """``local_bots`` for *runner*, recomputed only when its served bots moved."""
+    global _BOTS_MEMO
+    from gateway.session_authorities import local_bots
+    registry = getattr(runner, 'session_authorities', None)
+    if registry is None:
+        return local_bots(runner)
+    memo = _BOTS_MEMO
+    # The served set without a filesystem call: slot identities, the retiring flag a serve/unserve
+    # flips before the slot leaves, and the registry's own serve/unserve counter.
+    state = (registry.version, tuple((id(a), bool(getattr(a, 'retiring', False))) for a in list(registry)))
+    if memo and memo[0] is registry and memo[1] == state:
+        return memo[2]
+    bots = local_bots(runner)
+    _BOTS_MEMO = (registry, state, bots)
+    return bots
 
 
 def _roster_siblings(connection, params):
@@ -373,7 +396,6 @@ def _roster_siblings(connection, params):
     by its own name (no ``problem``) is the one a click on its row opens. It carries this socket's
     subject and capabilities, which is what the routed connection would carry; none is built, so
     no poll (routed or not) adds connections."""
-    from gateway.session_authorities import local_bots
     from gateway.session_contract import SessionActor
     authority, actor = connection.authority, connection.actor
     if getattr(getattr(authority, 'runner', None), 'session_authorities', None) is None:
@@ -381,7 +403,7 @@ def _roster_siblings(connection, params):
     readable = connection.host_scoped and params.get('include_sessions', True) is True
     return [(bot, SessionActor(actor.subject, bot.authority.profile_id, actor.capabilities, actor.transport_id)
              if readable and bot.problem is None else None)
-            for bot in local_bots(authority.runner) if bot.authority is not authority]
+            for bot in _served_bots(authority.runner) if bot.authority is not authority]
 
 
 def _bot_sessions(authority, actor):
