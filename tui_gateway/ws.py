@@ -115,6 +115,11 @@ _WS_PROFILE_START_WAIT_S = 20.0
 # ``clarify.lock``) settles in memory and never queues: the serial lane may be running the very handler
 # that waits for it (a plugin slash command's ``ctx.ask_choice`` under ``slash.exec``).
 _WS_ANSWER_METHODS = frozenset({"clarify.lock"})
+# Batches a connection may have parked for its sender before the socket is declared unable to keep up.
+# Every batch here is already-serialized text waiting on ONE peer's kernel buffer, so this is per
+# connection, not per process: a peer that stops reading must not grow a list without bound.
+# Overflow drops the backlog and closes with 1011 (same reconnect-and-replay contract as ``abort``).
+_WS_SEND_QUEUE_MAX = 64
 
 
 def _answers_open_request(req: Any) -> bool:
@@ -161,7 +166,14 @@ class WSTransport:
         self._token_flush_handle: asyncio.TimerHandle | None = None
         self._token_flush_armed = False
         # Socket writes need an async boundary: several batches can queue on the loop during a stall.
+        # ONE drain task per connection owns the socket writer; producers append to ``_send_queue``
+        # (bounded — a peer that stops reading cannot grow it without bound) and await their own
+        # batch's completion. Holding a lock across the socket write made every later producer wait
+        # inside the loop instead of parking on its own bounded slot; the lock stays as the drain's
+        # single-writer marker (and the seam tests use to hold the writer).
         self._send_lock = asyncio.Lock()
+        self._send_queue: collections.deque = collections.deque()
+        self._send_drain: asyncio.Task | None = None
         self._abort_requested = False
         # One socket close per transport: the send-deadline path and abort() both reach for a 1011,
         # and under load both fire — latched on the loop thread so the peer gets a single close frame.
@@ -267,37 +279,81 @@ class WSTransport:
 
     async def _safe_send_many(self, lines: list[str], *, is_current: Callable[[], bool] | None = None,
                               unguarded_prefix: int = 0) -> None:
-        """Send one indivisible batch of pre-serialized frames in wire order."""
-        async with self._send_lock:
+        """Queue one indivisible batch of pre-serialized frames for this connection's writer.
+
+        The batch goes into the connection's own FIFO (``_send_queue``) and the caller awaits only its
+        own completion, so wire order is the enqueue order while a stalled socket parks the backlog
+        instead of the loop: previously a lock was held across ``send_text``, and every other producer
+        on the loop spun on it. ``_WS_SEND_QUEUE_MAX`` bounds the backlog — a peer that has stopped
+        reading gets the same 1011 close-and-replay contract as ``abort()`` rather than unbounded
+        memory. Once a batch has been dropped, later producers return immediately.
+        """
+        if self._closed or not lines:
+            return
+        if len(self._send_queue) >= _WS_SEND_QUEUE_MAX:
+            self._closed = True
+            _log.warning("ws send queue overflow (peer not draining) peer=%s depth=%s — closing",
+                         self._peer, len(self._send_queue))
+            self._loop.create_task(self._close_socket(1011, "send queue overflow"))
+            return
+        done = self._loop.create_future()
+        self._send_queue.append((lines, is_current, unguarded_prefix, done))
+        if self._send_drain is None or self._send_drain.done():
+            self._send_drain = self._loop.create_task(self._drain_sends())
+        await done
+
+    async def _drain_sends(self) -> None:
+        """Loop-thread writer: one batch at a time, in queue order, until the queue is empty."""
+        try:
+            while self._send_queue:
+                lines, is_current, unguarded_prefix, done = self._send_queue.popleft()
+                try:
+                    async with self._send_lock:
+                        await self._write_batch(lines, is_current=is_current, unguarded_prefix=unguarded_prefix)
+                finally:
+                    if not done.done():
+                        done.set_result(None)
+                if self._closed:
+                    break
+        finally:
+            # Nothing may stay parked on a transport that stopped writing (closed, aborted, or torn down
+            # mid-drain): resolve the remaining waiters so their producers return instead of hanging.
+            while self._send_queue:
+                _, _, _, done = self._send_queue.popleft()
+                if not done.done():
+                    done.set_result(None)
+            self._send_drain = None
+
+    async def _write_batch(self, lines: list[str], *, is_current: Callable[[], bool] | None = None,
+                           unguarded_prefix: int = 0) -> None:
+        """Write one batch of pre-serialized frames in wire order (drain task only)."""
+        for index, line in enumerate(lines):
             if self._closed:
                 return
-            for index, line in enumerate(lines):
-                if self._closed:
-                    return
-                if is_current is not None and index >= unguarded_prefix and not is_current():
-                    return
-                payload = _sanitize_ws_text(line)
-                try:
-                    await asyncio.wait_for(self._ws.send_text(payload), timeout=_WS_SEND_DEADLINE_S)
-                except TimeoutError:
-                    # The loop is responsive (the timer fired) but the socket never drained: unlike the
-                    # loop-stall wait in write(), this is a dead peer. Latch under the writer lock so queued
-                    # batches bail, and close the socket so handle_ws's read loop ends and its teardown
-                    # (session detach/reap, client reconnect) runs. See #106369.
-                    self._closed = True
-                    _log.warning("ws send deadline exceeded (socket stalled, loop responsive) peer=%s deadline=%ss — closing",
-                                 self._peer, _WS_SEND_DEADLINE_S)
-                    self._loop.create_task(self._close_socket(1011, "send deadline"))
-                    return
-                except UnicodeEncodeError as exc:
-                    # A single illegal UTF-8 frame (lone surrogate) must not tear down the socket.
-                    _log.warning("ws send skipped invalid utf-8 frame peer=%s error=%s", self._peer, exc)
-                    continue
-                except Exception as exc:
-                    # Latch while holding the writer lock so queued batches observe the failure first.
-                    self._closed = True
-                    _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
-                    return
+            if is_current is not None and index >= unguarded_prefix and not is_current():
+                return
+            payload = _sanitize_ws_text(line)
+            try:
+                await asyncio.wait_for(self._ws.send_text(payload), timeout=_WS_SEND_DEADLINE_S)
+            except TimeoutError:
+                # The loop is responsive (the timer fired) but the socket never drained: unlike the
+                # loop-stall wait in write(), this is a dead peer. Latch so queued batches bail, and
+                # close the socket so handle_ws's read loop ends and its teardown (session
+                # detach/reap, client reconnect) runs. See #106369.
+                self._closed = True
+                _log.warning("ws send deadline exceeded (socket stalled, loop responsive) peer=%s deadline=%ss — closing",
+                             self._peer, _WS_SEND_DEADLINE_S)
+                self._loop.create_task(self._close_socket(1011, "send deadline"))
+                return
+            except UnicodeEncodeError as exc:
+                # A single illegal UTF-8 frame (lone surrogate) must not tear down the socket.
+                _log.warning("ws send skipped invalid utf-8 frame peer=%s error=%s", self._peer, exc)
+                continue
+            except Exception as exc:
+                # Latch so queued batches observe the failure first.
+                self._closed = True
+                _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
+                return
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
         self._closed = True

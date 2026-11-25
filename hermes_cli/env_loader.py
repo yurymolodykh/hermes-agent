@@ -170,9 +170,36 @@ def managed_dotenv_keys() -> frozenset[str]:
     return frozenset(_MANAGED_DOTENV_KEYS)
 
 
+_HOME_RESOLVE_CACHE: dict[str, str] = {}
+_HOME_RESOLVE_CACHE_LOCK = threading.RLock()
+_HOME_RESOLVE_CACHE_MAX = 64  # one entry per profile home in practice
+
+
+def _home_key(hermes_home: str | os.PathLike) -> str:
+    """``str(Path(hermes_home).resolve())``, memoised per handed-in path.
+
+    The key is read on every secret-scope build — each WS dispatch, each hosted-room watcher cycle —
+    and ``resolve()`` is a ``realpath`` walk per call. A process only ever serves a handful of homes,
+    and the answer for one input string only changes if a directory in it is replaced by a symlink,
+    so it is remembered. The value format is unchanged (plain ``resolve()``, not normcased) because
+    several caches key on it across modules.
+    """
+    raw = str(hermes_home)
+    with _HOME_RESOLVE_CACHE_LOCK:
+        cached = _HOME_RESOLVE_CACHE.get(raw)
+        if cached is not None:
+            return cached
+    key = str(Path(raw).resolve())
+    with _HOME_RESOLVE_CACHE_LOCK:
+        _HOME_RESOLVE_CACHE[raw] = key
+        while len(_HOME_RESOLVE_CACHE) > _HOME_RESOLVE_CACHE_MAX:
+            _HOME_RESOLVE_CACHE.pop(next(iter(_HOME_RESOLVE_CACHE)))
+    return key
+
+
 def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Return the external-secret value snapshot for ``hermes_home``."""
-    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
+    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(_home_key(hermes_home), {}))
 
 
 def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, str]:
