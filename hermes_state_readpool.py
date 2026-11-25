@@ -77,7 +77,15 @@ _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
 _read_open_denied_fd_headroom = 0
 
 _fd_usage_lock = threading.Lock()
+# (probe stamp, probed count) published by the reconciler; None until the first probe.
 _fd_usage_cache: tuple[float, Optional[int]] = (0.0, None)
+# Net descriptors this module's read pool opened/closed since that probe. The guard
+# needs no fresh directory listing to see its own usage: permits == live read
+# connections, so acquire(+1) / release(-1) keep the sample exact between probes.
+_fd_usage_delta = 0
+_fd_reconciler_lock = threading.Lock()
+_fd_reconciler_started = False
+_fd_reconciler_stop_event: list[threading.Event] = []
 
 
 def _proc_fd_targets(pid: int) -> Iterator[tuple[str, str]]:
@@ -122,22 +130,78 @@ def _fd_soft_limit() -> Optional[int]:
 def _fd_headroom_ok() -> bool:
     """Can the process spare a descriptor for a new read connection? Fails OPEN
     when unmeasurable (refusing every read would be a self-inflicted convoy);
-    fails CLOSED only on evidence (measured shortfall or a starved probe)."""
+    fails CLOSED only on evidence (measured shortfall or a starved probe).
+
+    Never lists the fd directory on this path: the value is the last sample the
+    background reconciler published, corrected by this module's own net opens.
+    When no sample exists yet (first call in a cold process, or a probe that could
+    not read the directory) unmeasurable means fail open, as before.
+    """
     soft = _fd_soft_limit()
     if soft is None:
         return True
-    global _fd_usage_cache
-    now = time.monotonic()
     with _fd_usage_lock:
-        stamp, cached = _fd_usage_cache
-        fresh = cached is not None and (now - stamp) < _FD_USAGE_CACHE_SECONDS
-    if not fresh:
-        cached = _open_fd_count()
-        with _fd_usage_lock:
-            _fd_usage_cache = (now, cached)
-    if cached is None:
+        _cached, delta = _fd_usage_cache[1], _fd_usage_delta
+    if _cached is None:
         return True
+    cached = _cached + delta
     return cached >= 0 and (soft - cached) > _FD_HEADROOM_RESERVE
+
+
+def _sample_fd_usage() -> Optional[int]:
+    """Measure the fd table once and publish it as the new base for the delta."""
+    global _fd_usage_cache, _fd_usage_delta
+    count = _open_fd_count()
+    # Reset the delta in the same critical section that publishes the sample, so a
+    # concurrent acquire either lands before the reset (and is already counted in
+    # ``count`` only if its descriptor existed at listing time — bounded by one
+    # descriptor) or after it (and is counted by the delta). Never double-counted.
+    with _fd_usage_lock:
+        _fd_usage_cache = (time.monotonic(), count)
+        _fd_usage_delta = 0
+    return count
+
+
+def _fd_reconcile_loop(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            _sample_fd_usage()
+        except Exception:  # health: allow BLE001 -- a probe must never kill its thread
+            logger.debug("fd usage reconcile failed", exc_info=True)
+        stop.wait(_FD_RECONCILE_SECONDS)
+
+
+def ensure_fd_reconciler() -> bool:
+    """Start the background fd-table sampler once per process; True when it runs.
+
+    Lazy on purpose: the first read path that needs a real measurement starts it,
+    and a process that never opens a read connection never pays for the thread.
+    """
+    global _fd_reconciler_started
+    with _fd_reconciler_lock:
+        if _fd_reconciler_started:
+            return True
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_fd_reconcile_loop, args=(stop,), name="readpool-fd-reconciler", daemon=True)
+        _fd_reconciler_stop_event.append(stop)
+        try:
+            thread.start()
+        except RuntimeError:  # interpreter shutting down
+            _fd_reconciler_stop_event.clear()
+            return False
+        _fd_reconciler_started = True
+        return True
+
+
+def stop_fd_reconciler() -> None:
+    """Signal the sampler to exit (tests and orderly shutdown)."""
+    global _fd_reconciler_started
+    with _fd_reconciler_lock:
+        for stop in _fd_reconciler_stop_event:
+            stop.set()
+        _fd_reconciler_stop_event.clear()
+        _fd_reconciler_started = False
 
 
 def _reclaim_idle_read_conn_anywhere() -> bool:
