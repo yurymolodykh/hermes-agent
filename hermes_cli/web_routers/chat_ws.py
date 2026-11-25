@@ -648,6 +648,26 @@ def _authority_for_ticket_home(authority, home: str):
     return authority_for_home(getattr(authority, 'runner', None), home)
 
 
+def _ticket_profile_refused(identity: dict, ticket_home: str) -> bool:
+    """Whether a signed-in principal may NOT be bound to the profile its ticket names.
+
+    ``hermes_acl_profiles.allows`` is the same policy the REST ``?profile=`` routes ask, applied to
+    the ticket's verified subject: a Webapp tab that signed in as ``person/alice`` must not be
+    rebound to Bob's profile just because it put ``?profile=01-bob`` on the page. Without this the
+    ``session_authority.authorize`` profile check below compares the OVERWRITTEN id with itself and
+    can never fail. The host owner (and multi-user-off) keeps every profile, unchanged.
+    """
+    from hermes_acl_profiles import allows
+    from hermes_constants import profile_name_for_home
+
+    name = profile_name_for_home(ticket_home)
+    if not name:
+        return True  # a home that names no profile cannot be attributed — refuse rather than guess
+    from gateway.owner_identity import principal_subject
+
+    return not allows(principal_subject(identity), name)
+
+
 def socket_operator(identity) -> bool:
     """Whether a dashboard socket acts as the host operator (``session:operator``).
 
@@ -710,6 +730,13 @@ async def gateway_ws(ws: WebSocket) -> None:
         # A Webapp tab's ticket names its profile (``webapp.issue_gateway_ticket``): bind the socket
         # to that home's authority, as a native ticket does (``gateway/run_api.py``), so a request
         # that names no profile is answered for the tab's profile, not the launch profile.
+        # FIRST the subject check: the rebinding below overwrites ``profile_id``, which would
+        # otherwise make ``session_authority.authorize``'s profile comparison compare the new id
+        # with itself. The mint route gates the same name (``webapp.issue_socket_ticket``); this is
+        # the check that holds for a ticket minted before the policy changed.
+        if _ticket_profile_refused(identity, ticket_home):
+            await ws.close(code=4403)
+            return
         served = _authority_for_ticket_home(authority, ticket_home)
         if served is None:
             await ws.close(code=4403)

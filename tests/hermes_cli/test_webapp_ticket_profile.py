@@ -12,6 +12,13 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+# Module-level on purpose: importing ``hermes_cli.web_server`` from a test body
+# runs ``hermes_bootstrap._settle_interrupted_update`` after the autouse
+# HomeIOGuard is installed, and its pull-marker stat resolves this worktree's git
+# dir under the real home. Collection-time imports happen before the guard.
+import hermes_cli.web_server
+import tui_gateway.ws
+
 _TOKEN = "b" * 43
 
 
