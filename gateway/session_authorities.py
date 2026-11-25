@@ -162,14 +162,20 @@ def local_bots(runner) -> list[LocalBot]:
     registry = getattr(runner, 'session_authorities', None)
     if registry is None:
         authority = getattr(runner, 'session_authority', None)
-        pairs = [(served_profile_name(authority.profile_id), authority)] if authority is not None else []
+        pairs = [(authority, served_profile_name(authority.profile_id))] if authority is not None else []
+        own_names = None
     else:
         # A snapshot: hosted-room coordinator threads read the served set while the loop hot-serves.
-        pairs = [(registry.profile_name(a) or served_profile_name(a.profile_id), a)
-                 for a in list(registry._by_key.values()) if a is not None]
-    counts = Counter(name for name, _ in pairs)
+        pairs = [(a, registry.profile_name(a)) for a in list(registry._by_key.values()) if a is not None]
+        own_names = None
+    # One canonical name per authority: the registry's reserved name when it has one, else the name
+    # its home resolves to. Computing it once also answers the ``problem`` check below, which used to
+    # resolve the same home a second time per bot on every poll.
+    resolved = [(authority, name if name is not None else served_profile_name(authority.profile_id))
+                for authority, name in pairs]
+    counts = Counter(name for _, name in resolved)
     bots = []
-    for name, authority in pairs:
+    for authority, name in resolved:
         problem = None
         if counts[name] > 1:
             problem = 'two served homes answer to that name'

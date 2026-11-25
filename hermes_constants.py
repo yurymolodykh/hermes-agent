@@ -9,6 +9,8 @@ import re
 import shutil
 import stat
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping, MutableMapping
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -207,6 +209,12 @@ def get_hermes_home() -> Path:
 # syscall per lookup. A process only ever sees a handful of home paths, so
 # the dict stays tiny. Only paths that really exist are stored, see below.
 _HOME_KEY_CACHE: dict[str, str] = {}
+# ``profile_name_for_home``'s remembered answers, keyed by the path string handed in plus the
+# process's default root (the answer is relative to it). See the function for why.
+_PROFILE_NAME_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
+_PROFILE_NAME_LOCK = threading.RLock()
+_PROFILE_NAME_TTL = 60.0
+_PROFILE_NAME_MAX_ENTRIES = 256
 
 
 def hermes_home_key(path: str | Path | None = None) -> str:
@@ -238,6 +246,8 @@ def hermes_home_key(path: str | Path | None = None) -> str:
 def reset_hermes_home_key_cache() -> None:
     """Forget every remembered home key (for tests that move a home dir on disk)."""
     _HOME_KEY_CACHE.clear()
+    with _PROFILE_NAME_LOCK:
+        _PROFILE_NAME_CACHE.clear()
 
 
 def get_process_hermes_home() -> Path:
@@ -363,10 +373,32 @@ def profile_name_for_home(path: str | Path | None) -> str | None:
 
     The default home is the Hermes root itself, so its basename is an installation detail (``.hermes``
     on POSIX and commonly ``hermes`` on Windows), not the profile id ``default``.
+
+    The answer is a pure function of the path string and the process's default root, but it costs a
+    ``Path.resolve()`` (a ``realpath`` syscall) plus a couple of ``stat``s. The WS request path reaches
+    it several times per bot on every ``profiles.list`` poll, so the answer is remembered per input
+    path: cleared by :func:`reset_hermes_home_key_cache` and expired after ``_PROFILE_NAME_TTL``
+    seconds, which covers a profile created or renamed on disk behind our back.
     """
     if path is None or not str(path).strip():
         return None
-    current = Path(path).expanduser()
+    raw = str(path)
+    key = (raw, str(get_default_hermes_root()))
+    now = time.monotonic()
+    with _PROFILE_NAME_LOCK:
+        hit = _PROFILE_NAME_CACHE.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    result = _profile_name_for_home_uncached(Path(raw))
+    with _PROFILE_NAME_LOCK:
+        if len(_PROFILE_NAME_CACHE) >= _PROFILE_NAME_MAX_ENTRIES:
+            _PROFILE_NAME_CACHE.clear()
+        _PROFILE_NAME_CACHE[key] = (now + _PROFILE_NAME_TTL, result)
+    return result
+
+
+def _profile_name_for_home_uncached(current: Path) -> str | None:
+    current = current.expanduser()
     try:
         default_root = get_default_hermes_root()
         for candidate in (current, current.resolve(strict=False)):
