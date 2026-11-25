@@ -43,6 +43,15 @@ export interface RuntimeReadinessOptions {
   unknownReady?: boolean
 }
 
+/**
+ * Why neither probe answered. `busy` means the transport is alive but slow —
+ * a request timeout, a socket still dialing, a reset mid-flight: the backend is
+ * loaded, and a later round can still succeed. `unreachable` means the
+ * connection was refused or the peer resolved nowhere: the port really is
+ * closed, so waiting changes nothing.
+ */
+export type RuntimeTransportFailure = 'busy' | 'unreachable'
+
 export interface RuntimeReadinessResult {
   checksDisagree: boolean
   /** Passed through from `setup.runtime_check.error_code`. */
@@ -57,6 +66,9 @@ export interface RuntimeReadinessResult {
   ready: boolean
   reason: null | string
   source: 'fallback' | 'runtime_check' | 'setup_status'
+  /** Set only on `source: 'fallback'`: why nothing answered. Absent when a probe
+   *  answered, so it is never read as a verdict on an authoritative round. */
+  transport?: RuntimeTransportFailure
 }
 
 export type RuntimeReadinessDisplay = 'checking' | 'needs_setup' | 'ready' | 'unavailable'
@@ -85,6 +97,19 @@ function normalizeMessage(value: null | string | undefined): null | string {
   const next = value?.trim()
 
   return next ? next : null
+}
+
+// Errors that PROVE the peer is not there: the TCP dial was refused, or the name
+// resolved nowhere. A timeout, a reset mid-flight, a socket still handshaking and
+// the renderer's bare "gateway is not connected" prove nothing about the port —
+// those are the busy class, and a later probe can still answer.
+const UNREACHABLE_TRANSPORT =
+  /\bECONNREFUSED\b|\bENOTFOUND\b|\bEAI_AGAIN\b|\bEHOSTUNREACH\b|\bENETUNREACH\b|connection refused|no route to host|network is unreachable|could not resolve host/i
+
+function classifyTransportFailure(errors: Array<null | string>): RuntimeTransportFailure {
+  const present = errors.filter((error): error is string => Boolean(error))
+
+  return present.length > 0 && present.every(error => UNREACHABLE_TRANSPORT.test(error)) ? 'unreachable' : 'busy'
 }
 
 async function requestWithFallback<T>(
@@ -203,7 +228,8 @@ export function interpretRuntimeReadiness(
     checksDisagree: false,
     ready: unknownReady,
     reason: unknownReady ? null : (failure.raw ?? defaultReason),
-    source: 'fallback'
+    source: 'fallback',
+    transport: classifyTransportFailure([signals.setupError, signals.runtimeError])
   }
 }
 
