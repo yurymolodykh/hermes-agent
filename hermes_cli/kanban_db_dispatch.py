@@ -28,8 +28,11 @@ from typing import TYPE_CHECKING
 
 from hermes_cli import kanban_db_capacity as _kbcap
 from hermes_cli import kanban_auto_continue as _kac
+<<<<<<< Updated upstream
 from hermes_cli import kanban_db_day_window as _kbday
 from hermes_cli import kanban_db_schedule as _kbschedule
+=======
+>>>>>>> Stashed changes
 from hermes_cli import kanban_db_worker_env as _kbenv
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -198,12 +201,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+<<<<<<< Updated upstream
     budget_hold: Optional[str] = None
     """Which concurrency cap stopped this tick before the lane loops ran:
     ``"max_in_progress"`` (host-level, every slot in use) or ``"max_spawn"``
     (per-board cap). The tick returns with an otherwise EMPTY result in that
     case — no skipped bucket is filled — which is why :func:`capacity_bound`
     needs this marker: a full host cap is saturation, not a stall."""
+=======
+>>>>>>> Stashed changes
     auto_split: list[str] = field(default_factory=list)
     """Cards this tick split into child cards after burning their retry counter
     twice in one generation (``kanban.auto_continue``)."""
@@ -2720,10 +2726,20 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+<<<<<<< Updated upstream
     # The auto-split phase is deliberately NOT here: its decomposer is an aux
     # LLM call (up to 180 s x 3 attempts) and this whole function runs under the
     # board's single-writer lock. ``dispatch_once`` runs it BEFORE taking that
     # lock, under its own non-blocking ``.split.lock``.
+=======
+    # Cards whose retry counter burned twice in one generation wait for a split.
+    # OUTSIDE any write txn (the decomposer is an aux LLM call) and BEFORE the
+    # spawn budget is computed: a split moves the card to ``todo`` and its
+    # children to ``ready``, which changes what this tick can spawn. A dry run
+    # must not create child cards, so it skips the phase entirely.
+    if not dry_run:
+        result.auto_split, result.auto_split_failed = _kac.run_split_phase(conn)
+>>>>>>> Stashed changes
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
