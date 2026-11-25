@@ -419,7 +419,9 @@ describe('refreshOnboarding', () => {
       notifySpy.mock.calls.filter(([notice]) => (notice as { id?: string }).id === 'runtime-not-ready').length
 
     try {
-      const ready = await settleBackoff(refreshOnboarding(onboardingContext(refusedPortGateway())))
+      // A refused dial is classified immediately — no ladder is walked, so both
+      // rounds land without any waiting.
+      const ready = await refreshOnboarding(onboardingContext(refusedPortGateway()))
 
       expect(ready).toBe(false)
       expect(outageRounds()).toBe(1)
@@ -428,10 +430,14 @@ describe('refreshOnboarding', () => {
       )
       expect($desktopOnboarding.get().configured).toBe(true)
 
-      // A second exhausted round must not stack a duplicate: the notice keeps its
-      // stable id and the dedup slot.
-      await settleBackoff(refreshOnboarding(onboardingContext(refusedPortGateway())))
-      expect(outageRounds()).toBe(1)
+      // The notice dedups by id (a repeat REPLACES the entry, it does not stack),
+      // so the stack must still hold exactly one outage notice.
+      const outageInStack = () =>
+        notifications.$notifications.get().filter(item => item.id === 'runtime-not-ready').length
+
+      expect(outageInStack()).toBe(1)
+      await refreshOnboarding(onboardingContext(refusedPortGateway()))
+      expect(outageInStack()).toBe(1)
     } finally {
       notifySpy.mockRestore()
       notifications.clearNotifications()
