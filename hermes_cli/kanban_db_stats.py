@@ -13,6 +13,7 @@ knows the first three keeps working.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from typing import Any, Optional
@@ -64,6 +65,51 @@ def _scheduled_stats(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
     }
 
 
+def _respawn_guarded_stats(conn: sqlite3.Connection, now: int) -> dict[str, Any]:
+    """Cards whose newest guard event is still trailing — i.e. the dispatcher is
+    currently declining to spawn them. Mirrors the ``respawn_guarded`` rule so
+    ``kanban stats`` answers "is anything silently parked?" without a per-task
+    diagnostics pass. Absent-key-safe for older callers."""
+    rows = conn.execute(
+        "SELECT e.task_id AS task_id, e.created_at AS ts, e.payload AS payload "
+        "FROM task_events e "
+        "WHERE e.kind = 'respawn_guarded' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM task_events f WHERE f.task_id = e.task_id "
+        "  AND f.kind IN ('claimed', 'promoted', 'reclaimed', 'unblocked', 'respawned') "
+        "  AND f.id > e.id"
+        ") "
+        "AND e.id = ("
+        "  SELECT MAX(g.id) FROM task_events g "
+        "  WHERE g.task_id = e.task_id AND g.kind = 'respawn_guarded'"
+        ")"
+    ).fetchall()
+    by_reason: dict[str, int] = {}
+    oldest: Optional[int] = None
+    for row in rows:
+        payload: dict = {}
+        raw = row["payload"]
+        if isinstance(raw, dict):
+            payload = raw
+        elif isinstance(raw, str):
+            try:
+                payload = json.loads(raw) or {}
+            except json.JSONDecodeError:
+                # A malformed payload row is bookkeeping noise; the guard still
+                # counts, only its reason label falls back to "unknown".
+                payload = {}
+        reason = str(payload.get("reason") or "unknown")
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        ts = _kb()._to_epoch(row["ts"])
+        if ts is not None and (oldest is None or ts < oldest):
+            oldest = ts
+    return {
+        "respawn_guarded_total": len(rows),
+        "respawn_guarded_by_reason": by_reason,
+        "respawn_guarded_oldest_age_seconds": (now - oldest) if oldest is not None else None,
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, the oldest ``ready`` age and parked deadlines."""
     by_status: dict[str, int] = {}
@@ -90,6 +136,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
         **_scheduled_stats(conn, now),
+        **_respawn_guarded_stats(conn, now),
     }
 
 

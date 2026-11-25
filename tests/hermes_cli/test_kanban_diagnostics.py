@@ -212,6 +212,50 @@ def _triage_task():
 
 
 
+def test_respawn_guarded_fires_for_trailing_streak_only():
+    """The dispatcher's refusals must be visible with a reason and a stamp age;
+    a later claim ends the streak so a cleared guard is not reported forever."""
+    now = int(time.time())
+    task = _task(status="ready")
+    events = [
+        _event("respawn_guarded", ts=now - 7200, reason="rate_limit_cooldown"),
+        _event("respawn_guarded", ts=now - 3600, reason="rate_limit_cooldown"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert [d.kind for d in diags] == ["respawn_guarded"]
+    d = diags[0]
+    assert d.data["guard_reason"] == "rate_limit_cooldown"
+    assert d.data["guard_count"] == 2
+    assert d.data["first_guarded_at"] == now - 7200
+    assert d.data["last_guarded_at"] == now - 3600
+    assert d.data["age_seconds"] == 7200
+    assert "rate_limit_cooldown" in d.title
+    # Claimed after the last guard -> the streak is over, nothing to report.
+    cleared = events + [_event("claimed", ts=now - 60)]
+    assert kd.compute_task_diagnostics(task, cleared, [], now=now) == []
+    # No guard events at all -> silence.
+    assert kd.compute_task_diagnostics(task, [], [], now=now) == []
+
+
+def test_respawn_guarded_stats_counts_trailing_cards(kanban_home):
+    """``board_stats`` must surface currently guarded cards by reason so an
+    operator sees a silently parked card without per-task diagnostics."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="guarded", assignee="demo")
+        tid2 = kb.create_task(conn, title="guarded-then-claimed", assignee="demo")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "blocker_auth"})
+            kb._append_event(conn, tid2, "respawn_guarded", {"reason": "rate_limit_cooldown"})
+            kb._append_event(conn, tid2, "claimed", {})
+        stats = kb.board_stats(conn)
+        assert stats["respawn_guarded_total"] == 1
+        assert stats["respawn_guarded_by_reason"] == {"blocker_auth": 1}
+        assert stats["respawn_guarded_oldest_age_seconds"] is not None
+    finally:
+        conn.close()
+
+
 def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("warning", "warning") is True
     assert kd.severity_at_or_above("error", "warning") is True
