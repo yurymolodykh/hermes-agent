@@ -434,7 +434,7 @@ def test_rate_limit_stamp_does_not_park_card_after_a_normal_run(kanban_home, mon
 
         latest = conn.execute(
             "SELECT outcome FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
-            "ORDER BY ended_at DESC LIMIT 1", (tid,),
+            "ORDER BY ended_at DESC, id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert latest["outcome"] == "review_requested"
         # The stale stamp is still on the row — it must not park the card.
