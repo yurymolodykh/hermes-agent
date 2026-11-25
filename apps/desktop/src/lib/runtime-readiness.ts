@@ -242,6 +242,14 @@ export function runtimeReadinessDisplay(status: RuntimeReadinessResult | null): 
     return 'ready'
   }
 
+  // A round that never reached an authority (both probes silent — a loaded or
+  // booting backend) knows nothing about setup. Calling it "needs setup" sends a
+  // configured install back through onboarding for a backend that is merely busy,
+  // so it stays "checking" until a probe actually answers.
+  if (status.source === 'fallback') {
+    return 'checking'
+  }
+
   // Credentials exist but runtime resolution failed. Calling that "needs
   // setup" sends users back through onboarding for provider/quota failures
   // that setup cannot repair; the reason tooltip carries the specific cause.
