@@ -882,10 +882,21 @@ async def stream_managed_file(
 
 def _managed_write_target(path: str, request: Request, overwrite: bool):
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
+    # The team exchange has no OS-level owner, so WHO writes is decided here (L2-c): a scoped
+    # person's upload lands in ``shared/<subject-slug>/``, a root-level name is moved there, and a
+    # neighbour's folder is refused. Unscoped callers (multi_user off, the host owner) get the
+    # path back unchanged — the pre-change behaviour.
+    from hermes_acl_results import exchange_write_target, require_exchange_authorship
+
+    redirected = exchange_write_target(request, target)
+    if redirected != target:
+        display_path = str(redirected)
+        target = redirected
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
     if target.exists() and not overwrite:
         raise HTTPException(status_code=409, detail="File already exists")
+    require_exchange_authorship(request, target)
     return policy, target, display_path
 
 
@@ -905,6 +916,9 @@ def upload_managed_file(payload: ManagedFileUpload, request: Request):
     with _io_errors("File is not writable", "Could not write file"):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+    from hermes_acl_results import record_exchange_authorship
+
+    record_exchange_authorship(request, target)
     return _managed_write_result(policy, target, display_path)
 
 
@@ -973,6 +987,9 @@ async def upload_managed_file_stream(
         not_writable="File is not writable",
         write_failed="Could not write file",
     )
+    from hermes_acl_results import record_exchange_authorship
+
+    record_exchange_authorship(request, target)
     return _managed_write_result(policy, target, display_path)
 
 
