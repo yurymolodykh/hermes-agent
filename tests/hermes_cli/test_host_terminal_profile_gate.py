@@ -168,3 +168,35 @@ def test_a_credential_less_dial_is_left_to_the_upgrade_gate(multi_user):
     from hermes_cli.web_routers.webapp import _terminal_profile_refused
 
     assert not _terminal_profile_refused(_ws(FOREIGN, identity=None))
+
+
+# ── end to end: the real route refuses before accept, no PTY ─────────────────
+
+
+def test_the_real_route_closes_a_foreign_profile_ticket_with_4403(multi_user, webapp_home):
+    """A ticket minted BEFORE the mint gate existed still cannot open a foreign shell."""
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from hermes_cli import web_server as server
+    from hermes_cli.web_host_terminal_sessions import host_terminal_lifespan
+    from hermes_cli.web_routers.webapp import mint_socket_ticket, router
+    from hermes_cli.web_session_sockets import HOST_TERMINAL_SOCKET
+
+    app = FastAPI()
+    app.include_router(router)
+    app.router.lifespan_context = host_terminal_lifespan
+    app.state.ui_surface = "webapp"
+    app.state.bound_host = "127.0.0.1"
+    app.state.auth_required = False
+    server.app.state.ui_surface = "webapp"
+
+    # Minted directly, as a pre-fix server would: the mint gate is bypassed on purpose.
+    ticket = mint_socket_ticket({"user_id": "alice", "provider": "basic", "issuer": ""},
+                                HOST_TERMINAL_SOCKET, session_token=server._SESSION_TOKEN)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        with pytest.raises(WebSocketDisconnect) as refused:
+            with client.websocket_connect(f"/api/host-terminal?ticket={ticket}&profile={FOREIGN}") as ws:
+                ws.receive_bytes()
+    assert refused.value.code == 4403
