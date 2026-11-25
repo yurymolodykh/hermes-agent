@@ -195,6 +195,20 @@ def _require_held_task(
     return task
 
 
+def _require_owner(request: Optional[Request], action: str = "owner_only") -> None:
+    """Refuse a HOST-WIDE administrative action to a non-owner.
+
+    Boards (create/rename/switch), profile metadata, orchestration knobs and the raw-text estimate
+    all act on the installation rather than on one card, so they stop at the host owner exactly as
+    the profile router's import/rename/delete routes do — one mechanism
+    (``hermes_acl_profiles.require_owner``), not a second policy: with ``acl.multi_user`` off
+    nothing changes, and the owner always passes.
+    """
+    from hermes_acl_profiles import require_owner
+
+    require_owner(request, action=action)
+
+
 def _require_run(conn: sqlite3.Connection, run_id: int) -> kanban_db.Run:
     return _require(kanban_db.get_run, conn, run_id, "run")
 
