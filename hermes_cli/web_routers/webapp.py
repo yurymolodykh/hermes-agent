@@ -38,6 +38,29 @@ def _require_private_webapp(request: Request) -> None:
         raise HTTPException(404, "Private Webapp window handoff is unavailable")
 
 
+def _host_terminal_profile_matches(ws: WebSocket) -> bool:
+    """Whether the profile this ``/api/host-terminal`` request names is the one its ticket binds.
+
+    The shell's home comes from the redeemed ticket (``web_server_chat._ws_auth_reason`` stamps
+    ``_hermes_ticket_profile_home``), whose mint gated ``?profile=`` against the ticket's principal.
+    A ticket minted before that gate existed names no home; such a request may still open the
+    gateway's own launch profile, and nothing else.
+    """
+    from pathlib import Path
+
+    from hermes_cli.web_host_terminal_sessions import _request_home
+    from hermes_constants import get_hermes_home
+
+    requested = (ws.query_params.get("profile") or "").strip()
+    if not requested or requested.lower() == "current":
+        return True  # no name: the ticket's own home is opened
+    from hermes_cli.web_host_terminal_sessions import _request_home
+
+    ticket_home = getattr(ws, "_hermes_ticket_profile_home", None)
+    wanted = Path(ticket_home).resolve() if ticket_home else Path(get_hermes_home()).resolve()
+    return _request_home(requested) == wanted
+
+
 @router.websocket("/api/host-terminal")
 async def host_terminal_ws(ws: WebSocket) -> None:
     from hermes_cli import web_host_terminal
@@ -50,6 +73,13 @@ async def host_terminal_ws(ws: WebSocket) -> None:
     peer, mode, cred = gate
     if not web_host_terminal.request_allowed():
         await ws.close(code=4403, reason="host terminal requires authenticated Webapp")
+        return
+    # The profile this shell opens comes from the TICKET, never from the query string: the mint
+    # route gates ``?profile=`` against the ticket's principal (``_require_profile_for_principal``),
+    # and a ticket minted before that policy existed must not open a profile it does not name. A
+    # request that names a different profile is refused here, before any shell exists.
+    if not _host_terminal_profile_matches(ws):
+        await ws.close(code=4403, reason="host terminal profile does not match its ticket")
         return
     await ws.accept()
     _log.info("host terminal accepted peer=%s mode=%s cred=%s", peer, mode, cred)
@@ -241,7 +271,7 @@ def _socket_ticket_response(request: Request, identity: dict, socket: str, sessi
 #: its profile is gone there rather than from a socket that keeps closing.
 SOCKET_TICKETS: dict[str, tuple[str, bool]] = {
     GATEWAY_SOCKET: ("gateway_ticket", True),
-    HOST_TERMINAL_SOCKET: ("host_terminal", False),
+    HOST_TERMINAL_SOCKET: ("host_terminal", True),
     SPEAK_STREAM_SOCKET: ("gateway_ticket", False),
     TRANSCRIBE_STREAM_SOCKET: ("gateway_ticket", False),
     RELAY_SOCKET: ("gateway_connections", False),
@@ -274,7 +304,7 @@ async def issue_socket_ticket(request: Request, socket: str = "", profile: str |
             # answering for another person's profile). Same gate, same 404 as the REST routes.
             _require_profile_for_principal(request, identity, profile)
         _name, home = _cron_profile_home(profile)
-        if socket == GATEWAY_SOCKET and profile:
+        if socket in (GATEWAY_SOCKET, HOST_TERMINAL_SOCKET) and profile:
             profile_home = str(home)
     return _socket_ticket_response(request, identity, socket, session_token, profile_home=profile_home)
 

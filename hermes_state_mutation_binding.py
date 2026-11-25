@@ -81,6 +81,13 @@ def authorize_history(conn, actor, session_id, *, claim=False):
     # transcript as imported history, even if stale import metadata exists.
     if row['session_key'] or row['chat_id'] or row['origin_json']:
         return False
+    # A row that names its own owner is never readable by anyone else, binding or not: the stored
+    # ``gateway.history_control.v1.<sid>`` binding waives the "ownership unstated" requirement
+    # (and its ``session:create``), it does not replace the ownership check. Read the owner first,
+    # so a binding that "stuck" to a previous owner cannot hand this row to a second person.
+    from gateway.owner_identity import same_owner
+    if _owner_user(row) and not same_owner(row['user_id'], actor.subject):
+        raise RuntimeStoreError('permission_denied')
     key = BINDING_PREFIX + session_id
     binding = json.dumps([actor.profile_id, actor.subject], separators=(',', ':'))
     saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
@@ -90,9 +97,6 @@ def authorize_history(conn, actor, session_id, *, claim=False):
         return True
     if not _history_row(row):
         return False
-    from gateway.owner_identity import same_owner
-    if _owner_user(row) and not same_owner(row['user_id'], actor.subject):
-        raise RuntimeStoreError('permission_denied')
     if 'session:create' not in actor.capabilities:
         raise RuntimeStoreError('permission_denied')
     if claim:
