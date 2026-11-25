@@ -60,4 +60,8 @@ export interface OnboardingTranslations {
   change: string
   startChatting: string
   docs: (provider: string) => string
+  /** Quiet line while a verified install waits out a busy (loaded, not absent) backend. */
+  runtimeConnecting: string
+  runtimeNotReadyTitle: string
+  runtimeNotReadyBody: string
 }
