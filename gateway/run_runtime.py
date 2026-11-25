@@ -331,6 +331,11 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
         if worker.closed.is_set() or (getattr(worker, 'stop', None) is not None and worker.stop.is_set()):
             continue
         worker.stop_cause = reason
+        if reason:
+            # A Kanban worker's card should name this cause even if its cooperative Stop is not
+            # honoured and the owner ends up recording a lost attempt: the reason file is what
+            # turns a bare ``EOFError`` into ``shutdown``.
+            _note_stop_reason(worker, reason)
         try:
             worker.control({'type': 'stop'})
         except RuntimeStoreError as exc:
@@ -357,6 +362,34 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
             request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown')
         signalled += 1
     return signalled
+
+
+def _note_stop_reason(worker, reason):
+    """Write the stop cause into the Kanban card's workspace so its dying worker can name it.
+
+    A shutdown/restart Stop is cooperative, but the worker may still die before writing anything
+    (or the owner may record a lost attempt): the reason file is the only channel that survives
+    that. Best effort — a non-Kanban worker or an unwritable workspace is simply skipped, and the
+    stop proceeds exactly as before.
+    """
+    try:
+        import json as _json
+        from hermes_cli import kanban_stop_reason as ksr
+        policy = getattr(worker, 'policy', None)
+        context = _json.loads(getattr(policy, 'kanban_json', None) or 'null')
+        if not context:
+            return
+        # Anything the gateway itself says (restart drain, shutdown phases) is one cause on the
+        # board: the host went away. Only a known reason is written, so map rather than pass through.
+        known = ksr.KNOWN
+        mapped = reason if reason in known else 'shutdown'
+        ksr.write_reason_for_task(
+            context.get('task_id', ''), mapped,
+            detail=f'остановлен: останов шлюза ({reason})', source='gateway_stop',
+            workspace=context.get('workspace'), run_id=context.get('run_id'),
+        )
+    except Exception:
+        pass
 
 
 def _stop_spawning_managed(authority, workers, reason):
