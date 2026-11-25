@@ -322,56 +322,64 @@ describe('refreshOnboarding', () => {
   })
 
   it('does not downgrade configured=true on fallback-only readiness failures', async () => {
-    const api = vi.fn(async ({ path }: { path: string }) => {
-      if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
-      }
+    vi.useFakeTimers()
+    notifications.clearNotifications()
 
-      throw new Error(`unexpected api path: ${path}`)
-    })
+    try {
+      const api = vi.fn(async ({ path }: { path: string }) => {
+        if (path === '/api/providers/oauth') {
+          return { providers: [makeOAuthProvider('fresh')] }
+        }
 
-    installApiMock(api)
-    // Simulate a returning user: cache is set and store is configured.
-    window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
-    $desktopOnboarding.set(
-      baseState({
-        configured: true,
-        providers: [makeOAuthProvider('cached')],
-        reason: null,
-        requested: false
+        throw new Error(`unexpected api path: ${path}`)
       })
-    )
 
-    const ready = await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
+      installApiMock(api)
+      // Simulate a returning user: cache is set and store is configured.
+      window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
+      $desktopOnboarding.set(
+        baseState({
+          configured: true,
+          providers: [makeOAuthProvider('cached')],
+          reason: null,
+          requested: false
+        })
+      )
 
-    expect(ready).toBe(false)
-    expect(api).not.toHaveBeenCalled()
-    expect($desktopOnboarding.get().configured).toBe(true)
-    expect($desktopOnboarding.get().reason).toBeNull()
-    // The cache must survive the refresh — proving we didn't downgrade.
-    expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(refusedPortGateway())))
+
+      expect(ready).toBe(false)
+      expect(api).not.toHaveBeenCalled()
+      expect($desktopOnboarding.get().configured).toBe(true)
+      expect($desktopOnboarding.get().reason).toBeNull()
+      // The cache must survive the refresh — proving we didn't downgrade.
+      expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+    } finally {
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
   })
 
-  it('keeps an unknown readiness notice temporary and clears it on recovery (#124545)', async () => {
+  it('drops the unknown-readiness notice once the retry ladder lands a ready round', async () => {
     vi.useFakeTimers()
     notifications.clearNotifications()
     installApiMock(vi.fn())
     $desktopOnboarding.set(baseState({ configured: true }))
 
     try {
-      await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
-      expect(notifications.$notifications.get()).toEqual([
-        expect.objectContaining({ id: 'runtime-not-ready', kind: 'info' })
-      ])
-      expect($desktopOnboarding.get().configured).toBe(true)
-      await vi.advanceTimersByTimeAsync(5_000)
-      expect(notifications.$notifications.get()).toEqual([])
+      // Three timed-out rounds, then the backend answers: the ladder absorbs the
+      // load and the user only ever sees the quiet "connecting" line, never the
+      // outage notice.
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(busyThenReadyGateway(3))))
 
-      // A later outage can show a fresh notice; an authoritative ready clears it
-      // without waiting for its timer, and must not dismiss unrelated errors.
-      await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
+      expect(ready).toBe(true)
+      expect(notifications.$notifications.get().map(item => item.id)).not.toContain('runtime-not-ready')
+      expect($desktopOnboarding.get().configured).toBe(true)
+
+      // An authoritative ready clears the line without waiting for its timer,
+      // and must not dismiss unrelated errors.
       notifications.notify({ id: 'unrelated', kind: 'error', message: 'Keep me' })
-      await refreshOnboarding(onboardingContext(keylessCustomGateway()))
+      await settleBackoff(refreshOnboarding(onboardingContext(keylessCustomGateway())))
       expect(notifications.$notifications.get().map(item => item.id)).toEqual(['unrelated'])
     } finally {
       notifications.clearNotifications()
