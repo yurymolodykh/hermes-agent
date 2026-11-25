@@ -212,6 +212,10 @@ _HOME_KEY_CACHE: dict[str, str] = {}
 # ``profile_name_for_home``'s remembered answers, keyed by the path string handed in plus the
 # process's default root (the answer is relative to it). See the function for why.
 _PROFILE_NAME_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
+# ``home_paths_match``'s remembered answers, keyed by the two paths already normalized to their
+# comparable spelling. Same reset hook, TTL and ceiling as ``_PROFILE_NAME_CACHE``: one profile
+# switch must not leave a stale "served from this home" verdict behind.
+_HOME_MATCH_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
 _PROFILE_NAME_LOCK = threading.RLock()
 _PROFILE_NAME_TTL = 60.0
 _PROFILE_NAME_MAX_ENTRIES = 256
@@ -248,6 +252,44 @@ def reset_hermes_home_key_cache() -> None:
     _HOME_KEY_CACHE.clear()
     with _PROFILE_NAME_LOCK:
         _PROFILE_NAME_CACHE.clear()
+        _HOME_MATCH_CACHE.clear()
+
+
+def _comparable_spelling(path: str | Path) -> str:
+    """Syscall-free spelling of *path* for a cache key.
+
+    ``Path`` already folds ``/a//b/`` and ``/a/./b`` into one spelling and ``normcase`` folds the
+    Windows case/separator difference, so the everyday variants of one path share a key. Any other
+    alias (``..``, a symlink) only costs one extra ``resolve`` before it shares the answer.
+    """
+    return os.path.normcase(str(Path(path).expanduser()))
+
+
+def home_paths_match(target: str | Path, home: str | Path) -> bool:
+    """True when *target* and *home* name the same directory once symlinks are followed.
+
+    This is the ``realpath`` comparison behind ``hermes_cli.profiles.profile_matches_home``, which
+    the WS request path reaches on every routed request (``gateway/session_controls.py``): two
+    ``Path.resolve`` calls per call, i.e. ``realpath`` syscalls on the main thread. Both operands are
+    plain paths, so the answer is remembered per normalized spelling pair — cleared by
+    :func:`reset_hermes_home_key_cache` (profile switch, tests that move a home) and expired after
+    ``_PROFILE_NAME_TTL`` seconds, which covers a directory re-pointed on disk behind our back.
+    """
+    key = (_comparable_spelling(target), _comparable_spelling(home))
+    now = time.monotonic()
+    with _PROFILE_NAME_LOCK:
+        hit = _HOME_MATCH_CACHE.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    result = (
+        os.path.normcase(str(Path(target).expanduser().resolve(strict=False)))
+        == os.path.normcase(str(Path(home).expanduser().resolve(strict=False)))
+    )
+    with _PROFILE_NAME_LOCK:
+        if len(_HOME_MATCH_CACHE) >= _PROFILE_NAME_MAX_ENTRIES:
+            _HOME_MATCH_CACHE.clear()
+        _HOME_MATCH_CACHE[key] = (now + _PROFILE_NAME_TTL, result)
+    return result
 
 
 def get_process_hermes_home() -> Path:
