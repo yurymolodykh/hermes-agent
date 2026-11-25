@@ -80,7 +80,7 @@ class HostOwner:
 
     def matches(self, ws: WebSocket) -> bool:
         return (getattr(ws.state, "ssh_terminal", None) is None
-                and _request_home(ws.query_params.get("profile")) == self.home)
+                and _shell_home(ws) == self.home)
 
     def admit(self, write):
         """Run ``write`` while this owner's profile home is live, or raise ``TerminalExpired``.
@@ -109,6 +109,22 @@ def _request_home(profile: str | None) -> Path:
         _resolve_profile_dir(requested)
         if requested and requested.lower() != "current" else get_hermes_home()
     ).resolve()
+
+
+def _ticket_home(ws: WebSocket) -> Path | None:
+    """The profile home the redeemed ticket binds, or None when it names none.
+
+    ``webapp.host_terminal_ws`` refuses a request whose ``?profile=`` differs from it before the
+    socket is accepted; this is the home the shell then opens, so the query string can only ever
+    name the profile the ticket already carries.
+    """
+    home = getattr(ws, "_hermes_ticket_profile_home", None)
+    return Path(home).resolve() if home else None
+
+
+def _shell_home(ws: WebSocket) -> Path:
+    """The home an accepted host-terminal request opens: its ticket's, else the named/launch one."""
+    return _ticket_home(ws) or _request_home(ws.query_params.get("profile"))
 
 
 class HostTerminalRegistry(PtySessionRegistry):
@@ -145,7 +161,7 @@ class HostTerminalRegistry(PtySessionRegistry):
                 from hermes_cli.web_host_terminal_ssh import prepare_shell
                 owner, argv, cwd, env = prepare_shell(ws, identity)
             else:
-                home = _request_home(ws.query_params.get("profile"))
+                home = _shell_home(ws)
                 if not _home_live(home):
                     raise TerminalExpired()
                 argv, cwd, env, shell = resolve_argv(home=home, requested_cwd=ws.query_params.get("cwd"))
