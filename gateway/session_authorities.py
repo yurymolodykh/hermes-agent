@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home, get_hermes_home_override, hermes_home_key
+from hermes_constants import (
+    forget_home_match_cache, get_hermes_home, get_hermes_home_override, hermes_home_key)
 from hermes_state_runtime import RuntimeStoreError
 
 
@@ -49,6 +50,9 @@ class SessionAuthorities:
         if key != self.launch_key:
             self.multiplexed = True
         self.version += 1
+        # A profile this process serves is now known here: the memoized "does this name resolve to
+        # that home" verdicts of the previous served set must not outlive it.
+        forget_home_match_cache()
 
     def replace(self, home, authority) -> None:
         """Fill the slot reserved by ``add(home, None, name=...)`` once the authority exists."""
@@ -69,6 +73,7 @@ class SessionAuthorities:
         self._end_start(key)
         dropped = self._by_key.pop(key, None)
         self.version += 1
+        forget_home_match_cache()
         return dropped
 
     def _end_start(self, key) -> None:

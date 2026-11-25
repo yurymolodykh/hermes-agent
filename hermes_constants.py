@@ -255,6 +255,18 @@ def reset_hermes_home_key_cache() -> None:
         _HOME_MATCH_CACHE.clear()
 
 
+def forget_home_match_cache() -> None:
+    """Drop the memoized "same directory" verdicts only.
+
+    Called where a profile is connected or disconnected (``SessionAuthorities.add``/``replace``/
+    ``remove``): the served set is what those verdicts answer about, so one switch must not let a
+    previous routing decision survive. The resolved home keys and profile names are left alone —
+    they are keyed by paths that did not change.
+    """
+    with _PROFILE_NAME_LOCK:
+        _HOME_MATCH_CACHE.clear()
+
+
 def _comparable_spelling(path: str | Path) -> str:
     """Syscall-free spelling of *path* for a cache key.
 
