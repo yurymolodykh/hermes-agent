@@ -55,9 +55,19 @@ _HANDLES_PER_PATH_WARN = 4
 # So the read pool also yields when the PROCESS is close to its limit, whatever is consuming it.
 _FD_HEADROOM_RESERVE = 64
 
-# The fd count is a directory listing; cache it briefly so a read burst isn't a
-# syscall per query (staleness lets through at most the ceiling's worth of opens).
+# The fd count used to be re-listed from /proc/self/fd (~700 entries on the live
+# gateway) on EVERY checkout of a pooled read connection: 15% of the process's
+# py-spy samples (314/2049). The request path no longer walks the fd directory at
+# all — it reads the sample below, corrected by this module's own open connections.
+# The name stays because probes and tests key on it; it now only rate-limits a
+# retry of a cold/failed first sample.
 _FD_USAGE_CACHE_SECONDS = 0.25
+
+# Cadence of the background fd-table sampler. Reserved headroom is
+# _FD_HEADROOM_RESERVE (64) descriptors while this module's read pool can only add
+# _READ_POOL_PROCESS_MAX (24) between two samples, so two seconds of staleness for
+# everything else cannot walk the process into EMFILE.
+_FD_RECONCILE_SECONDS = 2.0
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
 
@@ -66,7 +76,17 @@ _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
 _read_open_denied_fd_headroom = 0
 
 _fd_usage_lock = threading.Lock()
+# (probe stamp, probed count) published by the reconciler; None until the first probe.
 _fd_usage_cache: tuple[float, Optional[int]] = (0.0, None)
+# Read connections this module holds open right now (one permit == one live read
+# connection). Absolute, not a running sum: the estimate below is the last probe
+# plus the pool's growth SINCE that probe, so a connection opened before a probe and
+# closed after it is never subtracted twice.
+_fd_pool_live = 0
+_fd_pool_live_at_probe = 0
+_fd_reconciler_lock = threading.Lock()
+_fd_reconciler_started = False
+_fd_reconciler_stop_event: list[threading.Event] = []
 
 
 def _proc_fd_targets(pid: int) -> Iterator[tuple[str, str]]:
@@ -111,22 +131,95 @@ def _fd_soft_limit() -> Optional[int]:
 def _fd_headroom_ok() -> bool:
     """Can the process spare a descriptor for a new read connection? Fails OPEN
     when unmeasurable (refusing every read would be a self-inflicted convoy);
-    fails CLOSED only on evidence (measured shortfall or a starved probe)."""
+    fails CLOSED only on evidence (measured shortfall or a starved probe).
+
+    Never lists the fd directory on this path: the value is the last sample the
+    background reconciler published, corrected by this module's own net opens.
+    When no sample exists yet (first call in a cold process, or a probe that could
+    not read the directory) unmeasurable means fail open, as before.
+    """
     soft = _fd_soft_limit()
     if soft is None:
         return True
-    global _fd_usage_cache
-    now = time.monotonic()
     with _fd_usage_lock:
-        stamp, cached = _fd_usage_cache
-        fresh = cached is not None and (now - stamp) < _FD_USAGE_CACHE_SECONDS
-    if not fresh:
-        cached = _open_fd_count()
+        stamp, cached, live, live_at_probe = (
+            _fd_usage_cache[0], _fd_usage_cache[1], _fd_pool_live, _fd_pool_live_at_probe)
+    if cached is None and (time.monotonic() - stamp) >= _FD_USAGE_CACHE_SECONDS:
+        # Cold start (or a probe that could not read the table, retried at most on
+        # the old 0.25 s cadence): take one sample here, then hand the measuring to
+        # the background thread and never list the fd directory on this path again.
+        ensure_fd_reconciler()
+        cached = _sample_fd_usage()
         with _fd_usage_lock:
-            _fd_usage_cache = (now, cached)
+            live, live_at_probe = _fd_pool_live, _fd_pool_live_at_probe
     if cached is None:
         return True
+    # The probe already saw every read connection that existed when it ran; only the
+    # ones opened since are missing from it, and the pool ceiling bounds that gap.
+    cached = cached + (live - live_at_probe)
     return cached >= 0 and (soft - cached) > _FD_HEADROOM_RESERVE
+
+
+def _sample_fd_usage() -> Optional[int]:
+    """Measure the fd table once and publish it as the new base for the estimate."""
+    global _fd_usage_cache, _fd_pool_live_at_probe
+    count = _open_fd_count()
+    # The pool watermark is captured in the same critical section as the published
+    # sample, so a concurrent acquire/release lands on one side of the pair, not
+    # between them (which would count it twice or not at all).
+    with _fd_usage_lock:
+        _fd_usage_cache = (time.monotonic(), count)
+        _fd_pool_live_at_probe = _fd_pool_live
+    return count
+
+
+def _note_fd_delta(step: int) -> None:
+    """Track how many read connections this module holds open right now."""
+    global _fd_pool_live
+    with _fd_usage_lock:
+        _fd_pool_live += step
+
+
+def _fd_reconcile_loop(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            _sample_fd_usage()
+        except Exception:  # health: allow BLE001 -- a probe must never kill its thread
+            logger.debug("fd usage reconcile failed", exc_info=True)
+        stop.wait(_FD_RECONCILE_SECONDS)
+
+
+def ensure_fd_reconciler() -> bool:
+    """Start the background fd-table sampler once per process; True when it runs.
+
+    Lazy on purpose: the first read path that needs a real measurement starts it,
+    and a process that never opens a read connection never pays for the thread.
+    """
+    global _fd_reconciler_started
+    with _fd_reconciler_lock:
+        if _fd_reconciler_started:
+            return True
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_fd_reconcile_loop, args=(stop,), name="readpool-fd-reconciler", daemon=True)
+        _fd_reconciler_stop_event.append(stop)
+        try:
+            thread.start()
+        except RuntimeError:  # interpreter shutting down
+            _fd_reconciler_stop_event.clear()
+            return False
+        _fd_reconciler_started = True
+        return True
+
+
+def stop_fd_reconciler() -> None:
+    """Signal the sampler to exit (tests and orderly shutdown)."""
+    global _fd_reconciler_started
+    with _fd_reconciler_lock:
+        for stop in _fd_reconciler_stop_event:
+            stop.set()
+        _fd_reconciler_stop_event.clear()
+        _fd_reconciler_started = False
 
 
 def _reclaim_idle_read_conn_anywhere() -> bool:
@@ -207,6 +300,7 @@ class _PathReadBudget:
         if not self._acquire_process_permit():
             return False
         if self._acquire_path_permit(requester):
+            _note_fd_delta(1)
             return True
         _process_read_permits.release()
         return False
@@ -215,6 +309,7 @@ class _PathReadBudget:
         """Return one connection's permits. Pairs with a successful acquire()."""
         self.permits.release()
         _process_read_permits.release()
+        _note_fd_delta(-1)
 
     def _acquire_process_permit(self) -> bool:
         # Another thread may take a freed permit first: legitimate loss, no looping.

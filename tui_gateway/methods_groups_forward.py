@@ -98,13 +98,12 @@ def _standalone_holder(room_id: str) -> str | None:
     """Where the standalone store says ``room_id`` lives: ``"gateway"`` (handed to the root
     gateway's store), ``"local"`` (any other room it holds: only this backend drives or mirrors
     it) or ``None`` (not a standalone room)."""
-    from contextlib import closing
-    from gateway.hosted_rooms import _read_connection, default_db_path
+    from gateway.hosted_rooms import _read_connection_ctx, default_db_path
     from gateway.hosted_rooms_gateway_import import handoff_gateway_id
     source = default_db_path()
     if not source.is_file():
         return None
-    with closing(_read_connection(source)) as conn:
+    with _read_connection_ctx(source) as conn:
         row = conn.execute("SELECT authority_gateway_id FROM hosted_rooms WHERE room_id=?",
                            (room_id,)).fetchone()
     if row is None:

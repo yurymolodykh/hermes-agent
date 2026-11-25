@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
 import sqlite3
 import threading
-from contextlib import closing
+import time
+from contextlib import closing, contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from gateway.hosted_rooms_common import (
     DbPath, bounded_int, canonical_json, clock as _now, compact_json, connect, fenced_update as _fenced_update,
@@ -45,6 +48,7 @@ MAX_GATEWAY_EVENT_BYTES = 16 * 1024 * 1024
 CONTROL_EVENT_COUNT_RESERVE = 64
 CONTROL_EVENT_BYTE_RESERVE = 1024 * 1024
 _JOURNAL_MODE_LOCK_RETRIES = 8
+logger = logging.getLogger(__name__)
 
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _CONTROL_EVENT_KINDS = frozenset({"authority.claimed", "authority.lost", "room.disbanded", "room.stop_requested"})
@@ -445,13 +449,46 @@ _SCHEMA_CACHE_MAX_FILES = 16
 _schema_cache: dict[tuple[str, int, int], tuple[int, bool]] = {}
 _schema_cache_lock = threading.Lock()
 
+# ``realpath`` (one syscall per path component) and the stat behind it used to run on
+# EVERY readiness check — 156 of 2049 py-spy samples on the live gateway, and a
+# component of the same 5-second room cycle as the schema probe. Both answers only
+# change when the file at that path does, and the (st_dev, st_ino) the cache key needs
+# is exactly what tells us that: stat the path without resolving it (``os.stat`` on
+# the path as given, no ``realpath``), and only resolve the path once, on a
+# (dev, ino) miss, so the key stays canonical for two spellings of one file.
+_identity_cache: dict[str, tuple[tuple[int, int], tuple[str, int, int]]] = {}
+_identity_cache_lock = threading.Lock()
+_IDENTITY_CACHE_MAX = 32
+
 
 def _file_identity(path: DbPath) -> tuple[str, int, int] | None:
+    """``(canonical path, st_dev, st_ino)`` for ``path``, without a ``realpath`` per call."""
+    raw = str(path)
     try:
-        stat = Path(path).stat()
+        stat = os.stat(raw)  # no realpath: one syscall, not one per path component
     except OSError:
         return None
-    return (str(Path(path).resolve()), int(stat.st_dev), int(stat.st_ino))
+    dev, ino = int(stat.st_dev), int(stat.st_ino)
+    with _identity_cache_lock:
+        cached = _identity_cache.get(raw)
+        if cached is not None and cached[0] == (dev, ino):
+            return cached[1]
+    try:
+        resolved = str(Path(raw).resolve())
+    except OSError:
+        resolved = raw
+    identity = (resolved, dev, ino)
+    with _identity_cache_lock:
+        if raw not in _identity_cache and len(_identity_cache) >= _IDENTITY_CACHE_MAX:
+            _identity_cache.pop(next(iter(_identity_cache)), None)
+        _identity_cache[raw] = ((dev, ino), identity)
+    return identity
+
+
+def clear_identity_cache() -> None:
+    """Drop the memoised path→identity pairs (a caller that just replaced a file)."""
+    with _identity_cache_lock:
+        _identity_cache.clear()
 
 
 def _schema_version(conn: sqlite3.Connection) -> int | None:
@@ -539,17 +576,154 @@ def _connect(db_path: DbPath) -> sqlite3.Connection:
         initialize=partial(_initialize_store, db_path=path), lock_retries=_JOURNAL_MODE_LOCK_RETRIES)
 
 
-def _read_connection(db_path: DbPath) -> sqlite3.Connection:
-    """Open the room store without steady-state journal or migration writes."""
+class _SharedReadConn:
+    """One reused read connection for a database file, serialized by its own lock.
+
+    ``identity`` is the ``(st_dev, st_ino)`` of the file the live connection was opened
+    against, so a store replaced under the process (a restore, a move, an atomic swap) is
+    detected by one cheap ``stat`` instead of being read through the dead inode.
+    """
+
+    __slots__ = ("conn", "identity", "lock")
+
+    def __init__(self) -> None:
+        self.conn: sqlite3.Connection | None = None
+        self.lock = threading.Lock()
+        self.identity: tuple[int, int] | None = None
+
+
+_shared_read_conns: dict[str, _SharedReadConn] = {}
+_shared_read_conns_lock = threading.Lock()
+_SHARED_READ_CONNS_MAX = 16
+
+
+def _open_shared_sqlite(path: Path) -> sqlite3.Connection:
+    """Steady-state reader connection usable from any thread.
+
+    ``check_same_thread=False`` because the handle outlives the thread that opened it
+    (the 5-second room cycle may run on another thread next tick); the per-path lock
+    in :class:`_SharedReadConn` is what serializes access.
+    """
+    from hermes_cli.sqlite_util import open_db
+
+    return open_db(path, db_label="shared-state.db", wal=False, foreign_keys=True,
+                   check_same_thread=False)
+
+
+def _read_connection_entry(path: Path) -> _SharedReadConn:
+    """The registry slot for ``path`` (created on first use, never opened here).
+
+    Taking the slot under the registry lock and opening/using the connection under the
+    slot's own lock keeps the two lock orders strictly nested one way (registry →
+    slot), so a fresh open can never deadlock against a concurrent reader.
+    """
+    key = str(path)
+    with _shared_read_conns_lock:
+        entry = _shared_read_conns.get(key)
+        if entry is None:
+            entry = _SharedReadConn()
+            if len(_shared_read_conns) >= _SHARED_READ_CONNS_MAX:
+                _, stale = _shared_read_conns.popitem()
+                _close_quietly(stale)
+            _shared_read_conns[key] = entry
+        return entry
+
+
+def _close_quietly(entry: _SharedReadConn) -> None:
+    """Close a slot's connection if it is still there (never under the registry lock)."""
+    try:
+        acquired = entry.lock.acquire(timeout=0.5)
+    except (RuntimeError, ValueError):
+        return
+    if not acquired:
+        return  # a live reader owns it; the descriptor dies with the slot
+    try:
+        if entry.conn is not None:
+            try:
+                entry.conn.close()
+            except sqlite3.Error:
+                logger.debug("closing a replaced read connection failed", exc_info=True)
+            entry.conn = None
+            entry.identity = None
+    finally:
+        entry.lock.release()
+
+
+def _file_identity_pair(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of *path* without following the path through realpath.
+
+    One ``stat`` is what lets a reused connection notice the file it holds was replaced;
+    ``None`` when the stat fails (the caller then treats the handle as unverifiable).
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _discard_entry_connection(entry: _SharedReadConn, why: str) -> None:
+    """Close and clear a slot's connection IN PLACE (caller holds ``entry.lock``)."""
+    if entry.conn is not None:
+        try:
+            entry.conn.close()
+        except sqlite3.Error:
+            logger.debug("closing a %s failed", why, exc_info=True)
+        entry.conn = None
+    entry.identity = None
+
+
+def _forget_read_connection(path: Path) -> None:
+    """Drop and close the shared reader for ``path`` (its file changed under it)."""
+    key = str(path)
+    with _shared_read_conns_lock:
+        entry = _shared_read_conns.pop(key, None)
+    if entry is not None:
+        _close_quietly(entry)
+
+
+def clear_read_connections() -> None:
+    """Drop every shared reader (tests, and an orderly shutdown)."""
+    with _shared_read_conns_lock:
+        entries = list(_shared_read_conns.values())
+        _shared_read_conns.clear()
+    for entry in entries:
+        _close_quietly(entry)
+
+
+@contextmanager
+def _read_connection_ctx(db_path: DbPath) -> Iterator[sqlite3.Connection]:
+    """Yield the reused read connection for ``db_path``, serialized by its own lock.
+
+    Replaces ``with closing(_read_connection(db_path))``: the handle is reused rather
+    than closed, so the room cycle's every-5-second read stops opening a connection
+    (and re-probing the schema) per call. Read-only statements run in autocommit, so a
+    shared handle never hands a caller another caller's open transaction.
+    """
     path = Path(db_path)
     if not path.is_file():
+        # Only the CREATE path needs the writable connector; it never caches a handle.
         _connect(path).close()
-    conn = open_sqlite(path)
-    if not _store_ready(conn, path):
-        conn.close()
-        _connect(path).close()
-        conn = open_sqlite(path)
-    return conn
+        with closing(open_sqlite(path)) as fresh:
+            yield fresh
+        return
+    entry = _read_connection_entry(path)
+    with entry.lock:
+        if entry.conn is not None and entry.identity != _file_identity_pair(path):
+            # The file behind the path was replaced (restore/move/atomic swap): the live
+            # handle still reads the DEAD inode, which would serve rows the store no
+            # longer has. One stat per read is the price of reusing the connection.
+            _discard_entry_connection(entry, "replaced read connection")
+        if entry.conn is None:
+            entry.conn = _open_shared_sqlite(path)
+            entry.identity = _file_identity_pair(path)
+        if not _store_ready(entry.conn, path):
+            # The schema is behind: let the writable connector migrate, then reopen.
+            _discard_entry_connection(entry, "stale read connection")
+            _connect(path).close()
+            entry.conn = _open_shared_sqlite(path)
+            entry.identity = _file_identity_pair(path)
+        yield entry.conn
 
 
 _transaction = partial(transaction, _connect, immediate=False)
@@ -703,7 +877,7 @@ def prune_disbanded_rooms(db_path: DbPath, *, now: float | None = None) -> int:
 def room_has_peer_obligations(db_path: DbPath, *, room_id: Any, now: float | None = None) -> bool:
     """Whether metadata-only Disband needs a runtime to settle peer access."""
     room_id = _room_id(room_id)
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         return conn.execute("""SELECT 1 FROM hosted_room_links WHERE room_id=?
             UNION ALL SELECT 1 FROM hosted_room_owed_revokes WHERE room_id=? AND expires_at>? LIMIT 1""",
             (room_id, room_id, _now(now))).fetchone() is not None
@@ -870,7 +1044,7 @@ _DUE_OWED_REVOKES = """SELECT room_id, member_id, grant_digest, target_url, gran
 
 def owes_room_grant_revokes(db_path: DbPath) -> bool:
     """Whether any owed revoke is recorded (read-only)."""
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         return conn.execute("SELECT 1 FROM hosted_room_owed_revokes LIMIT 1").fetchone() is not None
 
 
@@ -893,7 +1067,7 @@ def due_room_grant_revokes(db_path: DbPath, *, limit: int, now: float | None = N
     """Owed revokes due now, oldest first; one whose grant has expired is dropped instead. Read-only
     unless an expired row is there to drop, so an idle worker cycle never takes the write lock."""
     timestamp = _now(now)
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         rows = conn.execute(_DUE_OWED_REVOKES, (timestamp, timestamp, int(limit))).fetchall()
         expired = conn.execute(
             "SELECT 1 FROM hosted_room_owed_revokes WHERE expires_at<=? LIMIT 1", (timestamp,)).fetchone()
@@ -1192,7 +1366,7 @@ def list_rooms(
     """Return one bounded read-only page ordered by most recent change."""
     limit = _bounded_limit(limit, MAX_ROOM_LIST_LIMIT)
     offset = _non_negative(offset, "offset")
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         rows = conn.execute(
             f"""SELECT {_ROOM_COLUMNS} FROM hosted_rooms WHERE disbanded_at IS NULL OR ?
                 ORDER BY updated_at DESC, room_id ASC LIMIT ? OFFSET ?""", (int(include_disbanded), limit, offset)
