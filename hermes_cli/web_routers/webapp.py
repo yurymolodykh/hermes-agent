@@ -38,6 +38,12 @@ def _require_private_webapp(request: Request) -> None:
         raise HTTPException(404, "Private Webapp window handoff is unavailable")
 
 
+def _identity_of(ws: WebSocket) -> dict:
+    """The identity the redeemed ticket stamped on *ws* (never the query string), or ``{}``."""
+    identity = getattr(ws, "_hermes_auth_identity", None)
+    return identity if isinstance(identity, dict) else {}
+
+
 def _ticket_principal_may_open(ws: WebSocket, profile: str) -> bool:
     """Whether the identity the redeemed ticket CARRIES may use *profile* at all.
 
@@ -53,8 +59,8 @@ def _ticket_principal_may_open(ws: WebSocket, profile: str) -> bool:
 
     from hermes_acl_profiles import request_allows
 
-    identity = getattr(ws, "_hermes_auth_identity", None)
-    if not isinstance(identity, dict) or not identity.get("user_id"):
+    identity = _identity_of(ws)
+    if not identity.get("user_id"):
         return False
     request = SimpleNamespace(
         state=SimpleNamespace(
@@ -66,6 +72,23 @@ def _ticket_principal_may_open(ws: WebSocket, profile: str) -> bool:
     return request_allows(request, profile)
 
 
+def _ticket_principal_may_open_launch_home(ws: WebSocket) -> bool:
+    """Whether this principal may open the LAUNCH home (the server's own, ``?profile=`` absent).
+
+    Before multi-user the launch home was the one home every caller of this route could reach, so
+    the answer stays ``True``: the single-user host keeps its behaviour, and a ticket minted before
+    the gate existed still opens the shell it always did. With ``acl.multi_user`` on, the launch
+    home belongs to the deployment rather than to the person whose tab it is, so only the host
+    OWNER keeps it; an identity-less dial (already refused 4401 by ``_ws_gate``) gets nothing.
+    """
+    from hermes_acl_profiles import multi_user_enabled
+    from gateway.owner_identity import identity_is_host_owner
+
+    if not multi_user_enabled():
+        return True
+    return bool(identity_is_host_owner(_identity_of(ws)))
+
+
 def _host_terminal_profile_matches(ws: WebSocket) -> bool:
     """Whether the profile this ``/api/host-terminal`` request names may be opened by its ticket.
 
@@ -73,19 +96,22 @@ def _host_terminal_profile_matches(ws: WebSocket) -> bool:
 
     * it names a home (``web_server_chat._ws_auth_reason`` stamps ``_hermes_ticket_profile_home``)
       — the ``?profile=`` must resolve to exactly that home, or nothing opens;
-    * it names no home — the real terminal dial mints without a profile, so the name arrives only
+    * it names no home — the REAL terminal dial mints without a profile, so the name arrives only
       on the socket. Such a request opens the named profile only when the ticket's own principal
-      may SEE it (``_ticket_principal_may_open``) and it exists; a request naming no profile keeps
-      opening the ticket's launch home.
+      may SEE it (``_ticket_principal_may_open``) and it exists; a request naming no profile opens
+      the ticket's launch home, which under multi-user is the owner's alone
+      (``_ticket_principal_may_open_launch_home``).
     """
     from pathlib import Path
 
     from hermes_cli.web_host_terminal_sessions import _request_home
 
     requested = (ws.query_params.get("profile") or "").strip()
-    if not requested or requested.lower() == "current":
-        return True  # no name: the ticket's own home is opened
     ticket_home = getattr(ws, "_hermes_ticket_profile_home", None)
+    if not requested or requested.lower() == "current":
+        # No name: the shell opens the ticket's home when it carries one (its mint already gated
+        # the name against this principal), else the launch home.
+        return True if ticket_home else _ticket_principal_may_open_launch_home(ws)
     if ticket_home:
         return _request_home(requested) == Path(ticket_home).resolve()
     try:
