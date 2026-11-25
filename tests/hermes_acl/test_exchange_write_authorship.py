@@ -299,6 +299,51 @@ class TestSiblingWriteRoutes:
             "DELETE", "/api/files", json={"path": str(victim)}).status_code == 200
         assert not victim.exists()
 
+    def test_the_spot_editor_root_save_lands_in_the_callers_folder(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """The editor route is a write too: probe10 must not survive through it."""
+        exchange = _isolated_home / "shared"
+        (exchange / "person_alice").mkdir(parents=True, exist_ok=True)
+        team = exchange / "team.docx"
+        team.write_text("bob's prepared deliverable", encoding="utf-8")
+        results_acl.record_exchange_authorship(_request_as("bob"), team)
+
+        response = fs_client_factory("alice").post(
+            "/api/fs/write-text", json={"path": str(team), "content": "clobbered"})
+
+        assert response.status_code == 200, response.text
+        assert team.read_text(encoding="utf-8") == "bob's prepared deliverable"
+        assert (exchange / "person_alice" / "team.docx").read_text(encoding="utf-8") == "clobbered"
+
+    def test_the_spot_editor_does_not_build_the_folder_it_redirects_into(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """The route's own contract (never build trees) wins: it names the folder instead."""
+        exchange = _isolated_home / "shared"
+        team = exchange / "team.docx"
+        team.write_text("bob's prepared deliverable", encoding="utf-8")
+
+        response = fs_client_factory("alice").post(
+            "/api/fs/write-text", json={"path": str(team), "content": "clobbered"})
+
+        assert response.status_code == 400, response.text
+        assert "person_alice" in response.json()["detail"]
+        assert team.read_text(encoding="utf-8") == "bob's prepared deliverable"
+        assert not (exchange / "person_alice").exists()
+
+    def test_the_spot_editor_refuses_a_foreign_authored_file(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        exchange = _isolated_home / "shared"
+        own = exchange / "person_alice" / "migrated.docx"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text("bob's migrated deliverable", encoding="utf-8")
+        results_acl.record_exchange_authorship(_request_as("bob"), own)
+
+        response = fs_client_factory("alice").post(
+            "/api/fs/write-text", json={"path": str(own), "content": "clobbered"})
+
+        assert response.status_code == 409, response.text
+        assert own.read_text(encoding="utf-8") == "bob's migrated deliverable"
+
 
 class TestAuthorshipBackstop:
     def test_a_root_level_file_another_subject_created_is_not_touched(

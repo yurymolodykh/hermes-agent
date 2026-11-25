@@ -1168,10 +1168,25 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
         from hermes_acl_results import require_path
 
         require_path(request, target)
-    from hermes_acl_results import record_exchange_authorship, require_exchange_authorship
+    from hermes_acl_results import (
+        exchange_write_target,
+        record_exchange_authorship,
+        require_exchange_authorship,
+    )
 
-    # The exchange has no OS-level owner (L2-c): the spot editor is a write like any other, so a
-    # colleague's file is not saved over. No-op outside the exchange and when unscoped.
+    # The exchange has no OS-level owner (L2-c): the spot editor is a write like any other, so the
+    # bytes go to the caller's own folder and a colleague's file is not saved over. Both are no-ops
+    # outside the exchange and when unscoped.
+    redirected = exchange_write_target(request, target)
+    if redirected != target:
+        if not redirected.parent.is_dir():
+            # This route never builds trees (see the docstring): say where the file has to go
+            # instead of inventing the folder behind the caller's back.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Create the folder {redirected.parent} first; the exchange is writable "
+                       "only inside your own folder")
+        target = redirected
     require_exchange_authorship(request, target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")

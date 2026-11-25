@@ -128,7 +128,8 @@ print("=" * 78)
 print("authorship journal backstop: a migrated file bob authored, inside alice's folder")
 print("=" * 78)
 planted = exchange / "person_alice" / "migrated.docx"
-planted.write_text("bob's migrated deliverable", encoding="utf-8")
+bob_migrated_text = "bob's migrated deliverable"
+planted.write_text(bob_migrated_text, encoding="utf-8")
 import hermes_acl_results as results_acl  # noqa: E402
 
 bob_request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
@@ -144,6 +145,7 @@ print("=" * 78)
 print("delete: alice tries to delete bob's folder file — must be refused")
 print("=" * 78)
 bobs = exchange / "person_bob" / "kept.txt"
+bobs.parent.mkdir(parents=True, exist_ok=True)
 bobs.write_text("bob keeps this", encoding="utf-8")
 resp = client_for("alice").request("DELETE", "/api/files", json={"path": str(bobs)})
 print(f"  DELETE -> HTTP {resp.status_code}: {resp.json().get('detail')}")
