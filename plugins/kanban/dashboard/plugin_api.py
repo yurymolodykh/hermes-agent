@@ -937,15 +937,25 @@ class LinkBody(BaseModel):
 
 
 @router.post("/links")
-def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
+def add_link(payload: LinkBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
+        # A dependency edge decides whose work unblocks when, so BOTH cards' holders must agree:
+        # a stranger must not graft a link onto somebody else's graph.
+        _require_held_task(conn, payload.parent_id, request)
+        _require_held_task(conn, payload.child_id, request)
         gated = kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True, "gated": gated}
 
 
 @router.delete("/links")
-def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: Optional[str] = Query(None)):
+def delete_link(
+    request: Request, parent_id: str = Query(...), child_id: str = Query(...),
+    board: Optional[str] = Query(None),
+):
     with _board_conn(board) as (board, conn):
+        # Removing an edge is the same mutation as adding one, in reverse.
+        _require_held_task(conn, parent_id, request)
+        _require_held_task(conn, child_id, request)
         return {"ok": bool(kanban_db.unlink_tasks(conn, parent_id, child_id))}
 
 
@@ -978,14 +988,22 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
 
 
 @router.post("/tasks/bulk")
-def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
+def bulk_update(payload: BulkTaskBody, request: Request, board: Optional[str] = Query(None)):
     """Apply the same patch to every id. Independent iteration — per-task
-    failures don't abort siblings; returns per-id outcome for partials."""
+    failures don't abort siblings; returns per-id outcome for partials.
+
+    The batch is REFUSED up front (403) when any existing id is somebody else's card: a bulk patch
+    moves statuses and priorities, and answering "3 of 5 applied" to a stranger would either be a
+    silent partial mutation or an id oracle.
+    """
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     with _board_conn(board) as (board, conn):
+        for tid in ids:
+            if kanban_db.get_task(conn, tid) is not None:
+                _require_held_task(conn, tid, request)
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:
@@ -1105,7 +1123,9 @@ class TerminateRunBody(BaseModel):
 
 
 @router.post("/runs/{run_id}/terminate")
-def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Optional[str] = _BOARD_Q):
+def terminate_run_endpoint(
+    run_id: int, payload: TerminateRunBody, request: Request, board: Optional[str] = _BOARD_Q,
+):
     """Terminate an in-flight run via ``reclaim_task`` (same SIGTERM->SIGKILL flow, bookkeeping
     and events as ``POST /tasks/{id}/reclaim``); 409 if already ended / not reclaimable.
 
@@ -1114,6 +1134,8 @@ def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Option
     """
     with _board_conn(board) as (board, conn):
         r = _require_run(conn, run_id)
+        # Killing a worker destroys whoever's run it is: the run's card decides, not the run id.
+        _require_held_task(conn, r.task_id, request)
         if r.ended_at is not None:
             raise _conflict(f"run {run_id} already ended")
         if not kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason):
@@ -1128,10 +1150,14 @@ class ReclaimBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/reclaim")
-def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[str] = Query(None)):
+def reclaim_task_endpoint(
+    task_id: str, payload: ReclaimBody, request: Request, board: Optional[str] = Query(None),
+):
     """Release an active worker claim without waiting for the claim TTL
     (``hermes kanban reclaim <task_id> --reason ...``)."""
     with _board_conn(board) as (board, conn):
+        # Reclaiming SIGTERMs the running worker: the card's holder decides, everybody else reads.
+        _require_held_task(conn, task_id, request)
         if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
             raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
         return {"ok": True, "task_id": task_id}
@@ -1145,9 +1171,15 @@ class SpecifyBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/specify")
-def specify_task_endpoint(task_id: str, payload: SpecifyBody, board: Optional[str] = Query(None)):
+def specify_task_endpoint(
+    task_id: str, payload: SpecifyBody, request: Request, board: Optional[str] = Query(None),
+):
     """Flesh out a triage task via the auxiliary LLM (``hermes kanban specify``). Non-OK is NOT
     an HTTP error — the UI renders the reason inline. Sync ``def`` → runs in the threadpool."""
+    # Specifying REWRITES the card's title/body: the holder's call, so the gate runs before the
+    # auxiliary model is ever asked to spend tokens on somebody else's card.
+    with _board_conn(board) as (board, conn):
+        _require_held_task(conn, task_id, request)
     outcome = _run_aux(board, "kanban_specify", "specify_task", task_id, payload.author)
     return {"ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason, "new_title": outcome.new_title}
 
@@ -1159,10 +1191,14 @@ class ReassignBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/reassign")
-def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
+def reassign_task_endpoint(
+    task_id: str, payload: ReassignBody, request: Request, board: Optional[str] = Query(None),
+):
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
     with _board_conn(board) as (board, conn):
+        # Reassignment (and the optional reclaim) hands somebody else's work order to a new worker.
+        _require_held_task(conn, task_id, request)
         ok = kanban_db.reassign_task(
             conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
@@ -1562,8 +1598,11 @@ def _validate_workdir(raw: str) -> str:
 
 
 @router.post("/boards")
-def create_board_endpoint(payload: CreateBoardBody):
+def create_board_endpoint(payload: CreateBoardBody, request: Request):
     """Create a board. Idempotent — ``slug`` collision returns the existing one."""
+    # A board is installation-wide structure (its default workdir, project scope, the switcher):
+    # creating one is the admin's call, exactly like the profile roster's create.
+    _require_owner(request, "kanban_board_admin")
     default_workdir = _validate_workdir(payload.default_workdir) if payload.default_workdir else None
     # A chosen project's primary repo becomes the default workdir unless one was passed explicitly.
     project_id, _pname, primary_path = _resolve_project(payload.project_id)
@@ -1579,8 +1618,9 @@ def create_board_endpoint(payload: CreateBoardBody):
 
 
 @router.patch("/boards/{slug}")
-def rename_board(slug: str, payload: RenameBoardBody):
+def rename_board(slug: str, payload: RenameBoardBody, request: Request):
     """Update display metadata / default workdir / project scope (slug is immutable)."""
+    _require_owner(request, "kanban_board_admin")
     normed = _existing_board_slug(slug)
     # write_board_metadata treats a falsy value as "clear", so pass "" through.
     default_workdir: Optional[str] = None
@@ -1664,9 +1704,11 @@ async def import_board_endpoint(body: ImportBoardBody):
 
 
 @router.post("/boards/{slug}/switch")
-def switch_board(slug: str):
+def switch_board(slug: str, request: Request):
     """Persist ``slug`` as the active board for CLI / slash-command parity
     (dashboard users pick boards client-side via localStorage)."""
+    # The ACTIVE board is shared process state: switching it redirects everybody's CLI/dispatcher.
+    _require_owner(request, "kanban_board_admin")
     normed = _existing_board_slug(slug)
     kanban_db.set_current_board(normed)
     return {"current": normed}
@@ -1697,9 +1739,11 @@ def list_profile_roster():
 
 
 @router.patch("/profiles/{profile_name}")
-def update_profile_description(profile_name: str, payload: DescribeBody):
+def update_profile_description(profile_name: str, payload: DescribeBody, request: Request):
     """Set (``description_auto: false`` so the auto-describer won't overwrite it
     without ``--overwrite``) or clear (empty string) a profile's description."""
+    # Routing metadata for the whole orchestrator, not one card: the admin writes it.
+    _require_owner(request, "kanban_profile_admin")
     with _errors_to_500("failed to update profile"):
         from hermes_cli import profiles as profiles_mod
         canon = profiles_mod.normalize_profile_name(profile_name)
@@ -1732,9 +1776,14 @@ class DecomposeBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/decompose")
-def decompose_task_endpoint(task_id: str, payload: DecomposeBody, board: Optional[str] = Query(None)):
+def decompose_task_endpoint(
+    task_id: str, payload: DecomposeBody, request: Request, board: Optional[str] = Query(None),
+):
     """Fan a triage task out into child tasks via the auxiliary LLM (``hermes kanban decompose``).
     Non-OK is NOT an HTTP error. Sync ``def`` → runs in the threadpool."""
+    # Decomposing rewrites the card's children and title, and spends aux-model tokens doing it.
+    with _board_conn(board) as (board, conn):
+        _require_held_task(conn, task_id, request)
     outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id, payload.author)
     return {
         "ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
