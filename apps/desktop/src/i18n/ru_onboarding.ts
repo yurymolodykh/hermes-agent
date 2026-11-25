@@ -75,5 +75,9 @@ export const ruOnboarding: TranslationOverrides['onboarding'] = {
   price: (input, output) => `${input} вход / ${output} выход за Mtok`,
   change: 'Изменить',
   startChatting: 'Начать',
-  docs: provider => `Документация ${provider}`
+  docs: provider => `Документация ${provider}`,
+  runtimeConnecting: 'Подключаемся к бэкенду Hermes… это может занять время, пока он запускается.',
+  runtimeNotReadyTitle: 'Бэкенд не отвечает',
+  runtimeNotReadyBody:
+    'Hermes Desktop не смог связаться с бэкендом. Возможно, он остановлен; приложение продолжит проверять и восстановится само.'
 }

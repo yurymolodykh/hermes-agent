@@ -92,6 +92,49 @@ function fallbackTimeoutGateway(): OnboardingContext['requestGateway'] {
   }
 }
 
+/** A closed port: the transport refuses the dial, so no probe reached a server. */
+function refusedPortGateway(): OnboardingContext['requestGateway'] {
+  return async method => {
+    if (method === 'setup.status' || method === 'setup.runtime_check') {
+      throw new Error(`connect ECONNREFUSED 127.0.0.1:9 (${method})`)
+    }
+
+    throw new Error(`unexpected gateway method: ${method}`)
+  }
+}
+
+/** Answers `timeouts` rounds with a request timeout, then the keyless custom
+ *  runtime_check — a backend that was busy and then came up. */
+function busyThenReadyGateway(timeouts: number): OnboardingContext['requestGateway'] {
+  let rounds = 0
+
+  return async method => {
+    if (method === 'setup.status') {
+      rounds += 1
+
+      if (rounds <= timeouts) {
+        throw new Error('request timed out after 30s: setup.status')
+      }
+
+      return { provider_configured: true } as never
+    }
+
+    if (method === 'setup.runtime_check') {
+      return { ok: true, provider: 'custom' } as never
+    }
+
+    throw new Error(`unexpected gateway method: ${method}`)
+  }
+}
+
+/** With fake timers: let one `refreshOnboarding` round walk its whole backoff
+ *  ladder, then read the result. */
+async function settleBackoff(pending: Promise<boolean>): Promise<boolean> {
+  await vi.advanceTimersByTimeAsync(60_000)
+
+  return pending
+}
+
 describe('refreshOnboarding', () => {
   it('keeps onboarding work in its initiating lifetime and profile', async () => {
     const { startManualOnboarding, startProviderOAuth, saveOnboardingApiKey, closeManualOnboarding } =
@@ -279,58 +322,170 @@ describe('refreshOnboarding', () => {
   })
 
   it('does not downgrade configured=true on fallback-only readiness failures', async () => {
-    const api = vi.fn(async ({ path }: { path: string }) => {
-      if (path === '/api/providers/oauth') {
-        return { providers: [makeOAuthProvider('fresh')] }
-      }
+    vi.useFakeTimers()
+    notifications.clearNotifications()
 
-      throw new Error(`unexpected api path: ${path}`)
-    })
+    try {
+      const api = vi.fn(async ({ path }: { path: string }) => {
+        if (path === '/api/providers/oauth') {
+          return { providers: [makeOAuthProvider('fresh')] }
+        }
 
-    installApiMock(api)
-    // Simulate a returning user: cache is set and store is configured.
-    window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
-    $desktopOnboarding.set(
-      baseState({
-        configured: true,
-        providers: [makeOAuthProvider('cached')],
-        reason: null,
-        requested: false
+        throw new Error(`unexpected api path: ${path}`)
       })
-    )
 
-    const ready = await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
+      installApiMock(api)
+      // Simulate a returning user: cache is set and store is configured.
+      window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
+      $desktopOnboarding.set(
+        baseState({
+          configured: true,
+          providers: [makeOAuthProvider('cached')],
+          reason: null,
+          requested: false
+        })
+      )
 
-    expect(ready).toBe(false)
-    expect(api).not.toHaveBeenCalled()
-    expect($desktopOnboarding.get().configured).toBe(true)
-    expect($desktopOnboarding.get().reason).toBeNull()
-    // The cache must survive the refresh — proving we didn't downgrade.
-    expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(refusedPortGateway())))
+
+      expect(ready).toBe(false)
+      expect(api).not.toHaveBeenCalled()
+      expect($desktopOnboarding.get().configured).toBe(true)
+      expect($desktopOnboarding.get().reason).toBeNull()
+      // The cache must survive the refresh — proving we didn't downgrade.
+      expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+    } finally {
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
   })
 
-  it('keeps an unknown readiness notice temporary and clears it on recovery (#124545)', async () => {
+  it('drops the unknown-readiness notice once the retry ladder lands a ready round', async () => {
     vi.useFakeTimers()
     notifications.clearNotifications()
     installApiMock(vi.fn())
     $desktopOnboarding.set(baseState({ configured: true }))
 
     try {
-      await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
-      expect(notifications.$notifications.get()).toEqual([
-        expect.objectContaining({ id: 'runtime-not-ready', kind: 'info' })
-      ])
-      expect($desktopOnboarding.get().configured).toBe(true)
-      await vi.advanceTimersByTimeAsync(5_000)
-      expect(notifications.$notifications.get()).toEqual([])
+      // Three timed-out rounds, then the backend answers: the ladder absorbs the
+      // load and the user only ever sees the quiet "connecting" line, never the
+      // outage notice.
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(busyThenReadyGateway(3))))
 
-      // A later outage can show a fresh notice; an authoritative ready clears it
-      // without waiting for its timer, and must not dismiss unrelated errors.
-      await refreshOnboarding(onboardingContext(fallbackTimeoutGateway()))
+      expect(ready).toBe(true)
+      expect(notifications.$notifications.get().map(item => item.id)).not.toContain('runtime-not-ready')
+      expect($desktopOnboarding.get().configured).toBe(true)
+
+      // An authoritative ready clears the line without waiting for its timer,
+      // and must not dismiss unrelated errors.
       notifications.notify({ id: 'unrelated', kind: 'error', message: 'Keep me' })
-      await refreshOnboarding(onboardingContext(keylessCustomGateway()))
+      await settleBackoff(refreshOnboarding(onboardingContext(keylessCustomGateway())))
       expect(notifications.$notifications.get().map(item => item.id)).toEqual(['unrelated'])
     } finally {
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows no outage notice when the retry ladder turns a timeout into a ready round', async () => {
+    vi.useFakeTimers()
+    notifications.clearNotifications()
+    installApiMock(vi.fn())
+    $desktopOnboarding.set(baseState({ configured: true }))
+
+    try {
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(busyThenReadyGateway(1))))
+
+      expect(ready).toBe(true)
+      // Only the quiet connecting line may ever have existed; the outage notice
+      // must never be raised for a backend that was merely slow.
+      expect(notifications.$notifications.get().map(item => item.id)).not.toContain('runtime-not-ready')
+      // Recovery takes the connecting line down too — nothing is left behind.
+      expect(notifications.$notifications.get()).toEqual([])
+    } finally {
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
+  })
+
+  it('raises exactly one outage notice when the ladder is exhausted and the port is closed', async () => {
+    vi.useFakeTimers()
+    notifications.clearNotifications()
+    installApiMock(vi.fn())
+    $desktopOnboarding.set(baseState({ configured: true }))
+    const notifySpy = vi.spyOn(notifications, 'notify')
+
+    const outageRounds = () =>
+      notifySpy.mock.calls.filter(([notice]) => (notice as { id?: string }).id === 'runtime-not-ready').length
+
+    try {
+      // A refused dial is classified immediately — no ladder is walked, so both
+      // rounds land without any waiting.
+      const ready = await refreshOnboarding(onboardingContext(refusedPortGateway()))
+
+      expect(ready).toBe(false)
+      expect(outageRounds()).toBe(1)
+      expect(notifySpy).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'runtime-not-ready', kind: 'info', title: expect.any(String) })
+      )
+      expect($desktopOnboarding.get().configured).toBe(true)
+
+      // The notice dedups by id (a repeat REPLACES the entry, it does not stack),
+      // so the stack must still hold exactly one outage notice.
+      const outageInStack = () =>
+        notifications.$notifications.get().filter(item => item.id === 'runtime-not-ready').length
+
+      expect(outageInStack()).toBe(1)
+      await refreshOnboarding(onboardingContext(refusedPortGateway()))
+      expect(outageInStack()).toBe(1)
+    } finally {
+      notifySpy.mockRestore()
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
+  })
+
+  it('never raises the outage notice for a backend that is only busy', async () => {
+    vi.useFakeTimers()
+    notifications.clearNotifications()
+    installApiMock(vi.fn())
+    $desktopOnboarding.set(baseState({ configured: true }))
+    const notifySpy = vi.spyOn(notifications, 'notify')
+
+    try {
+      // Every round times out — the port is alive but never answers in time. This
+      // is the cold-start/load-peak case the card is about: the owner must see the
+      // quiet connecting line, not "Runtime not ready".
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(fallbackTimeoutGateway())))
+
+      expect(ready).toBe(false)
+      expect(notifySpy).not.toHaveBeenCalledWith(expect.objectContaining({ id: 'runtime-not-ready' }))
+      expect(notifySpy).toHaveBeenCalledWith(expect.objectContaining({ id: 'runtime-connecting' }))
+      expect($desktopOnboarding.get().configured).toBe(true)
+    } finally {
+      notifySpy.mockRestore()
+      notifications.clearNotifications()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps configured=true when the backend answers after two timed-out rounds', async () => {
+    vi.useFakeTimers()
+    notifications.clearNotifications()
+    installApiMock(vi.fn())
+    window.localStorage.setItem('hermes-desktop-onboarded-v1', '1')
+    $desktopOnboarding.set(baseState({ configured: true, requested: false, reason: null }))
+
+    try {
+      const ready = await settleBackoff(refreshOnboarding(onboardingContext(busyThenReadyGateway(2))))
+
+      expect(ready).toBe(true)
+      expect($desktopOnboarding.get().configured).toBe(true)
+      expect($desktopOnboarding.get().reason).toBeNull()
+      expect(window.localStorage.getItem('hermes-desktop-onboarded-v1')).toBe('1')
+      expect(notifications.$notifications.get()).toEqual([])
+    } finally {
+      window.localStorage.clear()
       notifications.clearNotifications()
       vi.useRealTimers()
     }

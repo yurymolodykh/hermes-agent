@@ -353,7 +353,10 @@ export const zhHantBoot = {
     docs: provider => `${provider} 文件`,
     setupSlowTitle: '設定花費的時間比平常久。',
     setupSlowBody: 'Hermes 仍在背景中啟動。',
-    continueWithoutSetup: '略過設定並繼續'
+    continueWithoutSetup: '略過設定並繼續',
+    runtimeConnecting: '正在連線 Hermes 後端…… 啟動時可能需要一點時間。',
+    runtimeNotReadyTitle: '執行環境尚未就緒',
+    runtimeNotReadyBody: 'Hermes Desktop 無法連線後端。它可能已停止；應用程式會繼續檢查並自動復原。'
   }
 } satisfies Pick<
   TranslationOverrides,

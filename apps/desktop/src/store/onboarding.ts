@@ -246,6 +246,44 @@ async function checkRuntime(ctx: OnboardingContext, requestedProvider?: string):
   })
 }
 
+// A configured install whose port is alive but loaded: the probes answer late or
+// not at all while the backend serves other work. Each entry is the wait BEFORE
+// the next attempt, so a busy backend gets ~30 s in total to answer before any
+// verdict is shown; a boot-time cold start lands well inside that.
+const RUNTIME_BUSY_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+/** Re-probe a busy backend with backoff. Returns as soon as a round answers
+ *  authoritatively (ready or a real verdict) or stops being `busy`; otherwise the
+ *  last busy round after the ladder is exhausted. `stillWanted` is re-asked after
+ *  every wait so a user action that started mid-ladder cancels the retries. */
+async function retryBusyRuntime(
+  ctx: OnboardingContext,
+  first: RuntimeReadinessResult,
+  stillWanted?: () => boolean
+): Promise<RuntimeReadinessResult> {
+  let last = first
+
+  for (const wait of RUNTIME_BUSY_BACKOFF_MS) {
+    if (last.source !== 'fallback' || last.transport !== 'busy') {
+      return last
+    }
+
+    await sleep(wait)
+
+    if (stillWanted && !stillWanted()) {
+      return last
+    }
+
+    last = await checkRuntime(ctx)
+  }
+
+  return last
+}
+
 function shouldPreserveConfiguredOnFallback(runtime: RuntimeReadinessResult, state: DesktopOnboardingState): boolean {
   // Non-authoritative transport fallback only: NEITHER probe answered, so the
   // round carries no evidence either way and must never be written down as
@@ -314,6 +352,11 @@ const LOCAL_RUNTIME_UNAVAILABLE = 'local_runtime_unavailable'
 const LOCAL_MODELS_ROUTE = '/settings?tab=providers&pview=local'
 
 const LOCAL_RUNTIME_NOTICE_ID = 'local-runtime-unavailable'
+
+/** Quiet "hold on, we're connecting" line shown while a verified install waits
+ *  out a busy backend. Distinct from the outage notice so the two never share a
+ *  dedup slot (and so recovery can tell which one to take down). */
+const RUNTIME_CONNECTING_NOTICE_ID = 'runtime-connecting'
 
 function isLocalRuntimeDown(runtime: RuntimeReadinessResult, state: DesktopOnboardingState): boolean {
   return runtime.source === 'runtime_check' && runtime.errorCode === LOCAL_RUNTIME_UNAVAILABLE && !state.requested
@@ -803,6 +846,7 @@ export function closeManualOnboarding() {
 export function completeDesktopOnboarding(connected = false) {
   clearPoll()
   dismissNotification('runtime-not-ready')
+  dismissNotification(RUNTIME_CONNECTING_NOTICE_ID)
   dismissNotification(LOCAL_RUNTIME_NOTICE_ID)
   writeCachedConfigured(true)
 
@@ -867,10 +911,48 @@ export async function refreshOnboarding(ctx: OnboardingContext, stillWanted?: ()
   // A boot-race round (see shouldPreserveConfiguredOnBootRace) is recognized
   // from the module-level boot-generation clock, so there is nothing to
   // seed here — the round below just reads it.
-  const runtime = await checkRuntime(ctx)
+  let runtime = await checkRuntime(ctx)
 
   if (stillWanted && !stillWanted()) {
     return false
+  }
+
+  // A VERIFIED install that lost its answer to a busy backend (loaded gateway,
+  // cold boot, request timeout) is not an outage: the port is alive and a later
+  // probe answers. The old code showed "Runtime not ready" on the FIRST such
+  // round, so every cold start or load peak looked like a broken backend. Wait
+  // the load out instead, with one quiet localized "connecting" state.
+  if (
+    runtime.source === 'fallback' &&
+    runtime.transport === 'busy' &&
+    $desktopOnboarding.get().configured === true &&
+    !$desktopOnboarding.get().requested
+  ) {
+    notify({
+      id: RUNTIME_CONNECTING_NOTICE_ID,
+      kind: 'info',
+      message: translateNow('onboarding.runtimeConnecting')
+    })
+
+    runtime = await retryBusyRuntime(ctx, runtime, stillWanted)
+
+    if (stillWanted && !stillWanted()) {
+      return false
+    }
+
+    if (runtime.source !== 'fallback' || runtime.transport !== 'busy') {
+      // The ladder reached an authority (ready or a real verdict): the quiet
+      // "connecting" line has served its purpose.
+      dismissNotification(RUNTIME_CONNECTING_NOTICE_ID)
+    }
+
+    if (runtime.ready) {
+      completeDesktopOnboarding()
+      await applyFreeTierIntro(ctx, runtime)
+      ctx.onCompleted?.()
+
+      return true
+    }
   }
 
   if (runtime.ready) {
@@ -884,21 +966,21 @@ export async function refreshOnboarding(ctx: OnboardingContext, stillWanted?: ()
   const state = $desktopOnboarding.get()
 
   if (shouldPreserveConfiguredOnFallback(runtime, state)) {
-    // Gateway probes timed out — don't downgrade to the blocking onboarding
-    // overlay or claim an error verdict. Only a previously VERIFIED install
-    // losing its backend is worth telling the user about; an unknown state is
-    // just a round that landed before the backend could answer, and a notice
-    // on every cold launch would be noise. Use the temporary informational
-    // notice with a stable id, so repeated calls during an outage dedup and
-    // recovery clears it early.
     if (state.configured === true) {
-      notify({
-        id: 'runtime-not-ready',
-        kind: 'info',
-        title: 'Runtime not ready',
-        message:
-          'Hermes Desktop could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
-      })
+      // Still silent after the whole ladder: the probes never named a cause.
+      // Only a REFUSED port is worth the outage notice — a backend that is
+      // merely still loaded keeps the quiet "connecting" line that the retry
+      // loop already raised, so the owner is not told the runtime is broken
+      // while it is only busy.
+      if (runtime.transport === 'unreachable') {
+        dismissNotification(RUNTIME_CONNECTING_NOTICE_ID)
+        notify({
+          id: 'runtime-not-ready',
+          kind: 'info',
+          title: translateNow('onboarding.runtimeNotReadyTitle'),
+          message: translateNow('onboarding.runtimeNotReadyBody')
+        })
+      }
     }
 
     return false

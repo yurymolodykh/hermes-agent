@@ -116,6 +116,57 @@ describe('fetchRuntimeReadinessSignals', () => {
   })
 })
 
+describe('transport classification on a fallback round', () => {
+  const fallenThrough = (setupError: string | null, runtimeError: string | null) =>
+    interpretRuntimeReadiness({ setup: null, setupError, runtime: null, runtimeError })
+
+  it('treats a refused dial as unreachable', () => {
+    const result = fallenThrough('connect ECONNREFUSED 127.0.0.1:9', 'connect ECONNREFUSED 127.0.0.1:9')
+
+    expect(result.source).toBe('fallback')
+    expect(result.transport).toBe('unreachable')
+  })
+
+  it('treats an unresolvable host as unreachable', () => {
+    expect(fallenThrough('getaddrinfo ENOTFOUND hermes.local', null).transport).toBe('unreachable')
+  })
+
+  it('treats a bare "gateway not connected" as busy, not absent', () => {
+    // The renderer's generic dial failure says nothing about the port, so it must
+    // not be allowed to raise an outage notice on its own.
+    expect(fallenThrough('Could not connect to Hermes gateway', null).transport).toBe('busy')
+  })
+
+  it('treats a request timeout as busy', () => {
+    expect(fallenThrough('request timed out: setup.status', 'request timed out: setup.runtime_check').transport).toBe(
+      'busy'
+    )
+  })
+
+  it('mixes to busy: one unanswered probe is enough to keep waiting', () => {
+    expect(fallenThrough('connect ECONNREFUSED 127.0.0.1:9', 'request timed out').transport).toBe('busy')
+  })
+
+  it('never classifies an authoritative round as a transport failure', () => {
+    const ready = interpretRuntimeReadiness({
+      setup: null,
+      setupError: null,
+      runtime: { ok: true },
+      runtimeError: null
+    })
+
+    const verdict = interpretRuntimeReadiness({
+      setup: { provider_configured: false },
+      setupError: null,
+      runtime: { ok: false },
+      runtimeError: null
+    })
+
+    expect(ready.transport).toBeUndefined()
+    expect(verdict.transport).toBeUndefined()
+  })
+})
+
 describe('runtimeReadinessDisplay', () => {
   it('does not call configured credentials setup when runtime resolution fails', () => {
     expect(

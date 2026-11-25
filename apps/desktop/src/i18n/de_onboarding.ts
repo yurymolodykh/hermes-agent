@@ -96,5 +96,9 @@ export const deOnboarding: TranslationOverrides['onboarding'] = {
   price: (input, output) => `${input} rein / ${output} raus pro Mtok`,
   change: 'Ändern',
   startChatting: 'Loslegen',
-  docs: provider => `${provider}-Doku`
+  docs: provider => `${provider}-Doku`,
+  runtimeConnecting: 'Verbinde mit dem Hermes-Backend… das kann einen Moment dauern, während es startet.',
+  runtimeNotReadyTitle: 'Laufzeit nicht bereit',
+  runtimeNotReadyBody:
+    'Hermes Desktop konnte das Backend nicht erreichen. Es wurde möglicherweise beendet; die App prüft weiter und erholt sich selbst.'
 }

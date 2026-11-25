@@ -351,7 +351,11 @@ export const arBoot = {
     price: (input, output) => `${input} إدخال / ${output} إخراج لكل مليون رمز`,
     change: 'تغيير',
     startChatting: 'ابدأ',
-    docs: provider => `وثائق ${provider}`
+    docs: provider => `وثائق ${provider}`,
+    runtimeConnecting: 'جار الاتصال بواجهة Hermes الخلفية… قد يستغرق ذلك لحظة أثناء بدئها.',
+    runtimeNotReadyTitle: 'وقت التشغيل غير جاهز',
+    runtimeNotReadyBody:
+      'تعذر على Hermes Desktop الوصول إلى الواجهة الخلفية. ربما توقفت؛ سيواصل التطبيق الفحص ويتعافى تلقائياً.'
   }
 } satisfies Pick<
   TranslationOverrides,
