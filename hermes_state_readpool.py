@@ -141,10 +141,16 @@ def _fd_headroom_ok() -> bool:
     if soft is None:
         return True
     with _fd_usage_lock:
-        _cached, delta = _fd_usage_cache[1], _fd_usage_delta
-    if _cached is None:
+        stamp, cached, delta = _fd_usage_cache[0], _fd_usage_cache[1], _fd_usage_delta
+    if cached is None and (time.monotonic() - stamp) >= _FD_USAGE_CACHE_SECONDS:
+        # Cold start (or a probe that could not read the table, retried at most on
+        # the old 0.25 s cadence): take one sample here, then hand the measuring to
+        # the background thread and never list the fd directory on this path again.
+        ensure_fd_reconciler()
+        cached = _sample_fd_usage()
+    if cached is None:
         return True
-    cached = _cached + delta
+    cached = cached + delta
     return cached >= 0 and (soft - cached) > _FD_HEADROOM_RESERVE
 
 
@@ -160,6 +166,13 @@ def _sample_fd_usage() -> Optional[int]:
         _fd_usage_cache = (time.monotonic(), count)
         _fd_usage_delta = 0
     return count
+
+
+def _note_fd_delta(step: int) -> None:
+    """Track this module's own net descriptor opens between two samples."""
+    global _fd_usage_delta
+    with _fd_usage_lock:
+        _fd_usage_delta += step
 
 
 def _fd_reconcile_loop(stop: threading.Event) -> None:
