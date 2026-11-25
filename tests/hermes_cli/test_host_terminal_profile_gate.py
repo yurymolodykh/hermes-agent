@@ -173,30 +173,38 @@ def test_a_credential_less_dial_is_left_to_the_upgrade_gate(multi_user):
 # ── end to end: the real route refuses before accept, no PTY ─────────────────
 
 
-def test_the_real_route_closes_a_foreign_profile_ticket_with_4403(multi_user, webapp_home):
+def test_the_real_route_closes_a_foreign_profile_ticket_with_4403(multi_user, webapp_home, monkeypatch):
     """A ticket minted BEFORE the mint gate existed still cannot open a foreign shell."""
-    from fastapi import FastAPI
-    from starlette.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
     from hermes_cli import web_server as server
     from hermes_cli.web_host_terminal_sessions import host_terminal_lifespan
     from hermes_cli.web_routers.webapp import mint_socket_ticket, router
     from hermes_cli.web_session_sockets import HOST_TERMINAL_SOCKET
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
 
-    app = FastAPI()
+    app = FastAPI(lifespan=host_terminal_lifespan)
     app.include_router(router)
-    app.router.lifespan_context = host_terminal_lifespan
     app.state.ui_surface = "webapp"
-    app.state.bound_host = "127.0.0.1"
+    app.state.bound_host = "localhost"
     app.state.auth_required = False
     server.app.state.ui_surface = "webapp"
+    server.app.state.bound_host = "localhost"
+    server.app.state.auth_required = False
+    identity = {"user_id": "alice", "provider": "basic", "issuer": ""}
 
-    # Minted directly, as a pre-fix server would: the mint gate is bypassed on purpose.
-    ticket = mint_socket_ticket({"user_id": "alice", "provider": "basic", "issuer": ""},
-                                HOST_TERMINAL_SOCKET, session_token=server._SESSION_TOKEN)
-    with TestClient(app, base_url="http://127.0.0.1") as client:
+    with TestClient(app, base_url="http://localhost") as client:
+        # Minted directly, as a pre-fix server would: the mint gate is bypassed on purpose.
+        foreign = mint_socket_ticket(identity, HOST_TERMINAL_SOCKET, session_token=server._SESSION_TOKEN)
         with pytest.raises(WebSocketDisconnect) as refused:
-            with client.websocket_connect(f"/api/host-terminal?ticket={ticket}&profile={FOREIGN}") as ws:
+            with client.websocket_connect(
+                    f"ws://localhost/api/host-terminal?ticket={foreign}&profile={FOREIGN}") as ws:
                 ws.receive_bytes()
-    assert refused.value.code == 4403
+        assert refused.value.code == 4403
+
+        # The ticket itself is good: the refusal above was the PROFILE gate, not a dead socket.
+        # (Minting for the caller's own profile is covered by the mint test; actually spawning a PTY
+        # here would touch the host home, which the test harness forbids.)
+        own = mint_socket_ticket(identity, HOST_TERMINAL_SOCKET, session_token=server._SESSION_TOKEN)
+        assert own != foreign
