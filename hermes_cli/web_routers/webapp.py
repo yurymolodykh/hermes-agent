@@ -75,7 +75,7 @@ def _terminal_profile_refused(ws: WebSocket) -> bool:
     ``?profile=`` routes: ``hermes_acl_profiles.allows``; the host owner and multi-user-off keep
     every profile, unchanged.
     """
-    from hermes_acl_profiles import allows
+    from hermes_acl_profiles import allows, is_owner, multi_user_enabled
     from hermes_constants import profile_name_for_home
     from gateway.owner_identity import principal_subject
     from hermes_cli.web_host_terminal_sessions import _request_home
@@ -83,11 +83,16 @@ def _terminal_profile_refused(ws: WebSocket) -> bool:
     identity = getattr(ws, "_hermes_auth_identity", None) or {}
     if not identity.get("user_id"):
         return False  # the route has already refused a credential-less dial (4401)
+    subject = principal_subject(identity)
     home = _request_home(ws.query_params.get("profile"))
     name = profile_name_for_home(home)
     if not name:
-        return True  # a home that names no profile cannot be scoped — refuse rather than guess
-    return not allows(principal_subject(identity), name)
+        # A home that names no profile (a custom HERMES_HOME, the launch home of a host with no
+        # profiles tree) cannot be attributed to anyone. It is the server's OWN home, which every
+        # caller of this route could always reach; scoping it would lock the single-user host out.
+        # Under multi-user the roster rule still applies: only the host owner keeps it.
+        return multi_user_enabled() and not is_owner(subject)
+    return not allows(subject, name)
 
 
 def _mint_handoff_ticket(state, ttl: float, *, launch: bool) -> str:
