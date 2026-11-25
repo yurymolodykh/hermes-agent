@@ -677,6 +677,16 @@ _MEDIA_IMG_EXT = set(_MEDIA_MIME)
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
 
 
+def _caller_subject() -> str:
+    """The person whose turn this reply belongs to (``HERMES_SESSION_ACTOR_ID``), else ``""``."""
+    try:
+        from hermes_acl_scope import caller_subject
+
+        return caller_subject()
+    except Exception:  # health: allow BLE001 -- no ACL module means the legacy answer
+        return ""
+
+
 def _resolve_media_to_data_urls(text: str) -> str:
     """Replace ``MEDIA:<path>`` tags with inline base64 data URLs (remote frontends can't read
     server paths); non-image/unreadable paths stay untouched. Security: the shared
@@ -689,6 +699,16 @@ def _resolve_media_to_data_urls(text: str) -> str:
     def _to_data_url(path_str: str) -> Optional[str]:
         # validate_media_delivery_path() strips wrapping quotes/trailing punctuation itself.
         safe_path = validate_media_delivery_path(path_str)
+        if not safe_path:
+            return None
+        # Per-person gate (multi-user): a path outside the caller's roots is NOT inlined — the
+        # denylist above says "the gateway may disclose this", not "this caller may see it".
+        try:
+            from gateway.platforms.base import _acl_delivery_path
+
+            safe_path = _acl_delivery_path(safe_path, _caller_subject(), "MEDIA directive path")
+        except Exception:  # health: allow BLE001 -- a gate failure must not change the old answer
+            pass
         p = Path(safe_path) if safe_path else None
         suffix = p.suffix.lower() if p else ""
         if suffix not in _MEDIA_IMG_EXT:
