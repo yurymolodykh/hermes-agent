@@ -30,9 +30,9 @@ import hermes_acl_profiles as prof_acl
 # happens AFTER the autouse HomeIOGuard is installed, and its ``interrupted_pull_marker`` stat
 # resolves the worktree's git dir under the real home (TEST BUG, not a code defect). Module-level
 # imports happen during collection, before the guard.
-import gateway.run  # noqa: F401
-import hermes_cli.web_server  # noqa: F401
-import tui_gateway.ws  # noqa: F401
+import gateway.run
+import hermes_cli.web_server
+import tui_gateway.ws
 
 MARIA = "01-maria-safronova"
 ORCH = "01-orchestrator"
