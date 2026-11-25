@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 # dir under the real home. Collection-time imports happen before the guard.
 import hermes_cli.web_server
 import tui_gateway.ws
+from hermes_cli import web_server as server
 
 _TOKEN = "b" * 43
 
@@ -26,7 +27,6 @@ _TOKEN = "b" * 43
 def two_profiles(monkeypatch, tmp_path):
     from gateway.session_authorities import SessionAuthorities
     from gateway.session_authority import SessionAuthority
-    from hermes_cli import web_server as server
     from hermes_state import SessionDB
     from hermes_state_runtime import begin_runtime_epoch
 
