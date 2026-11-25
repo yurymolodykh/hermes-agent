@@ -107,6 +107,13 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
             stamps.append(f"{provider}:{user}")
         if user:
             stamps.append(user)
+            # The registry records a messaging person under its transport prefix (``tg:<id>``),
+            # while the gateway's own subject form uses the provider name (``telegram:<id>``).
+            # ``person_stamps`` keys on the RECORDED form, so without it the person's record is
+            # never found and their own profile home never enters their download roots.
+            recorded = _REGISTRY_PREFIX_BY_PROVIDER.get(provider.lower())
+            if recorded:
+                stamps.append(f"{recorded}:{user}")
     for stamp in list(stamps):
         stamps.extend(_binding_stamps(stamp))
     # A gateway stores a messaging row under the BARE platform id (``241213869``) while the
@@ -125,6 +132,12 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
         if stamp and stamp not in seen:
             seen.append(stamp)
     return seen
+
+
+# The transport prefix the ACL bindings registry records for a messaging provider. ``person_stamps``
+# matches the RECORDED subject form, not the gateway's ``<provider>:<id>`` subject, so this mapping is
+# what lets a Telegram person's own record (and therefore their profile home) be found.
+_REGISTRY_PREFIX_BY_PROVIDER = {"telegram": "tg"}
 
 
 def _bare_platform_id(stamp: str) -> str:
