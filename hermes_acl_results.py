@@ -49,6 +49,7 @@ a broken registry must not lock the operator out of their own dashboard.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -247,6 +248,23 @@ def _profile_home(name: str) -> Optional[Path]:
     except Exception:
         logger.debug("acl results: profile dir unresolvable for %r", name, exc_info=True)
         return None
+
+
+def _profile_workspace(name: str) -> Optional[Path]:
+    """A profile's own working tree: ``~/workspaces/<profile>`` when it exists.
+
+    The convention every profile's ``terminal.cwd`` follows (``03-software-engineer``,
+    ``01-<login>``); the root config's cwd is just one profile's instance of it. Resolved against
+    the OS home and returned only when the directory is real — a name that resolves nowhere
+    contributes nothing.
+    """
+    if not name or "/" in name or name.startswith("."):
+        return None
+    try:
+        base = Path(os.path.expanduser("~")) / "workspaces" / name
+    except Exception:  # health: allow BLE001 -- an unresolvable home grants nothing
+        return None
+    return _real(base) if base.is_dir() else None
 
 
 def _exchange_dirs() -> list[Path]:
