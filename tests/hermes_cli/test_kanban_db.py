@@ -384,6 +384,67 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_rate_limit_stamp_does_not_park_card_after_a_normal_run(kanban_home, monkeypatch):
+    """A rate-limit requeue stamp is evidence only until a *normal* run supersedes it.
+
+    The requeue writes ``last_failure_error = "pid N exited rate-limited (quota
+    wall) — requeued without counting a failure"`` and deliberately does not
+    count a failure. The text matches ``_RESPAWN_BLOCKER_RE``, so before the fix
+    the guard returned ``blocker_auth`` for it *forever* once the rate-limit run
+    was no longer the latest one — the card was never re-spawned and the breaker
+    never tripped (``consecutive_failures`` stayed 0), i.e. silently parked.
+
+    Expected: ``rate_limit_cooldown`` while the rate-limited run is the latest
+    and inside the cooldown; ``None`` once a later run reached a normal terminal
+    outcome (``review_requested``) and the stamp is stale context.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="rl-stamp", assignee="a")
+
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        pid = 72000
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kbd._record_worker_exit(pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+        kbd.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error and "rate-limited" in task.last_failure_error
+
+        # Latest run is the rate-limited one and inside the cooldown.
+        assert _kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # The card is picked up again and this time reaches a normal outcome.
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w1")
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="done", reviewer="r",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "review_requested"
+        # The stale stamp is still on the row — it must not park the card.
+        assert (kb.get_task(conn, tid).last_failure_error or "")
+        assert _kbd.check_respawn_guard(conn, tid, lane="review") is None, (
+            "a rate-limit stamp superseded by a normal run must not return blocker_auth"
+        )
+        assert _kbd.check_respawn_guard(conn, tid) is None
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_home, monkeypatch, lane):
     """A worker that exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` (credential revoked, model
