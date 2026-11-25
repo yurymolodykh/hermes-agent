@@ -439,30 +439,44 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
 
 # ``_schema_is_current`` reads one ``PRAGMA table_info`` per required table plus two index lookups, and
 # every store open runs it (``_store_ready`` is the ``ready`` hook of the shared connector), so it lands
-# in the hot path of every room read. The answer only changes when the schema does, and SQLite bumps
-# ``PRAGMA schema_version`` on every DDL statement and on a rolled-back migration. That integer plus the
-# file's identity is therefore a complete key with no time component: a migration (in this or any other
-# process sharing the database) is detected on the next open, and a replaced/removed file — new inode —
-# is a miss. Only the ``table_info`` scan is skipped; ``settled`` below it is re-checked every call.
-_SCHEMA_CACHE_MAX_FILES = 16
-# key: (resolved path, st_dev, st_ino) -> (schema_version, verdict)
-_schema_cache: dict[tuple[str, int, int], tuple[int, bool]] = {}
+# in the hot path of every room read. The answer only changes when the schema (or the file) does, so the
+# memo is keyed by CANONICAL PATH and the entry carries the file's full stat identity
+# ``(st_dev, st_ino, st_mtime_ns, st_size)`` plus ``PRAGMA schema_version``. Any of those changing is a
+# miss: a restore/move/atomic swap → new inode, a checkpoint or an external rewrite → new mtime/size, and
+# a DDL from any process sharing the database → new ``schema_version`` (a WAL commit can leave the main
+# file's mtime untouched, which is why the stat key alone is not sufficient). Nothing else is a miss.
+#
+# There is deliberately NO small file-count ceiling. A 16-file cap on a 41-database fleet evicted every
+# entry between passes, so 123 of 123 probes over three passes ran the full ``table_info`` scan. The
+# ceiling is now an observability bound orders of magnitude above any fleet we run (evictions are counted
+# and logged, never a silent cache-off); one entry per file means the dict cannot grow past the fleet.
+_SCHEMA_CACHE_MAX_FILES = 4096
+# key: canonical path -> ((st_dev, st_ino, st_mtime_ns, st_size), schema_version, verdict)
+_schema_cache: dict[str, tuple[tuple[int, int, int, int], int, bool]] = {}
+# Live-entries / full-scan / eviction counters — the ceiling's effect is observable, not assumed.
+_schema_cache_metrics = {"scans": 0, "evictions": 0}
 _schema_cache_lock = threading.Lock()
 
 # ``realpath`` (one syscall per path component) and the stat behind it used to run on
 # EVERY readiness check — 156 of 2049 py-spy samples on the live gateway, and a
-# component of the same 5-second room cycle as the schema probe. Both answers only
-# change when the file at that path does, and the (st_dev, st_ino) the cache key needs
+# component of the same 5-second room cycle as the schema probe. The canonical path only
+# changes when the file at that path does, and the (st_dev, st_ino) the cache key needs
 # is exactly what tells us that: stat the path without resolving it (``os.stat`` on
 # the path as given, no ``realpath``), and only resolve the path once, on a
 # (dev, ino) miss, so the key stays canonical for two spellings of one file.
-_identity_cache: dict[str, tuple[tuple[int, int], tuple[str, int, int]]] = {}
+_identity_cache: dict[str, tuple[tuple[int, int], str]] = {}
 _identity_cache_lock = threading.Lock()
-_IDENTITY_CACHE_MAX = 32
+# Same reasoning as the schema memo above: a ceiling under the fleet size turns a cheap stat into a
+# ``realpath`` per path component on every pass. One entry per spelling, so 4096 is far above any fleet.
+_IDENTITY_CACHE_MAX = 4096
 
 
-def _file_identity(path: DbPath) -> tuple[str, int, int] | None:
-    """``(canonical path, st_dev, st_ino)`` for ``path``, without a ``realpath`` per call."""
+def _file_identity(path: DbPath) -> tuple[str, int, int, int, int] | None:
+    """``(canonical path, st_dev, st_ino, st_mtime_ns, st_size)`` for ``path``.
+
+    One ``stat`` per call, no ``realpath`` on a hit: ``realpath`` runs only when the
+    (device, inode) pair behind the given spelling changed.
+    """
     raw = str(path)
     try:
         stat = os.stat(raw)  # no realpath: one syscall, not one per path component
@@ -472,17 +486,16 @@ def _file_identity(path: DbPath) -> tuple[str, int, int] | None:
     with _identity_cache_lock:
         cached = _identity_cache.get(raw)
         if cached is not None and cached[0] == (dev, ino):
-            return cached[1]
+            return (cached[1], dev, ino, int(stat.st_mtime_ns), int(stat.st_size))
     try:
         resolved = str(Path(raw).resolve())
     except OSError:
         resolved = raw
-    identity = (resolved, dev, ino)
     with _identity_cache_lock:
         if raw not in _identity_cache and len(_identity_cache) >= _IDENTITY_CACHE_MAX:
             _identity_cache.pop(next(iter(_identity_cache)), None)
-        _identity_cache[raw] = ((dev, ino), identity)
-    return identity
+        _identity_cache[raw] = ((dev, ino), resolved)
+    return (resolved, dev, ino, int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def clear_identity_cache() -> None:
@@ -499,7 +512,7 @@ def _schema_version(conn: sqlite3.Connection) -> int | None:
 
 
 def _schema_is_current_cached(conn: sqlite3.Connection, db_path: DbPath) -> bool:
-    """``_schema_is_current`` memoised per (file identity, ``schema_version``).
+    """``_schema_is_current`` memoised per (canonical path, full stat identity, ``schema_version``).
 
     Falls back to the full check whenever the cheap key cannot be read (an in-memory database, an
     unreadable path, a SQLite error): a readiness probe must never answer from a cache it cannot key.
@@ -508,16 +521,33 @@ def _schema_is_current_cached(conn: sqlite3.Connection, db_path: DbPath) -> bool
     version = _schema_version(conn) if identity is not None else None
     if identity is None or version is None:
         return _schema_is_current(conn)
+    key, stat_key = identity[0], identity[1:]
     with _schema_cache_lock:
-        cached = _schema_cache.get(identity)
-        if cached is not None and cached[0] == version:
-            return cached[1]
+        cached = _schema_cache.get(key)
+        if cached is not None and cached[0] == stat_key and cached[1] == version:
+            return cached[2]
     verdict = _schema_is_current(conn)
     with _schema_cache_lock:
-        if identity not in _schema_cache and len(_schema_cache) >= _SCHEMA_CACHE_MAX_FILES:
+        _schema_cache_metrics["scans"] += 1
+        if key not in _schema_cache and len(_schema_cache) >= _SCHEMA_CACHE_MAX_FILES:
+            # Not a silent off-switch: an eviction means the ceiling is below the fleet size. Logged on
+            # the first eviction and then every 1000th, so a mis-set ceiling is loud without flooding.
             _schema_cache.pop(next(iter(_schema_cache)), None)
-        _schema_cache[identity] = (version, verdict)
+            _schema_cache_metrics["evictions"] += 1
+            if _schema_cache_metrics["evictions"] % 1000 == 1:
+                logger.warning(
+                    "hosted room schema cache evicting at its ceiling (%s files, %s evictions): "
+                    "raise gateway.hosted_rooms._SCHEMA_CACHE_MAX_FILES above the database count",
+                    _SCHEMA_CACHE_MAX_FILES, _schema_cache_metrics["evictions"])
+        _schema_cache[key] = (stat_key, version, verdict)
     return verdict
+
+
+def schema_cache_metrics() -> dict[str, int]:
+    """Observability: live entries, full schema scans and ceiling evictions since process start."""
+    with _schema_cache_lock:
+        return {**_schema_cache_metrics, "entries": len(_schema_cache),
+                "ceiling": _SCHEMA_CACHE_MAX_FILES}
 
 
 def clear_schema_cache() -> None:
