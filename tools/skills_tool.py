@@ -44,6 +44,7 @@ _SIGNATURE_MAX_DEPTH = 6
 def clear_skills_cache() -> None:
     """Drop the scanned catalog so the next listing re-scans (explicit reloads must not wait out the TTL)."""
     _SKILLS_CACHE.clear()
+    _clear_signature_cache()
 
 
 def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH, _known_stat=None) -> None:
