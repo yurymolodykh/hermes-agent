@@ -55,9 +55,20 @@ _HANDLES_PER_PATH_WARN = 4
 # So the read pool also yields when the PROCESS is close to its limit, whatever is consuming it.
 _FD_HEADROOM_RESERVE = 64
 
-# The fd count is a directory listing; cache it briefly so a read burst isn't a
-# syscall per query (staleness lets through at most the ceiling's worth of opens).
+# The fd count is a directory listing of /proc/self/fd (~700 entries on the live
+# gateway), which measured 15% of the process's samples when it ran on the request
+# path: every checkout of a pooled read connection re-listed it. It is now sampled
+# ONLY by a background reconciler thread (below); the request path reads the last
+# published sample and never walks the fd directory. The name stays because probes
+# and tests key on it; it is the floor between two probes of the same sample.
 _FD_USAGE_CACHE_SECONDS = 0.25
+
+# How often the background reconciler re-measures the fd table. The guard's only
+# use of the value is "is the process short of descriptors", reserved headroom is
+# _FD_HEADROOM_RESERVE (64) descriptors and this module's own read pool can only
+# add _READ_POOL_PROCESS_MAX (24) between two samples, so a couple of seconds of
+# staleness cannot walk the process into EMFILE.
+_FD_RECONCILE_SECONDS = 2.0
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
 
