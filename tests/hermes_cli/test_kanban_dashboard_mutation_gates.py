@@ -323,7 +323,8 @@ class TestTaskScopedMutations:
 
     def test_the_owner_may_change_any_card(self, multi_user, registry, cards):
         response = _app(OWNER_LOGIN).post(
-            f"/api/plugins/kanban/tasks/{cards['bob']}/reassign", json={"profile": "10-owner-pick"})
+            f"/api/plugins/kanban/tasks/{cards['bob']}/reassign",
+            json={"profile": "10-owner-pick", "reclaim_first": True})
         assert response.status_code == 200, _body(response)
 
 
@@ -449,7 +450,8 @@ class TestLegacySurfaces:
     def test_the_old_behaviour_survives_with_the_flag_off(self, legacy, cards):
         client = _app("alice")
         assert client.post(
-            f"/api/plugins/kanban/tasks/{cards['bob']}/reassign", json={"profile": "10-legacy"}
+            f"/api/plugins/kanban/tasks/{cards['bob']}/reassign",
+            json={"profile": "10-legacy", "reclaim_first": True},
         ).status_code == 200
         assert client.post("/api/plugins/kanban/boards", json={"slug": "legacy-board"}).status_code == 200
         assert client.put(
