@@ -340,6 +340,10 @@ class TestAdministrativeRoutes:
         ("POST", "/api/plugins/kanban/boards", {"slug": "second", "title": "Second"}),
         ("PATCH", "/api/plugins/kanban/boards/default", {"title": "Renamed"}),
         ("POST", "/api/plugins/kanban/boards/default/switch", None),
+        ("DELETE", "/api/plugins/kanban/boards/default", None),
+        ("POST", "/api/plugins/kanban/boards/default/export", {"output": "/tmp/x.tar.gz"}),
+        ("POST", "/api/plugins/kanban/boards/import", {"archive": "/tmp/x.tar.gz"}),
+        ("POST", "/api/plugins/kanban/dispatch", None),
         ("PATCH", "/api/plugins/kanban/profiles/03-software-engineer", {"description": "hijacked"}),
         ("POST", "/api/plugins/kanban/profiles/03-software-engineer/describe-auto", {"overwrite": True}),
         ("PUT", "/api/plugins/kanban/orchestration", {"orchestrator_profile": "01-alice"}),
@@ -481,6 +485,7 @@ class TestNoUngatedRouteRemains:
             cwd=repo_root, capture_output=True, text=True,
         )
         assert result.returncode == 0, (
-            "a mutating route with {task_id} has no gate:\n" + result.stdout + result.stderr)
-        assert "ungated:      0" in result.stdout, result.stdout
-        assert "stale excuse: 0" in result.stdout, result.stdout
+            "a mutating route has no gate:\n" + result.stdout + result.stderr)
+        assert "ungated:                  0" in result.stdout, result.stdout
+        assert "stale excuse:             0" in result.stdout, result.stdout
+        assert "of which ungated:            0" in result.stdout, result.stdout

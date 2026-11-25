@@ -1430,7 +1430,7 @@ def get_task_log(task_id: str, request: Request, tail: Optional[int] = Query(Non
 
 
 @router.post("/dispatch")
-def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None), request: Request = None):
+def dispatch(request: Request, dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
     # A nudge SPAWNS workers for whoever's cards are ready — every profile's work, not one card's.
     _require_owner(request, "kanban_dispatch_admin")
@@ -1649,6 +1649,7 @@ def rename_board(slug: str, payload: RenameBoardBody, request: Request):
 @router.delete("/boards/{slug}")
 def delete_board(
     slug: str,
+    request: Request,
     delete: bool = Query(False, description="Hard-delete instead of archive"),
     force: bool = Query(
         False,
@@ -1657,6 +1658,8 @@ def delete_board(
 ):
     """Archive (default) or hard-delete a board; a hard delete is refused (400) while a
     task workspace still holds git work that exists nowhere else, unless ``force``."""
+    # Destroys (or archives) every card on the board — the heaviest administrative action here.
+    _require_owner(request, "kanban_board_admin")
     with _value_error_400():
         res = kanban_db.remove_board(slug, archive=not delete, force=force)
     return {"result": res, "current": kanban_db.get_current_board()}
@@ -1677,10 +1680,13 @@ async def _run_transfer(fn, log_label: str):
 
 
 @router.post("/boards/{slug}/export")
-async def export_board_endpoint(slug: str, body: ExportBoardBody):
+async def export_board_endpoint(slug: str, body: ExportBoardBody, request: Request):
     """Write ``slug`` to a portable archive; return the path written."""
     from hermes_cli import kanban_transfer
 
+    # An export bundles every card, attachment and log on the board into one file on disk,
+    # optionally at a caller-chosen path: that is a whole-installation read, not one card's.
+    _require_owner(request, "kanban_board_admin")
     output = (body.output or "").strip()
     if not output:
         staging = kanban_db.kanban_home() / "kanban" / "board-exports"
@@ -1695,10 +1701,12 @@ async def export_board_endpoint(slug: str, body: ExportBoardBody):
 
 
 @router.post("/boards/import")
-async def import_board_endpoint(body: ImportBoardBody):
+async def import_board_endpoint(body: ImportBoardBody, request: Request):
     """Import a board archive as a NEW board; return the landed board."""
     from hermes_cli import kanban_transfer
 
+    # Creates a whole board (and may activate it) from a caller-supplied archive: installation-wide.
+    _require_owner(request, "kanban_board_admin")
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
