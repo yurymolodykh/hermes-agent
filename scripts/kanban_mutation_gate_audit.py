@@ -103,8 +103,8 @@ def audit(path: Path) -> dict[str, list[tuple[str, str, str]]]:
                 out["stale"].append(entry)      # declared exempt, but the declared state changed
             else:
                 out["ungated"].append(entry)
-    for key in out:
-        out[key].sort()
+    for bucket in out.values():
+        bucket.sort()
     return out
 
 

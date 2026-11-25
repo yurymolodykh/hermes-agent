@@ -369,7 +369,7 @@ class TestAdministrativeRoutes:
             ok, profile_name, reason, description = True, "03-software-engineer", "", "auto"
 
         monkeypatch.setattr(profile_describer, "describe_profile", lambda name, overwrite=False: _Outcome())
-        monkeypatch.setattr(config_mod, "load_config", lambda: {})
+        monkeypatch.setattr(config_mod, "load_config", dict)
         monkeypatch.setattr(config_mod, "save_config", lambda cfg: None)
 
         mod = _load_router()
@@ -482,7 +482,7 @@ class TestNoUngatedRouteRemains:
         repo_root = Path(__file__).resolve().parents[2]
         result = subprocess.run(
             [_sys.executable, str(repo_root / "scripts" / "kanban_mutation_gate_audit.py")],
-            cwd=repo_root, capture_output=True, text=True,
+            cwd=repo_root, capture_output=True, text=True, check=False,
         )
         assert result.returncode == 0, (
             "a mutating route has no gate:\n" + result.stdout + result.stderr)
