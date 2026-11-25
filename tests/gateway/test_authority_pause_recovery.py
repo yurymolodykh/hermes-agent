@@ -37,8 +37,11 @@ async def test_busy_head_keeps_api_waiter_until_the_worker_finish_answers_it(own
     monkeypatch.setattr('gateway.session_api_turn.check_api_turn', lambda *a, **k: None)
     await owner._drain(ref)
     assert get_session_admission(owner.db, admission_id=row['admission_id'])['status'] == 'queued'
-    # Process identity is independent of this test's real receipt and scheduler path.
-    monkeypatch.setattr('gateway.session_worker._claim', lambda *args: 'private')
+    # Process identity is independent of this test's real receipt and scheduler path. The double
+    # must accept the ``db=`` keyword the caller passes so the durable read runs on the worker
+    # thread (``_authorize``); a positional-only lambda breaks on a signature change, not on logic.
+    monkeypatch.setattr('gateway.session_worker._claim', lambda *args, **kwargs: 'private')
+    monkeypatch.setattr('gateway.session_worker._verify', lambda *args, **kwargs: None)
     connection = SimpleNamespace(authority=owner, actor=SessionActor('human', owner.profile_id,
                                  frozenset({'worker:adopt'}), 'worker-transport'))
     await worker_request(connection, ref, dict(profile_id=owner.profile_id, session_id='s',
