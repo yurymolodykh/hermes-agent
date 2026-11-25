@@ -40,6 +40,23 @@ STOP_FILE_ENV = "HERMES_KANBAN_STOP_REASON"
 #: ``unknown`` means on the board.
 KNOWN = ("limit_exceeded", "reassigned", "archived", "shutdown")
 
+#: What a read found. ``ABSENT`` is the honest SIGKILL (the cause *is* unknowable); ``CORRUPT``
+#: means a writer DID record a cause and the record was lost — diagnosable, so it must not read
+#: the same as ``ABSENT``; ``STALE`` is a record left by an EARLIER attempt of the same card.
+ABSENT = "absent"
+CORRUPT = "corrupt"
+STALE = "stale"
+OK = "ok"
+
+#: Transport failures that assert nothing about WHY a worker ended: the frame stream simply ended
+#: (``EOFError`` after a SIGTERM). A reason outside this set (``managed_worker_failed``, a turn
+#: error) is itself a cause and must reach the board verbatim instead of being flattened to
+#: ``unknown (<reason>)``.
+TRANSPORT_ONLY = frozenset({
+    "EOFError", "BrokenPipeError", "ConnectionResetError", "ConnectionAbortedError",
+    "IncompleteReadError", "TimeoutError",
+})
+
 #: Human text per reason, used when a writer supplies no ``detail``.
 _DEFAULT_DETAIL = {
     "limit_exceeded": "остановлен: превышен лимит времени карточки",
@@ -67,12 +84,17 @@ def write_reason(
     source: Optional[str] = None,
     pid: Optional[int] = None,
     task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> bool:
     """Atomically record ``reason`` for a stopping worker; True when the file landed.
 
     Never raises: the caller is a kill path, and a workspace that is missing, read-only or
     unmounted must not turn "the worker could not be told why" into "the worker was not
     stopped". ``os.replace`` makes the read side never observe a half-written file.
+
+    ``run_id`` is the attempt this cause belongs to. A card reuses one workspace across
+    attempts, so without it a record left by attempt 1 is indistinguishable from attempt 2's
+    (a SIGKILLed retry then reports the previous attempt's ``limit_exceeded``).
     """
     if not path:
         return False
@@ -85,6 +107,7 @@ def write_reason(
             "source": source,
             "pid": int(pid) if pid else None,
             "task_id": task_id,
+            "run_id": int(run_id) if run_id is not None else None,
             "ts": int(time.time()),
         }
         fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".stop-reason.", suffix=".tmp")
@@ -114,6 +137,7 @@ def write_reason_for_task(
     pid: Optional[int] = None,
     workspace: Optional[os.PathLike | str] = None,
     workspaces_root: Optional[os.PathLike | str] = None,
+    run_id: Optional[int] = None,
 ) -> bool:
     """``write_reason`` for a card whose workspace path may be unknown.
 
@@ -126,30 +150,85 @@ def write_reason_for_task(
         if workspaces_root is None:
             return False
         path = Path(workspaces_root).expanduser() / str(task_id) / STOP_FILE_NAME
-    return write_reason(path, reason, detail=detail, source=source, pid=pid, task_id=task_id)
+    return write_reason(path, reason, detail=detail, source=source, pid=pid, task_id=task_id,
+                        run_id=run_id)
 
 
-def read_reason(path: Optional[os.PathLike | str]) -> Optional[dict[str, Any]]:
-    """Payload written by a stop path, or None when absent/unreadable/malformed."""
+def clear_reason(workspace: Optional[os.PathLike | str], *, task_id: Optional[str] = None) -> bool:
+    """Forget the cause of a PREVIOUS attempt when a new one starts; True when removed.
+
+    A card keeps one workspace across attempts, so the record an earlier stop left is still
+    on disk when the next attempt claims it. Reading it then would report the previous
+    attempt's cause for a death that recorded nothing. Best effort and never raises: a
+    read-only or missing workspace simply leaves the file (the ``run_id`` check in
+    ``read_reason`` still rejects it).
+    """
+    path = stop_file_path(workspace)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def read_reason(
+    path: Optional[os.PathLike | str], *, run_id: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Payload written by a stop path, or None when absent/unreadable/malformed.
+
+    ``run_id`` scopes the read to one attempt: a record whose ``run_id`` names a different
+    attempt (or none at all, when the caller knows better) reads as ``None`` — the current
+    attempt did not record a cause, whatever the previous one left on disk.
+    ``inspect_reason`` is the diagnosable variant.
+    """
+    status, payload = inspect_reason(path, run_id=run_id)
+    return payload if status == OK else None
+
+
+def inspect_reason(
+    path: Optional[os.PathLike | str], *, run_id: Optional[int] = None,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """``(status, payload)``: exactly one of ``ABSENT``/``CORRUPT``/``STALE``/``OK``.
+
+    The distinction matters for diagnosis, not for reading: ``ABSENT`` is a SIGKILL (the cause
+    genuinely could not be known) while ``CORRUPT`` means a stop path DID name a cause and the
+    record was lost — an operator chasing a mystery stop needs to tell those two apart.
+    """
     if not path:
-        return None
+        return ABSENT, None
     try:
         with open(Path(path), encoding="utf-8") as fh:
             data = json.load(fh)
+    except FileNotFoundError:
+        return ABSENT, None
     except (OSError, ValueError):
-        return None
+        return CORRUPT, None
     if not isinstance(data, dict):
-        return None
+        return CORRUPT, None
     reason = str(data.get("reason") or "").strip()
     if not reason:
-        return None
+        return CORRUPT, None
     data["reason"] = reason
-    return data
+    if run_id is not None:
+        recorded = data.get("run_id")
+        try:
+            recorded_int = int(recorded) if recorded is not None else None
+        except (TypeError, ValueError):
+            return CORRUPT, None
+        if recorded_int != int(run_id):
+            return STALE, None
+    return OK, data
 
 
-def read_reason_for_workspace(workspace: Optional[os.PathLike | str]) -> Optional[dict[str, Any]]:
+def read_reason_for_workspace(
+    workspace: Optional[os.PathLike | str], *, run_id: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
     """``read_reason`` at the workspace-derived path (``STOP_FILE_ENV`` honoured)."""
-    return read_reason(stop_file_path(workspace))
+    return read_reason(stop_file_path(workspace), run_id=run_id)
 
 
 def describe(payload: Optional[dict[str, Any]], *, fallback: str = "unknown") -> str:
@@ -163,6 +242,29 @@ def describe(payload: Optional[dict[str, Any]], *, fallback: str = "unknown") ->
     reason = str(payload.get("reason") or fallback)
     detail = str(payload.get("detail") or _DEFAULT_DETAIL.get(reason, "") or "").strip()
     return f"{reason}: {detail}" if detail else reason
+
+
+def fallback_for(status: str, transport: Optional[str] = None) -> str:
+    """Board text when no usable record was read — the three no-cause cases apart.
+
+    * ``OK`` should never reach here; treated as a lost record.
+    * ``ABSENT`` is the honest SIGKILL: nothing wrote a cause, so it is unknowable.
+    * ``CORRUPT`` means a stop path DID name a cause and the bytes were lost — that is a
+      diagnosable defect, not an unknowable one, and it must not read the same as ABSENT.
+    * ``STALE`` is a record from an EARLIER attempt of the card: again famously not this one.
+
+    ``transport`` is the failure that ended the frame stream. When it is itself a cause
+    (``managed_worker_failed``, a turn error) it is returned verbatim; only a pure transport
+    failure (``EOFError`` and friends) is wrapped, because on its own it says nothing about WHY.
+    """
+    transport = str(transport or "").strip()
+    if status == CORRUPT:
+        return "unknown (запись повреждена)"
+    if status == STALE:
+        return "unknown (запись прошлой попытки)"
+    if transport and transport not in TRANSPORT_ONLY:
+        return transport
+    return f"unknown ({transport})" if transport else "unknown"
 
 
 def is_known(payload: Optional[dict[str, Any]]) -> bool:

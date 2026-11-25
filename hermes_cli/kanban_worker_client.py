@@ -357,19 +357,27 @@ def _install_stop_handler():
     (``hermes_cli.kanban_stop_reason``), appends a durable ``worker_stopping`` event to the card
     and prints the exit trailer, so the log and the board both say WHY.
 
+    The card identity is captured HERE, at install time, not read from ``os.environ`` when the
+    signal arrives: ``_submit()`` pops every ``HERMES_KANBAN_*`` key before the turn precisely so
+    the owner never inherits this worker's task identity, so at signal time the environment is
+    empty and an env-reading handler would always answer ``unknown``.
+
     Never raises and never blocks the stop: an unknown reason still exits, with the trailer, and
     the board then reads ``unknown`` — which is exactly a SIGKILL's meaning.
     """
     import signal
 
+    context = _card_context()
+
     def _on_stop(signum, frame):  # noqa: ARG001 - signal handler signature
         reason, detail = "unknown", ""
         try:
             from hermes_cli import kanban_stop_reason as ksr
-            payload = ksr.read_reason_for_workspace(os.environ.get("HERMES_KANBAN_WORKSPACE"))
+            payload = ksr.read_reason_for_workspace(context.get("workspace"),
+                                                    run_id=context.get("run_id"))
             if payload:
                 reason, detail = payload.get("reason", "unknown"), payload.get("detail", "")
-            _record_stopping(reason, detail, signum)
+            _record_stopping(reason, detail, signum, context=context)
         except BaseException:
             pass
         finally:
@@ -389,21 +397,58 @@ def _install_stop_handler():
                 signal.signal(sig, _on_stop)
 
 
-def _record_stopping(reason, detail, signum):
-    """Append the durable ``worker_stopping`` event for this attempt (best effort)."""
-    task_id, run_id, db_path = (os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_RUN_ID"),
-                                os.environ.get("HERMES_KANBAN_DB"))
+def _card_context() -> dict:
+    """The card identity this process belongs to, read once (``None`` when not a Kanban worker).
+
+    Captured before ``_submit()`` scrubs the environment (see ``_install_stop_handler``), and
+    re-read after it: the bind path sets the same keys a second time, so either source works
+    while only this one survives the scrub.
+    """
+    try:
+        run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+        return {
+            "task_id": os.environ.get("HERMES_KANBAN_TASK"),
+            "run_id": int(run_id) if run_id else None,
+            "db": os.environ.get("HERMES_KANBAN_DB"),
+            "workspace": os.environ.get("HERMES_KANBAN_WORKSPACE"),
+        }
+    except (TypeError, ValueError):
+        return {}
+
+
+def _record_stopping(reason, detail, signum, *, context=None):
+    """Append the durable ``worker_stopping`` event for this attempt (best effort).
+
+    Runs inside a signal handler, so the board write is bounded: a contended database must not
+    hold a dying worker open past the stopper's SIGKILL grace (the reason is already on disk by
+    then, which is what the trailer and ``record_worker_loss`` read). ``busy_timeout=0`` makes a
+    locked board give up immediately instead of waiting the 120 s the normal connections allow —
+    a lost event is recoverable from the file, a 45 s hang is not.
+    """
+    context = context if context is not None else _card_context()
+    task_id, run_id, db_path = context.get("task_id"), context.get("run_id"), context.get("db")
     if not (task_id and run_id and db_path):
         return
-    from hermes_cli.kanban_db_connect import connect_closing
+    import sqlite3
     from hermes_cli import kanban_db as kb
     from pathlib import Path
     payload = {"reason": reason, "detail": str(detail or "")[:200], "signal": int(signum), "pid": os.getpid()}
-    with connect_closing(Path(db_path)) as conn, kb.write_txn(conn):
+    conn = sqlite3.connect(str(Path(db_path)), timeout=0.0, isolation_level=None)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
         if row is None or row[1] != int(run_id):
+            conn.execute("ROLLBACK")
             return  # the attempt already moved on: this note would describe a later run
         kb._append_event(conn, task_id, 'worker_stopping', payload, run_id=int(run_id))
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            conn.execute("ROLLBACK")
+    finally:
+        conn.close()
 
 
 def main():

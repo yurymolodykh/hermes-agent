@@ -779,10 +779,11 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    termination_causes: list[dict[str, Any]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, worker_pid, claim_lock, worker_started_at, workspace_path FROM tasks WHERE id = ?",
             (task_id,)).fetchone()
         if prev is None:
             return False
@@ -811,6 +812,11 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
             terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            termination_causes.append({
+                "task_id": task_id, "workspace": prev["workspace_path"], "run_id": prev["current_run_id"],
+                "reason": "archived" if effective_status == "archived" else "reassigned",
+                "detail": f"остановлен: статус изменён на {effective_status} (dashboard/direct)",
+            })
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
@@ -819,8 +825,15 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+            termination_causes.extend(result.get("termination_causes") or [])
+    for (pid, claim_lock, started_at), cause in zip(terminations, termination_causes):
+        kanban_db._terminate_reclaimed_worker(
+            pid, claim_lock, started_at=started_at,
+            stop_reason=cause.get("reason") or "reassigned",
+            task_id=cause["task_id"], workspace=cause["workspace"],
+            stop_detail=cause.get("detail") or "остановлен: предок переоткрыт, карточка снята",
+            run_id=cause["run_id"],
+        )
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)

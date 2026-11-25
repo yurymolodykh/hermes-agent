@@ -290,7 +290,10 @@ def test_record_worker_loss_names_the_recorded_cause(board, tmp_path):
     task_id, run_id = _live_claim(conn, ws)
     conn.close()
 
-    ksr.write_reason_for_task(task_id, "archived", workspace=ws, detail="остановлен: карточка архивирована")
+    # A real stop path names the attempt it stops: without a run_id the record cannot be
+    # attributed to this attempt and reads as STALE (see the stale-cause test below).
+    ksr.write_reason_for_task(task_id, "archived", workspace=ws, detail="остановлен: карточка архивирована",
+                              run_id=run_id)
     policy = _Policy({"task_id": task_id, "run_id": run_id, "claim_lock": "host-1-x",
                       "db": str(tmp_path / ".hermes" / "kanban.db"), "workspace": str(ws)})
 

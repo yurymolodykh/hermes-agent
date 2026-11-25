@@ -221,8 +221,48 @@ def _watch_submitter(db, run_id):
                 except sqlite3.Error:
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
+                    _note_submitter_death(db, run_id)
                     os._exit(1)
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
+
+
+def _note_submitter_death(db, run_id):
+    """Name this attempt's death on the board before the hard exit (best effort, never blocks).
+
+    A SIGKILL/OOM of the spawned submitter gives this interpreter no chance to say anything,
+    and ``os._exit`` here is the last moment its reason can be recorded. The cause is whatever
+    the stopper wrote for THIS run (``limit_exceeded``/``reassigned``/``archived``/``shutdown``);
+    with no record the event says ``unknown`` — the same meaning a SIGKILL has.
+
+    Bounded: the signal-free path still must not hang a dying interpreter, so the write uses a
+    short busy timeout and gives up silently if the board is contended.
+    """
+    try:
+        import os
+        from hermes_cli import kanban_stop_reason as ksr
+        conn = sqlite3.connect(str(db), timeout=1.0, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA busy_timeout=500')
+            conn.execute('BEGIN IMMEDIATE')
+            run = conn.execute('SELECT task_id FROM task_runs WHERE id=?', (int(run_id),)).fetchone()
+            row = conn.execute('SELECT id, workspace_path, current_run_id, status FROM tasks WHERE id=?',
+                               (run['task_id'],)).fetchone() if run is not None else None
+            if row is None or row['current_run_id'] != int(run_id):
+                conn.execute('ROLLBACK')
+                return
+            status, stop = ksr.inspect_reason(ksr.stop_file_path(row['workspace_path']), run_id=int(run_id))
+            from hermes_cli import kanban_db as kb
+            payload = {'reason': str((stop or {}).get('reason') or 'unknown'),
+                       'detail': str((stop or {}).get('detail') or '')[:200],
+                       'signal': None, 'pid': os.getpid(), 'source': 'submitter_watch',
+                       'stop_status': status}
+            kb._append_event(conn, row['id'], 'worker_stopping', payload, run_id=int(run_id))
+            conn.execute('COMMIT')
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 def run_worker_turns(agent, frame, history):
@@ -354,8 +394,12 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
         from hermes_cli import kanban_db as kb
         run_id = int(context['run_id'])
         from hermes_cli import kanban_stop_reason as ksr
-        stop = ksr.read_reason_for_workspace(context.get('workspace'))
-        reason_text = ksr.describe(stop, fallback=f'unknown ({reason})')
+        # Scoped to THIS attempt: a record the previous attempt left in the same workspace says
+        # nothing about why this one died (a SIGKILLed retry would otherwise inherit the earlier
+        # attempt's ``limit_exceeded``). ``inspect_reason`` keeps absent/corrupt/stale apart so the
+        # text can say which of the three no-cause cases this is.
+        status, stop = ksr.inspect_reason(ksr.stop_file_path(context.get('workspace')), run_id=run_id)
+        reason_text = ksr.describe(stop, fallback=ksr.fallback_for(status, reason))
         with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
             row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?',
                                (context['task_id'],)).fetchone()

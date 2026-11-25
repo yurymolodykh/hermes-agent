@@ -386,7 +386,7 @@ def _note_stop_reason(worker, reason):
         ksr.write_reason_for_task(
             context.get('task_id', ''), mapped,
             detail=f'остановлен: останов шлюза ({reason})', source='gateway_stop',
-            workspace=context.get('workspace'),
+            workspace=context.get('workspace'), run_id=context.get('run_id'),
         )
     except Exception:
         pass

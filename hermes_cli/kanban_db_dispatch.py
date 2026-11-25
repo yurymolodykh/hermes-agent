@@ -521,12 +521,16 @@ def _write_stop_reason(
     pid: Optional[int] = None,
     detail: Optional[str] = None,
     source: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> bool:
     """Record WHY a worker is about to be killed, before the signal (best effort, never raises).
 
     ``unknown`` is the ABSENCE of the record, so only a known reason writes one. A workspace that
     is missing or read-only must not turn "the worker could not be told why" into "the worker was
     not stopped": every failure degrades to today's silent kill.
+
+    ``run_id`` scopes the record to the attempt being killed — without it the read side cannot
+    tell this cause from one an earlier attempt left in the same workspace.
     """
     try:
         from hermes_cli import kanban_stop_reason as ksr
@@ -536,6 +540,7 @@ def _write_stop_reason(
             str(task_id) if task_id else "", reason, detail=detail, source=source, pid=pid,
             workspace=workspace,
             workspaces_root=_kb.workspaces_root() if not workspace else None,
+            run_id=run_id,
         )
     except Exception:
         return False
@@ -551,6 +556,7 @@ def _terminate_reclaimed_worker(
     stop_detail: Optional[str] = None,
     task_id: Optional[str] = None,
     workspace: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
@@ -592,7 +598,7 @@ def _terminate_reclaimed_worker(
         return info
 
     _write_stop_reason(stop_reason, task_id=task_id, workspace=workspace, pid=pid,
-                       detail=stop_detail, source="reclaim")
+                       detail=stop_detail, source="reclaim", run_id=run_id)
     info["termination_attempted"] = True
     if stop_reason:
         info["stop_reason"] = stop_reason
@@ -775,7 +781,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None,
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock, t.workspace_path "
+        "       t.max_runtime_seconds, t.claim_lock, t.workspace_path, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -816,7 +822,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None,
             _write_stop_reason("limit_exceeded", task_id=tid, pid=pid, source="enforce_max_runtime",
                                workspace=row["workspace_path"],
                                detail=f"остановлен: лимит времени {limit} с "
-                                      f"(прошло {int(elapsed)} с)")
+                                      f"(прошло {int(elapsed)} с)",
+                               run_id=_kb._opt_int(_kb._row_get(row, "current_run_id")))
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
@@ -901,6 +908,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       t.workspace_path, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -927,7 +935,11 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"),
+            stop_reason="reassigned", task_id=tid, workspace=row["workspace_path"],
+            stop_detail="остановлен: нет heartbeat (перепризнание stale-карточки)",
+            run_id=_kb._opt_int(_kb._row_get(row, "current_run_id")),
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -961,6 +973,8 @@ def detect_stale_running(
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
                 "retry_status": retry_status,
+                "stop_reason": "reassigned",
+                "stop_detail": "остановлен: нет heartbeat (перепризнание stale-карточки)",
             }
             payload.update(termination)
 
