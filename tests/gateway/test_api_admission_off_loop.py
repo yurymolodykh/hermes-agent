@@ -64,7 +64,9 @@ async def _sample_gaps(seconds):
     """Owner-loop tick gaps over a window with no request in flight — the host's own noise."""
     gaps, last = [], time.monotonic()
     for _ in range(math.ceil(seconds / POLL_S)):
-        await asyncio.sleep(POLL_S)
+        # The fixed cadence IS the measurement: each gap is what one tick of a normally-served
+        # loop costs, so waiting on a condition would remove the sample.
+        await asyncio.sleep(POLL_S)  # health: allow HX013 -- the delay IS the measured behaviour
         now = time.monotonic()
         gaps.append(now - last)
         last = now
