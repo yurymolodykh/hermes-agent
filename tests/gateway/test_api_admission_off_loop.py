@@ -128,7 +128,7 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
     async with TestClient(TestServer(app)) as client:
         # Boot cost paid up front, unheld: imports, the profile's first sqlite open and the route's
         # one-time setup. A real server pays this once at first use; it is not an admission stall.
-        warmup = await client.post(path, json=body, headers={**AUTH, **headers})
+        warmup = await client.post(path, json=body, headers={**AUTH, **_door_headers(headers, 'warmup')})
         assert warmup.status == expected, await warmup.text()
 
         # The same loop, the same sampling, no writer held: this IS the machine's noise level.
@@ -136,10 +136,11 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
         noise = _percentile(control, 0.95)
 
         p95s, waits = [], []
-        for _ in range(REPETITIONS):
+        for round_index in range(REPETITIONS):
             holder, timer = await _hold_writer(owner.db.db_path, HOLD_S)
             try:
-                response, gaps, waited = await _request_gaps(client, path, body, headers)
+                response, gaps, waited = await _request_gaps(
+                    client, path, body, _door_headers(headers, round_index))
             finally:
                 timer.join()
                 holder.close()
