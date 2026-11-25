@@ -120,14 +120,6 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
-            # DIAG: attempt resolution-based interpreter exemption before refusing.
-            try:
-                pre = _normcase(os.path.realpath(absolute))
-            except OSError:
-                pre = absolute
-            for prefix in _INTERPRETER_PREFIX_STRS:
-                if _within(pre, prefix):
-                    return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
@@ -165,10 +157,10 @@ class HomeIOGuard:
 
     @staticmethod
     def refuse(value):
-        import sys
-        with open("/tmp/diag_refuse.log", "a") as fh:
-            fh.write(f"{value}\n")
-        return None
+        raise AssertionError(
+            f"TEST BUG: file I/O against the REAL hermes home: {value}\n"
+            "Use the isolated HERMES_HOME or a temporary fixture instead."
+        )
 
     @staticmethod
     @lru_cache(maxsize=8)
