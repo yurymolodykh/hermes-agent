@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import hermes_constants as hc
-import hermes_cli.profiles as profiles
+from hermes_cli import profiles
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +72,7 @@ class TestSameAnswerAsBefore:
 
     def test_an_invalid_name_is_still_false(self, root):
         assert profiles.profile_matches_home("../escape", root) is False
-        assert profiles.profile_matches_home(0, root) is False
+        assert profiles.profile_matches_home(0, root) is False  # pyright: ignore[reportArgumentType]
 
     def test_a_trailing_separator_and_dot_segments_are_the_same_home(self, root):
         home = root / "profiles" / "alpha"
