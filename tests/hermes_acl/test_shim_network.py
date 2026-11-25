@@ -428,8 +428,10 @@ class TestOverhead:
             return statistics.median(xs)
 
         bare = med(["/bin/true"])
+        confined = None
         if binary:
             confined = med([binary, "--spec", str(spec_path), "--", "/bin/true"])
             assert confined - bare < 2.0, f"native shim costs {confined - bare:+.2f} ms"
         py = med([sys.executable, "-m", "hermes_acl.shim", "--spec", str(spec_path), "--", "/bin/true"], n=10)
-        print(f"\nbare={bare:.2f} ms native={confined if binary else float('nan'):.2f} ms python={py:.2f} ms")
+        native_ms = confined if confined is not None else float("nan")
+        print(f"\nbare={bare:.2f} ms native={native_ms:.2f} ms python={py:.2f} ms")

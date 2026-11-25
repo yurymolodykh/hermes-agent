@@ -264,6 +264,10 @@ def _profile_workspace(name: str) -> Optional[Path]:
         base = Path(os.path.expanduser("~")) / "workspaces" / name
     except Exception:  # health: allow BLE001 -- an unresolvable home grants nothing
         return None
+    if base.is_symlink():
+        # A symlinked ``~/workspaces/<profile>`` would silently turn the caller's root into whatever
+        # it points at (a neighbour profile, ``/etc``): the convention is a real directory or nothing.
+        return None
     return _real(base) if base.is_dir() else None
 
 
@@ -486,9 +490,9 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
         for path in _exchange_dirs():
             if path not in roots:
                 roots.append(path)
-    for path in _shared_work_dirs():
-        if path not in roots:
-            roots.append(path)
+        for path in _shared_work_dirs():
+            if path not in roots:
+                roots.append(path)
     return tuple(roots)
 
 
