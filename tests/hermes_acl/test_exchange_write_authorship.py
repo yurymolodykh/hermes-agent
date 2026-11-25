@@ -229,6 +229,77 @@ class TestScopedWriteLandsInOwnFolder:
 # ---------------------------------------------------------------------------
 
 
+class TestSiblingWriteRoutes:
+    """The other writes into the exchange follow the same rule — else the guard is hollow."""
+
+    def test_mkdir_at_the_root_is_redirected_into_the_callers_folder(
+            self, multi_user, registry, fs_client_factory, _isolated_home):
+        exchange = _isolated_home / "shared"
+        response = fs_client_factory("alice").post(
+            "/api/files/mkdir", json={"path": str(exchange / "deliverables")})
+
+        assert response.status_code == 200, response.text
+        assert (exchange / "person_alice" / "deliverables").is_dir()
+        assert not (exchange / "deliverables").exists()
+
+    def test_mkdir_in_a_neighbours_folder_is_refused(self, multi_user, registry,
+                                                     fs_client_factory, _isolated_home):
+        exchange = _isolated_home / "shared"
+        response = fs_client_factory("alice").post(
+            "/api/files/mkdir", json={"path": str(exchange / "person_bob" / "planted")})
+
+        assert response.status_code == 403, response.text
+        assert not (exchange / "person_bob" / "planted").exists()
+
+    def test_deleting_a_neighbours_exchange_file_is_refused(self, multi_user, registry,
+                                                             fs_client_factory, profile_homes,
+                                                             _isolated_home):
+        foreign = _isolated_home / "shared" / "person_bob" / "kept.txt"
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_text("bob's deliverable", encoding="utf-8")
+
+        response = fs_client_factory("alice").request("DELETE", "/api/files", json={"path": str(foreign)})
+
+        assert response.status_code == 403, response.text
+        assert foreign.read_text(encoding="utf-8") == "bob's deliverable"
+
+    def test_deleting_your_own_exchange_file_works(self, multi_user, registry,
+                                                   fs_client_factory, profile_homes, _isolated_home):
+        own = _isolated_home / "shared" / "person_alice" / "scratch.txt"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text("mine", encoding="utf-8")
+
+        response = fs_client_factory("alice").request("DELETE", "/api/files", json={"path": str(own)})
+
+        assert response.status_code == 200, response.text
+        assert not own.exists()
+
+    def test_deleting_a_foreign_authored_root_file_is_refused(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """A flat-layout file the journal attributes to bob: alice may not delete it."""
+        legacy_file = _isolated_home / "shared" / "team.docx"
+        legacy_file.write_text("bob's prepared deliverable", encoding="utf-8")
+        results_acl.record_exchange_authorship(_request_as("bob"), legacy_file)
+
+        response = fs_client_factory("alice").request("DELETE", "/api/files", json={"path": str(legacy_file)})
+
+        assert response.status_code == 403, response.text
+        assert legacy_file.is_file()
+
+    def test_with_scoping_off_delete_and_mkdir_are_unchanged(
+            self, legacy, fs_client_factory, _isolated_home):
+        exchange = _isolated_home / "shared"
+        assert fs_client_factory("alice").post(
+            "/api/files/mkdir", json={"path": str(exchange / "plain")}).status_code == 200
+        assert (exchange / "plain").is_dir()
+
+        victim = exchange / "plain" / "gone.txt"
+        victim.write_text("bye", encoding="utf-8")
+        assert fs_client_factory("alice").request(
+            "DELETE", "/api/files", json={"path": str(victim)}).status_code == 200
+        assert not victim.exists()
+
+
 class TestAuthorshipBackstop:
     def test_a_root_level_file_another_subject_created_is_not_touched(
             self, multi_user, registry, fs_client_factory, _isolated_home):

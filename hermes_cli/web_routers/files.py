@@ -882,10 +882,21 @@ async def stream_managed_file(
 
 def _managed_write_target(path: str, request: Request, overwrite: bool):
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
+    # The team exchange has no OS-level owner, so WHO writes is decided here (L2-c): a scoped
+    # person's upload lands in ``shared/<subject-slug>/``, a root-level name is moved there, and a
+    # neighbour's folder is refused. Unscoped callers (multi_user off, the host owner) get the
+    # path back unchanged — the pre-change behaviour.
+    from hermes_acl_results import exchange_write_target, require_exchange_authorship
+
+    redirected = exchange_write_target(request, target)
+    if redirected != target:
+        display_path = str(redirected)
+        target = redirected
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
     if target.exists() and not overwrite:
         raise HTTPException(status_code=409, detail="File already exists")
+    require_exchange_authorship(request, target)
     return policy, target, display_path
 
 
@@ -905,6 +916,9 @@ def upload_managed_file(payload: ManagedFileUpload, request: Request):
     with _io_errors("File is not writable", "Could not write file"):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+    from hermes_acl_results import record_exchange_authorship
+
+    record_exchange_authorship(request, target)
     return _managed_write_result(policy, target, display_path)
 
 
@@ -973,12 +987,23 @@ async def upload_managed_file_stream(
         not_writable="File is not writable",
         write_failed="Could not write file",
     )
+    from hermes_acl_results import record_exchange_authorship
+
+    record_exchange_authorship(request, target)
     return _managed_write_result(policy, target, display_path)
 
 
 @router.post("/api/files/mkdir")
 def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
+    # Same rule as an upload (L2-c): a scoped caller's folder is created under their own slug,
+    # and a neighbour's folder is refused. Unscoped callers keep the requested path.
+    from hermes_acl_results import exchange_write_target
+
+    redirected = exchange_write_target(request, target)
+    if redirected != target:
+        display_path = str(redirected)
+        target = redirected
     if target.exists() and not target.is_dir():
         raise HTTPException(status_code=409, detail="A file already exists at that path")
     with _io_errors("Directory is not writable", "Could not create directory"):
@@ -995,6 +1020,11 @@ def delete_managed_file(payload: ManagedFileDelete, request: Request):
         raise HTTPException(status_code=400, detail="Cannot delete the filesystem root")
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
+    # The exchange has no OS-level owner (L2-c): destroying a colleague's deliverable is refused
+    # unless it is this person's own file. No-op with multi_user off and for the host owner.
+    from hermes_acl_results import require_exchange_removal
+
+    require_exchange_removal(request, target)
 
     try:
         if target.is_dir():
@@ -1138,6 +1168,11 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
         from hermes_acl_results import require_path
 
         require_path(request, target)
+    from hermes_acl_results import record_exchange_authorship, require_exchange_authorship
+
+    # The exchange has no OS-level owner (L2-c): the spot editor is a write like any other, so a
+    # colleague's file is not saved over. No-op outside the exchange and when unscoped.
+    require_exchange_authorship(request, target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
@@ -1145,7 +1180,9 @@ async def fs_write_text(payload: FsWriteText, request: Request, profile: Optiona
     # path the caller chose: on a slow/spinning volume or a mounted share they park the whole
     # event loop (and with it every other request in this process). One worker hop covers the
     # whole decision so the checks stay atomic against the same staging file.
-    return await off_loop(_fs_write_text_blocking, target, text)
+    result = await off_loop(_fs_write_text_blocking, target, text)
+    record_exchange_authorship(request, target)
+    return result
 
 
 def _fs_write_text_blocking(target: Path, text: str) -> dict[str, Any]:
