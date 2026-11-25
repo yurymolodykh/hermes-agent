@@ -47,6 +47,18 @@ def _median(values):
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
 
+def _door_headers(headers, suffix):
+    """A per-request copy of the caller's headers.
+
+    The Responses door replays a repeated ``Idempotency-Key`` from its store, so a duplicated key
+    would answer without ever meeting the held writer and the round would measure nothing.
+    """
+    fresh = dict(headers)
+    if 'Idempotency-Key' in fresh:
+        fresh['Idempotency-Key'] = f"{fresh['Idempotency-Key']}-{suffix}"
+    return fresh
+
+
 async def _sample_gaps(seconds):
     """Owner-loop tick gaps over a window with no request in flight — the host's own noise."""
     gaps, last = [], time.monotonic()
