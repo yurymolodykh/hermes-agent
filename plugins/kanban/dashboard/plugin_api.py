@@ -1430,8 +1430,10 @@ def get_task_log(task_id: str, request: Request, tail: Optional[int] = Query(Non
 
 
 @router.post("/dispatch")
-def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
+def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None), request: Request = None):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    # A nudge SPAWNS workers for whoever's cards are ready — every profile's work, not one card's.
+    _require_owner(request, "kanban_dispatch_admin")
     with _board_conn(board) as (board, conn):
         result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
         try:

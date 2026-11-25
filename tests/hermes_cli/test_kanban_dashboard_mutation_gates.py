@@ -457,3 +457,30 @@ class TestLegacySurfaces:
         assert client.put(
             "/api/plugins/kanban/orchestration", json={"auto_decompose": False}
         ).status_code != 403
+
+
+# ---------------------------------------------------------------------------
+# acceptance #1 — the structural count, so a NEW route cannot reopen the hole
+# ---------------------------------------------------------------------------
+
+
+class TestNoUngatedRouteRemains:
+    """``scripts/kanban_mutation_gate_audit.py`` reads the route table, not this file's fixtures.
+
+    Every test above proves TODAY's eight routes behave; this one catches the route somebody adds
+    next month, which is exactly how the original hole opened (a route landing after the gate).
+    """
+
+    def test_every_mutating_task_route_is_gated(self):
+        import subprocess
+        import sys as _sys
+
+        repo_root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [_sys.executable, str(repo_root / "scripts" / "kanban_mutation_gate_audit.py")],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            "a mutating route with {task_id} has no gate:\n" + result.stdout + result.stderr)
+        assert "ungated:      0" in result.stdout, result.stdout
+        assert "stale excuse: 0" in result.stdout, result.stdout
