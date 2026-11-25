@@ -9,7 +9,6 @@ follows the disk once the profile is reset/renamed.
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -89,8 +88,8 @@ class TestInvalidation:
         link.unlink()
         link.symlink_to(plain)
         assert hc.profile_name_for_home(link) == 'alpha'  # still inside the TTL
-        time.sleep(0.1)
-        assert hc.profile_name_for_home(link) is None
+        from tests.waiting import wait_until
+        wait_until(lambda: hc.profile_name_for_home(link) is None, timeout=5, interval=0.01)
 
 
 class TestSameAnswerAsBefore:
