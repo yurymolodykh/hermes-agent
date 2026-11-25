@@ -2383,8 +2383,41 @@ def claim_task(
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
+    # A new attempt must not inherit the previous attempt's cause: the card reuses one
+    # workspace, so a record an earlier stop left there would read as THIS attempt's. Outside
+    # the txn — the file is best-effort and must never lengthen the claim's write lock.
+    _forget_previous_stop_reason(claimed)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
+
+
+def _forget_previous_stop_reason(task: Optional[Task]) -> None:
+    """Drop a stop-reason file an EARLIER attempt left in this card's workspace.
+
+    Called when a new attempt starts (``claim_task``/``claim_review_task``): the card reuses one
+    workspace across attempts, so the old record would otherwise be read as this attempt's cause
+    — a SIGKILLed retry would report the previous attempt's ``limit_exceeded``. Best effort:
+    the read side ALSO rejects a record whose ``run_id`` names another attempt, so a workspace
+    that cannot be cleaned (read-only, missing) still cannot leak a stale cause.
+
+    Deliberately NOT done in ``bind_worker_context``: the bind of a retried interpreter happens
+    after the dispatch already owns the claimed run, so clearing there could erase a cause the
+    stopper wrote for THIS attempt. A claim creates the run, so nothing can name it yet — that
+    is the only race-free moment to forget the previous attempt.
+    """
+    if task is None:
+        return
+    try:
+        from hermes_cli import kanban_stop_reason as ksr
+        workspace = getattr(task, "workspace_path", None)
+        if workspace:
+            ksr.clear_reason(workspace)
+        else:
+            # A never-dispatched/scratch card has no persisted workspace: the dispatcher will
+            # derive ``<workspaces_root>/<task_id>``, which is where a previous stop wrote.
+            ksr.clear_reason(workspaces_root() / str(getattr(task, "id", "")))
+    except Exception:
+        pass
 
 
 def claim_review_task(
@@ -2414,7 +2447,9 @@ def claim_review_task(
         )
         if run_id is None:
             return None
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+    _forget_previous_stop_reason(claimed)
+    return claimed
 
 
 def _retry_status_for_run(
@@ -2532,7 +2567,7 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, workspace_path, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -2554,6 +2589,9 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            stop_reason="reassigned", task_id=row["id"], workspace=row["workspace_path"],
+            stop_detail="остановлен: карточка перепризначена, попытка освобождена",
+            run_id=_row_get(row, "current_run_id"),
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2582,6 +2620,7 @@ def release_stale_claims(
             run_id = _record_reclaim(
                 conn, row["id"], termination,
                 error=error,
+                reason="reassigned",
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
@@ -2615,14 +2654,27 @@ def release_stale_claims(
 
 def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
+    reason: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-    (payload merged with the termination report). Caller holds the txn."""
+    (payload merged with the termination report). Caller holds the txn.
+
+    ``reason`` is the stop cause (``reassigned`` for a reclaim). It is copied into BOTH the
+    event payload and ``task_runs.metadata``: the workspace and its reason file are deleted when
+    the card is archived or completed, so the board itself has to carry why the worker died.
+    """
     run_id = _end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
     )
     payload.update(termination)
+    if reason:
+        payload.setdefault("stop_reason", reason)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    if reason and run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (_json_or_null({**(termination or {}), "stop_reason": reason}), run_id),
+        )
     return run_id
 
 
@@ -2662,7 +2714,7 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, worker_started_at, workspace_path, current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -2671,7 +2723,11 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"],
+        stop_reason="reassigned", task_id=task_id, workspace=row["workspace_path"],
+        stop_detail="остановлен: карточка перепризначена, попытка освобождена",
+        run_id=_row_get(row, "current_run_id"),
+    )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3889,6 +3945,8 @@ def invalidate_descendants_for_parent_reopen(
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    # What each termination also needs to NAME its cause: the card and the attempt being closed.
+    termination_causes: list[dict[str, Any]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3899,7 +3957,8 @@ def invalidate_descendants_for_parent_reopen(
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.worker_started_at
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.worker_started_at,
+                   t.workspace_path
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -3917,9 +3976,15 @@ def invalidate_descendants_for_parent_reopen(
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
                 terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+                termination_causes.append({
+                    "task_id": row["id"], "workspace": _row_get(row, "workspace_path"),
+                    "run_id": row["current_run_id"],
+                })
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
+                    metadata={"stop_reason": "reassigned",
+                              "stop_detail": "остановлен: предок переоткрыт, карточка снята"},
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
@@ -3934,7 +3999,8 @@ def invalidate_descendants_for_parent_reopen(
             }
             _append_event(
                 conn, row["id"], "descendant_invalidated",
-                {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"}},
+                {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"},
+                 **({"stop_reason": "reassigned"} if previous_status == "running" else {})},
                 run_id=run_id,
             )
             # Legacy 'status' event so existing live-feed consumers still see
@@ -3956,9 +4022,15 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock, started_at in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
-    return {"invalidated": invalidated, "terminations": terminations}
+        for (pid, claim_lock, started_at), cause in zip(terminations, termination_causes):
+            _terminate_reclaimed_worker(
+                pid, claim_lock, started_at=started_at,
+                stop_reason="reassigned", task_id=cause["task_id"], workspace=cause["workspace"],
+                stop_detail="остановлен: предок переоткрыт, карточка снята",
+                run_id=cause["run_id"],
+            )
+    return {"invalidated": invalidated, "terminations": terminations,
+            "termination_causes": termination_causes}
 
 
 def specify_triage_task(
@@ -4034,13 +4106,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, workspace_path, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        prev_workspace = row["workspace_path"]
+        prev_run_id = _row_get(row, "current_run_id")
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -4052,10 +4126,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
+            metadata={"stop_reason": "archived"} if was_running else None,
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", {"stop_reason": "archived"} if was_running else None,
+                      run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+            stop_reason="archived", task_id=task_id, workspace=prev_workspace,
+            stop_detail="остановлен: карточка архивирована",
+            run_id=prev_run_id,
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.

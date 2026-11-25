@@ -168,6 +168,9 @@ class ManagedWorker:
         self.stopped_at = None
         # The gateway restart/shutdown reason when that stop (not a user's) signalled this worker.
         self.stop_cause = None
+        # The frozen policy of the turn this worker runs (set at spawn); stop paths read the
+        # Kanban context from it to name the card's stop cause.
+        self.policy = None
         self.writer = threading.Thread(target=self._write_controls, name='managed-control-writer', daemon=True)
         # One dedicated reader thread per worker (never the loop's shared default executor, which
         # parked pipe reads would exhaust). It reads one frame per demand, so the pipe keeps its
@@ -690,6 +693,9 @@ async def execute_managed(authority, ref, row, policy):
     # refusal keeps alive. Mark the worker so ``_restart_starved_managed_count`` can exclude it
     # instead of waiting out a circular wait that always ends in the submitter's death.
     worker.kanban_submitted = getattr(policy, 'source', None) == 'kanban'
+    # Kept for the stop paths: a shutdown/reclaim that signals this worker must know which card
+    # (and workspace) to name its cause in, and the ManagedWorker has no policy of its own.
+    worker.policy = policy
     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
     authority.adopt_agent(ref.session_id, row['generation'], worker)
