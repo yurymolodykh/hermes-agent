@@ -84,7 +84,10 @@ def _terminal_profile_refused(ws: WebSocket) -> bool:
     if not identity.get("user_id"):
         return False  # the route has already refused a credential-less dial (4401)
     subject = principal_subject(identity)
-    home = _request_home(ws.query_params.get("profile"))
+    try:
+        home = _request_home(ws.query_params.get("profile"))
+    except Exception:  # a name that does not validate (400/404) cannot be scoped either
+        return True
     name = profile_name_for_home(home)
     if not name:
         # A home that names no profile (a custom HERMES_HOME, the launch home of a host with no
