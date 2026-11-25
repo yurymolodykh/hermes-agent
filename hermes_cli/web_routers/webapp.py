@@ -54,8 +54,6 @@ def _host_terminal_profile_matches(ws: WebSocket) -> bool:
     requested = (ws.query_params.get("profile") or "").strip()
     if not requested or requested.lower() == "current":
         return True  # no name: the ticket's own home is opened
-    from hermes_cli.web_host_terminal_sessions import _request_home
-
     ticket_home = getattr(ws, "_hermes_ticket_profile_home", None)
     wanted = Path(ticket_home).resolve() if ticket_home else Path(get_hermes_home()).resolve()
     return _request_home(requested) == wanted
