@@ -94,7 +94,9 @@ def _respawn_guarded_stats(conn: sqlite3.Connection, now: int) -> dict[str, Any]
         elif isinstance(raw, str):
             try:
                 payload = json.loads(raw) or {}
-            except Exception:
+            except json.JSONDecodeError:
+                # A malformed payload row is bookkeeping noise; the guard still
+                # counts, only its reason label falls back to "unknown".
                 payload = {}
         reason = str(payload.get("reason") or "unknown")
         by_reason[reason] = by_reason.get(reason, 0) + 1
