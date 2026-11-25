@@ -315,6 +315,8 @@ def home_paths_match(target: str | Path, home: str | Path) -> bool:
     operand's resolved spelling is therefore remembered per input path (see
     :func:`_resolved_spelling`), and the answer is a plain string compare of the two spellings:
     identical semantics to comparing the two ``resolve`` results, with no syscall on a warm path.
+    Both lookups share one lock acquisition on the steady-state path, so a routed frame pays one
+    short critical section, not two.
 
     Cleared by :func:`reset_hermes_home_key_cache` (profile switch, tests that move a home) and by
     :func:`forget_home_match_cache` (a served set changed), expired after ``_PROFILE_NAME_TTL``
@@ -322,6 +324,15 @@ def home_paths_match(target: str | Path, home: str | Path) -> bool:
     swapped by something other than a profile connect) keeps its old verdict for up to that TTL.
     """
     root_key = str(get_default_hermes_root())
+    target_key = (_comparable_spelling(target), root_key)
+    home_key = (_comparable_spelling(home), root_key)
+    now = time.monotonic()
+    with _PROFILE_NAME_LOCK:
+        target_hit = _HOME_MATCH_CACHE.get(target_key)
+        home_hit = _HOME_MATCH_CACHE.get(home_key)
+        if (target_hit is not None and target_hit[0] > now
+                and home_hit is not None and home_hit[0] > now):
+            return target_hit[1] == home_hit[1]
     return _resolved_spelling(target, root_key) == _resolved_spelling(home, root_key)
 
 
