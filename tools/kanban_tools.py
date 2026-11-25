@@ -1265,7 +1265,7 @@ def _requester_subject(raw_user_id: str) -> str:
         import hermes_acl_identity as _ident
 
         return str(_ident.resolve_subject(text) or "")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- an unreadable identity is "unknown", never fatal
         return ""
 
 
