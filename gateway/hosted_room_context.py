@@ -17,7 +17,6 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from contextlib import closing
 from typing import Any
 
 from gateway import hosted_rooms
@@ -76,7 +75,7 @@ def _latest_context(conn: Any, room_id: str, before_seq: int | None) -> dict[str
 def room_context(db_path: DbPath, *, room_id: Any, before_seq: int | None = None) -> dict[str, str]:
     """The latest purpose/notes, or the ones in force before ``before_seq`` when given."""
     room_id = hosted_rooms._room_id(room_id)
-    with closing(hosted_rooms._read_connection(db_path)) as conn:
+    with hosted_rooms._read_connection_ctx(db_path) as conn:
         return _latest_context(conn, room_id, before_seq)
 
 
@@ -153,7 +152,7 @@ def post_scheduled_message(
     except hosted_rooms.EventConflictError:
         # A retry of the same run re-rendered different text (a re-run agent, a new timestamp): the first
         # post already landed and the run is delivered, so report that post rather than a failure.
-        with closing(hosted_rooms._read_connection(db_path)) as conn:
+        with hosted_rooms._read_connection_ctx(db_path) as conn:
             row = hosted_rooms._load_event(conn, state["room_id"], event_id)
         if row is None:
             raise

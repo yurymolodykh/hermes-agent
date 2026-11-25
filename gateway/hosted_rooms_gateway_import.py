@@ -99,9 +99,8 @@ def _record_handoff(source: Path, room_ids: set[str], now: float) -> None:
 
 def handed_room_ids(source: Path) -> set[str]:
     """Every room ``source`` handed to the gateway store (recorded or still only fenced)."""
-    from contextlib import closing
-    from gateway.hosted_rooms import _read_connection
-    with closing(_read_connection(source)) as conn:
+    from gateway.hosted_rooms import _read_connection_ctx
+    with _read_connection_ctx(source) as conn:
         return {str(row[0]) for row in conn.execute(
             "SELECT room_id FROM hosted_rooms WHERE authority_gateway_id=?", (handoff_gateway_id(),))}
 

@@ -15,10 +15,10 @@ import re
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from gateway.hosted_rooms_common import (
     DbPath, bounded_int, canonical_json, clock as _now, compact_json, connect, fenced_update as _fenced_update,
@@ -843,7 +843,7 @@ def prune_disbanded_rooms(db_path: DbPath, *, now: float | None = None) -> int:
 def room_has_peer_obligations(db_path: DbPath, *, room_id: Any, now: float | None = None) -> bool:
     """Whether metadata-only Disband needs a runtime to settle peer access."""
     room_id = _room_id(room_id)
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         return conn.execute("""SELECT 1 FROM hosted_room_links WHERE room_id=?
             UNION ALL SELECT 1 FROM hosted_room_owed_revokes WHERE room_id=? AND expires_at>? LIMIT 1""",
             (room_id, room_id, _now(now))).fetchone() is not None
@@ -1010,7 +1010,7 @@ _DUE_OWED_REVOKES = """SELECT room_id, member_id, grant_digest, target_url, gran
 
 def owes_room_grant_revokes(db_path: DbPath) -> bool:
     """Whether any owed revoke is recorded (read-only)."""
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         return conn.execute("SELECT 1 FROM hosted_room_owed_revokes LIMIT 1").fetchone() is not None
 
 
@@ -1033,7 +1033,7 @@ def due_room_grant_revokes(db_path: DbPath, *, limit: int, now: float | None = N
     """Owed revokes due now, oldest first; one whose grant has expired is dropped instead. Read-only
     unless an expired row is there to drop, so an idle worker cycle never takes the write lock."""
     timestamp = _now(now)
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         rows = conn.execute(_DUE_OWED_REVOKES, (timestamp, timestamp, int(limit))).fetchall()
         expired = conn.execute(
             "SELECT 1 FROM hosted_room_owed_revokes WHERE expires_at<=? LIMIT 1", (timestamp,)).fetchone()
@@ -1332,7 +1332,7 @@ def list_rooms(
     """Return one bounded read-only page ordered by most recent change."""
     limit = _bounded_limit(limit, MAX_ROOM_LIST_LIMIT)
     offset = _non_negative(offset, "offset")
-    with closing(_read_connection(db_path)) as conn:
+    with _read_connection_ctx(db_path) as conn:
         rows = conn.execute(
             f"""SELECT {_ROOM_COLUMNS} FROM hosted_rooms WHERE disbanded_at IS NULL OR ?
                 ORDER BY updated_at DESC, room_id ASC LIMIT ? OFFSET ?""", (int(include_disbanded), limit, offset)

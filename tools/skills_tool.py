@@ -97,20 +97,68 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH, _known_stat=None)
         _dir_tree_signature(entry.path, sig, depth - 1, child_mtime)
 
 
+# ``_dir_tree_signature`` walks every catalog directory with ``os.scandir``: on the
+# measured 161-directory tree that is ~450 ``openat`` / ~440 ``getdents64`` per call, and
+# the status/skills paths call it repeatedly for unchanged trees (59 of 2049 py-spy
+# samples, all inside one unchanged walk). The signature of an unchanged tree does not
+# change, and a change moves some directory's mtime — so the walk is cached per root with
+# the list of directories it visited, and a repeat call only re-stats them (no scandir).
+#
+# One documented gap has to be closed for this to be safe: an install and an uninstall
+# inside one coarse mtime tick (1-2 s on some filesystems) leave every mtime equal while
+# the child NAMES differ, which is why the signature records names at all. A directory
+# whose mtime is still inside that window cannot be trusted from mtime alone, so the full
+# walk is repeated while any visited directory is that recent. Once the window has passed,
+# equal mtimes really do mean an unchanged tree.
+_SIGNATURE_CACHE: dict[str, tuple[tuple[tuple[str, int], ...], tuple]] = {}
+_SIGNATURE_CACHE_MAX_ROOTS = 16
+# Coarse-mtime window: the 1-2 s tick Python's timestamps are reduced to on some
+# filesystems (and NTFS's 100 ns to anything reading through a network share).
+_SIGNATURE_RECENT_SECONDS = 2.0
+
+
+def _clear_signature_cache() -> None:
+    """Drop the cached tree walks (explicit reloads must not be served from a memo)."""
+    _SIGNATURE_CACHE.clear()
+
+
+def _fresh_walk_available(walked, now: float) -> bool:
+    """True when every visited directory's mtime is unchanged AND outside the coarse tick."""
+    for path, old_mtime in walked:
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            return False  # vanished or unreadable: the walk has to run again
+        if mtime != old_mtime or (now - mtime / 1e9) < _SIGNATURE_RECENT_SECONDS:
+            return False
+    return True
+
+
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Stat-based change signature over every directory the catalog walks; platform is read via
     ``agent.skill_utils.sys`` so test patches are honored.
 
-    Deliberately NOT memoised: ``test_skill_added_on_disk_after_the_first_scan_is_served_without_reload``
-    and its nested-category sibling install a skill between two calls and require the very next call to
-    see it, so any TTL on this value is a correctness regression, not a tuning knob. The walk itself is
-    a single ``os.scandir`` per directory (see ``_dir_tree_signature``), but no speedup is claimed for it.
+    Memoised per root on the walk's own directory mtimes (see ``_SIGNATURE_CACHE``): an
+    unchanged, settled tree costs one ``stat`` per directory instead of a ``scandir`` that
+    enumerates it, while a skill installed a moment ago — the case the freshness tests pin —
+    still forces a full walk, because that directory's mtime is inside the coarse tick.
     """
     from agent import skill_utils as _skill_utils
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+    now = time.time()
     sig: list = []
     for d in dirs_to_scan:
-        _dir_tree_signature(str(d), sig)
+        root = str(d)
+        cached = _SIGNATURE_CACHE.get(root)
+        if cached is not None and _fresh_walk_available(cached[0], now):
+            sig.extend(cached[1])
+            continue
+        root_sig: list = []
+        _dir_tree_signature(root, root_sig)
+        _SIGNATURE_CACHE[root] = (tuple((row[0], row[1]) for row in root_sig), tuple(root_sig))
+        if len(_SIGNATURE_CACHE) > _SIGNATURE_CACHE_MAX_ROOTS:
+            _SIGNATURE_CACHE.pop(next(iter(_SIGNATURE_CACHE)), None)
+        sig.extend(root_sig)
     return (tuple(sig), frozenset(disabled), platform)
 
 

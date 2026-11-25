@@ -8,6 +8,31 @@ Hermes' own bootstraps, which run an entry point in-process and are mapped back 
 from __future__ import annotations
 
 import re
+import threading
+
+# Every ``/api/status`` poll parses the SAME command lines again: the gateway's own
+# argv, its parents', and each live process in the holder table. The bootstrap scan is
+# a set of ``.*``/DOTALL patterns tried in order, and py-spy attributed 123 of 2049
+# samples to this genexpr alone. The parse is a pure function of its inputs, so the
+# results are memoised: ``source``/``argv`` fully determine the answer, and a changed
+# source is by definition a different key (no staleness window at all, unlike a TTL).
+_BOOTSTRAP_CACHE_MAX = 256
+_bootstrap_cache: dict[tuple[str, tuple[str, ...]], list[str] | None] = {}
+_bootstrap_cache_lock = threading.Lock()
+
+# The outer loop re-joins token runs and re-matches them; that walk is memoised too,
+# keyed by the whole token tuple (argv is immutable in practice, one entry per process).
+_INLINE_ARGV_CACHE_MAX = 512
+_inline_argv_cache: dict[tuple[str, ...], list[str] | None] = {}
+_inline_argv_cache_lock = threading.Lock()
+
+
+def clear_inline_source_cache() -> None:
+    """Drop both parse memos (tests, and a caller that needs a forced re-read)."""
+    with _bootstrap_cache_lock:
+        _bootstrap_cache.clear()
+    with _inline_argv_cache_lock:
+        _inline_argv_cache.clear()
 
 
 def inline_source_flag_index(tokens: list[str]) -> int | None:
@@ -107,8 +132,25 @@ _EXEC_BASE64 = re.compile(r"import base64; exec\(base64\.b64decode\(\W*(?P<b64>[
 
 
 def _bootstrap_entry(source: str, argv: list[str]) -> list[str] | None:
-    """``[-m, <module>, *argv]`` (or ``[<path>, *argv]``) the inline *source* runs in-process, else None."""
+    """``[-m, <module>, *argv]`` (or ``[<path>, *argv]``) the inline *source* runs in-process, else None.
+
+    Memoised on ``(source, argv)``: the parser is pure, and both are the complete input,
+    so a repeat costs a dict lookup instead of six DOTALL regex attempts.
+    """
     source = source.strip()
+    key = (source, tuple(argv))
+    with _bootstrap_cache_lock:
+        if key in _bootstrap_cache:
+            return _bootstrap_cache[key]
+    result = _bootstrap_entry_uncached(source, argv)
+    with _bootstrap_cache_lock:
+        if len(_bootstrap_cache) >= _BOOTSTRAP_CACHE_MAX:
+            _bootstrap_cache.pop(next(iter(_bootstrap_cache)), None)
+        _bootstrap_cache[key] = result
+    return result
+
+
+def _bootstrap_entry_uncached(source: str, argv: list[str]) -> list[str] | None:
     kind, match = next(((k, m) for k, p in _BOOTSTRAPS if (m := p.fullmatch(source))), (None, None))
     if match is None:
         return None
@@ -154,9 +196,20 @@ def inline_bootstrap_argv(tokens: list[str]) -> list[str] | None:
     index = inline_source_flag_index(tokens)
     if index is None:
         return None
+    cache_key = tuple(tokens)
+    with _inline_argv_cache_lock:
+        if cache_key in _inline_argv_cache:
+            hit = _inline_argv_cache[cache_key]
+            return None if hit is None else list(hit)
+    result = None
     for end in range(index + 1, len(tokens)):
         if tokens[end].rstrip().endswith(")"):
             entry = _bootstrap_entry(" ".join(tokens[index + 1 : end + 1]), tokens[end + 1 :])
             if entry is not None:
-                return [tokens[0], *entry]
-    return None
+                result = [tokens[0], *entry]
+                break
+    with _inline_argv_cache_lock:
+        if len(_inline_argv_cache) >= _INLINE_ARGV_CACHE_MAX:
+            _inline_argv_cache.pop(next(iter(_inline_argv_cache)), None)
+        _inline_argv_cache[cache_key] = result
+    return None if result is None else list(result)
