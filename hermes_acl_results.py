@@ -249,6 +249,24 @@ def _profile_home(name: str) -> Optional[Path]:
         return None
 
 
+def _exchange_dirs() -> list[Path]:
+    """The team exchange directory: deliverables handed to whoever asked for them.
+
+    A personal profile's working directory belongs to its owner, so a file an agent produced for
+    another person there answers 403 to that person — correct, and useless as a delivery. Files in
+    ``{HERMES_HOME}/shared`` are readable by every VERIFIED person: the producer writes there, the
+    requester downloads there. An unidentified caller never reaches this list (the caller gates it
+    on :func:`_verified`), and a missing directory contributes nothing.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = Path(get_hermes_home()) / "shared"
+    except Exception:  # health: allow BLE001 -- a stripped build without the constant
+        return []
+    return [path] if path.is_dir() else []
+
+
 def _team_card_dirs(subject: Any) -> list[Path]:
     """``kanban/workspaces/<id>`` and ``kanban/attachments/<id>`` of the cards TEAM may read.
 
@@ -440,6 +458,10 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
     for path in _team_card_dirs(subject):
         if path not in roots:
             roots.append(path)
+    if _verified(subject):
+        for path in _exchange_dirs():
+            if path not in roots:
+                roots.append(path)
     for path in _shared_work_dirs():
         if path not in roots:
             roots.append(path)

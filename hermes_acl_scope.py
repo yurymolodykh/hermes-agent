@@ -114,6 +114,10 @@ def owner_stamps(identity: Optional[str]) -> list[str]:
             recorded = _REGISTRY_PREFIX_BY_PROVIDER.get(provider.lower())
             if recorded:
                 stamps.append(f"{recorded}:{user}")
+            # A dashboard login labels the person by its login (``maksim.matrosov``) while the
+            # registry and every row use ``person/maksim.matrosov``; resolving the LOGIN to its
+            # subject is what keeps a signed-in person's own profile home in their roots.
+            stamps.extend(_identity_subject_stamps(user))
     for stamp in list(stamps):
         stamps.extend(_binding_stamps(stamp))
     # A gateway stores a messaging row under the BARE platform id (``241213869``) while the
