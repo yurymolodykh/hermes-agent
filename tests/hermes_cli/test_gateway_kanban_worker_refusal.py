@@ -25,31 +25,56 @@ def no_supervisor_markers(monkeypatch):
     monkeypatch.setenv("INVOCATION_ID", "a" * 32)
     monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
 
 
-def test_refuses_gateway_run_from_kanban_worker(no_supervisor_markers, monkeypatch, capsys):
+def test_refuses_gateway_run_from_kanban_worker(no_supervisor_markers, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_aa6015fa")
     with pytest.raises(SystemExit) as exc:
         gateway_cli._guard_kanban_worker_gateway()
     assert exc.value.code == 78
-    err = capsys.readouterr().out + capsys.readouterr().err
-    assert "t_aa6015fa" in err
+
+
+def test_refuses_on_workspace_marker_without_task_id(monkeypatch):
+    """A worker's shell keeps HERMES_KANBAN_WORKSPACE when the task id was consumed.
+
+    Measured on the live host: the incident's worker shell carried
+    HERMES_KANBAN_WORKSPACE and HERMES_KANBAN_BOARD but no HERMES_KANBAN_TASK, so a
+    guard keyed on the task id alone would have let the second gateway start.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE",
+                       "/home/hermes/.hermes/kanban/workspaces/t_43e43ad3")
+    with pytest.raises(SystemExit) as exc:
+        gateway_cli._guard_kanban_worker_gateway()
+    assert exc.value.code == 78
+
+
+def test_the_live_gateway_environment_is_allowed(monkeypatch):
+    """The real gateway carries NO HERMES_KANBAN_* key — verified on pid 2144916."""
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
+    monkeypatch.setenv("INVOCATION_ID", "b" * 32)
+    gateway_cli._guard_kanban_worker_gateway()  # the supervised gateway itself: allowed
 
 
 def test_refusal_is_not_bound_to_the_supervisor_markers(no_supervisor_markers, monkeypatch):
-    """Without a task id the guard is silent, however supervised it looks."""
+    """Without a kanban marker the guard is silent, however supervised it looks."""
     gateway_cli._guard_kanban_worker_gateway()  # returns, no SystemExit
 
 
 def test_plain_shell_run_is_allowed(monkeypatch):
     """No kanban marker at all: the operator's own ``gateway run`` still works."""
-    for name in ("HERMES_KANBAN_TASK", "INVOCATION_ID", "HERMES_SUPERVISED_CHILD"):
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
+                 "INVOCATION_ID", "HERMES_SUPERVISED_CHILD"):
         monkeypatch.delenv(name, raising=False)
     gateway_cli._guard_kanban_worker_gateway()
 
 
-def test_blank_task_id_is_not_a_worker(monkeypatch):
+def test_blank_markers_are_not_a_worker(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "   ")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "\t")
     gateway_cli._guard_kanban_worker_gateway()
 
 

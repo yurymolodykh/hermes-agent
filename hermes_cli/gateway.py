@@ -4411,25 +4411,34 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
 def _guard_kanban_worker_gateway() -> None:
     """Refuse ``gateway run`` from inside a kanban dispatcher worker.
 
-    A dispatcher worker inherits the gateway's OWN supervisor markers
+    A dispatcher worker inherits the live gateway's OWN supervisor markers
     (``INVOCATION_ID``, ``HERMES_SUPERVISED_CHILD``) because the dispatcher hands its
     environment to every worker it spawns. ``_running_under_gateway_supervisor()``
-    reads exactly those markers, so inside a worker it answers True and every
-    conflict guard below returns early — the worker was therefore free to start a
-    SECOND gateway on the same ``HERMES_HOME``/``state.db`` as the live owner
-    (incident 26.11: pid 2125256, a child of the card's worker, beside pid 1999484).
+    reads exactly those markers, so inside a worker it answers True and
+    ``_guard_existing_gateway_process_conflict`` returns at its FIRST line — before
+    it ever reads the pid file. That is the bypass: the worker is not the supervised
+    gateway, it merely looks like one, so it was free to start a SECOND gateway on
+    the same ``HERMES_HOME``/``state.db`` as the live owner (incident 26.11: pid
+    2125256, a child of the card's worker, beside live owner 1999484).
 
-    The worker's own identity (``HERMES_KANBAN_TASK``) is the one marker the live
-    gateway never carries, so it is checked FIRST and never inferred from the
-    supervisor markers. Exit 78 (EX_CONFIG) is deliberate: the condition is a wrong
-    caller, not a transient fault, so a supervisor must not retry it.
+    The discriminator is therefore the worker's OWN dispatch identity, never the
+    supervisor markers. Both markers are injected by the dispatcher per worker
+    (``kanban_db_dispatch`` sets ``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_WORKSPACE``) and neither is ever set in the gateway's own
+    environment — measured on the live host: gateway pid 2144916 carries zero
+    ``HERMES_KANBAN_*`` keys. ``HERMES_KANBAN_WORKSPACE`` matters because it is what
+    a worker's own shell/terminal keeps when ``HERMES_KANBAN_TASK`` was already
+    consumed upstream — keying on the task id alone would miss that path.
+
+    Exit 78 (EX_CONFIG) is deliberate: a wrong caller, not a transient fault, so a
+    supervisor must not retry it.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
+    workspace = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not task_id and not workspace:
         return
-    print_error(
-        f"Refusing to start a gateway from inside kanban worker for task {task_id}."
-    )
+    who = f"task {task_id}" if task_id else f"workspace {workspace}"
+    print_error(f"Refusing to start a gateway from inside a kanban worker ({who}).")
     print(
         "  A worker inherits the live gateway's supervisor markers, so it cannot\n"
         "  tell a second copy of that gateway apart from being one: starting here\n"
@@ -4439,8 +4448,9 @@ def _guard_kanban_worker_gateway() -> None:
         "  outside any kanban worker."
     )
     logger.warning(
-        "gateway run refused: launched from a kanban worker (task %s); the live "
-        "gateway's supervisor markers are inherited, never owned", task_id,
+        "gateway run refused: launched from a kanban worker (%s); supervisor "
+        "markers are inherited from the parent gateway, never owned by a worker",
+        who,
     )
     sys.exit(78)
 
