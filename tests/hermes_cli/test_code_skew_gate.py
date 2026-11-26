@@ -221,6 +221,36 @@ def test_refusal_message_names_both_commits_and_the_fix():
     assert "does not match the running gateway" in skew.message
 
 
+def test_the_field_channel_refuses_end_to_end(monkeypatch):
+    """``check_code_skew`` — not just ``compare_contracts`` — refuses on the extras alone.
+
+    Both sides are the REAL parsed contracts of the incident pair; only the two readers are pinned
+    (a checkout on 34086e258353 talking to a gateway on 4713ca0ab46). Without this, a gate could
+    parse the field correctly and still never reach the refusal, which is the other half of the
+    defect: "sees the field" and "refuses because of it" are separate claims.
+    """
+    repo = _repo_root()
+    if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", "34086e258353^{commit}"],
+                      capture_output=True, check=False).returncode != 0:
+        pytest.skip("the incident commits are not in this checkout's object database")
+    disk = gate.commit_contract("34086e258353", repo)
+    running = gate.commit_contract("4713ca0ab46", repo)
+    assert disk is not None and running is not None
+    monkeypatch.setattr(gate, "disk_contract", lambda *_a, **_kw: disk)
+    monkeypatch.setattr(gate, "commit_contract", lambda *_a, **_kw: running)
+
+    skew = gate.check_code_skew(disk_sha="34086e258353", gateway_sha="4713ca0ab46", repo=repo)
+    assert skew is not None, "the field channel must produce a refusal, not only a comparison"
+    assert "prompt_cache_clock" in skew.problems[0]
+    assert "does not match the running gateway" in skew.message
+
+    # and the safe direction stays allowed
+    monkeypatch.setattr(gate, "disk_contract", lambda *_a, **_kw: running)
+    monkeypatch.setattr(gate, "commit_contract", lambda *_a, **_kw: disk)
+    assert gate.check_code_skew(disk_sha="4713ca0ab46", gateway_sha="34086e258353",
+                                repo=repo) is None
+
+
 # --- an unknowable side NEVER refuses -------------------------------------------------------------
 
 def test_unknown_gateway_sha_passes():
