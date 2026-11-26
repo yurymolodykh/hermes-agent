@@ -345,3 +345,10 @@ apps/desktop/.dist-build*
 /PROGRESS-*.md
 /PROGRESS.md
 /REPORT-*.md
+# живые пробы, вердикты и патчи карточек — вложения доски, не файлы ветки
+/.vpy
+/live_demo_*.py
+/live_demo_*.out
+/t_*.patch
+/VERDICT-t_*.md
+/.probe/
