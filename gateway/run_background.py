@@ -132,7 +132,10 @@ class GatewayBackgroundMixin:
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                # This reply goes to ``source.chat_id``: name that recipient explicitly rather than
+                # relying on an ambient turn actor, which a background run does not carry.
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files, source=source)
                 images, text_content = adapter.extract_images(response)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)

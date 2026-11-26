@@ -929,7 +929,9 @@ def _send_media_via_adapter(
     job_ref = {"id": job.get("id", "?")}
     errors: list = []
     requested = [(str(p), v) for p, v in (media_files or [])]
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # No recipient identity at this seam (a cron tick): ``subject=""`` keeps the attachment on the
+    # legacy path, so a job's file is still sent instead of silently dropped.
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files, subject="")
     # Report paths the safety filter dropped (missing file, denied prefix, strict-mode miss).
     kept = {p for p, _ in media_files}
     for raw_path, _v in requested:
@@ -1897,7 +1899,11 @@ def _deliver_result(
     # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
     cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
     requested_media = len(media_files)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # A cron tick has NO recipient identity: the job's ``origin`` is delivery metadata, not a
+    # person who is reading this reply (#L2-c). Declaring that explicitly (``subject=""``) keeps a
+    # normal MEDIA attachment on the legacy path instead of dropping it, and stops a stale ambient
+    # turn actor from hijacking the gate.
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files, subject="")
     # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
     _policy_dropped = requested_media - len(media_files)
     policy_drop_errors = [

@@ -8,14 +8,18 @@ instead of a deliverable (the root of the incident this card comes from).
 
 Two answers are acceptable and both are tested here:
 
-* the file is MOVED into the team exchange under the recipient's own subfolder
-  (``{HERMES_HOME}/shared/<subject-slug>/``), which is one of their file roots — the returned path
-  is the moved one, and it downloads for them (200 through the real files router);
+* the file is COPIED into the recipient's own inbox (``{HERMES_HOME}/delivery/<subject-slug>/``),
+  which is a file root for that person alone — the returned path is the copy, it downloads for
+  them (200 through the real files router), answers 403 to a third verified user and 401 to an
+  anonymous tab, and the SOURCE is left untouched;
 * the handover is impossible — then the path is DROPPED with a readable reason in ``dropped``,
   never offered as a link.
 
+A delivery with NO recipient at all (a cron tick, a kanban watcher, a background run) is not a
+policy decision: the path comes back unchanged, as it did before the per-person gate existed.
+
 And the no-op contract: with ``acl.multi_user`` off — and for the host owner — the same path comes
-back unchanged and nothing is moved.
+back unchanged and nothing is copied.
 """
 from __future__ import annotations
 
@@ -34,9 +38,11 @@ from gateway.owner_identity import host_owner_subject
 
 ALICE = "person/alice"
 BOB = "person/bob"
+CAROL = "person/carol"
 OWNER_LOGIN = "owner"
 ALICE_ROOT = "01-alice"
 BOB_ROOT = "01-bob"
+CAROL_ROOT = "01-carol"
 SHARED = ("02-hermes-platform", "03-software-engineer")
 
 ALICE_DOC = {
@@ -46,6 +52,10 @@ ALICE_DOC = {
 BOB_DOC = {
     "slug": BOB, "display_name": "Bob", "shared": False,
     "profiles": [BOB_ROOT], "subjects": [], "owner": BOB, "source": "admin",
+}
+CAROL_DOC = {
+    "slug": CAROL, "display_name": "Carol", "shared": False,
+    "profiles": [CAROL_ROOT], "subjects": [], "owner": CAROL, "source": "admin",
 }
 SHARED_DOC = {
     "slug": "shared/service", "display_name": "Shared", "shared": True,
@@ -100,7 +110,7 @@ def registry(_isolated_home):
     path.parent.mkdir(parents=True, exist_ok=True)
     document = {
         "schema": hb.SCHEMA, "written_at": "2026-11-20T00:00:00+00:00", "written_by": "admin",
-        "persons": [ALICE_DOC, BOB_DOC, SHARED_DOC],
+        "persons": [ALICE_DOC, BOB_DOC, CAROL_DOC, SHARED_DOC],
     }
     path.write_text(json.dumps(document), encoding="utf-8")
     hb.reset_cache()
@@ -139,7 +149,7 @@ def profile_homes(_isolated_home, monkeypatch):
     root = default_home / "profiles"
     homes = {"default": default_home}
     (default_home / "config.yaml").write_text("{}\n", encoding="utf-8")
-    for name in (ALICE_ROOT, BOB_ROOT, *SHARED):
+    for name in (ALICE_ROOT, BOB_ROOT, CAROL_ROOT, *SHARED):
         home = root / name
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text("{}\n", encoding="utf-8")
@@ -154,6 +164,13 @@ def profile_homes(_isolated_home, monkeypatch):
 
 @pytest.fixture
 def fs_client_factory(profile_homes, monkeypatch):
+    """A real files router behind the REAL auth gate (``web_server.auth_middleware``).
+
+    An authenticated client carries the deployment session token exactly as the dashboard does,
+    so the acceptance probe answers for all three roles on one stack: recipient 200, third
+    verified user 403 (the multi-user boundary), anonymous 401 (the auth gate).
+    """
+    from hermes_cli import web_server
     from hermes_cli.web_routers import files as files_router
 
     def build(login):
@@ -161,11 +178,15 @@ def fs_client_factory(profile_homes, monkeypatch):
 
         @app.middleware("http")
         async def _stamp(request, call_next):
-            request.state.session = _Session(login)
+            request.state.session = _Session(login) if login else None
             return await call_next(request)
 
+        app.middleware("http")(web_server.auth_middleware)
         app.include_router(files_router.router)
-        return TestClient(app)
+        client = TestClient(app)
+        if login:
+            client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+        return client
 
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
     monkeypatch.setattr(
@@ -213,37 +234,43 @@ class TestPathAllowedForSubject:
 # ---------------------------------------------------------------------------
 
 
-def _filter(path, source, monkeypatch, actor=""):
+def _filter(path, source, monkeypatch, actor="", subject=None):
     """Run the real MEDIA filter with the turn's actor stubbed."""
     from gateway.platforms import base as base_mod
 
     monkeypatch.setattr("hermes_acl_scope.caller_subject", lambda: actor)
     dropped: list = []
+    kwargs = {} if subject is None else {"subject": subject}
     out = base_mod.BasePlatformAdapter.filter_media_delivery_paths(
-        [(str(path), False)], dropped=dropped, source=source)
+        [(str(path), False)], dropped=dropped, source=source, **kwargs)
     return out, dropped
 
 
 class TestMediaDeliveryGate:
-    def test_a_foreign_personal_file_is_handed_over_to_the_exchange(
+    def test_a_foreign_personal_file_is_copied_into_the_recipients_inbox(
             self, multi_user, registry, profile_homes, monkeypatch, _isolated_home):
-        """Acceptance 1a: the recipient gets a path THEY can download, not a 403 link."""
+        """Д1+Д2: the recipient gets a path THEY can download; the source is never touched."""
         foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        original = foreign.read_text(encoding="utf-8")
         out, dropped = _filter(foreign, _Source(ALICE), monkeypatch)
 
         assert dropped == [], "a successful handover is a delivery, not a drop"
         assert out, "the path must survive as a deliverable"
-        delivered = Path(out[0][0])
-        assert delivered != foreign
-        assert delivered.parent == (_isolated_home / "shared" / "person_alice").resolve() \
-            or delivered.parent == _isolated_home / "shared" / "person_alice"
-        assert delivered.read_text(encoding="utf-8") == "only 01-bob reads this"
-        assert not foreign.exists(), "the handover is a move, not a copy"
-        assert results_acl.path_allowed_for_subject(ALICE, delivered) is True
+        delivered = Path(out[0][0]).resolve()
+        assert delivered != foreign.resolve()
+        assert delivered.parent == (_isolated_home / "delivery" / "person_alice").resolve(), \
+            "the copy lives in the recipient's own inbox, never in the team exchange"
+        assert delivered.read_text(encoding="utf-8") == original
+        # Д1: the producer's file is still there, byte for byte — the old MOVE deleted it.
+        assert foreign.exists(), "the handover must never remove the original"
+        assert foreign.read_text(encoding="utf-8") == original
+        assert not (_isolated_home / "shared").exists() or not any(
+            (_isolated_home / "shared").rglob("secret.txt")), \
+            "a private file must not be published in the team exchange"
 
-    def test_the_handed_over_path_downloads_for_that_person(
+    def test_the_copy_downloads_for_that_person(
             self, multi_user, registry, profile_homes, monkeypatch, fs_client_factory):
-        """Acceptance 4 (live): the link alice receives answers 200 for alice."""
+        """Acceptance 3 (live): the link alice receives answers 200 for alice, same bytes."""
         foreign = profile_homes[BOB_ROOT] / "secret.txt"
         out, _ = _filter(foreign, _Source(ALICE), monkeypatch)
         delivered = out[0][0]
@@ -251,31 +278,95 @@ class TestMediaDeliveryGate:
         response = fs_client_factory("alice").get(
             "/api/fs/download", params={"path": delivered})
         assert response.status_code == 200
-        assert response.content == b"only 01-bob reads this"
+        assert response.content == foreign.read_bytes()
+
+    def test_a_third_user_cannot_download_the_copy(
+            self, multi_user, registry, profile_homes, monkeypatch, fs_client_factory):
+        """Д2: the delivered copy is NOT readable by a third verified person (403, not 200)."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, _ = _filter(foreign, _Source(ALICE), monkeypatch)
+        delivered = out[0][0]
+
+        assert fs_client_factory("alice").get(
+            "/api/fs/download", params={"path": delivered}).status_code == 200
+        assert fs_client_factory("bob").get(
+            "/api/fs/download", params={"path": delivered}).status_code == 403
+        assert fs_client_factory("carol").get(
+            "/api/fs/download", params={"path": delivered}).status_code == 403
+
+    def test_the_copy_is_refused_to_an_anonymous_caller(
+            self, multi_user, registry, profile_homes, monkeypatch, fs_client_factory):
+        """Acceptance 3: an unauthenticated tab gets 401 on the delivered copy, not the bytes."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, _ = _filter(foreign, _Source(ALICE), monkeypatch)
+        delivered = out[0][0]
+
+        assert fs_client_factory("alice").get(
+            "/api/fs/download", params={"path": delivered}).status_code == 200
+        assert fs_client_factory(None).get(
+            "/api/fs/download", params={"path": delivered}).status_code == 401
+
+    def test_the_delivered_copy_matches_the_source_md5(
+            self, multi_user, registry, profile_homes, monkeypatch, fs_client_factory):
+        """Acceptance 3: the recipient's download is byte-identical to what was delivered."""
+        import hashlib
+
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, _ = _filter(foreign, _Source(ALICE), monkeypatch)
+        delivered = out[0][0]
+        response = fs_client_factory("alice").get(
+            "/api/fs/download", params={"path": delivered})
+
+        assert response.status_code == 200
+        assert hashlib.md5(response.content).hexdigest() == \
+            hashlib.md5(foreign.read_bytes()).hexdigest()
 
     def test_the_original_foreign_path_still_refuses_her(
             self, multi_user, registry, profile_homes, monkeypatch, fs_client_factory):
-        """The counter-example: without the handover the link WOULD 403 — the defect itself."""
+        """The counter-example: the source path itself stays a 403 for the recipient."""
         foreign = profile_homes[BOB_ROOT] / "secret.txt"
-        assert not foreign.exists() or True  # untouched by this test
         response = fs_client_factory("alice").get(
             "/api/fs/download", params={"path": str(foreign)})
         assert response.status_code == 403
 
-    def test_an_own_file_is_delivered_unchanged(self, multi_user, registry, profile_homes,
-                                                monkeypatch):
+    def test_an_own_file_is_delivered_unchanged_and_not_copied(self, multi_user, registry,
+                                                               profile_homes, monkeypatch):
         own = profile_homes[ALICE_ROOT] / "secret.txt"
         out, dropped = _filter(own, _Source(ALICE), monkeypatch)
         assert dropped == []
         assert Path(out[0][0]).resolve() == own.resolve()
         assert own.exists()
 
+    def test_the_same_path_twice_delivers_one_copy(self, multi_user, registry, profile_homes,
+                                                   monkeypatch, _isolated_home):
+        """Д4: a duplicate path in one turn is not a second, differently-named deliverable."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        first, dropped_first = _filter(foreign, _Source(ALICE), monkeypatch)
+        second, dropped_second = _filter(foreign, _Source(ALICE), monkeypatch)
+        assert dropped_first == [] and dropped_second == []
+        assert Path(first[0][0]).resolve() == Path(second[0][0]).resolve()
+        inbox = _isolated_home / "delivery" / "person_alice"
+        assert sorted(p.name for p in inbox.iterdir()) == ["secret.txt"]
+        assert foreign.exists()
+
+    def test_a_different_file_with_the_same_name_gets_its_own_copy(
+            self, multi_user, registry, profile_homes, monkeypatch, _isolated_home):
+        """The collision that IS real: another content under the same name keeps both copies."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        first, _ = _filter(foreign, _Source(ALICE), monkeypatch)
+        other = profile_homes[SHARED[0]] / "secret.txt"
+        second, _ = _filter(other, _Source(ALICE), monkeypatch)
+        assert Path(first[0][0]).resolve() != Path(second[0][0]).resolve()
+        assert Path(first[0][0]).read_text() == foreign.read_text()
+        assert Path(second[0][0]).read_text() == other.read_text()
+
     def test_an_impossible_handover_is_a_reasoned_drop(
             self, multi_user, registry, profile_homes, monkeypatch, _isolated_home):
-        """Acceptance 1b: no move possible -> a dropped entry with a readable reason, no 403 link."""
+        """Acceptance 1b: no copy possible -> a dropped entry with a readable reason, no 403 link."""
         foreign = profile_homes[BOB_ROOT] / "secret.txt"
-        # Make the exchange unusable: a FILE where the subject's folder must be.
-        blocked = _isolated_home / "shared" / "person_alice"
+        # Make the delivery folder unusable: a FILE where the subject's folder must be.
+        blocked = _isolated_home / "delivery" / "person_alice"
+        blocked.parent.mkdir(parents=True, exist_ok=True)
         blocked.write_text("not a directory", encoding="utf-8")
 
         out, dropped = _filter(foreign, _Source(ALICE), monkeypatch)
@@ -291,8 +382,34 @@ class TestMediaDeliveryGate:
         out, _ = _filter(own, _Source(BOB), monkeypatch, actor=ALICE)
         assert Path(out[0][0]).resolve() == own.resolve()
 
+    def test_no_recipient_delivers_as_before(self, multi_user, registry, profile_homes,
+                                             monkeypatch, _isolated_home):
+        """Д3: an actorless seam (cron tick, background run) must NOT drop a normal MEDIA file."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, dropped = _filter(foreign, None, monkeypatch, actor="")
+        assert dropped == [], "no actor is not a policy refusal"
+        assert [Path(p).resolve() for p, _ in out] == [foreign.resolve()]
+        assert not (_isolated_home / "delivery").exists(), "nothing was copied for nobody"
+
+    def test_an_explicit_empty_subject_overrides_a_stale_actor(
+            self, multi_user, registry, profile_homes, monkeypatch):
+        """A seam that knows it has no recipient says so instead of inheriting an ambient actor."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, dropped = _filter(foreign, None, monkeypatch, actor=ALICE, subject="")
+        assert dropped == []
+        assert [Path(p).resolve() for p, _ in out] == [foreign.resolve()]
+
+    def test_an_explicit_subject_names_a_kanban_customer(self, multi_user, registry,
+                                                          profile_homes, monkeypatch):
+        """A kanban handoff has no turn actor: its card recipient is passed explicitly."""
+        foreign = profile_homes[BOB_ROOT] / "secret.txt"
+        out, dropped = _filter(foreign, None, monkeypatch, actor="", subject=ALICE)
+        assert dropped == []
+        assert Path(out[0][0]).resolve().parent.name == "person_alice"
+        assert foreign.exists()
+
     def test_scoping_off_leaves_the_path_alone(self, legacy, profile_homes, monkeypatch):
-        """Acceptance 2: ``multi_user=false`` is a no-op — same path, nothing moved."""
+        """Acceptance 2: ``multi_user=false`` is a no-op — same path, nothing copied."""
         foreign = profile_homes[BOB_ROOT] / "secret.txt"
         out, dropped = _filter(foreign, _Source(ALICE), monkeypatch)
         assert dropped == []

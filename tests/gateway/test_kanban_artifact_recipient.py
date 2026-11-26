@@ -188,3 +188,51 @@ def test_an_acl_off_installation_records_the_legacy_answer(board, registry, tmp_
     (row,) = _journals(board)
     assert row["verdict"] == kdel.VERDICT_DELIVERED
     assert row["reason"] == "acl-off; no relation check"
+
+
+def test_a_card_with_no_recipient_still_delivers_its_artifacts(board, registry, tmp_path):
+    """Д3: under ``multi_user`` a card that names nobody must NOT lose its file.
+
+    The regression this pins: the per-person gate treated "no established recipient" as a refusal,
+    so every artifact of a card created without a customer was dropped — the card's deliverables
+    vanished while the parent revision delivered them. No recipient is not a policy decision.
+    """
+    _task_id, task = _card(created_by="")
+    artifact = tmp_path / "report.pdf"
+    artifact.write_bytes(b"%PDF-1.4 report")
+    adapter = _RecordingAdapter()
+
+    _deliver(adapter, task, chat_id="125805788", artifact=artifact, subject="")
+
+    assert adapter.documents == [("125805788", str(artifact))], \
+        "an actorless card handoff delivers as before, it does not drop"
+
+
+def test_a_card_artifact_outside_the_recipients_folders_reaches_them_anyway(
+        board, registry, tmp_path):
+    """Д2 at the card seam: a foreign artifact is copied into the recipient's own inbox.
+
+    The artifact sits in a profile tree that is NOT the customer's, so the raw path would 403 for
+    them at download time; the gate must hand over a copy they can actually open — and only they.
+    """
+    import hermes_acl_results as hr
+
+    _task_id, task = _card()
+    artifact = tmp_path / "report.pdf"
+    artifact.write_bytes(b"%PDF-1.4 report")
+    adapter = _RecordingAdapter()
+    # The customer may read their own delivery inbox and nothing else here.
+    inbox = board / "delivery" / "person_anna"
+    monkeypatch_roots = (inbox,)
+    original_roots = hr.subject_roots
+    hr.subject_roots = lambda subject: (monkeypatch_roots if str(subject) == "person/anna"
+                                        else original_roots(subject))
+
+    _deliver(adapter, task, chat_id="555000111", artifact=artifact, subject="person/anna")
+
+    assert len(adapter.documents) == 1
+    sent_path = Path(adapter.documents[0][1])
+    assert sent_path.parent.resolve() == inbox.resolve(), \
+        "the customer was handed a copy in their own inbox, not a path they cannot open"
+    assert sent_path.read_bytes() == b"%PDF-1.4 report"
+    assert artifact.exists(), "Д1: the card's artifact is never consumed by the handover"

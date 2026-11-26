@@ -203,7 +203,10 @@ class GatewayKanbanWatchersMixin:
             return
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        # The card's recipient is who gets the artefacts; when the card names nobody this is
+        # ``""`` — "no recipient", which delivers as before instead of dropping every artefact
+        # (a kanban handoff has no turn actor at all; #L2-c must not eat card deliverables).
+        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates, subject=recipient)
         if not candidates:
             return
 
