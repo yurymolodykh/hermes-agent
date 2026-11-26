@@ -1012,10 +1012,17 @@ def _refuse_detached_off_branch(git_cmd, branch, *, pre_pull_sha, pre_branch, re
           "update is not accepted.")
     restored = _git_run(git_cmd, ["checkout", "--no-guess", restore])
     if restored.returncode != 0:
-        restored = _git_run(git_cmd, ["checkout", "--detach", pre_pull_sha]) if pre_pull_sha \
-            else restored
+        # A refused checkout leaves files of the foreign commit behind as untracked/modified, so
+        # the plain return can abort ("would be overwritten"). Serving foreign code to workers is
+        # the P0 harm here, so force the return and SAY that the leftovers were discarded.
+        restored = _git_run(git_cmd, ["checkout", "--no-guess", "-f", restore])
+        if restored.returncode == 0:
+            print("  (forced: files from the refused checkout were discarded)")
+    if restored.returncode != 0 and pre_pull_sha:
+        restored = _git_run(git_cmd, ["checkout", "--detach", "-f", pre_pull_sha])
     if restored.returncode == 0:
-        print(f"  ✓ Tree returned to {restore if restored.args[-1] != pre_pull_sha else pre_pull_sha[:10]}.")
+        landed = restore
+        print(f"  ✓ Tree returned to {landed if landed != pre_pull_sha else pre_pull_sha[:10]}.")
     else:
         print(f"  ✗ Could not return the tree; recover with: git -C {_m().PROJECT_ROOT} checkout {restore}")
     print(f"  Inspect with: git -C {_m().PROJECT_ROOT} log --oneline -3 && git -C {_m().PROJECT_ROOT} status")
