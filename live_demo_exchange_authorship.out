@@ -1,11 +1,9 @@
-/home/hermes/.hermes/kanban/workspaces/t_44c98868/.vpy/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
-  from starlette.testclient import TestClient as TestClient  # noqa
 ==============================================================================
 PROBE10: bob prepares shared/team.docx, alice uploads the same path (overwrite=true)
 ==============================================================================
 alice upload -> HTTP 200
   shared/team.docx content   : "bob's prepared deliverable"
-  response path              : /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx
+  response path              : /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx
   shared/person_alice/team.docx exists: True content='ALICE CLOBBERED IT'
   verdict: bob's file INTACT = True
 
@@ -34,6 +32,13 @@ delete: alice tries to delete bob's folder file — must be refused
   file survives = True
 
 ==============================================================================
+spot editor (/api/fs/write-text) is a write too — bob's file must survive alice
+==============================================================================
+  editor save to shared/team.docx -> HTTP 200
+  shared/team.docx content: "bob's prepared deliverable"
+  landed at: 'editor clobbered'
+
+==============================================================================
 NO-OP: multi_user=false — the exchange root takes the write, as before
 ==============================================================================
   alice upload to exchange root -> HTTP 200, content='pre-change behaviour'
@@ -45,7 +50,8 @@ NO-OP: host owner — same, even with multi_user ON
   owner upload to exchange root -> HTTP 200, content="owner's file"
   journal row for it: '' (empty = not journalled)
 
-journal: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/.authorship.jsonl
-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-25T23:48:15+00:00"}
-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-25T23:48:15+00:00"}
-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/migrated.docx", "subject": "person/bob", "at": "2026-11-25T23:48:15+00:00"}
+journal: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/.authorship.jsonl
+  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:10+00:00"}
+  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:10+00:00"}
+  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/migrated.docx", "subject": "person/bob", "at": "2026-11-26T00:05:10+00:00"}
+  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:11+00:00"}

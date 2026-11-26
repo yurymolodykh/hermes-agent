@@ -153,6 +153,16 @@ print(f"  file survives = {bobs.is_file()}")
 
 print()
 print("=" * 78)
+print("spot editor (/api/fs/write-text) is a write too — bob's file must survive alice")
+print("=" * 78)
+(exchange / "person_alice").mkdir(exist_ok=True)
+resp = client_for("alice").post("/api/fs/write-text", json={"path": str(team), "content": "editor clobbered"})
+print(f"  editor save to shared/team.docx -> HTTP {resp.status_code}")
+print(f"  shared/team.docx content: {team.read_text(encoding='utf-8')!r}")
+print(f"  landed at: {(exchange / 'person_alice' / 'team.docx').read_text(encoding='utf-8')!r}")
+
+print()
+print("=" * 78)
 print("NO-OP: multi_user=false — the exchange root takes the write, as before")
 print("=" * 78)
 hermes_acl_identity.multi_user_enabled = lambda: False
