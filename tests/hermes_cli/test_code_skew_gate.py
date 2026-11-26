@@ -172,6 +172,9 @@ def test_the_real_incident_pair_is_refused_by_contract():
     assert problems, "this is the incident: a real split must not compare as equal"
     assert "prompt_cache_clock" in problems[0]
     assert gate.compare_contracts(running, disk, frozenset()) == ()
+    # the split is visible in both directions, not only as a refusal
+    assert "prompt_cache_clock" in gate.field_set_differences(disk, running)[0]
+    assert "prompt_cache_clock" in gate.field_set_differences(running, disk)[0]
 
 
 def test_the_pre_split_store_layout_is_parsed_too():
