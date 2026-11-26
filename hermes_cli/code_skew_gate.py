@@ -48,16 +48,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, FrozenSet, Iterable, Optional
 
-# The keys ``usage.main`` accepts on top of ``_MODEL_USAGE_FIELDS`` — ``hermes_state_runtime.
-# _worker_usage``'s non-auxiliary branch: ``_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute',
-# 'task'}``. Kept here as one literal so both sides of the comparison are computed the same way.
-_USAGE_MAIN_EXTRA_FIELDS = frozenset({"pricing_version", "absolute", "task"})
+# ``usage.main``'s accepted field set is NEVER restated here: it is read out of the code that
+# enforces it — the ``allowed = ...`` expression of ``_worker_usage`` in the runtime, evaluated
+# against the module constants that expression names. A literal copy of that set in this gate goes
+# stale the moment the handler's contract moves (that is how ``prompt_cache_clock`` stayed
+# invisible), so the only thing pinned here is WHICH files to look in: two repository layouts carry
+# the same handler (a checkout before and after the store's module split), and the gate must parse
+# both or it is blind to exactly the incident it exists for.
+_FIELD_LAYOUTS = (
+    ("hermes_state_usage.py", "hermes_state_runtime.py"),
+    ("persistence/sqlite/conversation/_store/usage.py", "persistence/sqlite/workers/_receipt.py"),
+)
+_DISPATCH_LAYOUTS = ("hermes_state_runtime.py", "persistence/sqlite/workers/_receipt.py")
+_LIFECYCLE_MODULES = ("hermes_state_worker_lifecycle.py", "persistence/sqlite/workers/_lifecycle.py")
+_COMPRESSION_MODULES = ("hermes_state_worker_compression.py",
+                        "persistence/sqlite/workers/_compression.py")
+_STORE_MODULES = ("agent/runtime_session_store.py",)
 
 _USAGE_MODULE = "hermes_state_usage.py"
 _RUNTIME_MODULE = "hermes_state_runtime.py"
-_LIFECYCLE_MODULE = "hermes_state_worker_lifecycle.py"
-_COMPRESSION_MODULE = "hermes_state_worker_compression.py"
-_STORE_MODULE = "agent/runtime_session_store.py"
+_LIFECYCLE_MODULE = _LIFECYCLE_MODULES[0]
+_COMPRESSION_MODULE = _COMPRESSION_MODULES[0]
+_STORE_MODULE = _STORE_MODULES[0]
+
+#: Every file the extraction may look at. Read once per side; a layout that does not exist in this
+#: checkout simply reads as ``None``.
+_CANDIDATE_PATHS = tuple(dict.fromkeys(
+    [p for pair in _FIELD_LAYOUTS for p in pair]
+    + list(_DISPATCH_LAYOUTS) + list(_LIFECYCLE_MODULES) + list(_COMPRESSION_MODULES)
+    + list(_STORE_MODULES)))
 
 _ANONYMOUS_BASE = "HEAD"  # a commit the gateway advertises but this repo cannot resolve
 
