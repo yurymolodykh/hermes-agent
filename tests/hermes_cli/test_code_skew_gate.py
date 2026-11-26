@@ -139,6 +139,13 @@ def test_two_editions_differing_only_in_extras_are_not_mistaken_for_one_contract
     # reverse order: parsed on both sides (so the difference is visible), yet allowed by the
     # subset rule — a gateway ahead of disk is an ordinary forward commit.
     assert gate.compare_contracts(without_clock, with_clock, frozenset()) == ()
+    # ...but the difference is never invisible: the symmetric view names the field from BOTH sides,
+    # which is precisely what the blind revision could not do.
+    forward = gate.field_set_differences(without_clock, with_clock)
+    assert forward and "prompt_cache_clock" in forward[0]
+    backward = gate.field_set_differences(with_clock, without_clock)
+    assert backward and "prompt_cache_clock" in backward[0]
+    assert gate.field_set_differences(with_clock, with_clock) == ()
 
 
 def test_the_real_incident_pair_is_refused_by_contract():

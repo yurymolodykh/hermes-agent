@@ -343,6 +343,24 @@ def required_operations_from_sources(read: Callable[[str], Optional[str]]) -> Op
     return frozenset(ops) if ops else None
 
 
+def field_set_differences(left: RpcContract, right: RpcContract) -> tuple[str, ...]:
+    """Every field by which the two ``usage.main`` sets differ, in WHICHEVER direction.
+
+    Symmetric on purpose. ``compare_contracts`` answers "may this worker run?" (a subset test, so a
+    gateway ahead of disk passes). This answers "do the two sides even describe the same set?" — the
+    question the earlier revision could not answer at all, because it parsed only the model fields
+    and never the extras. A difference the gate cannot see is a difference it cannot report.
+    """
+    only_left = sorted(set(left.usage_main_fields) - set(right.usage_main_fields))
+    only_right = sorted(set(right.usage_main_fields) - set(left.usage_main_fields))
+    differences: list[str] = []
+    if only_left:
+        differences.append("only the first side accepts " + ", ".join(only_left))
+    if only_right:
+        differences.append("only the second side accepts " + ", ".join(only_right))
+    return tuple(differences)
+
+
 def compare_contracts(disk: RpcContract, gateway: RpcContract,
                       required_ops: Optional[Iterable[str]] = None) -> tuple[str, ...]:
     """Human-readable incompatibilities: the disk side must be a SUBSET of what the gateway serves."""
