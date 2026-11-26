@@ -167,6 +167,24 @@ def test_the_real_incident_pair_is_refused_by_contract():
     assert gate.compare_contracts(running, disk, frozenset()) == ()
 
 
+def test_the_pre_split_store_layout_is_parsed_too():
+    """A checkout that keeps the handler under ``persistence/sqlite/workers/`` must parse as well.
+
+    Commit ``8fc03744473`` is the shape that caused the incident: the store modules live under
+    ``persistence/sqlite/``, not at the repository root. A gate that only knows the root layout
+    cannot read that side at all, and silently falls back to the history check.
+    """
+    repo = _repo_root()
+    if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", "8fc03744473^{commit}"],
+                      capture_output=True, check=False).returncode != 0:
+        pytest.skip("the pre-split commit is not in this checkout's object database")
+    contract = gate.commit_contract("8fc03744473", repo)
+    assert contract is not None, "the pre-split store layout must parse into a contract"
+    assert "prompt_cache_clock" in contract.usage_main_fields, \
+        "that revision accepts prompt_cache_clock; the gate must see it"
+    assert "usage.main" in contract.operations
+
+
 def test_disk_contract_reads_the_extras_of_this_checkout():
     """``disk_contract()`` on the real checkout matches the handler's own accepted set (D4)."""
     disk = gate.disk_contract(repo=_repo_root())
