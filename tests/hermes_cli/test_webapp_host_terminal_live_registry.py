@@ -160,16 +160,24 @@ def _mint(identity: dict) -> str:
 
 
 def _dial(host: FastAPI, ticket: str, profile: str | None) -> int | None:
-    """Dial ``/api/host-terminal``; return the close code, or None when the shell was accepted."""
+    """Dial ``/api/host-terminal``; return the close code, or None when the shell was accepted.
+
+    Runs inside the app's lifespan (the host-terminal service only starts there), and reads the
+    metadata frame exactly as ``test_webapp_host_terminal_real_dial`` does.
+    """
     url = f"ws://localhost/api/host-terminal?ticket={ticket}"
     if profile is not None:
         url += f"&profile={profile}"
-    client = TestClient(host, base_url="http://localhost")
-    with client.websocket_connect(url) as ws:
-        payload = json.loads(ws.receive_text())
-        if payload.get("type") == "error" and payload.get("code") in (4401, 4403):
-            return payload["code"]
-        return None
+    with TestClient(host) as client:
+        try:
+            with client.websocket_connect(url) as ws:
+                from hermes_cli import web_host_terminal
+
+                text = ws.receive_text()
+                assert text.startswith(web_host_terminal.META_PREFIX), text[:120]
+        except WebSocketDisconnect as closed:
+            return closed.code
+    return None
 
 
 def _grade(identity: dict, profile: str) -> tuple[bool, str]:
@@ -251,22 +259,28 @@ def test_a_launch_home_dial_belongs_to_the_owner_alone(live_home):
 # ── the real login shape: a ``basic`` session mints ``person/<login>`` through the LIVE users file ─
 
 def test_a_password_login_resolves_to_the_same_registry_person(live_home):
-    """``principal_subject`` for Maria's real login names the registry's ``person/maria.safronova``.
+    """A `basic` login and a `local` ticket both name the registry's ``person/<login>`` record.
 
-    This is the assertion the previous test could not make: ``resolve_subject`` was replaced by
-    ``person/<login>``, hiding that the registry is keyed the same way only AFTER expansion.
+    The two shapes differ — ``resolve_subject`` returns the BARE ``person/<login>`` for a password
+    login, while ``gateway.session_identity`` wraps a ``local`` identity as
+    ``auth:v1:[provider,"",user_id]`` — and only the wrapped one was broken. Both must reach the
+    same record, which is the whole point of resolving through the ACL rather than by string shape.
     """
     from gateway.owner_identity import principal_subject
 
-    subject = principal_subject(MARIA_LOGIN_IDENTITY)
-    assert subject == 'auth:v1:["basic","","person/maria.safronova"]', (
-        f"the minted login subject; got {subject!r}")
-    # Unwrapped and wrapped must both name the registry's record (the defect was the wrapped form).
-    assert prof_acl.registry_slug("person/maria.safronova") == "person/maria.safronova"
-    assert prof_acl.registry_slug(subject) == "person/maria.safronova", (
-        f"the wrapped login must expand to the person; got {prof_acl.registry_slug(subject)!r}")
-    assert prof_acl.allows(subject, MARIA) is True
-    assert prof_acl.allows(subject, ORCH) is False
+    bare = principal_subject(MARIA_LOGIN_IDENTITY)
+    assert bare == "person/maria.safronova", f"a password login names its person; got {bare!r}"
+    wrapped = principal_subject(MARIA_TICKET_IDENTITY)
+    assert wrapped == 'auth:v1:["local","","person/maria.safronova"]', (
+        f"a local ticket is wrapped; got {wrapped!r}")
+    # The registry is exact-match on purpose; the expansion is what recovers the person.
+    assert hb.load_cached().person_of(wrapped) is None
+    assert prof_acl.registry_slug(bare) == "person/maria.safronova"
+    assert prof_acl.registry_slug(wrapped) == "person/maria.safronova", (
+        f"the wrapped ticket must expand to the person; got {prof_acl.registry_slug(wrapped)!r}")
+    for subject in (bare, wrapped):
+        assert prof_acl.allows(subject, MARIA) is True, subject
+        assert prof_acl.allows(subject, ORCH) is False, subject
 
 
 def test_the_minted_subject_resolves_through_the_acls_own_expansion(live_home):
