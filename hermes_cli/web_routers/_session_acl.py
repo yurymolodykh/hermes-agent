@@ -23,11 +23,14 @@ Nothing here decides ownership by itself; it only routes the store's own compari
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable, Optional, Sequence
 
 from fastapi import HTTPException, Request
 
 NOT_FOUND = "Session not found"
+
+logger = logging.getLogger(__name__)
 
 
 def session_scope(request: Optional[Request]) -> Optional[list[str]]:
@@ -37,6 +40,44 @@ def session_scope(request: Optional[Request]) -> Optional[list[str]]:
         return None if not acl_enabled() else []
     from hermes_acl_scope import request_owner_scope
     return request_owner_scope(request)
+
+
+def session_profile(request: Optional[Request], profile: Optional[str]) -> Optional[str]:
+    """The profile whose store a SESSION route acts on when the caller named none.
+
+    Naming no ``?profile=`` used to mean "whichever home this process launched with", which on a
+    shared host is the owner's ROOT store: a signed-in person's own conversations therefore never
+    appeared, and their sidebar read somebody else's ``state.db`` (scoped to their stamps, so the
+    page came back empty rather than foreign — the store was simply the wrong one).
+
+    * a NAMED profile — returned as given, unchanged: this seam only supplies a default;
+    * ``acl.multi_user`` off, or the host OWNER — unchanged (the launch profile, as always);
+    * nobody verified on the request — unchanged: the store scope already fails closed for it;
+    * a person whose registry record names no profile, or names one that is not on disk —
+      unchanged, for the same reason (a broken registry must not turn a sidebar into a 404);
+    * a person with their own orchestrator root — that root, which is what the profiles and
+      results surfaces already answer for the same caller (``hermes_acl_results.resolve_profile``).
+
+    The redirect only ever NARROWS: it replaces the launch store with a store the caller owns,
+    never with somebody else's, and it never widens what ``acl.enabled``'s row scope admits.
+    """
+    if str(profile or "").strip():
+        return profile
+    from hermes_acl_results import profile_names, request_subject, scoped
+
+    if not scoped(request):
+        return profile
+    owns = profile_names(request_subject(request))
+    if not owns:
+        logger.debug("acl sessions: caller owns no profile — keeping the store's own fail-closed answer")
+        return profile
+    from hermes_cli.profiles import profile_exists
+
+    if not profile_exists(owns[0]):
+        logger.warning("acl sessions: the caller's own profile %r is not on disk — keeping the "
+                       "launch store (row scope still applies)", owns[0])
+        return profile
+    return owns[0]
 
 
 def row_outside(row: Any, scope: Optional[Sequence[str]]) -> bool:
