@@ -1,0 +1,115 @@
+From e38dee77ae1aabeb0bbdc7083eda410691cfd60f Mon Sep 17 00:00:00 2001
+From: Hermes <ops@molodykh.su>
+Date: Thu, 26 Nov 2026 03:05:36 +0300
+Subject: [PATCH] =?UTF-8?q?fix(acl):=20=D0=B7=D0=B0=D0=BF=D0=B8=D1=81?=
+ =?UTF-8?q?=D1=8C=20=D0=B2=20=D0=BE=D0=B1=D0=BC=D0=B5=D0=BD=D0=BD=D0=B8?=
+ =?UTF-8?q?=D0=BA=20=D1=82=D0=BE=D0=BB=D1=8C=D0=BA=D0=BE=20=D0=B2=20=D1=81?=
+ =?UTF-8?q?=D0=B2=D0=BE=D0=B9=20=D0=BF=D0=BE=D0=B4=D0=BA=D0=B0=D1=82=D0=B0?=
+ =?UTF-8?q?=D0=BB=D0=BE=D0=B3,=20=D1=87=D1=83=D0=B6=D0=BE=D0=B9=20=D1=84?=
+ =?UTF-8?q?=D0=B0=D0=B9=D0=BB=20=D0=BD=D0=B5=20=D0=BF=D0=B5=D1=80=D0=B5?=
+ =?UTF-8?q?=D0=B7=D0=B0=D0=BF=D0=B8=D1=81=D1=8B=D0=B2=D0=B0=D0=B5=D1=82?=
+ =?UTF-8?q?=D1=81=D1=8F=20(L2-c=20B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Обменник shared/ не имеет владельца по OS (одна учётная запись, одна группа,
+g+w), а обработчик загрузки решал по флагу overwrite из запроса — probe10:
+ALLOW на перезапись shared/team.docx любым проверенным субъектом, то есть
+один сотрудник молча затирал файл, подготовленный для другого.
+
+Правило одно для всех четырёх пишущих маршрутов обменника (upload обоих
+видов, mkdir, delete, редактор fs/write-text):
+
+- scoped-субъект пишет только в shared/<subject-slug>/; имя в корне
+  обменника переносится в свой подкаталог, чужой подкаталог — 403;
+- предохранитель поверх раскладки: перезапись файла, автором которого
+  журнал {HERMES_HOME}/shared/.authorship.jsonl называет другого субъекта,
+  — 409; свой файл переписывается; неучтённый файл не отказывается
+  («не определить» != «не твоё»), иначе человек запирается в своей папке;
+- удаление чужого файла обменника — 403 (уничтожение доставки = та же
+  потеря, что перезапись);
+- редактор не строит деревья: адресует папку вместо тихого создания;
+- acl.multi_user=false и владелец хоста — прежнее поведение, no-op.
+
+file_roots / _exchange_dirs не менялись; delivery/ и _acl_delivery_path
+(зона P0-A2) не тронуты — это разные механизмы.
+
+Тесты: tests/hermes_acl 89 passed (68 базы + 21 новых); новые падают
+на коде до правки (16 failed / 5 passed при откате к 7e7361e0);
+смежные test_web_server_files/test_results_route_scope/
+test_webapp_upload_limit 135 passed; ruff чист.
+Живая проба live_demo_exchange_authorship.py — probe10 закрыт.
+---
+ live_demo_exchange_authorship.out | 20 +++++++++++++-------
+ live_demo_exchange_authorship.py  | 10 ++++++++++
+ 2 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/live_demo_exchange_authorship.out b/live_demo_exchange_authorship.out
+index 7dfc5aab094..c290d5dbe76 100644
+--- a/live_demo_exchange_authorship.out
++++ b/live_demo_exchange_authorship.out
+@@ -1,11 +1,9 @@
+-/home/hermes/.hermes/kanban/workspaces/t_44c98868/.vpy/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+-  from starlette.testclient import TestClient as TestClient  # noqa
+ ==============================================================================
+ PROBE10: bob prepares shared/team.docx, alice uploads the same path (overwrite=true)
+ ==============================================================================
+ alice upload -> HTTP 200
+   shared/team.docx content   : "bob's prepared deliverable"
+-  response path              : /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx
++  response path              : /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx
+   shared/person_alice/team.docx exists: True content='ALICE CLOBBERED IT'
+   verdict: bob's file INTACT = True
+ 
+@@ -33,6 +31,13 @@ delete: alice tries to delete bob's folder file — must be refused
+   DELETE -> HTTP 403: Only the user who created this exchange file may delete it
+   file survives = True
+ 
++==============================================================================
++spot editor (/api/fs/write-text) is a write too — bob's file must survive alice
++==============================================================================
++  editor save to shared/team.docx -> HTTP 200
++  shared/team.docx content: "bob's prepared deliverable"
++  landed at: 'editor clobbered'
++
+ ==============================================================================
+ NO-OP: multi_user=false — the exchange root takes the write, as before
+ ==============================================================================
+@@ -45,7 +50,8 @@ NO-OP: host owner — same, even with multi_user ON
+   owner upload to exchange root -> HTTP 200, content="owner's file"
+   journal row for it: '' (empty = not journalled)
+ 
+-journal: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/.authorship.jsonl
+-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-25T23:48:15+00:00"}
+-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-25T23:48:15+00:00"}
+-  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-7w8gga3a/.hermes/shared/person_alice/migrated.docx", "subject": "person/bob", "at": "2026-11-25T23:48:15+00:00"}
++journal: /home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/.authorship.jsonl
++  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:10+00:00"}
++  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:10+00:00"}
++  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/migrated.docx", "subject": "person/bob", "at": "2026-11-26T00:05:10+00:00"}
++  {"path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/l2c-partb-hmkp_xnx/.hermes/shared/person_alice/team.docx", "subject": "person/alice", "at": "2026-11-26T00:05:11+00:00"}
+diff --git a/live_demo_exchange_authorship.py b/live_demo_exchange_authorship.py
+index 0e69cfac823..80cea76066e 100644
+--- a/live_demo_exchange_authorship.py
++++ b/live_demo_exchange_authorship.py
+@@ -151,6 +151,16 @@ resp = client_for("alice").request("DELETE", "/api/files", json={"path": str(bob
+ print(f"  DELETE -> HTTP {resp.status_code}: {resp.json().get('detail')}")
+ print(f"  file survives = {bobs.is_file()}")
+ 
++print()
++print("=" * 78)
++print("spot editor (/api/fs/write-text) is a write too — bob's file must survive alice")
++print("=" * 78)
++(exchange / "person_alice").mkdir(exist_ok=True)
++resp = client_for("alice").post("/api/fs/write-text", json={"path": str(team), "content": "editor clobbered"})
++print(f"  editor save to shared/team.docx -> HTTP {resp.status_code}")
++print(f"  shared/team.docx content: {team.read_text(encoding='utf-8')!r}")
++print(f"  landed at: {(exchange / 'person_alice' / 'team.docx').read_text(encoding='utf-8')!r}")
++
+ print()
+ print("=" * 78)
+ print("NO-OP: multi_user=false — the exchange root takes the write, as before")
+-- 
+2.34.1
+
