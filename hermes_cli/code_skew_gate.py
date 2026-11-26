@@ -56,13 +56,14 @@ from typing import Any, Callable, FrozenSet, Iterable, Optional
 # the same handler (a checkout before and after the store's module split), and the gate must parse
 # both or it is blind to exactly the incident it exists for.
 _FIELD_LAYOUTS = (
-    ("hermes_state_usage.py", "hermes_state_runtime.py"),
-    ("persistence/sqlite/conversation/_store/usage.py", "persistence/sqlite/workers/_receipt.py"),
+    ("hermes_state_usage.py", "hermes_state_runtime.py",
+     "hermes_state_worker_lifecycle.py", "hermes_state_worker_compression.py"),
+    ("persistence/sqlite/conversation/_store/usage.py", "persistence/sqlite/workers/_receipt.py",
+     "persistence/sqlite/workers/_lifecycle.py", "persistence/sqlite/workers/_compression.py"),
 )
 _DISPATCH_LAYOUTS = ("hermes_state_runtime.py", "persistence/sqlite/workers/_receipt.py")
-_LIFECYCLE_MODULES = ("hermes_state_worker_lifecycle.py", "persistence/sqlite/workers/_lifecycle.py")
-_COMPRESSION_MODULES = ("hermes_state_worker_compression.py",
-                        "persistence/sqlite/workers/_compression.py")
+_LIFECYCLE_MODULES = tuple(layout[2] for layout in _FIELD_LAYOUTS)
+_COMPRESSION_MODULES = tuple(layout[3] for layout in _FIELD_LAYOUTS)
 _STORE_MODULES = ("agent/runtime_session_store.py",)
 
 _USAGE_MODULE = "hermes_state_usage.py"
@@ -134,26 +135,130 @@ def _looks_like_op(value: str) -> bool:
     return bool(head) and bool(tail) and "." not in tail and value.islower()
 
 
-def _usage_fields_from(source: str) -> Optional[frozenset[str]]:
-    """``_MODEL_USAGE_FIELDS`` from a ``hermes_state_usage.py`` source, else ``None``."""
+def _set_literal(node: ast.AST) -> Optional[set[str]]:
+    """The string members of a set/list/tuple literal (``frozenset({...})``'s argument too)."""
+    if isinstance(node, ast.Call) and node.args:
+        node = node.args[0]
+    if not isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        return None
+    return {e.value for e in node.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+
+
+def _module_constants(source: str) -> dict[str, set[str]]:
+    """Every module-level ``NAME = frozenset((...))`` (any literal container) in *source*."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return None
+        return {}
+    out: dict[str, set[str]] = {}
     for node in tree.body:
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(t, ast.Name) and t.id == "_MODEL_USAGE_FIELDS" for t in targets):
+        members = _set_literal(node.value) if node.value is not None else None
+        if members is None:
             continue
-        value = node.value
-        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.args:
-            value = value.args[0]
-        if not isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        for target in targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = members
+    return out
+
+
+def _eval_field_set(node: ast.AST, consts: dict[str, set[str]],
+                    depth: int = 0) -> Optional[set[str]]:
+    """Evaluate a set expression over literals and module constants: ``A | B``, ``A - B``, ``A & B``.
+
+    ``None`` when the expression leans on anything else (a call, an attribute, an unknown name):
+    a contract half-understood is worse than no contract, because the gate would then compare a
+    smaller set than the handler enforces and pass a real skew.
+    """
+    if depth > 8:
+        return None
+    literal = _set_literal(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Name):
+        found = consts.get(node.id)
+        return set(found) if found is not None else None
+    if isinstance(node, ast.BinOp):
+        left = _eval_field_set(node.left, consts, depth + 1)
+        right = _eval_field_set(node.right, consts, depth + 1)
+        if left is None or right is None:
             return None
-        fields = [e.value for e in value.elts
-                  if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-        return frozenset(fields) if fields else None
+        if isinstance(node.op, ast.BitOr):
+            return left | right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.BitAnd):
+            return left & right
+    return None
+
+
+def _main_allowed_expr(func: ast.FunctionDef) -> Optional[ast.AST]:
+    """The ``allowed = ...`` expression of *func*'s NON-auxiliary branch (an ``IfExp`` aware walk).
+
+    The handler computes two sets: the ``usage.auxiliary`` subset and the ``usage.main`` set this
+    gate needs. Only the main one is the contract of a normal worker receipt, so both spellings are
+    handled — ``allowed = X if auxiliary else Y`` and ``if auxiliary: allowed = X`` / ``else: Y``.
+    """
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp) \
+                and any(isinstance(t, ast.Name) and t.id == "allowed" for t in node.targets):
+            return node.value.orelse
+        if not isinstance(node, ast.If):
+            continue
+        test_names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "auxiliary" not in test_names:
+            continue
+        # ``if auxiliary: ... else: <main>`` — the main branch is the else body (or the
+        # ``if not auxiliary:`` spelling, where it is the body).
+        main_body = node.orelse if not _negated_auxiliary(node.test) else node.body
+        for inner in main_body:
+            if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.IfExp) \
+                    and any(isinstance(t, ast.Name) and t.id == "allowed" for t in inner.targets):
+                return inner.value.orelse
+            if isinstance(inner, ast.Assign) \
+                    and any(isinstance(t, ast.Name) and t.id == "allowed" for t in inner.targets):
+                return inner.value
+    return None
+
+
+def _negated_auxiliary(test: ast.AST) -> bool:
+    return isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+
+
+def _usage_fields_from(source: str, runtime_source: Optional[str] = None) -> Optional[frozenset[str]]:
+    """The field set ``usage.main`` accepts, read out of the code that enforces it.
+
+    *source* is the module declaring the constants (``_MODEL_USAGE_FIELDS`` and the named extras);
+    *runtime_source* is the module whose ``_worker_usage`` builds the accepted set. With both, the
+    answer is that handler's own expression evaluated over those constants — so a field added to
+    either constant lands here without touching this gate. Without a runtime source the model-field
+    constant plus a named ``USAGE_MAIN_EXTRA_FIELDS``/``USAGE_MAIN_FIELDS`` constant is used, and
+    only if neither exists is the bare model set returned.
+    """
+    consts = _module_constants(source)
+    model = consts.get("_MODEL_USAGE_FIELDS")
+    named_extras = consts.get("USAGE_MAIN_EXTRA_FIELDS") or consts.get("USAGE_MAIN_FIELDS")
+    if runtime_source:
+        try:
+            tree = ast.parse(runtime_source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.FunctionDef) and node.name == "_worker_usage"):
+                    continue
+                expr = _main_allowed_expr(node)
+                fields = _eval_field_set(expr, consts) if expr is not None else None
+                if fields:
+                    return frozenset(fields)
+                break
+    if model is not None:
+        return frozenset(model | (named_extras or set()))
+    if named_extras:
+        return frozenset(named_extras)
     return None
 
 
@@ -192,21 +297,34 @@ def _dispatch_ops_from(source: str) -> list[str]:
 
 
 def contract_from_sources(read: Callable[[str], Optional[str]]) -> Optional[RpcContract]:
-    """The RPC contract *read* describes, or ``None`` when the layout is not this one."""
-    usage_source = read(_USAGE_MODULE)
-    fields = _usage_fields_from(usage_source) if usage_source else None
-    ops: set[str] = set()
-    runtime_source = read(_RUNTIME_MODULE)
-    if runtime_source:
-        ops.update(_dispatch_ops_from(runtime_source))
-    for module, name in ((_LIFECYCLE_MODULE, "WORKER_LIFECYCLE_HANDLERS"),
-                         (_COMPRESSION_MODULE, "WORKER_COMPRESSION_HANDLERS")):
-        source = read(module)
-        if source:
-            ops.update(_handler_keys_from(source, name))
-    if fields is None or not ops:
-        return None
-    return RpcContract(usage_main_fields=fields, operations=frozenset(ops))
+    """The RPC contract *read* describes, or ``None`` when the layout is not one of the known ones.
+
+    Each entry of ``_FIELD_LAYOUTS`` is one repository layout: the module with the named field
+    constants and the module whose ``_worker_usage`` builds the accepted set. The gate takes the
+    first layout whose field set parses, and pairs it with that layout's dispatch / lifecycle /
+    compression handler modules, so a checkout on either side of the store's module split yields a
+    complete contract instead of a blind one.
+    """
+    for usage_module, runtime_module, lifecycle_module, compression_module in _FIELD_LAYOUTS:
+        usage_source = read(usage_module)
+        if not usage_source:
+            continue
+        runtime_source = read(runtime_module)
+        fields = _usage_fields_from(usage_source, runtime_source)
+        if fields is None:
+            continue
+        ops: set[str] = set()
+        if runtime_source:
+            ops.update(_dispatch_ops_from(runtime_source))
+        for handler_module, handler_map in ((lifecycle_module, "WORKER_LIFECYCLE_HANDLERS"),
+                                            (compression_module, "WORKER_COMPRESSION_HANDLERS")):
+            source = read(handler_module)
+            if source:
+                ops.update(_handler_keys_from(source, handler_map))
+        if not ops:
+            continue
+        return RpcContract(usage_main_fields=fields, operations=frozenset(ops))
+    return None
 
 
 def required_operations_from_sources(read: Callable[[str], Optional[str]]) -> Optional[frozenset[str]]:
@@ -349,35 +467,30 @@ def _same_commit(left: str, right: str) -> bool:
 
 
 def _diverged(left: str, right: str, repo: Optional[Path] = None) -> Optional[bool]:
-    """``True`` when the two commits sit on unrelated histories, ``None`` when unknowable."""
+    """``True`` when the two commits sit on unrelated histories, ``None`` when unknowable.
+
+    The question is literally "is there a merge base": ``git merge-base`` answers it in one call and
+    a non-empty answer means the two commits share a history — including two SIBLING branches, whose
+    merge base is their fork point. Deciding this by two ``merge-base --is-ancestor`` calls, as an
+    earlier revision did, reports every non-ancestor pair as "no shared history", which refuses a
+    healthy host whose worker and gateway merely sit on different branches of one repository.
+    """
     root = repo or _repo_dir()
     if root is None:
         return None
-
-    def _is_ancestor(a: str, b: str) -> Optional[bool]:
-        try:
-            res = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", a, b],
-                                 capture_output=True, timeout=10, check=False)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if res.returncode == 0:
-            return True
-        if res.returncode == 1:
-            return False
-        return None  # unknown revision / broken repo
-
     try:
-        one_way = _is_ancestor(left, right)
-        if one_way is None:
-            return None
-        if one_way:
-            return False
-        other_way = _is_ancestor(right, left)
-        if other_way is None:
-            return None
-        return not other_way
-    except Exception:
+        res = subprocess.run(["git", "-C", str(root), "merge-base", left, right],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
         return None
+    if res.returncode == 0:
+        # exit 0 carries the merge base: shared history, however far apart the two tips are.
+        return not (res.stdout or "").strip()
+    if res.returncode == 1:
+        # exit 1 is git's "no merge base": the only proven-divergence answer.
+        return True
+    return None  # unknown revision / broken repo / ambiguous arguments
 
 
 _UNSET: Any = object()
