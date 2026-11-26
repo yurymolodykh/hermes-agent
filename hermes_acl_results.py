@@ -126,9 +126,19 @@ def _is_owner(subject: Any) -> bool:
 
 def scoped(request: Any) -> bool:
     """Whether THIS request is subject-scoped (multi-user on and the caller is not the owner)."""
+    return scoped_subject(request_subject(request))
+
+
+def scoped_subject(subject: Any) -> bool:
+    """Whether *subject* is subject-scoped — the same rule as :func:`scoped`, without a request.
+
+    A gateway delivery seam (MEDIA attachment, background reply) has no FastAPI request: the
+    sender is the turn's actor (``HERMES_SESSION_ACTOR_ID``). It needs the identical answer, so
+    the switch and the owner bypass live here once instead of being re-derived per call site.
+    """
     if not _multi_user():
         return False
-    return not _is_owner(request_subject(request))
+    return not _is_owner(str(subject or "").strip())
 
 
 def _registry():
@@ -463,7 +473,15 @@ def file_roots(request: Any) -> Optional[tuple[Path, ...]]:
     """
     if not scoped(request):
         return None
-    subject = request_subject(request)
+    return subject_roots(request_subject(request))
+
+
+def subject_roots(subject: Any) -> tuple[Path, ...]:
+    """The directories *subject* may read and write — the root set of :func:`file_roots`.
+
+    Split out so a caller that already knows WHO is asking (a gateway turn's actor) does not have
+    to fabricate an HTTP request: the roots themselves are computed exactly as before.
+    """
     # A signed-in dashboard subject is a composite (``auth:v1:[provider, issuer, user_id]``), which
     # the bindings registry does not key profiles by: resolving it to the person's stamps first is
     # what makes the roots non-empty for a cookie login. A bare stamp still answers as before.
@@ -501,6 +519,23 @@ def path_allowed(request: Any, target: Any) -> bool:
     roots = file_roots(request)
     if roots is None:
         return True
+    return _within(roots, target)
+
+
+def path_allowed_for_subject(subject: Any, target: Any) -> bool:
+    """Whether *target* lies inside *subject*'s root — the :func:`path_allowed` rule, no request.
+
+    ``None``-root semantics are preserved for the caller's sake: an UNSCOPED subject (multi-user
+    off, or the host owner) is allowed anything, exactly as :func:`path_allowed` answers for their
+    request. A scoped subject with no established identity gets an empty root set and is refused.
+    """
+    if not scoped_subject(subject):
+        return True
+    return _within(subject_roots(subject), target)
+
+
+def _within(roots, target: Any) -> bool:
+    """Containment of the resolved *target* in *roots* (the root itself included)."""
     resolved = _real(target)
     if resolved is None:
         return False

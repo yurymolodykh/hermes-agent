@@ -1087,6 +1087,101 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     return None
 
 
+def _delivery_subject(source: Any = None) -> str:
+    """The person a reply is being delivered to, for the per-person delivery gate (#L2-c).
+
+    The turn's actor is authoritative (``HERMES_SESSION_ACTOR_ID``, :func:`hermes_acl_scope.
+    caller_subject`); the sending ``SessionSource`` is the fallback for a delivery that runs
+    outside a bound turn (a background completion, a replayed notification). ``""`` means "no
+    person established", which the gate treats as the pre-change behaviour only while
+    ``acl.multi_user`` is off — a scoped empty subject is refused, never widened.
+    """
+    try:
+        from hermes_acl_scope import caller_subject
+
+        actor = caller_subject()
+    except Exception:  # a build without the gateway ACL modules keeps the old behaviour
+        logger.debug("delivery subject: caller_subject unavailable", exc_info=True)
+        actor = ""
+    return actor or str(getattr(source, "user_id", "") or "").strip()
+
+
+def _hand_over_to_exchange(safe_path: str, subject: str) -> Optional[str]:
+    """Move *safe_path* into the team exchange under the caller's own subfolder, or ``None``.
+
+    A file in somebody else's personal tree answers 403 to the person it was meant for — correct,
+    and useless as a delivery. ``{HERMES_HOME}/shared/<subject-slug>/`` is readable by every
+    verified person (it is one of their file roots), so the handover is a MOVE: the deliverable
+    lands where the recipient can download it instead of a link that fails.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        from tools.memory_tool import _subject_dirname
+
+        slug = _subject_dirname(subject)
+        if not slug:
+            return None
+        folder = Path(get_hermes_home()) / "shared" / slug
+        folder.mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError, ValueError, ImportError):
+        logger.warning("delivery gate: exchange folder unavailable for a handover", exc_info=True)
+        return None
+    source = Path(safe_path)
+    target = folder / (source.name or "file")
+    suffix = 0
+    while target.exists():
+        suffix += 1
+        target = folder / f"{source.stem}-{suffix}{source.suffix}"
+    try:
+        import shutil
+
+        shutil.move(str(source), str(target))
+    except (OSError, RuntimeError, ValueError):
+        logger.warning("delivery gate: could not hand %s over to the exchange",
+                       _log_safe_path(safe_path), exc_info=True)
+        return None
+    return str(target)
+
+
+def _acl_delivery_path(safe_path: str, subject: str, label: str,
+                       dropped: Optional[list[dict]] = None) -> Optional[str]:
+    """Keep an accepted path only when *subject* may READ it; otherwise hand it over or drop it.
+
+    ``validate_media_delivery_path`` answers "is this a host file the gateway may disclose at all"
+    — a denylist, not a person's boundary. Under ``acl.multi_user`` the recipient is a person, so
+    a path outside their roots must not be offered as a link they cannot open: it is moved into
+    the exchange (where they can) and the moved path is returned. When even that is impossible the
+    path is dropped with a reason the caller can show, instead of a 403 at download time.
+    With the flag off — and for the host owner, who is never scoped — this is a no-op.
+    """
+    try:
+        from hermes_acl_results import path_allowed_for_subject
+    except Exception:  # a stripped build: no ACL layer, exactly the previous behaviour
+        logger.debug("delivery gate: ACL policy unavailable", exc_info=True)
+        return safe_path
+    try:
+        if path_allowed_for_subject(subject, safe_path):
+            return safe_path
+    except Exception:  # health: allow BLE001 -- a policy error must not break delivery outright
+        logger.warning("delivery gate: policy error, delivering as before", exc_info=True)
+        return safe_path
+    moved = _hand_over_to_exchange(safe_path, subject)
+    if moved:
+        try:
+            allowed = path_allowed_for_subject(subject, moved)
+        except Exception:  # health: allow BLE001 -- an unverified handover is not a delivery
+            allowed = False
+        if allowed:
+            logger.info("delivery gate: handed %s over to the exchange for its recipient (%s)",
+                        _log_safe_path(safe_path), label)
+            return moved
+    reason = "outside this user's readable folders"
+    logger.warning("Skipping %s (%s): %s", label, reason, _log_safe_path(safe_path))
+    if dropped is not None:
+        dropped.append({"path": safe_path, "reason": reason})
+    return None
+
+
 # Control chars + Unicode line separators (NEL, LS, PS) that log aggregators treat as breaks: a
 # model-emitted path must not forge a log line.
 _LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
@@ -1098,11 +1193,17 @@ def _log_safe_path(path: str) -> str:
 
 
 def _validated_delivery_path(raw_path, session_key: str, label: str,
-                             dropped: Optional[list[dict]] = None) -> Optional[str]:
+                             dropped: Optional[list[dict]] = None,
+                             source: Any = None) -> Optional[str]:
     """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
     host cannot see is retried against the active remote sandbox (ssh/modal/...; #466). When
     ``dropped`` is a list, a rejected path is appended as ``{"path", "reason"}`` so the caller can
-    report the drop instead of booking a delivery that never happened (#115908)."""
+    report the drop instead of booking a delivery that never happened (#115908).
+
+    Delivery is per-PERSON: an accepted host file still has to be readable by the recipient
+    (:func:`_acl_delivery_path` — handover into the exchange, else a reasoned drop). The recipient
+    is the turn's actor, else *source*'s sender.
+    """
     raw = str(raw_path)
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
     if not safe_path:
@@ -1115,7 +1216,8 @@ def _validated_delivery_path(raw_path, session_key: str, label: str,
         logger.warning("Skipping %s (%s): %s", label, reason, _log_safe_path(raw))
         if dropped is not None:
             dropped.append({"path": raw, "reason": reason})
-    return safe_path
+        return None
+    return _acl_delivery_path(safe_path, _delivery_subject(source), label, dropped)
 
 
 def _existing_regular_file(raw: str) -> bool:
@@ -3135,16 +3237,20 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "",
-                                    dropped: Optional[list[dict]] = None) -> list[tuple[str, bool]]:
+                                    dropped: Optional[list[dict]] = None,
+                                    source: Any = None) -> list[tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
         return [
             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
-            if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
+            if (safe_path := _validated_delivery_path(
+                media_path, session_key, "MEDIA directive path", dropped, source=source))]
 
     @staticmethod
-    def filter_local_delivery_paths(file_paths, session_key: str = "") -> list[str]:
+    def filter_local_delivery_paths(file_paths, session_key: str = "",
+                                    source: Any = None) -> list[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
-        safe_paths = (_validated_delivery_path(p, session_key, "local file path") for p in file_paths or [])
+        safe_paths = (_validated_delivery_path(p, session_key, "local file path", source=source)
+                      for p in file_paths or [])
         return [p for p in safe_paths if p]
 
     @staticmethod
@@ -4378,7 +4484,8 @@ class BasePlatformAdapter(ABC):
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
-            media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
+            media_files = self.filter_media_delivery_paths(
+                media_files, session_key=session_key, source=event.source)
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
@@ -4389,7 +4496,8 @@ class BasePlatformAdapter(ABC):
             local_files = []
             if not is_ephemeral_response:
                 local_files, text_content = self.extract_local_files(text_content)
-                local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
+                local_files = self.filter_local_delivery_paths(
+                    local_files, session_key=session_key, source=event.source)
         history = (await self._bounded_history_media_paths_for_session(session_key)
                    if local_files else None)
         if history:
