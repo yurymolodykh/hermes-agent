@@ -8,6 +8,7 @@ turn died ~60 s in. An update must not be able to leave the tree that way: the r
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -49,8 +50,15 @@ def _head(root):
     return _git(root, "rev-parse", "HEAD").strip()
 
 
+def _main_stub(root):
+    """``_m()`` without importing ``hermes_cli.main``: its import settles the REAL checkout's
+    interrupted-pull marker, which is I/O against the live install and forbidden in tests."""
+    stub = SimpleNamespace(PROJECT_ROOT=root)
+    return patch.object(update_cmd, "_m", lambda: stub)
+
+
 def _refuse(root, *, pre_pull_sha, pre_branch="main", release_tag=False):
-    with patch("hermes_cli.main.PROJECT_ROOT", root), \
+    with _main_stub(root), \
             patch.object(update_cmd, "_record_stop") as record:
         with pytest.raises(SystemExit) as exc:
             update_cmd._refuse_detached_off_branch(
@@ -79,8 +87,7 @@ def test_detached_inside_the_branch_history_is_not_refused(repo):
     """A release/tag checkout at a commit the branch contains serves no foreign code."""
     root, branch_sha, _ = repo
     _detach(root, branch_sha)
-    with patch("hermes_cli.main.PROJECT_ROOT", root), \
-            patch.object(update_cmd, "_record_stop") as record:
+    with _main_stub(root), patch.object(update_cmd, "_record_stop") as record:
         update_cmd._refuse_detached_off_branch(
             ["git"], "main", pre_pull_sha=branch_sha, pre_branch="main", release_tag=False)
     record.assert_not_called()
@@ -90,8 +97,7 @@ def test_detached_inside_the_branch_history_is_not_refused(repo):
 def test_a_named_branch_is_never_refused(repo):
     """On a branch the wrong-branch gate judges; this rule only speaks for a detached HEAD."""
     root, branch_sha, _ = repo
-    with patch("hermes_cli.main.PROJECT_ROOT", root), \
-            patch.object(update_cmd, "_record_stop") as record:
+    with _main_stub(root), patch.object(update_cmd, "_record_stop") as record:
         update_cmd._refuse_detached_off_branch(
             ["git"], "main", pre_pull_sha=branch_sha, pre_branch="main", release_tag=False)
     record.assert_not_called()
@@ -101,8 +107,7 @@ def test_release_update_is_exempt(repo):
     """A release lands detached on its tag by design: the rule must not fight it."""
     root, _, foreign_sha = repo
     _detach(root, foreign_sha)
-    with patch("hermes_cli.main.PROJECT_ROOT", root), \
-            patch.object(update_cmd, "_record_stop") as record:
+    with _main_stub(root), patch.object(update_cmd, "_record_stop") as record:
         update_cmd._refuse_detached_off_branch(
             ["git"], "main", pre_pull_sha=foreign_sha, pre_branch="main", release_tag=True)
     record.assert_not_called()
