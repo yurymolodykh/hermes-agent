@@ -984,6 +984,46 @@ def _landed_off_target(git_cmd, target_sha: str, *, merged: bool = True) -> str 
     return landed or "an unreadable HEAD"
 
 
+def _refuse_detached_off_branch(git_cmd, branch, *, pre_pull_sha, pre_branch, release_tag) -> None:
+    """``code update SKIPPED`` + restore when the move left the live tree DETACHED off its branch.
+
+    A release moves the tree onto its tag's exact commit and stays detached there by design, so a
+    release update is exempt. Everything else must end ON ``branch`` or at a commit inside its
+    history: a checkout left detached on a commit no branch contains is how one host came to serve
+    ``8fc03744473`` to workers while its gateway booted ``da0f60614069`` (26.11.2026 03:19) — the
+    two sides then disagreed on ``usage.main`` and every laned turn died ~60 s in. The tree is put
+    back on the branch it came from before the refusal, never left parked on foreign history.
+    """
+    if release_tag or (_current_branch_name(git_cmd) or "").strip() != "HEAD":
+        return  # a release pin, or a named branch: the wrong-branch gate judges that case
+    head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    if not head:
+        return
+    inside_branch = _git_run(git_cmd, ["merge-base", "--is-ancestor", head, f"refs/heads/{branch}"])
+    if inside_branch.returncode == 0:
+        return  # detached inside the branch's own history: nothing foreign is being served
+    restore = (branch if pre_branch in (None, "", "HEAD") else pre_branch)
+    bar = "=" * 68
+    print(f"\n{bar}")
+    print(f"⚠ CODE UPDATE SKIPPED — the checkout was left detached at {head[:10]}, "
+          f"which is not in the history of '{branch}'.")
+    print("  A live tree on foreign history makes the running gateway and any new worker speak "
+          "different code (its persistence RPCs are rejected and each turn dies ~60 s in), so the "
+          "update is not accepted.")
+    restored = _git_run(git_cmd, ["checkout", "--no-guess", restore])
+    if restored.returncode != 0:
+        restored = _git_run(git_cmd, ["checkout", "--detach", pre_pull_sha]) if pre_pull_sha \
+            else restored
+    if restored.returncode == 0:
+        print(f"  ✓ Tree returned to {restore if restored.args[-1] != pre_pull_sha else pre_pull_sha[:10]}.")
+    else:
+        print(f"  ✗ Could not return the tree; recover with: git -C {_m().PROJECT_ROOT} checkout {restore}")
+    print(f"  Inspect with: git -C {_m().PROJECT_ROOT} log --oneline -3 && git -C {_m().PROJECT_ROOT} status")
+    print(bar)
+    _record_stop("detached_off_branch")
+    sys.exit(1)
+
+
 def _refuse_unselected_head(git_cmd, target_sha: str, unmoved: str | None) -> None:
     """``sys.exit(1)`` (the caller settles it as a failed move, its marker still on disk) when git
     landed on a commit other than the armed one (review O2/O3). A HEAD still on ``unmoved`` is
@@ -1071,6 +1111,8 @@ def _pull_updates(
     pull_marker = interrupted_pull_marker(_m().PROJECT_ROOT)
     # A release update moves the tree to its tag, not the branch tip: the marker names what git writes.
     merge_ref = target_ref if target_ref is not None else f"origin/{branch}"
+    # The branch the live tree was on before this move: the detached-off-branch refusal returns it there.
+    pre_branch = _current_branch_name(git_cmd)
     # Every refusal below runs inside the try: its finally names the autostash this run took.
     try:
         target_sha = (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{merge_ref}^{{commit}}"]).stdout
@@ -1100,6 +1142,11 @@ def _pull_updates(
             with _checkout_move(_windows_gateway_resume, target_sha):
                 _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha)
             _refuse_unselected_head(git_cmd, target_sha, pre_pull_sha)  # before the marker goes
+            # 26.11.2026: a move that left the live tree detached on foreign history must not stand —
+            # that is the shape that split the gateway's code from its workers' code.
+            _refuse_detached_off_branch(
+                git_cmd, branch, pre_pull_sha=pre_pull_sha, pre_branch=pre_branch,
+                release_tag=merge_ref != f"origin/{branch}")
         except KeyboardInterrupt:
             raise  # Ctrl-C reached git too (same process group): the tree may be torn, keep the marker
         except BaseException:
