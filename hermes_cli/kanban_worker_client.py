@@ -374,7 +374,7 @@ def _install_stop_handler():
 
     context = _card_context()
 
-    def _on_stop(signum, frame):  # noqa: ARG001 - signal handler signature
+    def _on_stop(signum, frame):
         reason, detail = "unknown", ""
         try:
             from hermes_cli import kanban_stop_reason as ksr

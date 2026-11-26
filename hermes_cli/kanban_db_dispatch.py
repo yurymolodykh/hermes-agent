@@ -2634,7 +2634,7 @@ def _run_reclaim_phase(
     # tick that arrives hours late wakes each card once instead of replaying.
     try:
         result.woken_by_timer = _kbschedule.wake_due_tasks(conn)
-    except Exception:  # noqa: BLE001 - a wake failure must never stop the tick
+    except Exception:
         _kb._log.exception("dispatcher: timed wake phase failed")
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

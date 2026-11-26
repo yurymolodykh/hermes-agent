@@ -66,8 +66,8 @@ _ANONYMOUS_BASE = "HEAD"  # a commit the gateway advertises but this repo cannot
 class RpcContract:
     """What one side of the split speaks: the ``usage.main`` field set and the ``worker.persist`` map."""
 
-    usage_main_fields: FrozenSet[str]
-    operations: FrozenSet[str]
+    usage_main_fields: frozenset[str]
+    operations: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ def _looks_like_op(value: str) -> bool:
     return bool(head) and bool(tail) and "." not in tail and value.islower()
 
 
-def _usage_fields_from(source: str) -> Optional[FrozenSet[str]]:
+def _usage_fields_from(source: str) -> Optional[frozenset[str]]:
     """``_MODEL_USAGE_FIELDS`` from a ``hermes_state_usage.py`` source, else ``None``."""
     try:
         tree = ast.parse(source)
@@ -190,7 +190,7 @@ def contract_from_sources(read: Callable[[str], Optional[str]]) -> Optional[RpcC
     return RpcContract(usage_main_fields=fields, operations=frozenset(ops))
 
 
-def required_operations_from_sources(read: Callable[[str], Optional[str]]) -> Optional[FrozenSet[str]]:
+def required_operations_from_sources(read: Callable[[str], Optional[str]]) -> Optional[frozenset[str]]:
     """Operations this checkout's worker store actually calls (``_apply('<op>')`` constants)."""
     source = read(_STORE_MODULE)
     if not source:
@@ -239,7 +239,7 @@ def disk_code_sha() -> Optional[str]:
 
 def _repo_dir() -> Optional[Path]:
     try:
-        from hermes_cli.version_info import _resolve_repo_dir  # noqa: PLC2701 — the one resolver
+        from hermes_cli.version_info import _resolve_repo_dir
 
         return _resolve_repo_dir()
     except Exception:
@@ -271,7 +271,7 @@ def commit_contract(sha: str, repo: Optional[Path] = None) -> Optional[RpcContra
         try:
             res = subprocess.run(["git", "-C", str(root), "show", f"{sha}:{rel}"],
                                  capture_output=True, text=True, encoding="utf-8",
-                                 errors="replace", timeout=10)
+                                 errors="replace", timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
         return res.stdout if res.returncode == 0 and res.stdout else None
@@ -279,7 +279,7 @@ def commit_contract(sha: str, repo: Optional[Path] = None) -> Optional[RpcContra
     return contract_from_sources(read)
 
 
-def _required_ops(repo: Optional[Path] = None) -> Optional[FrozenSet[str]]:
+def _required_ops(repo: Optional[Path] = None) -> Optional[frozenset[str]]:
     root = repo or _repo_dir()
     if root is None:
         return None
@@ -338,7 +338,7 @@ def _diverged(left: str, right: str, repo: Optional[Path] = None) -> Optional[bo
     def _is_ancestor(a: str, b: str) -> Optional[bool]:
         try:
             res = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", a, b],
-                                 capture_output=True, timeout=10)
+                                 capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
         if res.returncode == 0:

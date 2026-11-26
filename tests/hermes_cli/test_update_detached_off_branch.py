@@ -116,7 +116,7 @@ def test_release_update_is_exempt(repo):
 
 def test_restores_the_branch_it_came_from(repo):
     """When the update moved off another branch, the refusal returns THAT branch, not the target."""
-    root, branch_sha, foreign_sha = repo
+    root, _branch_sha, foreign_sha = repo
     _git(root, "checkout", "-q", "-b", "work")
     (root / "w.txt").write_text("w\n")
     _git(root, "add", "w.txt")
@@ -128,3 +128,41 @@ def test_restores_the_branch_it_came_from(repo):
 
     assert _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip() == "work"
     assert _head(root) == work_sha
+
+
+def test_leftover_files_do_not_block_the_return(tmp_path, capsys):
+    """A refused checkout leaves foreign files behind; the return must still happen.
+
+    Observed on a real copy: ``git checkout main`` aborted with "would be overwritten" because the
+    foreign commit left a file the branch tracks. The tree then stayed parked on the code the
+    gateway is not running — the P0 harm — so the return is forced and the discard is stated.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    (root / "keep.txt").write_text("branch version\n")
+    _git(root, "add", "keep.txt")
+    _git(root, "commit", "-qm", "branch commit")
+    branch_sha = _git(root, "rev-parse", "HEAD").strip()
+
+    _git(root, "checkout", "-q", "--orphan", "foreign")
+    _git(root, "rm", "-rq", "--cached", "keep.txt")
+    (root / "other.txt").write_text("foreign\n")
+    _git(root, "add", "other.txt")
+    _git(root, "commit", "-qm", "foreign commit")
+    foreign_sha = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "checkout", "-q", "-f", "main")
+    _git(root, "branch", "-q", "-D", "foreign")
+
+    _detach(root, foreign_sha)
+    (root / "keep.txt").write_text("untracked leftover that collides with the branch\n")
+
+    code, record = _refuse(root, pre_pull_sha=branch_sha)
+
+    assert code == 1
+    record.assert_called_once_with("detached_off_branch")
+    assert _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert _head(root) == branch_sha, "the tree must never stay on foreign history"
+    assert "forced" in capsys.readouterr().out, "a discarded working tree must be stated, not hidden"
