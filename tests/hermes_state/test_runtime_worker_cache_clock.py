@@ -35,6 +35,35 @@ def test_usage_receipt_accepts_the_cache_clock_field(tmp_path):
         db.close()
 
 
+def test_the_usage_main_extra_fields_are_exactly_the_named_contract(tmp_path):
+    """The handler accepts exactly ``USAGE_MAIN_EXTRA_FIELDS`` — the module-level contract.
+
+    That set is read from ``hermes_state_usage`` rather than written inside the handler, so a
+    contract reader (the code-skew gate) sees the same list the handler enforces (t_7403b0fe).
+    """
+    import hermes_state_usage as usage
+
+    assert usage.USAGE_MAIN_EXTRA_FIELDS.isdisjoint(usage._MODEL_USAGE_FIELDS)
+    assert 'task' in usage.USAGE_AUXILIARY_EXTRA_FIELDS
+    accepted = {'pricing_version': '2024-01-01', 'absolute': True, 'task': 'turn',
+                'prompt_cache_clock': json.dumps({'tier': '30m'})}
+    assert set(accepted) == set(usage.USAGE_MAIN_EXTRA_FIELDS)
+
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', source='cli')
+        scope = _scope(db)
+        rt.mutate_worker_execution(db, **scope, sequence=1, operation='usage.main',
+                                   payload={'input_tokens': 5, **accepted})
+        row = db.get_session('s') or {}
+        assert row['input_tokens'] == 5
+        with pytest.raises(rt.RuntimeStoreError, match='invalid_params'):
+            rt.mutate_worker_execution(db, **scope, sequence=2, operation='usage.main',
+                                       payload={'input_tokens': 1, 'not_in_the_contract': 1})
+    finally:
+        db.close()
+
+
 def test_usage_receipt_still_refuses_a_clock_that_is_not_a_bounded_string(tmp_path):
     db = SessionDB(tmp_path / 'state.db')
     try:

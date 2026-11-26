@@ -871,7 +871,8 @@ def _worker_turn(db, conn, session_id, payload, operation):
 
 
 def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
-    from hermes_state_usage import _MODEL_USAGE_FIELDS, _TOKEN_COUNTERS
+    from hermes_state_usage import (_MODEL_USAGE_FIELDS, _TOKEN_COUNTERS,
+                                    USAGE_AUXILIARY_EXTRA_FIELDS, USAGE_MAIN_EXTRA_FIELDS)
     source = None
     if not auxiliary:
         # ``source`` is the worker platform (turn_usage._agent_session_source). A Desktop
@@ -882,8 +883,14 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
         raw = payload.get('source')
         source = raw if isinstance(raw, str) else None
         payload = {k: v for k, v in payload.items() if k != 'source'}
-    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (
-        _MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task', 'prompt_cache_clock'})
+    # The accepted field set comes from ``hermes_state_usage`` module-level constants, never an
+    # inline literal: that named set is the RPC contract a code-skew gate compares (t_7403b0fe).
+    if auxiliary:
+        allowed = ((_MODEL_USAGE_FIELDS
+                    - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'})
+                   | USAGE_AUXILIARY_EXTRA_FIELDS)
+    else:
+        allowed = _MODEL_USAGE_FIELDS | USAGE_MAIN_EXTRA_FIELDS
     if set(payload) - allowed:
         raise RuntimeStoreError('invalid_params')
     for key, value in payload.items():
