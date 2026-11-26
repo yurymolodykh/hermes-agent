@@ -426,6 +426,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 
 
 import dataclasses
+import filecmp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
@@ -1093,8 +1094,9 @@ def _delivery_subject(source: Any = None) -> str:
     The turn's actor is authoritative (``HERMES_SESSION_ACTOR_ID``, :func:`hermes_acl_scope.
     caller_subject`); the sending ``SessionSource`` is the fallback for a delivery that runs
     outside a bound turn (a background completion, a replayed notification). ``""`` means "no
-    person established", which the gate treats as the pre-change behaviour only while
-    ``acl.multi_user`` is off — a scoped empty subject is refused, never widened.
+    person established" — a cron tick, a kanban watcher, a background run — and the gate then
+    delivers exactly as it did before the per-person check existed (see
+    :func:`_acl_delivery_path`): losing an attachment because nobody was bound is not a policy.
     """
     try:
         from hermes_acl_scope import caller_subject
@@ -1106,38 +1108,64 @@ def _delivery_subject(source: Any = None) -> str:
     return actor or str(getattr(source, "user_id", "") or "").strip()
 
 
-def _hand_over_to_exchange(safe_path: str, subject: str) -> Optional[str]:
-    """Move *safe_path* into the team exchange under the caller's own subfolder, or ``None``.
+def _delivery_copy_target(folder: Path, source: Path) -> Path:
+    """The path in *folder* a copy of *source* takes: the plain name, else ``-N``, else its twin.
+
+    "Same name already there" is not automatically a collision — a turn that mentions the same
+    file twice (a MEDIA tag plus the prose path) hands it over twice, and its recipient must get
+    ONE deliverable, not ``x.txt`` and ``x-1.txt``. An existing file with byte-identical content
+    (same size, then a real comparison) is therefore reused as-is; only a genuinely different
+    sibling gets a ``-N`` suffix, and the earlier file is never touched.
+    """
+    candidate = folder / (source.name or "file")
+    suffix = 0
+    while candidate.exists():
+        try:
+            if (candidate.is_file() and candidate.stat().st_size == source.stat().st_size
+                    and filecmp.cmp(str(candidate), str(source), shallow=False)):
+                return candidate
+        except OSError:
+            pass
+        suffix += 1
+        candidate = folder / f"{source.stem}-{suffix}{source.suffix}"
+    return candidate
+
+
+def _hand_over_to_delivery(safe_path: str, subject: str) -> Optional[str]:
+    """COPY *safe_path* into *subject*'s own delivery inbox and return the copy's path, or ``None``.
 
     A file in somebody else's personal tree answers 403 to the person it was meant for — correct,
-    and useless as a delivery. ``{HERMES_HOME}/shared/<subject-slug>/`` is readable by every
-    verified person (it is one of their file roots), so the handover is a MOVE: the deliverable
-    lands where the recipient can download it instead of a link that fails.
+    and useless as a delivery. ``{HERMES_HOME}/delivery/<subject-slug>/`` is one of THAT subject's
+    file roots and of nobody else's (:func:`hermes_acl_results.delivery_dir_for`), so the copy
+    downloads for its recipient, 403s for a third user and 401s for an anonymous tab. The team
+    exchange — ``{HERMES_HOME}/shared``, readable by every verified person — is deliberately NOT
+    used here: putting a private file there publishes it.
+
+    The source is READ ONLY. This used to be a ``shutil.move``, which deleted the producer's file
+    — including, in one review probe, the owner's own ``SOUL.md`` — and broke every link already
+    handed out to its owner. A deliverable must never destroy what it delivers.
     """
     try:
         from hermes_constants import get_hermes_home
-        from tools.memory_tool import _subject_dirname
+        from hermes_acl_results import delivery_dir_for
 
-        slug = _subject_dirname(subject)
-        if not slug:
+        folder = delivery_dir_for(subject)
+        if folder is None:
             return None
-        folder = Path(get_hermes_home()) / "shared" / slug
         folder.mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError, ImportError):
-        logger.warning("delivery gate: exchange folder unavailable for a handover", exc_info=True)
+        logger.warning("delivery gate: delivery folder unavailable for a handover", exc_info=True)
         return None
     source = Path(safe_path)
-    target = folder / (source.name or "file")
-    suffix = 0
-    while target.exists():
-        suffix += 1
-        target = folder / f"{source.stem}-{suffix}{source.suffix}"
+    target = _delivery_copy_target(folder, source)
     try:
+        if target.exists():  # an identical twin is already delivered: nothing to write
+            return str(target)
         import shutil
 
-        shutil.move(str(source), str(target))
+        shutil.copy2(str(source), str(target))
     except (OSError, RuntimeError, ValueError):
-        logger.warning("delivery gate: could not hand %s over to the exchange",
+        logger.warning("delivery gate: could not copy %s into the recipient's delivery folder",
                        _log_safe_path(safe_path), exc_info=True)
         return None
     return str(target)
@@ -1145,15 +1173,25 @@ def _hand_over_to_exchange(safe_path: str, subject: str) -> Optional[str]:
 
 def _acl_delivery_path(safe_path: str, subject: str, label: str,
                        dropped: Optional[list[dict]] = None) -> Optional[str]:
-    """Keep an accepted path only when *subject* may READ it; otherwise hand it over or drop it.
+    """Keep an accepted path only when *subject* may READ it; otherwise copy it over or drop it.
 
     ``validate_media_delivery_path`` answers "is this a host file the gateway may disclose at all"
     — a denylist, not a person's boundary. Under ``acl.multi_user`` the recipient is a person, so
-    a path outside their roots must not be offered as a link they cannot open: it is moved into
-    the exchange (where they can) and the moved path is returned. When even that is impossible the
-    path is dropped with a reason the caller can show, instead of a 403 at download time.
-    With the flag off — and for the host owner, who is never scoped — this is a no-op.
+    a path outside their roots must not be offered as a link they cannot open: it is COPIED into
+    their own delivery inbox (where only they can read it) and that path is returned. When even
+    that is impossible the path is dropped with a reason the caller can show, instead of a 403 at
+    download time.
+
+    No established recipient — a cron tick, a kanban watcher, a background completion, none of
+    which has a bound turn actor — is NOT a security decision: the file is delivered exactly as it
+    was before this gate existed, with a warning. Only an explicit refusal (a path the policy
+    denies, a handover that cannot be made) drops an attachment. With the flag off — and for the
+    host owner, who is never scoped — this is a no-op.
     """
+    if not str(subject or "").strip():
+        logger.info("delivery gate: no recipient bound for %s — delivering as before (%s)",
+                    label, _log_safe_path(safe_path))
+        return safe_path
     try:
         from hermes_acl_results import path_allowed_for_subject
     except Exception:  # a stripped build: no ACL layer, exactly the previous behaviour
@@ -1165,16 +1203,16 @@ def _acl_delivery_path(safe_path: str, subject: str, label: str,
     except Exception:  # health: allow BLE001 -- a policy error must not break delivery outright
         logger.warning("delivery gate: policy error, delivering as before", exc_info=True)
         return safe_path
-    moved = _hand_over_to_exchange(safe_path, subject)
-    if moved:
+    copied = _hand_over_to_delivery(safe_path, subject)
+    if copied:
         try:
-            allowed = path_allowed_for_subject(subject, moved)
+            allowed = path_allowed_for_subject(subject, copied)
         except Exception:  # health: allow BLE001 -- an unverified handover is not a delivery
             allowed = False
         if allowed:
-            logger.info("delivery gate: handed %s over to the exchange for its recipient (%s)",
+            logger.info("delivery gate: copied %s into its recipient's delivery folder (%s)",
                         _log_safe_path(safe_path), label)
-            return moved
+            return copied
     reason = "outside this user's readable folders"
     logger.warning("Skipping %s (%s): %s", label, reason, _log_safe_path(safe_path))
     if dropped is not None:
@@ -1194,15 +1232,20 @@ def _log_safe_path(path: str) -> str:
 
 def _validated_delivery_path(raw_path, session_key: str, label: str,
                              dropped: Optional[list[dict]] = None,
-                             source: Any = None) -> Optional[str]:
+                             source: Any = None, subject: Optional[str] = None) -> Optional[str]:
     """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
     host cannot see is retried against the active remote sandbox (ssh/modal/...; #466). When
     ``dropped`` is a list, a rejected path is appended as ``{"path", "reason"}`` so the caller can
     report the drop instead of booking a delivery that never happened (#115908).
 
     Delivery is per-PERSON: an accepted host file still has to be readable by the recipient
-    (:func:`_acl_delivery_path` — handover into the exchange, else a reasoned drop). The recipient
-    is the turn's actor, else *source*'s sender.
+    (:func:`_acl_delivery_path` — a copy into their delivery folder, else a reasoned drop). The
+    recipient is *subject* when the caller knows it, else the turn's actor, else *source*'s
+    sender; none of them established (a cron tick, a background run) delivers as before.
+
+    *subject* is ``None`` for "ask the turn", and ``""`` for "this delivery has no recipient" —
+    the distinction matters because a seam that already knows who receives the file must not be
+    overridden by a stale ambient actor.
     """
     raw = str(raw_path)
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
@@ -1217,7 +1260,8 @@ def _validated_delivery_path(raw_path, session_key: str, label: str,
         if dropped is not None:
             dropped.append({"path": raw, "reason": reason})
         return None
-    return _acl_delivery_path(safe_path, _delivery_subject(source), label, dropped)
+    recipient = _delivery_subject(source) if subject is None else str(subject or "").strip()
+    return _acl_delivery_path(safe_path, recipient, label, dropped)
 
 
 def _existing_regular_file(raw: str) -> bool:
@@ -3238,18 +3282,26 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "",
                                     dropped: Optional[list[dict]] = None,
-                                    source: Any = None) -> list[tuple[str, bool]]:
-        """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
+                                    source: Any = None,
+                                    subject: Optional[str] = None) -> list[tuple[str, bool]]:
+        """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects.
+
+        *subject* names the recipient when the caller knows it (a kanban card's customer); ``None``
+        asks the turn, and ``""`` declares that this delivery has no recipient at all.
+        """
         return [
             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
             if (safe_path := _validated_delivery_path(
-                media_path, session_key, "MEDIA directive path", dropped, source=source))]
+                media_path, session_key, "MEDIA directive path", dropped, source=source,
+                subject=subject))]
 
     @staticmethod
     def filter_local_delivery_paths(file_paths, session_key: str = "",
-                                    source: Any = None) -> list[str]:
+                                    source: Any = None, dropped: Optional[list[dict]] = None,
+                                    subject: Optional[str] = None) -> list[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
-        safe_paths = (_validated_delivery_path(p, session_key, "local file path", source=source)
+        safe_paths = (_validated_delivery_path(p, session_key, "local file path", dropped,
+                                              source=source, subject=subject)
                       for p in file_paths or [])
         return [p for p in safe_paths if p]
 

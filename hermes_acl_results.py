@@ -282,13 +282,17 @@ def _profile_workspace(name: str) -> Optional[Path]:
 
 
 def _exchange_dirs() -> list[Path]:
-    """The team exchange directory: deliverables handed to whoever asked for them.
+    """The team exchange directory: deliverables that are meant for the TEAM.
 
     A personal profile's working directory belongs to its owner, so a file an agent produced for
     another person there answers 403 to that person — correct, and useless as a delivery. Files in
     ``{HERMES_HOME}/shared`` are readable by every VERIFIED person: the producer writes there, the
     requester downloads there. An unidentified caller never reaches this list (the caller gates it
     on :func:`_verified`), and a missing directory contributes nothing.
+
+    This is NOT where a handover of somebody's PRIVATE file goes: everything here is readable by
+    every verified person, so copying a personal file into it would publish it. Delivery of another
+    person's file belongs in :func:`delivery_dir_for`.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -297,6 +301,40 @@ def _exchange_dirs() -> list[Path]:
     except Exception:  # health: allow BLE001 -- a stripped build without the constant
         return []
     return [path] if path.is_dir() else []
+
+
+def delivery_dir_for(subject: Any) -> Optional[Path]:
+    """The ONE directory *subject* — and nobody else — may download a handover from, or ``None``.
+
+    A deliverable that lives in another person's tree answers 403 to the person it was meant for.
+    The fix is a recipient-scoped inbox rather than the team exchange: ``{HERMES_HOME}/delivery/
+    <subject-slug>`` is added to THAT subject's roots alone (:func:`subject_roots` computes a
+    different slug for every other person), so the copy downloads for its recipient and 403s for a
+    third user — the exchange, readable by every verified person, would publish it instead.
+
+    The slug is the same sanitizer per-subject memory uses (``tools.memory_tool._subject_dirname``:
+    everything outside ``[A-Za-z0-9._-]`` collapses to ``_``, a dots-only or dot-leading name is
+    refused), so a subject can never name a directory outside ``delivery/``.
+    """
+    text = str(subject or "").strip()
+    if not text:
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+        from tools.memory_tool import _subject_dirname
+
+        slug = _subject_dirname(text)
+        if not slug:
+            return None
+        return _real(Path(get_hermes_home()) / "delivery" / slug)
+    except Exception:  # health: allow BLE001 -- a stripped build without the constant
+        return None
+
+
+def _delivery_dirs(subject: Any) -> list[Path]:
+    """The subject's own delivery inbox as a ROOT LIST (empty when it cannot be named)."""
+    path = delivery_dir_for(subject)
+    return [path] if path is not None else []
 
 
 def _team_card_dirs(subject: Any) -> list[Path]:
@@ -509,6 +547,13 @@ def subject_roots(subject: Any) -> tuple[Path, ...]:
             if path not in roots:
                 roots.append(path)
         for path in _shared_work_dirs():
+            if path not in roots:
+                roots.append(path)
+        # The subject's OWN delivery inbox — the one place a handover of somebody else's file may
+        # be read from. Built from the subject's slug, so it is a root for this person alone; a
+        # missing directory still counts (the handover creates it and the recipient downloads it
+        # afterwards). Gated on _verified like the exchange: an anonymous tab gets no inbox.
+        for path in _delivery_dirs(subject):
             if path not in roots:
                 roots.append(path)
     return tuple(roots)
