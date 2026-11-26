@@ -4408,6 +4408,43 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     sys.exit(1)
 
 
+def _guard_kanban_worker_gateway() -> None:
+    """Refuse ``gateway run`` from inside a kanban dispatcher worker.
+
+    A dispatcher worker inherits the gateway's OWN supervisor markers
+    (``INVOCATION_ID``, ``HERMES_SUPERVISED_CHILD``) because the dispatcher hands its
+    environment to every worker it spawns. ``_running_under_gateway_supervisor()``
+    reads exactly those markers, so inside a worker it answers True and every
+    conflict guard below returns early — the worker was therefore free to start a
+    SECOND gateway on the same ``HERMES_HOME``/``state.db`` as the live owner
+    (incident 26.11: pid 2125256, a child of the card's worker, beside pid 1999484).
+
+    The worker's own identity (``HERMES_KANBAN_TASK``) is the one marker the live
+    gateway never carries, so it is checked FIRST and never inferred from the
+    supervisor markers. Exit 78 (EX_CONFIG) is deliberate: the condition is a wrong
+    caller, not a transient fault, so a supervisor must not retry it.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return
+    print_error(
+        f"Refusing to start a gateway from inside kanban worker for task {task_id}."
+    )
+    print(
+        "  A worker inherits the live gateway's supervisor markers, so it cannot\n"
+        "  tell a second copy of that gateway apart from being one: starting here\n"
+        "  would leave two processes serving the same HERMES_HOME and state.db.\n"
+        "  If this card needs the gateway restarted, hand that to the platform\n"
+        "  profile as its own card, or run `hermes gateway restart` from a shell\n"
+        "  outside any kanban worker."
+    )
+    logger.warning(
+        "gateway run refused: launched from a kanban worker (task %s); the live "
+        "gateway's supervisor markers are inherited, never owned", task_id,
+    )
+    sys.exit(78)
+
+
 def _guard_official_docker_root_gateway() -> None:
     """Refuse gateway startup when the official Docker privilege drop was bypassed."""
     if not hasattr(os, "geteuid") or os.geteuid() != 0 or _truthy_env(os.getenv("HERMES_ALLOW_ROOT_GATEWAY")):
@@ -4553,6 +4590,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
+    _guard_kanban_worker_gateway()
     _guard_official_docker_root_gateway()
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)
@@ -5039,6 +5077,7 @@ def _print_runtime_health() -> None:
 
 
 def _cmd_run(args):
+    _guard_kanban_worker_gateway()
     if _maybe_redirect_run_to_s6_supervision(args):
         return  # unreachable; execvp doesn't return
     if getattr(args, "external_supervisor", False):
