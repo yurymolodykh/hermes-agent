@@ -12,6 +12,7 @@ wrapper is pinned here too, so it can never drift away from the canonical file.
 """
 from __future__ import annotations
 
+import builtins
 import hashlib
 import importlib.util
 import sqlite3
@@ -35,6 +36,20 @@ def wave():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _not_a_worker_parent(monkeypatch):
+    """Keep the suite honest when pytest itself is launched BY a kanban worker.
+
+    ``worker_context()`` also looks at the parent process, so running these tests from inside a
+    worker made every unrelated refusal test hit the worker gate first (exit 3 instead of 4/3-with-
+    -window). The parent marker is neutralised here; the worker tests set the ENV markers, which is
+    the other, independent path into the same guard and stays fully exercised.
+    """
+    monkeypatch.setattr("os.getppid", lambda: 1)
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_WORKSPACE"):
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
@@ -77,6 +92,39 @@ def test_every_worker_marker_refuses(wave, monkeypatch):
         _no_systemctl(monkeypatch)
         assert wave.main([]) == 3, f"{marker} alone must refuse the run"
         monkeypatch.delenv(marker)
+
+
+def test_a_worker_parent_process_is_refused_without_any_env_marker(wave, monkeypatch, capsys):
+    """The second, independent signal: the launching process IS a kanban worker.
+
+    No env marker is set here, only the parent's cmdline carries the marker — the shape of a
+    ``subprocess`` call from inside a worker. The guard must refuse before systemd.
+    """
+    real_open = builtins.open
+
+    class _Cmdline:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self, *_a):
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_open(path, *args, **kwargs):
+        if str(path).startswith("/proc/") and str(path).endswith("/cmdline"):
+            return _Cmdline(b"python3\x00/home/hermes/.hermes/hermes-agent/hermes_cli/kanban_worker_client.py\x00")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    _no_systemctl(monkeypatch)
+    assert wave.worker_context() == "родительский процесс — kanban_worker_client"
+    assert wave.main([]) == 3
+    assert "запуск из kanban-воркера запрещён" in capsys.readouterr().out
 
 
 # --- 2. never while admitted runs are alive -------------------------------------------------------
