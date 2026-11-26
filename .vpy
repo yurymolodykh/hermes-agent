@@ -1,1 +1,0 @@
-/home/hermes/.hermes/hermes-agent/.venv

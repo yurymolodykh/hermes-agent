@@ -599,6 +599,26 @@ def _refuse_exchange_write(detail: str) -> None:
     raise HTTPException(status_code=403, detail=detail)
 
 
+def exchange_foreign_folder(request: Any, target: Any) -> bool:
+    """True when *target* is a DIRECTORY inside another person's exchange subfolder.
+
+    The write routes ask this BEFORE any redirect: a path that is already a folder must not be
+    silently turned into a file named after that folder, and a neighbour's folder is a refusal
+    (403), not a name clash (409). Unscoped callers and paths outside the exchange answer False.
+    """
+    if not scoped(request):
+        return False
+    resolved = _real(target)
+    exchange = _exchange_of(resolved) if resolved is not None else None
+    if resolved is None or exchange is None or not resolved.is_dir():
+        return False
+    slug = subject_slug(verified_subject(request))
+    relative = resolved.relative_to(exchange)
+    if not relative.parts:
+        return False  # the exchange root itself: a name clash, not a neighbour's folder
+    return relative.parts[0] != slug
+
+
 def exchange_write_target(request: Any, target: Any) -> Path:
     """Where a write to *target* actually lands: the caller's own exchange subfolder when scoped.
 
@@ -621,6 +641,10 @@ def exchange_write_target(request: Any, target: Any) -> Path:
         # A scoped caller with no established identity: fail closed, like every other root.
         _refuse_exchange_write(OUTSIDE_ROOT)
     relative = resolved.relative_to(exchange)
+    if not relative.parts:
+        # The exchange root itself: never renamed into a person's folder (a "write to shared/"
+        # is either a directory clash, decided by the caller, or a no-op mkdir).
+        return resolved
     if relative.parts and relative.parts[0] == slug:
         return resolved
     if len(relative.parts) <= 1:
@@ -639,7 +663,10 @@ def _exchange_journal_path() -> Optional[Path]:
     except Exception:  # health: allow BLE001 -- no home, no journal, no backstop
         logger.debug("acl results: hermes home unresolvable for the exchange journal", exc_info=True)
         return None
-    return home / "shared" / EXCHANGE_AUTHORSHIP_FILE
+    # NOT under ``shared/``: that directory is a root of every verified subject, so a journal kept
+    # there would publish other people's paths and subjects to anyone who can list the exchange
+    # (while being undeletable by them). ``acl/`` sits outside every file root.
+    return home / "acl" / EXCHANGE_AUTHORSHIP_FILE
 
 
 def exchange_author(path: Any) -> str:
@@ -698,12 +725,17 @@ def require_exchange_authorship(request: Any, target: Any) -> None:
 
 
 def require_exchange_removal(request: Any, target: Any) -> None:
-    """Refuse DELETING an exchange file that is not this subject's own. No-op when unscoped.
+    """Refuse DELETING an exchange entry that is not this subject's own. No-op when unscoped.
 
     Destroying a colleague's deliverable is the same harm as overwriting it, and the delete route
-    only asked whether the path was inside the caller's roots. A file in another person's
-    subfolder, or one the journal attributes to another subject, is refused; everything outside
-    the exchange is untouched by this rule.
+    only asked whether the path was inside the caller's roots. Refused: the exchange root itself
+    (a recursive delete there is ``rmtree`` over everybody's folders), another person's subfolder,
+    and a file the journal attributes to another subject. Everything outside the exchange is
+    untouched by this rule.
+
+    A FILE at the exchange root has no subfolder: ``relative.parts[0]`` is its own name, so the
+    "foreign folder" test would refuse the author's own legacy file. For those the journal decides,
+    and an unrecorded root file keeps the pre-change behaviour (deletable).
     """
     if not scoped(request):
         return
@@ -716,7 +748,21 @@ def require_exchange_removal(request: Any, target: Any) -> None:
     if not subject or not slug:
         _refuse_exchange_write(OUTSIDE_ROOT)
     relative = resolved.relative_to(exchange)
-    foreign_folder = bool(relative.parts) and relative.parts[0] != slug
+    if not relative.parts:
+        # The exchange directory itself: a scoped caller never removes the shared tree.
+        logger.info("acl results: refusing to delete the exchange directory itself")
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=403,
+            detail="The team exchange directory itself cannot be deleted")
+    first = relative.parts[0]
+    if len(relative.parts) > 1:
+        foreign_folder = first != slug
+    else:
+        # A single segment is either this person's own folder or an entry at the exchange root;
+        # only a DIFFERENT DIRECTORY there has no author to consult.
+        foreign_folder = resolved.is_dir() and first != slug
     author = exchange_author(resolved)
     if foreign_folder or (author and author != subject):
         logger.info("acl results: refusing to delete another subject's exchange file")
