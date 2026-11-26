@@ -36,8 +36,8 @@ os.environ.setdefault("HERMES_HOME", str(Path.home() / ".hermes"))
 # The repo root is three levels up from tests/hermes_cli/tools/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-import hermes_acl_bindings as hb  # noqa: E402
-import hermes_acl_profiles as prof_acl  # noqa: E402
+import hermes_acl_bindings as hb
+import hermes_acl_profiles as prof_acl
 
 
 # ── roles derived from the registry document (never from a hardcoded name) ────────────────────

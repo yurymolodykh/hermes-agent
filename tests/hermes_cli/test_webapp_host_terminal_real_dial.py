@@ -34,13 +34,13 @@ import gateway.run
 import hermes_cli.web_server
 import tui_gateway.ws
 
-MARIA = "01-maria-safronova"
-ORCH = "01-orchestrator"
+PERSON = "01-person-a"        # a person's own root in this fixture
+UNOWNED = "01-unowned"        # a ``0N-`` root no personal record names
 
 
 @pytest.fixture
 def webapp_home(tmp_path, monkeypatch):
-    """A Webapp over ``<tmp>/.hermes`` with Maria's root and the orchestrator's beside it."""
+    """A Webapp over ``<tmp>/.hermes`` with the person's own root and an unowned one beside it."""
     from hermes_cli import web_host_terminal, web_server, web_server_chat
     from hermes_cli.web_host_terminal_sessions import host_terminal_lifespan
     from hermes_cli.web_routers import webapp as _webapp_module
@@ -50,7 +50,7 @@ def webapp_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True)
     (home / "config.yaml").write_text("{}\n", encoding="utf-8")
-    for name in (MARIA, ORCH):
+    for name in (PERSON, UNOWNED):
         (home / "profiles" / name).mkdir(parents=True)
         (home / "profiles" / name / "config.yaml").write_text("{}\n", encoding="utf-8")
 
@@ -110,14 +110,14 @@ def webapp_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def multi_user(webapp_home, monkeypatch):
-    """Maria is a PERSON with her own ``01-...`` root; ``01-orchestrator`` belongs to nobody."""
+    """The login is a PERSON with its own ``01-...`` root; ``01-unowned`` belongs to nobody."""
     path = webapp_home.home / "acl" / "profile-bindings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "schema": hb.SCHEMA, "written_at": "2026-11-20T00:00:00+00:00", "written_by": "admin",
         "persons": [{
-            "slug": "person/maria", "display_name": "Maria", "shared": False,
-            "profiles": [MARIA], "subjects": [], "owner": "person/maria", "source": "admin"}],
+            "slug": "person/person-a", "display_name": "Person A", "shared": False,
+            "profiles": [PERSON], "subjects": [], "owner": "person/person-a", "source": "admin"}],
     }), encoding="utf-8")
     monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: True)
     monkeypatch.setattr(prof_acl, "multi_user_enabled", lambda: True)
@@ -142,7 +142,7 @@ def _mint_without_profile(identity: dict) -> str:
 
     ``webapp.issue_socket_ticket`` passes ``profile_home`` only ``if profile`` — so a client that
     mints without one carries no home, which is exactly the shape under test. Minted through the
-    same ``mint_socket_ticket`` the route calls, with Maria's own login as the identity.
+    same ``mint_socket_ticket`` the route calls, with the person's own login as the identity.
     """
     from hermes_cli.dashboard_auth.ws_tickets import consume_ticket
     from hermes_cli.web_routers.webapp import mint_socket_ticket
@@ -173,19 +173,19 @@ def _dial_and_expect_refusal(host, ticket: str, profile: str):
 
 
 def test_own_profile_opens_through_the_real_pair(webapp_home, multi_user):
-    """Maria mints with no profile and dials ``?profile=01-maria-safronova``: the shell opens."""
-    ticket = _mint_without_profile({"user_id": "maria", "provider": "basic"})
+    """The person mints with no profile and dials ``?profile=01-person-a``: the shell opens."""
+    ticket = _mint_without_profile({"user_id": "person-a", "provider": "basic"})
     with TestClient(webapp_home.host) as shells:
         with shells.websocket_connect(
-                f"ws://localhost/api/host-terminal?ticket={ticket}&profile={MARIA}") as ws:
+                f"ws://localhost/api/host-terminal?ticket={ticket}&profile={PERSON}") as ws:
             assert _metadata(ws)["terminalId"]
     assert len(webapp_home.shells) == 1
 
 
 def test_foreign_personal_profile_is_refused_before_accept_and_before_pty(webapp_home, multi_user):
-    """Same pair for ``01-orchestrator``: 4403, no ``ws.accept()``, no PTY."""
-    ticket = _mint_without_profile({"user_id": "maria", "provider": "basic"})
-    assert _dial_and_expect_refusal(webapp_home.host, ticket, ORCH) == 4403
+    """Same pair for ``01-unowned``: 4403, no ``ws.accept()``, no PTY."""
+    ticket = _mint_without_profile({"user_id": "person-a", "provider": "basic"})
+    assert _dial_and_expect_refusal(webapp_home.host, ticket, UNOWNED) == 4403
     assert webapp_home.shells == []
 
 
@@ -193,7 +193,7 @@ def test_owner_opens_any_profile_through_the_real_pair(webapp_home, multi_user):
     """The host owner sees every profile, so either name opens a shell."""
     # The loopback session token's principal is the host owner on this host.
     identity = {"user_id": "legacy-token-owner", "provider": "session-token"}
-    for name in (MARIA, ORCH):
+    for name in (PERSON, UNOWNED):
         assert _mint_without_profile(identity)  # minted with no home, as the dial does
         ticket = _mint_without_profile(identity)
         with TestClient(webapp_home.host) as shells:
@@ -204,7 +204,7 @@ def test_owner_opens_any_profile_through_the_real_pair(webapp_home, multi_user):
 
 
 def test_an_unknown_profile_name_is_refused_not_spawned(webapp_home, multi_user):
-    ticket = _mint_without_profile({"user_id": "maria", "provider": "basic"})
+    ticket = _mint_without_profile({"user_id": "person-a", "provider": "basic"})
     assert _dial_and_expect_refusal(webapp_home.host, ticket, "01-nobody-here") == 4403
     assert webapp_home.shells == []
 
@@ -213,7 +213,7 @@ def test_an_identity_less_socket_opens_no_named_profile(webapp_home, multi_user)
     """Fail closed: a socket the gate stamped no identity onto opens nothing by name."""
     from hermes_cli.web_routers.webapp import _host_terminal_profile_matches
 
-    ws = SimpleNamespace(query_params={"profile": MARIA})
+    ws = SimpleNamespace(query_params={"profile": PERSON})
     assert _host_terminal_profile_matches(ws) is False
 
 
@@ -221,9 +221,9 @@ def test_the_launch_home_is_the_owners_alone_under_multi_user(webapp_home, multi
     """No ``?profile=`` at all: a person's tab gets nothing, the owner keeps the launch shell."""
     from hermes_cli.web_routers.webapp import _host_terminal_profile_matches
 
-    maria = SimpleNamespace(query_params={},
-                            _hermes_auth_identity={"user_id": "maria", "provider": "basic"})
-    assert _host_terminal_profile_matches(maria) is False
+    person = SimpleNamespace(query_params={},
+                             _hermes_auth_identity={"user_id": "person-a", "provider": "basic"})
+    assert _host_terminal_profile_matches(person) is False
     owner = SimpleNamespace(query_params={},
                             _hermes_auth_identity={"user_id": "legacy-token-owner",
                                                    "provider": "session-token"})
@@ -245,14 +245,14 @@ def test_a_ticket_that_names_its_home_still_binds_the_socket(webapp_home, multi_
     """The minted-home shape is unchanged: a differing ``?profile=`` never matches."""
     from hermes_cli.web_routers.webapp import _host_terminal_profile_matches
 
-    maria_home = str((webapp_home.home / "profiles" / MARIA).resolve())
-    identity = {"user_id": "maria", "provider": "basic"}
-    ws = SimpleNamespace(query_params={"profile": ORCH}, _hermes_ticket_profile_home=maria_home,
+    person_home = str((webapp_home.home / "profiles" / PERSON).resolve())
+    identity = {"user_id": "person-a", "provider": "basic"}
+    ws = SimpleNamespace(query_params={"profile": UNOWNED}, _hermes_ticket_profile_home=person_home,
                          _hermes_auth_identity=identity)
     assert _host_terminal_profile_matches(ws) is False
-    ws_own = SimpleNamespace(query_params={"profile": MARIA}, _hermes_ticket_profile_home=maria_home,
+    ws_own = SimpleNamespace(query_params={"profile": PERSON}, _hermes_ticket_profile_home=person_home,
                              _hermes_auth_identity=identity)
     assert _host_terminal_profile_matches(ws_own) is True
-    ws_none = SimpleNamespace(query_params={}, _hermes_ticket_profile_home=maria_home,
+    ws_none = SimpleNamespace(query_params={}, _hermes_ticket_profile_home=person_home,
                               _hermes_auth_identity=identity)
     assert _host_terminal_profile_matches(ws_none) is True
