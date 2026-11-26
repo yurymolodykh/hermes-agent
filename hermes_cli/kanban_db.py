@@ -4128,8 +4128,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
             metadata={"stop_reason": "archived"} if was_running else None,
         )
+        # ``_end_run`` follows ``tasks.current_run_id`` only. A run row whose
+        # task lost that pointer (a crash between claim and pointer write, a DB
+        # restore, a reclaim that cleared the pointer but not the row) stays
+        # OPEN forever: nothing scans a task that is no longer ``running``, so
+        # the dispatcher counted it as a live worker against
+        # ``kanban.max_in_progress`` for a week (runs 117/118/119 of 19.11,
+        # archived probe cards). Archiving is terminal, so no run of this task
+        # can still be in flight — close every one still open.
+        closed_extra = conn.execute(
+            "UPDATE task_runs "
+            "   SET status = 'crashed', outcome = 'crashed', "
+            "       summary = COALESCE(summary, 'task archived with run still open'), "
+            "       error = COALESCE(error, 'stale run of an archived task'), "
+            "       ended_at = ?, claim_expires = NULL "
+            " WHERE task_id = ? AND ended_at IS NULL",
+            (int(time.time()), task_id),
+        ).rowcount
         _append_event(conn, task_id, "archived", {"stop_reason": "archived"} if was_running else None,
                       run_id=run_id)
+        if closed_extra:
+            _append_event(conn, task_id, "archived_open_runs_closed",
+                          {"closed": int(closed_extra), "reason": "task archived"}, run_id=run_id)
     if was_running:
         termination = _terminate_reclaimed_worker(
             prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
