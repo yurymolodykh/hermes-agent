@@ -1,12 +1,12 @@
 """Acceptance: the terminal gate resolves the SAME registry key the policy is written for.
 
 The previous iteration's test (``test_webapp_host_terminal_real_dial.py``) mocked
-``hermes_acl_identity.resolve_subject`` to return ``person/<login>`` and put ``"slug": "person/maria"``
-in a fixture registry — so ``allows`` received a key the LIVE path never produces. On the real
-deployment the ticket carries ``{user_id: "person/maria.safronova", provider: "local"}``
+``hermes_acl_identity.resolve_subject`` to return ``person/<login>`` and put a hand-made
+``"slug": "person/<name>"`` in a fixture registry — so ``allows`` received a key the LIVE path never
+produces. On the real deployment the ticket carries ``{user_id: "person/<login>", provider: "local"}``
 (``web_server_chat._consume_ws_ticket``), which ``gateway.owner_identity.principal_subject`` names
-``auth:v1:["local","","person/maria.safronova"]``; ``hermes_acl_bindings.person_of`` matched that
-form EXACTLY and answered ``None``, so Maria's own profile was refused while the green tests said
+``auth:v1:["local","","person/<login>"]``; ``hermes_acl_bindings.person_of`` matched that form
+EXACTLY and answered ``None``, so a person's own profile was refused while the green tests said
 otherwise.
 
 This module pins the real path: the ticket is minted the way the real dial mints it, and the
@@ -40,9 +40,9 @@ import gateway.run
 import hermes_cli.web_server
 import tui_gateway.ws
 
-MARIA = "01-maria-safronova"
-KSENIA = "01-ksenia-kozlovskaya"
-ORCH = "01-orchestrator"
+MARIA = "01-user15"
+KSENIA = "01-user12"
+ORCH = "01-user22"
 PERSONAL = "16-personal"
 SHARED = "03-software-engineer"
 
@@ -51,13 +51,13 @@ SNAPSHOT_REGISTRY = Path(__file__).with_name("data_profile_bindings_snapshot.jso
 
 #: The identity the REAL terminal dial's ticket carries (``web_server_chat._consume_ws_ticket``
 #: stamps ``{"user_id": info["user_id"], "provider": info["provider"]}`` — no issuer).
-MARIA_TICKET_IDENTITY = {"user_id": "person/maria.safronova", "provider": "local"}
-KSENIA_TICKET_IDENTITY = {"user_id": "person/ksenia.kozlovskaya", "provider": "local"}
+MARIA_TICKET_IDENTITY = {"user_id": "person/user15", "provider": "local"}
+KSENIA_TICKET_IDENTITY = {"user_id": "person/user12", "provider": "local"}
 OWNER_TICKET_IDENTITY = {"user_id": "uid:1001", "provider": "local"}
 
-#: A ``basic`` password login names Maria's person on the users file; the snapshot registry keys
-#: that same ``person/maria.safronova`` record, so the resolution is exercised end to end.
-MARIA_LOGIN = "maria.safronova"
+#: A ``basic`` password login names ``person/user15`` on the users file; the snapshot registry keys
+#: that same ``person/user15`` record, so the resolution is exercised end to end.
+MARIA_LOGIN = "user15"
 MARIA_LOGIN_IDENTITY = {"user_id": MARIA_LOGIN, "provider": "basic"}
 
 pytestmark = pytest.mark.skipif(
@@ -83,12 +83,12 @@ def live_home(tmp_path, monkeypatch):
     (home / "acl" / "profile-bindings.json").write_text(
         SNAPSHOT_REGISTRY.read_text(encoding="utf-8"), encoding="utf-8")
     # A REAL users file, so ``resolve_subject`` names a person from a record instead of falling back
-    # to the legacy owner subject: this is what makes Maria a non-owner password login.
+    # to the legacy owner subject: this is what makes user15 a non-owner password login.
     from hermes_cli.dashboard_users import hash_password
 
     users = home / "dashboard-users.jsonl"
     users.write_text(json.dumps({
-        "login": MARIA_LOGIN, "display_name": "Maria", "role": "user",
+        "login": MARIA_LOGIN, "display_name": "User 15", "role": "user",
         "password_hash": hash_password("not-a-real-password"), "gen": 1,
     }) + "\n", encoding="utf-8")
     users.chmod(0o600)
@@ -202,16 +202,16 @@ def _grade(identity: dict, profile: str) -> tuple[bool, str]:
     return allowed, diag
 
 
-# ── acceptance 1: Maria opens her OWN profile on the live registry ───────────────────────────────
+# ── acceptance 1: the person opens their OWN profile on the live registry ────────────────────────
 
-def test_maria_opens_her_own_profile_on_the_live_registry(live_home):
+def test_a_person_opens_their_own_profile_on_the_live_registry(live_home):
     allowed, diag = _grade(MARIA_TICKET_IDENTITY, MARIA)
-    assert allowed is True, f"Maria must open her own profile; {diag}"
+    assert allowed is True, f"the person must open their own profile; {diag}"
 
 
-def test_maria_own_profile_is_accepted_on_the_real_socket(live_home):
+def test_own_profile_is_accepted_on_the_real_socket(live_home):
     code = _dial(live_home.host, _mint(MARIA_TICKET_IDENTITY), MARIA)
-    assert code is None, "the real host-terminal socket must accept Maria's own profile"
+    assert code is None, "the real host-terminal socket must accept the person's own profile"
     assert len(live_home.shells) == 1
 
 
@@ -220,7 +220,7 @@ def test_maria_own_profile_is_accepted_on_the_real_socket(live_home):
 @pytest.mark.parametrize("foreign", [ORCH, KSENIA, PERSONAL])
 def test_a_foreign_personal_profile_is_refused_before_any_shell(live_home, foreign):
     allowed, diag = _grade(MARIA_TICKET_IDENTITY, foreign)
-    assert allowed is False, f"Maria must not open {foreign!r}; {diag}"
+    assert allowed is False, f"the person must not open {foreign!r}; {diag}"
     code = _dial(live_home.host, _mint(MARIA_TICKET_IDENTITY), foreign)
     assert code == 4403, f"expected 4403 for {foreign!r}, got {code!r}"
     assert live_home.shells == [], "no PTY may exist for a refused profile"
@@ -250,8 +250,8 @@ def test_an_anonymous_dial_opens_nothing(live_home):
 def test_a_launch_home_dial_belongs_to_the_owner_alone(live_home):
     from hermes_cli.web_routers.webapp import _host_terminal_profile_matches
 
-    maria = SimpleNamespace(query_params={}, _hermes_auth_identity=MARIA_TICKET_IDENTITY)
-    assert _host_terminal_profile_matches(maria) is False
+    person = SimpleNamespace(query_params={}, _hermes_auth_identity=MARIA_TICKET_IDENTITY)
+    assert _host_terminal_profile_matches(person) is False
     owner = SimpleNamespace(query_params={}, _hermes_auth_identity=OWNER_TICKET_IDENTITY)
     assert _host_terminal_profile_matches(owner) is True
 
@@ -269,14 +269,14 @@ def test_a_password_login_resolves_to_the_same_registry_person(live_home):
     from gateway.owner_identity import principal_subject
 
     bare = principal_subject(MARIA_LOGIN_IDENTITY)
-    assert bare == "person/maria.safronova", f"a password login names its person; got {bare!r}"
+    assert bare == "person/user15", f"a password login names its person; got {bare!r}"
     wrapped = principal_subject(MARIA_TICKET_IDENTITY)
-    assert wrapped == 'auth:v1:["local","","person/maria.safronova"]', (
+    assert wrapped == 'auth:v1:["local","","person/user15"]', (
         f"a local ticket is wrapped; got {wrapped!r}")
     # The registry is exact-match on purpose; the expansion is what recovers the person.
     assert hb.load_cached().person_of(wrapped) is None
-    assert prof_acl.registry_slug(bare) == "person/maria.safronova"
-    assert prof_acl.registry_slug(wrapped) == "person/maria.safronova", (
+    assert prof_acl.registry_slug(bare) == "person/user15"
+    assert prof_acl.registry_slug(wrapped) == "person/user15", (
         f"the wrapped ticket must expand to the person; got {prof_acl.registry_slug(wrapped)!r}")
     for subject in (bare, wrapped):
         assert prof_acl.allows(subject, MARIA) is True, subject
@@ -286,9 +286,9 @@ def test_a_password_login_resolves_to_the_same_registry_person(live_home):
 def test_the_minted_subject_resolves_through_the_acls_own_expansion(live_home):
     """The exact defect: ``person_of`` on the minted subject is None, expansion recovers the key."""
     registry = hb.load_cached()
-    minted = 'auth:v1:["local","","person/maria.safronova"]'
+    minted = 'auth:v1:["local","","person/user15"]'
     assert registry.person_of(minted) is None, "exact match is intentional — do not weaken person_of"
-    assert prof_acl.registry_slug(minted) == "person/maria.safronova", (
+    assert prof_acl.registry_slug(minted) == "person/user15", (
         f"registry_slug must expand the minted subject; got {prof_acl.registry_slug(minted)!r}")
 
 
@@ -296,7 +296,7 @@ def test_the_minted_subject_resolves_through_the_acls_own_expansion(live_home):
 
 @pytest.mark.parametrize("identity", [
     {"user_id": "999999999", "provider": "telegram"},
-    {"user_id": "person/yury2", "provider": "local"},
+    {"user_id": "person/user22x", "provider": "local"},
     {"user_id": "nobody.at.all", "provider": "federated-unknown"},
 ])
 def test_an_unknown_principal_gains_no_personal_profile(live_home, identity):

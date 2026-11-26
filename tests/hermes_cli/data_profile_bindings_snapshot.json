@@ -4,280 +4,280 @@
   "written_by": "admin",
   "persons": [
     {
-      "slug": "person/aleksei.tumanov",
-      "display_name": "Алексей Туманов",
+      "slug": "person/user01",
+      "display_name": "Сотрудник 01",
       "shared": false,
       "profiles": [
-        "01-aleksei-tumanov"
+        "01-user01"
       ],
       "subjects": [
         "tg:900000001"
       ],
-      "owner": "person/aleksei.tumanov",
+      "owner": "person/user01",
       "source": "hermes user add"
     },
     {
-      "slug": "person/alexander.shashkov",
-      "display_name": "Александр Шашков",
+      "slug": "person/user02",
+      "display_name": "Сотрудник 02",
       "shared": false,
       "profiles": [
-        "01-alexander-shashkov"
+        "01-user02"
       ],
       "subjects": [],
-      "owner": "person/alexander.shashkov",
+      "owner": "person/user02",
       "source": "hermes user add"
     },
     {
-      "slug": "person/alexander.yakovlev",
-      "display_name": "Александр Яковлев",
+      "slug": "person/user03",
+      "display_name": "Сотрудник 03",
       "shared": false,
       "profiles": [
-        "01-alexander-yakovlev"
+        "01-user03"
       ],
       "subjects": [
         "tg:900000002"
       ],
-      "owner": "person/alexander.yakovlev",
+      "owner": "person/user03",
       "source": "hermes user add"
     },
     {
-      "slug": "person/anastasia.abramova",
-      "display_name": "Анастасия Абрамова",
+      "slug": "person/user04",
+      "display_name": "Сотрудник 04",
       "shared": false,
       "profiles": [
-        "01-anastasia-abramova"
+        "01-user04"
       ],
       "subjects": [
         "tg:900000003"
       ],
-      "owner": "person/anastasia.abramova",
+      "owner": "person/user04",
       "source": "hermes user add"
     },
     {
-      "slug": "person/anastasia.zaichikova",
-      "display_name": "Анастасия Зайчикова",
+      "slug": "person/user05",
+      "display_name": "Сотрудник 05",
       "shared": false,
       "profiles": [
-        "01-anastasia-zaichikova"
+        "01-user05"
       ],
       "subjects": [
         "tg:900000004"
       ],
-      "owner": "person/anastasia.zaichikova",
+      "owner": "person/user05",
       "source": "hermes user add"
     },
     {
-      "slug": "person/bogatiy",
-      "display_name": "Bogatiy",
+      "slug": "person/user06",
+      "display_name": "Сотрудник 06",
       "shared": false,
       "profiles": [
-        "01-bogatiy"
+        "01-user06"
       ],
       "subjects": [
         "tg:900000005"
       ],
-      "owner": "person/bogatiy",
+      "owner": "person/user06",
       "source": "hermes user add"
     },
     {
-      "slug": "person/dmitry.borodulin",
-      "display_name": "Дмитрий Бородулин",
+      "slug": "person/user07",
+      "display_name": "Сотрудник 07",
       "shared": false,
       "profiles": [
-        "01-dmitry-borodulin"
+        "01-user07"
       ],
       "subjects": [
         "tg:900000006"
       ],
-      "owner": "person/dmitry.borodulin",
+      "owner": "person/user07",
       "source": "hermes user add"
     },
     {
-      "slug": "person/ekaterina.zaitseva",
-      "display_name": "Екатерина Зайцева",
+      "slug": "person/user08",
+      "display_name": "Сотрудник 08",
       "shared": false,
       "profiles": [
-        "01-ekaterina-zaitseva"
+        "01-user08"
       ],
       "subjects": [
         "tg:900000007"
       ],
-      "owner": "person/ekaterina.zaitseva",
+      "owner": "person/user08",
       "source": "hermes user add"
     },
     {
-      "slug": "person/evgenia.venina",
-      "display_name": "Евгения Венина",
+      "slug": "person/user09",
+      "display_name": "Сотрудник 09",
       "shared": false,
       "profiles": [
-        "01-evgenia-venina"
+        "01-user09"
       ],
       "subjects": [
         "tg:900000008"
       ],
-      "owner": "person/evgenia.venina",
+      "owner": "person/user09",
       "source": "hermes user add"
     },
     {
-      "slug": "person/evgeny.gerasimov",
-      "display_name": "Евгений Герасимов",
+      "slug": "person/user10",
+      "display_name": "Сотрудник 10",
       "shared": false,
       "profiles": [
-        "01-evgeny-gerasimov"
+        "01-user10"
       ],
       "subjects": [
         "tg:900000009"
       ],
-      "owner": "person/evgeny.gerasimov",
+      "owner": "person/user10",
       "source": "hermes user add"
     },
     {
-      "slug": "person/grigory.sergeev",
-      "display_name": "Григорий Сергеев",
+      "slug": "person/user11",
+      "display_name": "Сотрудник 11",
       "shared": false,
       "profiles": [
-        "01-grigory-sergeev"
+        "01-user11"
       ],
       "subjects": [],
-      "owner": "person/grigory.sergeev",
+      "owner": "person/user11",
       "source": "hermes user add"
     },
     {
-      "slug": "person/ksenia.kozlovskaya",
-      "display_name": "Ксения Козловская",
+      "slug": "person/user12",
+      "display_name": "Сотрудник 12",
       "shared": false,
       "profiles": [
-        "01-ksenia-kozlovskaya"
+        "01-user12"
       ],
       "subjects": [
         "tg:900000010"
       ],
-      "owner": "person/ksenia.kozlovskaya",
+      "owner": "person/user12",
       "source": "hermes user add"
     },
     {
-      "slug": "person/kurilenko",
-      "display_name": "Kurilenko",
+      "slug": "person/user13",
+      "display_name": "Сотрудник 13",
       "shared": false,
       "profiles": [
-        "01-kurilenko"
+        "01-user13"
       ],
       "subjects": [
         "tg:900000011"
       ],
-      "owner": "person/kurilenko",
+      "owner": "person/user13",
       "source": "hermes user add"
     },
     {
-      "slug": "person/maksim.matrosov",
-      "display_name": "Максим Матросов",
+      "slug": "person/user14",
+      "display_name": "Сотрудник 14",
       "shared": false,
       "profiles": [
-        "01-maksim-matrosov"
+        "01-user14"
       ],
       "subjects": [
         "tg:900000012"
       ],
-      "owner": "person/maksim.matrosov",
+      "owner": "person/user14",
       "source": "hermes user add"
     },
     {
-      "slug": "person/maria.safronova",
-      "display_name": "Мария Сафронова",
+      "slug": "person/user15",
+      "display_name": "Сотрудник 15",
       "shared": false,
       "profiles": [
-        "01-maria-safronova"
+        "01-user15"
       ],
       "subjects": [
         "tg:900000013"
       ],
-      "owner": "person/maria.safronova",
+      "owner": "person/user15",
       "source": "hermes user add"
     },
     {
-      "slug": "person/mikhail.shashkov",
-      "display_name": "Михаил Шашков",
+      "slug": "person/user16",
+      "display_name": "Сотрудник 16",
       "shared": false,
       "profiles": [
-        "01-mikhail-shashkov"
+        "01-user16"
       ],
       "subjects": [
         "tg:900000014"
       ],
-      "owner": "person/mikhail.shashkov",
+      "owner": "person/user16",
       "source": "hermes user add"
     },
     {
-      "slug": "person/novikov",
-      "display_name": "Novikov",
+      "slug": "person/user17",
+      "display_name": "Сотрудник 17",
       "shared": false,
       "profiles": [
-        "01-novikov"
+        "01-user17"
       ],
       "subjects": [
         "tg:900000015"
       ],
-      "owner": "person/novikov",
+      "owner": "person/user17",
       "source": "hermes user add"
     },
     {
-      "slug": "person/sergei.lobanov",
-      "display_name": "Сергей Лобанов",
+      "slug": "person/user18",
+      "display_name": "Сотрудник 18",
       "shared": false,
       "profiles": [
-        "01-sergei-lobanov"
+        "01-user18"
       ],
       "subjects": [
         "tg:900000016"
       ],
-      "owner": "person/sergei.lobanov",
+      "owner": "person/user18",
       "source": "hermes user add"
     },
     {
-      "slug": "person/tatiana.maksimova",
-      "display_name": "Татьяна Максимова",
+      "slug": "person/user19",
+      "display_name": "Сотрудник 19",
       "shared": false,
       "profiles": [
-        "01-tatiana-maksimova"
+        "01-user19"
       ],
       "subjects": [
         "tg:900000017"
       ],
-      "owner": "person/tatiana.maksimova",
+      "owner": "person/user19",
       "source": "hermes user add"
     },
     {
-      "slug": "person/vladimir.molodykh",
-      "display_name": "Владимир Молодых",
+      "slug": "person/user20",
+      "display_name": "Сотрудник 20",
       "shared": false,
       "profiles": [
-        "01-vladimir-molodykh"
+        "01-user20"
       ],
       "subjects": [
         "tg:900000018"
       ],
-      "owner": "person/vladimir.molodykh",
+      "owner": "person/user20",
       "source": "hermes user add"
     },
     {
-      "slug": "person/vladimir.smirnov",
-      "display_name": "Владимир Смирнов",
+      "slug": "person/user21",
+      "display_name": "Сотрудник 21",
       "shared": false,
       "profiles": [
-        "01-vladimir-smirnov"
+        "01-user21"
       ],
       "subjects": [
         "tg:900000019"
       ],
-      "owner": "person/vladimir.smirnov",
+      "owner": "person/user21",
       "source": "hermes user add"
     },
     {
-      "slug": "person/yury",
-      "display_name": "Юрий Молодых",
+      "slug": "person/user22",
+      "display_name": "Сотрудник 22",
       "shared": false,
       "profiles": [
-        "01-orchestrator",
+        "01-user22",
         "16-personal"
       ],
       "subjects": [
@@ -285,7 +285,7 @@
         "cron-owner",
         "900000020"
       ],
-      "owner": "person/yury",
+      "owner": "person/user22",
       "source": "bootstrap-owner"
     },
     {
