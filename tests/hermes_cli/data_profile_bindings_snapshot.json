@@ -1,0 +1,315 @@
+{
+  "schema": 1,
+  "written_at": "2026-01-01T00:00:00+00:00",
+  "written_by": "admin",
+  "persons": [
+    {
+      "slug": "person/user01",
+      "display_name": "Сотрудник 01",
+      "shared": false,
+      "profiles": [
+        "01-user01"
+      ],
+      "subjects": [
+        "tg:900000001"
+      ],
+      "owner": "person/user01",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user02",
+      "display_name": "Сотрудник 02",
+      "shared": false,
+      "profiles": [
+        "01-user02"
+      ],
+      "subjects": [],
+      "owner": "person/user02",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user03",
+      "display_name": "Сотрудник 03",
+      "shared": false,
+      "profiles": [
+        "01-user03"
+      ],
+      "subjects": [
+        "tg:900000002"
+      ],
+      "owner": "person/user03",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user04",
+      "display_name": "Сотрудник 04",
+      "shared": false,
+      "profiles": [
+        "01-user04"
+      ],
+      "subjects": [
+        "tg:900000003"
+      ],
+      "owner": "person/user04",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user05",
+      "display_name": "Сотрудник 05",
+      "shared": false,
+      "profiles": [
+        "01-user05"
+      ],
+      "subjects": [
+        "tg:900000004"
+      ],
+      "owner": "person/user05",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user06",
+      "display_name": "Сотрудник 06",
+      "shared": false,
+      "profiles": [
+        "01-user06"
+      ],
+      "subjects": [
+        "tg:900000005"
+      ],
+      "owner": "person/user06",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user07",
+      "display_name": "Сотрудник 07",
+      "shared": false,
+      "profiles": [
+        "01-user07"
+      ],
+      "subjects": [
+        "tg:900000006"
+      ],
+      "owner": "person/user07",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user08",
+      "display_name": "Сотрудник 08",
+      "shared": false,
+      "profiles": [
+        "01-user08"
+      ],
+      "subjects": [
+        "tg:900000007"
+      ],
+      "owner": "person/user08",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user09",
+      "display_name": "Сотрудник 09",
+      "shared": false,
+      "profiles": [
+        "01-user09"
+      ],
+      "subjects": [
+        "tg:900000008"
+      ],
+      "owner": "person/user09",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user10",
+      "display_name": "Сотрудник 10",
+      "shared": false,
+      "profiles": [
+        "01-user10"
+      ],
+      "subjects": [
+        "tg:900000009"
+      ],
+      "owner": "person/user10",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user11",
+      "display_name": "Сотрудник 11",
+      "shared": false,
+      "profiles": [
+        "01-user11"
+      ],
+      "subjects": [],
+      "owner": "person/user11",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user12",
+      "display_name": "Сотрудник 12",
+      "shared": false,
+      "profiles": [
+        "01-user12"
+      ],
+      "subjects": [
+        "tg:900000010"
+      ],
+      "owner": "person/user12",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user13",
+      "display_name": "Сотрудник 13",
+      "shared": false,
+      "profiles": [
+        "01-user13"
+      ],
+      "subjects": [
+        "tg:900000011"
+      ],
+      "owner": "person/user13",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user14",
+      "display_name": "Сотрудник 14",
+      "shared": false,
+      "profiles": [
+        "01-user14"
+      ],
+      "subjects": [
+        "tg:900000012"
+      ],
+      "owner": "person/user14",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user15",
+      "display_name": "Сотрудник 15",
+      "shared": false,
+      "profiles": [
+        "01-user15"
+      ],
+      "subjects": [
+        "tg:900000013"
+      ],
+      "owner": "person/user15",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user16",
+      "display_name": "Сотрудник 16",
+      "shared": false,
+      "profiles": [
+        "01-user16"
+      ],
+      "subjects": [
+        "tg:900000014"
+      ],
+      "owner": "person/user16",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user17",
+      "display_name": "Сотрудник 17",
+      "shared": false,
+      "profiles": [
+        "01-user17"
+      ],
+      "subjects": [
+        "tg:900000015"
+      ],
+      "owner": "person/user17",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user18",
+      "display_name": "Сотрудник 18",
+      "shared": false,
+      "profiles": [
+        "01-user18"
+      ],
+      "subjects": [
+        "tg:900000016"
+      ],
+      "owner": "person/user18",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user19",
+      "display_name": "Сотрудник 19",
+      "shared": false,
+      "profiles": [
+        "01-user19"
+      ],
+      "subjects": [
+        "tg:900000017"
+      ],
+      "owner": "person/user19",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user20",
+      "display_name": "Сотрудник 20",
+      "shared": false,
+      "profiles": [
+        "01-user20"
+      ],
+      "subjects": [
+        "tg:900000018"
+      ],
+      "owner": "person/user20",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user21",
+      "display_name": "Сотрудник 21",
+      "shared": false,
+      "profiles": [
+        "01-user21"
+      ],
+      "subjects": [
+        "tg:900000019"
+      ],
+      "owner": "person/user21",
+      "source": "hermes user add"
+    },
+    {
+      "slug": "person/user22",
+      "display_name": "Сотрудник 22",
+      "shared": false,
+      "profiles": [
+        "01-user22",
+        "16-personal"
+      ],
+      "subjects": [
+        "uid:1001",
+        "cron-owner",
+        "900000020"
+      ],
+      "owner": "person/user22",
+      "source": "bootstrap-owner"
+    },
+    {
+      "slug": "shared/service",
+      "display_name": "Shared profiles",
+      "shared": true,
+      "profiles": [
+        "02-hermes-platform",
+        "03-software-engineer",
+        "04-web-researcher",
+        "05-rag-knowledge-engineer",
+        "06-contest-methodologist",
+        "07-document-producer",
+        "08-visual-media-designer",
+        "09-independent-reviewer",
+        "10-skill-librarian",
+        "12-archaeologist",
+        "13-uas-expert",
+        "14-space-systems-engineer",
+        "15-sre-qa"
+      ],
+      "subjects": [],
+      "owner": "admin",
+      "source": "admin"
+    }
+  ]
+}
