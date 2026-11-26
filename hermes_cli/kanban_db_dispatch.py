@@ -81,7 +81,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # run ends in one of these the leftover text is stale context: it must not park
 # the card in ``blocker_auth`` forever (#119070).
 _RESPAWN_BLOCKER_SUPERSEDED_OUTCOMES = frozenset(
-    {"completed", "review_requested", "changes_requested", "crashed"}
+    {"completed", "review_requested", "changes_requested", "crashed", "code_skew"}
 )
 
 # Newest-run ordering. ``ended_at`` has one-second resolution, so two runs that
@@ -95,6 +95,12 @@ _LATEST_RUN_ORDER = "ORDER BY ended_at DESC, id DESC LIMIT 1"
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Cooldown after a ``code_skew`` requeue (see ``_kb.KANBAN_CODE_SKEW_EXIT_CODE``). A refused start
+# costs one spawn and no budget, but nothing changes until an operator restarts the gateway, so the
+# retry is spaced instead of firing on every tick. Kept SHORT (60 s) on purpose: the same restart
+# that heals the skew makes the next spawn succeed, and the gate is re-read on every start.
+DEFAULT_CODE_SKEW_COOLDOWN_SECONDS = 60
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -346,6 +352,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("owner_lost", code)
     if code == _kb.KANBAN_WORKER_LOST_EXIT_CODE:
         return ("worker_lost", code)
+    if code == _kb.KANBAN_CODE_SKEW_EXIT_CODE:
+        return ("code_skew", code)
     return ("nonzero_exit", code)
 
 
@@ -1279,6 +1287,11 @@ class _DeadWorker:
     """``KANBAN_WORKER_LOST_EXIT_CODE``: the owner lost the execution it admitted and no
     ``worker_result`` exists (a host watchdog kill, an OOM, a manual kill). A platform loss, not
     the card's fault — requeued WITHOUT counting a failure, run outcome ``interrupted`` (OPS-16)."""
+    code_skew: bool = False
+    """``KANBAN_CODE_SKEW_EXIT_CODE``: the worker refused to start because the checkout on disk
+    speaks a different ``worker.persist`` contract than the running owner (26.11.2026). Nothing of
+    the card ran and no retry can change the tree, so it is requeued WITHOUT counting a failure and
+    the respawn guard spaces it until the gateway is restarted onto this checkout."""
 
     @property
     def run_outcome(self) -> str:
@@ -1289,6 +1302,10 @@ class _DeadWorker:
         # An absent owner is an infrastructure requeue, not a card failure.
         if self.owner_lost:
             return "owner_lost"
+        # A refused start on split code is a host condition with its own name, so a run history
+        # cannot read it as the card having failed.
+        if self.code_skew:
+            return "code_skew"
         # A restart/shutdown interruption is an infrastructure requeue, not a card failure.
         # So is a lost execution: the platform dropped the attempt, the card did nothing wrong —
         # the same ``interrupted`` a gateway restart books, so the card is not read as broken.
@@ -1423,6 +1440,22 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
             worker_lost=True,
         )
+    if kind == "code_skew":
+        # The gate refused before its first dial: the checkout on disk cannot speak the running
+        # owner's ``worker.persist`` contract (26.11.2026 — a new agent's ``usage.main`` met an old
+        # gateway's ``invalid_params`` and every turn died ~60 s in). Nothing of the card ran and
+        # retrying cannot change the tree, so requeue WITHOUT counting a failure, name both commits
+        # and the one fix, and let the respawn guard space the retries until the gateway restarts.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} refused to start (exit {code}): the code on disk is not the code the running "
+            "gateway serves, so its persistence RPCs would be rejected — restart the gateway onto "
+            "this checkout (`hermes gateway restart`) or move the checkout back to the gateway's "
+            "commit; requeued without counting a failure",
+            "code_skew",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "code_skew": True},
+            code_skew=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1515,7 +1548,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "retry_status": retry_status,
             })
             if dead.rate_limited or dead.protocol_violation or dead.host_interrupted or dead.owner_lost \
-                    or dead.worker_lost:
+                    or dead.worker_lost or dead.code_skew:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1549,7 +1582,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *,
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
-        if dead.host_interrupted or dead.owner_lost or dead.worker_lost:
+        if dead.host_interrupted or dead.owner_lost or dead.worker_lost or dead.code_skew:
             continue  # a host-caused requeue is not evidence of a systemic card fault
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
@@ -1568,6 +1601,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *,
         if dead.worker_lost:
             # The platform lost the attempt's execution (OPS-16): already requeued with no failure
             # counted. A dropped execution is an infrastructure condition, never a card fault.
+            continue
+        if dead.code_skew:
+            # The gate refused before anything ran (26.11.2026): the tree cannot change by retrying,
+            # so a failure counter here would only block five cards for one host condition. Already
+            # requeued with no failure counted; ``check_respawn_guard`` spaces the attempts.
             continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1922,6 +1960,13 @@ def check_respawn_guard(
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
+    if latest_run is not None and latest_run["outcome"] == "code_skew":
+        # A refused start on split code: nothing ran, no budget spent, and only a gateway restart
+        # changes the answer — so space the retry instead of spawning on every tick. Short on
+        # purpose: the restart that heals it makes the very next attempt pass the gate.
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        if ended_at is not None and (now - ended_at) < DEFAULT_CODE_SKEW_COOLDOWN_SECONDS:
+            return "code_skew_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so

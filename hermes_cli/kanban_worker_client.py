@@ -36,6 +36,11 @@ OWNER_LOST_EXIT_CODE = 69
 # the card's failure budget for a host watchdog kill or an OOM (23.11.2026, run 708: 42 minutes of
 # work booked ``crashed``). 71 == BSD EX_OSERR; the crash sweep requeues without counting a failure.
 WORKER_LOST_EXIT_CODE = 71
+# Exit code of a submitter that refused to start because the checkout on disk cannot speak the
+# running owner's ``worker.persist`` contract (``hermes_cli.code_skew_gate``). 76 == BSD
+# EX_PROTOCOL; the crash sweep requeues without counting a failure (see
+# ``hermes_cli.kanban_db.KANBAN_CODE_SKEW_EXIT_CODE``).
+CODE_SKEW_EXIT_CODE = 76
 
 
 def owner_wait_seconds():
@@ -479,10 +484,54 @@ def _submit():
                 os.environ.pop(key)
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
+        if (skew := _refuse_on_code_skew(params, board_db)) is not None:
+            return skew
         return asyncio.run(run(params, board_db))
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
+
+
+def _refuse_on_code_skew(params, board_db):
+    """``CODE_SKEW_EXIT_CODE`` when this checkout cannot speak the running owner, else None.
+
+    The gate is consulted BEFORE the first dial, so a split contract costs one refused spawn instead
+    of a 60-second turn that dies inside ``usage.main`` (26.11.2026). A refusal here is the host's
+    condition, not the card's: the exit code is separate, it spends no failure budget, and a
+    checkpoint records both commits so the board explains itself without re-diagnosis.
+    """
+    from hermes_cli import code_skew_gate
+    try:
+        skew = code_skew_gate.check_code_skew()
+    except Exception as exc:  # the gate must never be the reason a worker cannot start
+        print(f'Kanban code-skew gate not conclusive ({type(exc).__name__}: {exc}); starting anyway',
+              file=sys.stderr)
+        return None
+    if skew is None:
+        return None
+    print(f'Kanban worker refused to start: {skew.message}', file=sys.stderr)
+    _checkpoint_code_skew(params, board_db, skew)
+    return CODE_SKEW_EXIT_CODE
+
+
+def _checkpoint_code_skew(params, board_db, skew) -> None:
+    """Leave the refusal on the card (both commits + the fix). Best-effort, like its siblings."""
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        note = {
+            'kind': 'code_skew',
+            'disk_sha': skew.disk_sha,
+            'gateway_sha': skew.gateway_sha,
+            'gateway_pid': skew.gateway_pid,
+            'problems': list(skew.problems),
+            'message': skew.message[:500],
+        }
+        with connect_closing(Path(board_db)) as conn:
+            kb._append_event(conn, params['task_id'], 'checkpoint', note, run_id=params['run_id'])
+            conn.commit()
+    except Exception as exc:  # never mask the exit code the crash sweep reads
+        print(f'Kanban code-skew checkpoint not written: {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
 if __name__ == '__main__':
