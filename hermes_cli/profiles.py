@@ -471,13 +471,19 @@ def profile_matches_home(name: str, home: Path | None = None) -> bool:
 
     Lets single-profile gateways decide whether a ``/p/<profile>/`` URL prefix is
     self-referential (safe on the bare route) or names a different profile, which must fail
-    closed rather than silently resolve the owner's config. Invalid names return False."""
+    closed rather than silently resolve the owner's config. Invalid names return False.
+
+    The comparison itself (``hermes_constants.home_paths_match``) is memoized: the WS request path
+    reaches this on every routed request, and resolving two paths per call put ``realpath``
+    syscalls on the gateway's main thread.
+    """
     try:
         target = get_profile_dir(name)
         if home is None:
             from hermes_constants import get_hermes_home
             home = get_hermes_home()
-        return Path(target).expanduser().resolve(strict=False) == Path(home).expanduser().resolve(strict=False)
+        from hermes_constants import home_paths_match
+        return home_paths_match(target, home)
     except Exception:
         return False
 

@@ -212,6 +212,13 @@ _HOME_KEY_CACHE: dict[str, str] = {}
 # ``profile_name_for_home``'s remembered answers, keyed by the path string handed in plus the
 # process's default root (the answer is relative to it). See the function for why.
 _PROFILE_NAME_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
+# ``home_paths_match``'s remembered resolved spellings, keyed by ONE path (normalized spelling)
+# plus the process's default root — the same key shape as ``_PROFILE_NAME_CACHE``, and for the
+# same reason. One entry per distinct path, never one per compared pair: the WS request path walks
+# a host-scoped socket over every served profile, so a pair key grows with profiles x families
+# (n^2 at 38 served profiles: 1444 pairs against a 256 ceiling, which cleared the whole dict on
+# every insert) while a per-path key stays O(profiles). Same reset hook and TTL.
+_HOME_MATCH_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _PROFILE_NAME_LOCK = threading.RLock()
 _PROFILE_NAME_TTL = 60.0
 _PROFILE_NAME_MAX_ENTRIES = 256
@@ -248,6 +255,85 @@ def reset_hermes_home_key_cache() -> None:
     _HOME_KEY_CACHE.clear()
     with _PROFILE_NAME_LOCK:
         _PROFILE_NAME_CACHE.clear()
+        _HOME_MATCH_CACHE.clear()
+
+
+def forget_home_match_cache() -> None:
+    """Drop the remembered resolved path spellings behind ``home_paths_match``.
+
+    Called where a profile is connected or disconnected (``SessionAuthorities.add``/``replace``/
+    ``remove``): the served set is what those comparisons answer about, so one switch must not let
+    a previous routing decision survive. The resolved home keys and profile names are left alone —
+    they are keyed by paths that did not change.
+    """
+    with _PROFILE_NAME_LOCK:
+        _HOME_MATCH_CACHE.clear()
+
+
+def _comparable_spelling(path: str | Path) -> str:
+    """Syscall-free spelling of *path* for a cache key.
+
+    ``Path`` already folds ``/a//b/`` and ``/a/./b`` into one spelling and ``normcase`` folds the
+    Windows case/separator difference, so the everyday variants of one path share a key. Any other
+    alias (``..``, a symlink) gets its own key and one extra ``resolve``, then shares the answer.
+    """
+    return os.path.normcase(str(Path(path).expanduser()))
+
+
+def _resolved_spelling(path: str | Path, root_key: str) -> str:
+    """Resolved, normcased spelling of *path*, remembered per spelling + default root.
+
+    Keyed by ONE path plus :func:`get_default_hermes_root` — the same key shape as
+    ``profile_name_for_home`` — so one entry per distinct path rather than one per compared pair.
+    A path that is not on disk is resolved leniently but NOT stored: the answer can change once it
+    is created (part of it may turn out to be a symlink), exactly as :func:`hermes_home_key` does.
+    """
+    key = (_comparable_spelling(path), root_key)
+    now = time.monotonic()
+    with _PROFILE_NAME_LOCK:
+        hit = _HOME_MATCH_CACHE.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    expanded = Path(path).expanduser()
+    try:
+        resolved = os.path.normcase(str(expanded.resolve(strict=True)))
+    except OSError:
+        return os.path.normcase(str(expanded.resolve(strict=False)))
+    with _PROFILE_NAME_LOCK:
+        if len(_HOME_MATCH_CACHE) >= _PROFILE_NAME_MAX_ENTRIES:
+            _HOME_MATCH_CACHE.clear()
+        _HOME_MATCH_CACHE[key] = (now + _PROFILE_NAME_TTL, resolved)
+    return resolved
+
+
+def home_paths_match(target: str | Path, home: str | Path) -> bool:
+    """True when *target* and *home* name the same directory once symlinks are followed.
+
+    This is the ``realpath`` comparison behind ``hermes_cli.profiles.profile_matches_home``, which
+    the WS request path reaches on every routed request (``gateway/session_controls.py``) — twice
+    per served profile per frame, i.e. ``realpath`` syscalls on the gateway's main thread. Each
+    operand's resolved spelling is therefore remembered per input path (see
+    :func:`_resolved_spelling`), and the answer is a plain string compare of the two spellings:
+    identical semantics to comparing the two ``resolve`` results, with no syscall on a warm path.
+    Both lookups share one lock acquisition on the steady-state path, so a routed frame pays one
+    short critical section, not two.
+
+    Cleared by :func:`reset_hermes_home_key_cache` (profile switch, tests that move a home) and by
+    :func:`forget_home_match_cache` (a served set changed), expired after ``_PROFILE_NAME_TTL``
+    seconds. Known, accepted limit: a directory re-pointed on disk behind our back (a symlink
+    swapped by something other than a profile connect) keeps its old verdict for up to that TTL.
+    """
+    root_key = str(get_default_hermes_root())
+    target_key = (_comparable_spelling(target), root_key)
+    home_key = (_comparable_spelling(home), root_key)
+    now = time.monotonic()
+    with _PROFILE_NAME_LOCK:
+        target_hit = _HOME_MATCH_CACHE.get(target_key)
+        home_hit = _HOME_MATCH_CACHE.get(home_key)
+        if (target_hit is not None and target_hit[0] > now
+                and home_hit is not None and home_hit[0] > now):
+            return target_hit[1] == home_hit[1]
+    return _resolved_spelling(target, root_key) == _resolved_spelling(home, root_key)
 
 
 def get_process_hermes_home() -> Path:
