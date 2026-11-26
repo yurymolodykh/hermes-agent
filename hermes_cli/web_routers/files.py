@@ -886,8 +886,21 @@ def _managed_write_target(path: str, request: Request, overwrite: bool):
     # person's upload lands in ``shared/<subject-slug>/``, a root-level name is moved there, and a
     # neighbour's folder is refused. Unscoped callers (multi_user off, the host owner) get the
     # path back unchanged — the pre-change behaviour.
-    from hermes_acl_results import exchange_write_target, require_exchange_authorship
+    from hermes_acl_results import (
+        exchange_foreign_folder,
+        exchange_write_target,
+        require_exchange_authorship,
+    )
 
+    # Order matters: the "that path is a directory" guard must see the path the CALLER named, or a
+    # redirect would turn ``upload(path=shared/person_bob)`` into a file named ``person_bob`` inside
+    # the caller's own folder. A neighbour's folder is a refusal; any other folder is a name clash.
+    if exchange_foreign_folder(request, target):
+        raise HTTPException(
+            status_code=403,
+            detail="The team exchange is writable only inside your own folder")
+    if target.exists() and target.is_dir():
+        raise HTTPException(status_code=409, detail="A directory already exists at that path")
     redirected = exchange_write_target(request, target)
     if redirected != target:
         display_path = str(redirected)

@@ -287,7 +287,6 @@ class TestSiblingWriteRoutes:
         assert legacy_file.is_file()
 
     def test_with_scoping_off_delete_and_mkdir_are_unchanged(
-            self, legacy, fs_client_factory, _isolated_home):
         exchange = _isolated_home / "shared"
         assert fs_client_factory("alice").post(
             "/api/files/mkdir", json={"path": str(exchange / "plain")}).status_code == 200
@@ -415,12 +414,27 @@ class TestAuthorshipBackstop:
         exchange = _isolated_home / "shared"
         assert _upload(fs_client_factory("alice"), exchange / "x.txt", "x").status_code == 200
 
-        journal = exchange / ".authorship.jsonl"
+        # The journal lives OUTSIDE every file root (``acl/``): in the exchange it would publish
+        # other people's paths and subjects to everyone who can list ``shared/`` (H3).
+        journal = _isolated_home / "acl" / ".authorship.jsonl"
         assert journal.is_file()
+        assert not (exchange / ".authorship.jsonl").exists()
         rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line]
         assert rows and rows[-1]["subject"] == ALICE
         assert Path(rows[-1]["path"]) == (exchange / "person_alice" / "x.txt").resolve()
         assert rows[-1]["at"]
+
+    def test_the_journal_is_not_listed_in_the_exchange(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """H3: a colleague listing the exchange never sees other people's authorship."""
+        exchange = _isolated_home / "shared"
+        assert _upload(fs_client_factory("bob"), exchange / "b.txt", "bob's").status_code == 200
+
+        listing = fs_client_factory("alice").get("/api/fs/list", params={"path": str(exchange)})
+
+        assert listing.status_code == 200, listing.text
+        names = {entry["name"] for entry in listing.json()["entries"]}
+        assert ".authorship.jsonl" not in names
 
 
 # ---------------------------------------------------------------------------
