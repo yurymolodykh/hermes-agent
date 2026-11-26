@@ -25,7 +25,6 @@ from fastapi.testclient import TestClient
 
 import hermes_acl_bindings as hb
 import hermes_acl_identity
-import hermes_acl_profiles as prof_acl
 import hermes_acl_scope
 from gateway.owner_identity import host_owner_subject
 from hermes_state import SessionDB
@@ -87,7 +86,6 @@ def multi_user(monkeypatch):
     monkeypatch.setattr(hermes_acl_scope, "acl_enabled", lambda: True)
     monkeypatch.setattr(hermes_acl_scope, "identity_trust", lambda: "untrusted")
     monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: True)
-    monkeypatch.setattr(prof_acl, "multi_user_enabled", lambda: True)
 
     def _resolve(value, fallback=""):
         login = str(value or "").strip()
@@ -229,7 +227,6 @@ def test_acl_off_keeps_the_launch_store(homes, monkeypatch, registry):
     """The shipped single-user default is untouched: the root store, as before."""
     monkeypatch.setattr(hermes_acl_scope, "acl_enabled", lambda: False)
     monkeypatch.setattr(hermes_acl_identity, "multi_user_enabled", lambda: False)
-    monkeypatch.setattr(prof_acl, "multi_user_enabled", lambda: False)
     with _client() as cli:
         ids, _ = _ids(cli, "/api/sessions?limit=50")
     assert ids == {"root-owner-1", "root-alice-1"}
