@@ -61,6 +61,11 @@ def _caller_summary(limit=8):
     return ' <- '.join(frames)
 
 
+def _entry_operation(entry):
+    """The journal entry's RPC operation name, or '?' for a malformed entry (diagnostics only)."""
+    return entry.get('operation', '?') if isinstance(entry, dict) else '?'
+
+
 def _failure_log_path(scope):
     """``<profile>/logs/persist-failures.log`` for this worker's profile, or None if unknown.
 
@@ -442,14 +447,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self.failure = str(exc)
                 # The refused entry stays at the head of the journal: its operation and payload
                 # are what the owner rejected, so they name the culprit of a bare error string.
-                stuck = self.journal['pending'][0] if self.journal.get('pending') else None
+                pending = self.journal.get('pending') or []
+                stuck = pending[0] if pending and isinstance(pending[0], dict) else {}
+                payload = stuck.get('payload')
                 record_persist_failure(
-                    self.scope, operation=(stuck or {}).get('operation') or 'worker.persist',
-                    params={'sequence': (stuck or {}).get('sequence'),
-                            **((stuck or {}).get('payload') or {})},
+                    self.scope, operation=stuck.get('operation') or 'worker.persist',
+                    params={'sequence': stuck.get('sequence'),
+                            **(payload if isinstance(payload, dict) else {})},
                     error=exc, trace=traceback.format_exc(),
                     extra={'stuck_entry': True,
-                           'pending_operations': [e.get('operation') for e in self.journal.get('pending') or []]})
+                           'pending_operations': [_entry_operation(e) for e in pending]})
                 raise
             self.failure = None
             return results
@@ -517,7 +524,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 record_persist_failure(self.scope, operation='flush_token_counts', params={},
                                        error=WorkerPersistenceError(self.failure),
                                        extra={'surface': 'flush_token_counts',
-                                              'pending_operations': [e.get('operation') for e in
+                                              'pending_operations': [_entry_operation(e) for e in
                                                                      self.journal.get('pending') or []]})
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:

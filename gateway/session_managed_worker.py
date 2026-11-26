@@ -745,9 +745,16 @@ async def execute_managed(authority, ref, row, policy):
                 authority.sessions[ref.session_id].controls.snapshot(ref.session_id, None)
                 await asyncio.to_thread(worker.send, {'type': 'finish'})
                 continue
-            if frame == {'type': 'finished'} and accepted is not None:
+            if kind == 'finished' and set(frame) in ({'type'}, {'type', 'persistence_error'}) and accepted is not None:
                 # 'finished' follows the worker's durable execution.finish: the turn is complete.
                 # A slow or non-zero interpreter exit after it is close()'s cleanup, not a loss.
+                # ``persistence_error`` says the worker could not write its close-time receipt
+                # (outbox/usage flush refused): the answer exists, only its receipt is lost, so
+                # settlement closes the execution and the card keeps its result (t_7403b0fe).
+                if frame.get('persistence_error') is not None:
+                    logging.getLogger(__name__).warning(
+                        'Managed worker finished with a persistence error (result kept): %s',
+                        frame['persistence_error'])
                 with suppress(subprocess.TimeoutExpired):
                     await asyncio.to_thread(process.wait, 10)
                 accepted = _with_stop_cause(accepted, worker)
