@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import asdict, replace
 from functools import partial
 import json
+import logging
 import os
 import queue
 import threading
