@@ -882,7 +882,8 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
         raw = payload.get('source')
         source = raw if isinstance(raw, str) else None
         payload = {k: v for k, v in payload.items() if k != 'source'}
-    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task'})
+    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (
+        _MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task', 'prompt_cache_clock'})
     if set(payload) - allowed:
         raise RuntimeStoreError('invalid_params')
     for key, value in payload.items():
@@ -896,6 +897,13 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
             valid = value is None or (isinstance(value, str) and len(value) <= 4096)
         if not valid:
             raise RuntimeStoreError('invalid_params')
+    # ``prompt_cache_clock`` is the *advisory* cache-window record a newer worker's
+    # ``agent.turn_usage.cache_clock_column`` adds to its usage batch. It is validated above
+    # (an optional bounded string) and dropped here: this schema has no column for it, and it
+    # never belongs in the token write. Refusing it as an unknown key failed the whole usage
+    # receipt with ``invalid_params`` — sticky for the rest of the turn — so an otherwise
+    # successful card died at close (t_7403b0fe).
+    payload = {key: value for key, value in payload.items() if key != 'prompt_cache_clock'}
     if auxiliary:
         if not payload.get('task'):
             raise RuntimeStoreError('invalid_params')
