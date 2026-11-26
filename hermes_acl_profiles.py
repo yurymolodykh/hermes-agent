@@ -406,7 +406,7 @@ def create_allowed(request: Any, name: Any) -> bool:
         return False
     if registry is not None:
         owner_slug = registry.profile_owner(profile)
-        person = registry.person_of(registry_slug(subject))
+        person = registry_slug(subject)  # already a record slug (the registry's own key)
         if owner_slug is not None and owner_slug != person:
             return False
     return True
