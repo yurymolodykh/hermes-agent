@@ -55,7 +55,7 @@ def test_missing_operation_is_refused():
 
 # --- extras live in the code, and the gate reads them there --------------------------------------
 
-def _repo_root() -> "Path":
+def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
@@ -66,22 +66,34 @@ def _read_repo(rel: str):
         return None
 
 
-def _edition(drop: str = ""):
-    """The repository's own sources, optionally with one field removed from the extras constant.
+def _edition(extra: str = "") -> gate.RpcContract:
+    """A contract built from THIS checkout's real modules, with one field added to the handler's set.
 
-    Built from the REAL modules (not from invented names), so this follows the code: whatever the
-    handler accepts is what the gate must compare.
+    Nothing is hand-written: the field set comes from ``hermes_state_usage._MODEL_USAGE_FIELDS`` and
+    from the accepted-set expression inside the real ``_worker_usage``. ``extra`` injects one more
+    field into that expression — the shape of the commit that added ``prompt_cache_clock`` — so the
+    two editions differ ONLY in the extras, exactly as the incident pair did.
     """
     usage = _read_repo("hermes_state_usage.py")
-    assert usage, "hermes_state_usage.py must exist in the checkout"
-    if drop:
-        needle = f'"{drop}"'
-        assert needle in usage, f"{drop} must be accepted by the real handler to test it"
-        usage = usage.replace(needle, '"_replaced_placeholder_"', 1)
+    runtime = _read_repo("hermes_state_runtime.py")
+    assert usage and runtime, "the real modules must exist in this checkout"
+    if extra:
+        # the first ``allowed =`` line that names the model-field constant IS the handler's set
+        # (the turn-lease handler above it names only its two payload keys).
+        lines = runtime.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("allowed = ") and "_MODEL_USAGE_FIELDS" in line:
+                lines[index] = line.rstrip("\n") + f" | {{{extra!r}}}\n"
+                break
+        else:
+            raise AssertionError("the handler's accepted-set expression must name the field constant")
+        runtime = "".join(lines)
 
-    def read(rel: str):
+    def read(rel):
         if rel == "hermes_state_usage.py":
             return usage
+        if rel == "hermes_state_runtime.py":
+            return runtime
         return _read_repo(rel)
 
     contract = gate.contract_from_sources(read)
@@ -90,75 +102,79 @@ def _edition(drop: str = ""):
 
 
 def test_extras_are_read_from_the_code_not_a_literal():
-    """``prompt_cache_clock`` is in the real handler's accepted set, and the gate sees it there.
+    """The gate carries no extras literal and the parsed set contains the handler's extras.
 
-    This is the D1 regression: the earlier revision declared an extras literal in the gate, never
-    read it, and compared only ``_MODEL_USAGE_FIELDS`` — structurally blind to the very field the
-    incident was about. Both halves are pinned: the gate parses the extras out of the source, and
-    removing a field from that ONE constant changes the parsed contract.
+    D1 regression: the earlier revision declared ``_USAGE_MAIN_EXTRA_FIELDS`` in the gate, never
+    read it, and parsed only ``_MODEL_USAGE_FIELDS`` — structurally blind to the field that caused
+    the incident. Extras must come from the code, so adding one field to the handler's expression
+    changes the parsed contract without touching the gate.
     """
     assert not hasattr(gate, "_USAGE_MAIN_EXTRA_FIELDS"), \
         "a literal copy of the extras set in the gate goes stale; it must be parsed from the code"
-    usage = _read_repo("hermes_state_usage.py")
-    assert usage and "USAGE_MAIN_EXTRA_FIELDS" in usage, \
-        "the handler's extras must be a named constant"
-    full = _edition()
-    assert "prompt_cache_clock" in full.usage_main_fields, \
-        "the real handler accepts prompt_cache_clock, so the contract must list it"
-    for field in ("pricing_version", "absolute", "task"):
-        assert field in full.usage_main_fields, f"{field} is accepted by the real handler"
-    assert "prompt_cache_clock" not in _edition(drop="prompt_cache_clock").usage_main_fields
+    plain = _edition()
+    with_clock = _edition("prompt_cache_clock")
+    assert "prompt_cache_clock" not in plain.usage_main_fields
+    assert "prompt_cache_clock" in with_clock.usage_main_fields, \
+        "a field added to the handler's accepted set must appear in the parsed contract"
+    # the extras that already exist in this checkout came out of the same expression
+    assert with_clock.usage_main_fields - plain.usage_main_fields == {"prompt_cache_clock"}
 
 
 def test_two_editions_differing_only_in_extras_are_not_mistaken_for_one_contract():
-    """The field channel decides on the extras too: same model fields, different extras, different verdict.
+    """Same model fields, different extras: the field channel must see a difference, both ways.
 
-    ``disk`` sends ``prompt_cache_clock`` and the gateway does not accept it: a refusal that names
-    the field. The opposite order is an ordinary forward commit (gateway ahead) and must stay
-    allowed — the requirement is a subset test, and refusing a gateway that accepts a superset would
-    itself be the false refusal this gate is forbidden from making.
+    The unsafe direction (disk accepts ``prompt_cache_clock``, gateway does not) is a refusal that
+    names the field. The safe direction (the gateway accepts a superset) is a forward commit, so it
+    is NOT a refusal — but it is never reported as "identical contracts" either: the difference is
+    visible in the parsed sets, which is what the blind revision lost.
     """
-    with_clock = _edition()
-    without_clock = _edition(drop="prompt_cache_clock")
-    assert with_clock.usage_main_fields != without_clock.usage_main_fields
-    assert not (with_clock.usage_main_fields - without_clock.usage_main_fields
-                - {"prompt_cache_clock"}), "the two editions differ ONLY in the extras field"
+    without_clock = _edition()
+    with_clock = _edition("prompt_cache_clock")
+    assert with_clock.usage_main_fields - without_clock.usage_main_fields == {"prompt_cache_clock"}
+    assert without_clock.usage_main_fields - with_clock.usage_main_fields == set()
 
     problems = gate.compare_contracts(with_clock, without_clock, frozenset())
-    assert problems, "a field set differing only in extras must produce a verdict"
+    assert problems, "a field the gateway does not accept must be reported"
     assert "prompt_cache_clock" in problems[0] and "usage.main" in problems[0]
+    # reverse order: parsed on both sides (so the difference is visible), yet allowed by the
+    # subset rule — a gateway ahead of disk is an ordinary forward commit.
     assert gate.compare_contracts(without_clock, with_clock, frozenset()) == ()
 
 
-def test_the_real_incident_pair_is_refused_and_its_reverse_still_passes():
-    """Disk ``34086e258353`` (accepts ``prompt_cache_clock``) vs gateway ``4713ca0ab46`` (does not).
+def test_the_real_incident_pair_is_refused_by_contract():
+    """Disk ``34086e258353`` accepts ``prompt_cache_clock``; gateway ``4713ca0ab46`` does not.
 
-    The pair the previous verdict walked through as PASSING. Skipped only when this checkout does
-    not carry those objects (a shallow clone); never silently green without the objects present.
+    The exact pair the previous verdict walked through as PASSING. Both sides are parsed out of the
+    object database, so this holds regardless of which checkout runs the test; skipped (never
+    silently green) when the objects are absent.
     """
     repo = _repo_root()
+
     def present(sha: str) -> bool:
         return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
-                              capture_output=True).returncode == 0
+                              capture_output=True, check=False).returncode == 0
+
     if not (present("34086e258353") and present("4713ca0ab46")):
         pytest.skip("the incident commits are not in this checkout's object database")
-    skew = gate.check_code_skew(disk_sha="34086e258353", gateway_sha="4713ca0ab46", repo=repo)
-    assert skew is not None, "disk accepts a field the gateway rejects: this is the incident"
-    assert "prompt_cache_clock" in skew.problems[0]
-    # Reverse: the gateway accepts MORE than disk sends — a forward commit, not skew.
-    assert gate.check_code_skew(disk_sha="4713ca0ab46", gateway_sha="34086e258353",
-                                repo=repo) is None
+    disk = gate.commit_contract("34086e258353", repo)
+    running = gate.commit_contract("4713ca0ab46", repo)
+    assert disk is not None and running is not None
+    assert "prompt_cache_clock" in disk.usage_main_fields
+    assert "prompt_cache_clock" not in running.usage_main_fields
+    problems = gate.compare_contracts(disk, running, frozenset())
+    assert problems, "this is the incident: a real split must not compare as equal"
+    assert "prompt_cache_clock" in problems[0]
+    assert gate.compare_contracts(running, disk, frozenset()) == ()
 
 
 def test_disk_contract_reads_the_extras_of_this_checkout():
-    """``disk_contract()`` on the real checkout includes the named extras (D4: real modules only)."""
-    disk = gate.disk_contract()
+    """``disk_contract()`` on the real checkout matches the handler's own accepted set (D4)."""
+    disk = gate.disk_contract(repo=_repo_root())
     assert disk is not None
-    usage = _read_repo("hermes_state_usage.py")
-    assert usage and "_MODEL_USAGE_FIELDS" in usage
-    # every field the module names as an accepted extra is in the parsed contract
+    expected = _edition()
+    assert disk.usage_main_fields == expected.usage_main_fields, \
+        "disk_contract must agree with the real handler's expression, not with a literal"
     assert {"pricing_version", "absolute", "task"} <= set(disk.usage_main_fields)
-    assert "prompt_cache_clock" in disk.usage_main_fields
 
 
 # --- the refusal text is actionable ---------------------------------------------------------------
@@ -252,11 +268,11 @@ def test_sibling_branches_with_a_common_fork_are_not_diverged(tmp_path):
 
     # Neither tip contains the other, yet both hang off one fork point.
     assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", worker, gateway],
-                          capture_output=True).returncode == 1
+                          capture_output=True, check=False).returncode == 1
     assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", gateway, worker],
-                          capture_output=True).returncode == 1
+                          capture_output=True, check=False).returncode == 1
     assert subprocess.run(["git", "-C", str(repo), "merge-base", worker, gateway],
-                          capture_output=True, text=True).stdout.strip() == base
+                          capture_output=True, text=True, check=False).stdout.strip() == base
     assert gate._diverged(worker, gateway, repo) is False
     # The whole gate must not refuse: unparsable layouts + shared history == PASS.
     assert gate.check_code_skew(disk_sha=worker, gateway_sha=gateway, repo=repo) is None

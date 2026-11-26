@@ -118,7 +118,7 @@ def window_ok(path: str | None) -> str | None:
 def pid_of_gateway() -> str:
     out = subprocess.run(
         ["systemctl", "--user", "show", "-p", "MainPID", "--value", "hermes-gateway.service"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     ).stdout.strip()
     return out or "0"
 
@@ -131,7 +131,7 @@ def fetch(path: str) -> tuple[int, float, bytes]:
             return resp.status, (time.perf_counter() - start) * 1000, body
     except urllib.error.HTTPError as exc:
         return exc.code, (time.perf_counter() - start) * 1000, exc.read()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return 0, (time.perf_counter() - start) * 1000, str(exc).encode()
 
 
@@ -151,7 +151,7 @@ def main(argv: list[str]) -> int:
     # 2. Живые прогоны: рестарт оборвал бы admitted-исполнения (как 03:19).
     try:
         live = live_runs()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return refuse(f"не удалось проверить живые прогоны: {exc}", code=4)
     if live:
         listing = ", ".join(f"{tid}(pid {pid or '?'})" for tid, pid in live[:8])
@@ -172,7 +172,7 @@ def main(argv: list[str]) -> int:
     log("рестарт: systemctl --user restart hermes-gateway.service")
     r = subprocess.run(
         ["systemctl", "--user", "restart", "hermes-gateway.service"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     )
     log(f"systemctl вернул код={r.returncode} stderr={r.stderr.strip()[:200]}")
 
@@ -209,7 +209,7 @@ def main(argv: list[str]) -> int:
     code, ms, body = fetch("/api/status")
     try:
         payload = json.loads(body)
-    except Exception:  # noqa: BLE001
+    except Exception:
         payload = {}
     offload = payload.get("handler_offload")
     log(f"handler_offload после: {json.dumps(offload, ensure_ascii=False)}")
