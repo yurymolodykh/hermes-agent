@@ -63,6 +63,7 @@ def _isolated_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
     hb.reset_cache()
     yield home
     hb.reset_cache()
