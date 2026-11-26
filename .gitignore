@@ -351,3 +351,4 @@ apps/desktop/.dist-build*
 /live_demo_*.out
 /t_*.patch
 /VERDICT-t_*.md
+/.probe/
