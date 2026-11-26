@@ -92,6 +92,14 @@ def webapp_home(tmp_path, monkeypatch):
     from tools.environments import local as _local_env
 
     monkeypatch.setattr(_local_env, "_resolve_hermes_bin_dir", lambda: None)
+    # ...and the PATH it also builds asks the pm store for its node/npm dirs, which reads the
+    # checkout's ``manifest.json``. The shell's PATH is irrelevant here.
+    monkeypatch.setattr(_local_env, "_managed_runtime_path_entries", list)
+    # The child env also strips Hermes-owned site-packages, which asks the pm store for the
+    # payload venv — the same checkout manifest read. No PYTHONPATH matters for an idle shell.
+    from tools.environments import local_pythonpath as _local_pp
+
+    monkeypatch.setattr(_local_pp, "_get_hermes_site_packages", lambda _env: [])
     hb.reset_cache()
 
     host = FastAPI(lifespan=host_terminal_lifespan)
