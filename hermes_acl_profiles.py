@@ -153,6 +153,58 @@ def root_login(profile: Any) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def registry_slug(subject: Any) -> str:
+    """The registry record slug *subject* acts as — the key ``person_of``/``allows`` are written for.
+
+    A verified dashboard login reaches the policy as the SUBJECT ``gateway.session_identity`` mints
+    (``auth:v1:[provider, issuer, login]``), while the bindings registry keys a person by its record
+    slug (``person/<login>``) and by the stamps it records (``tg:<id>``, ``uid:<n>``). ``person_of``
+    is exact-match on purpose — a prefix match would let ``person/yury2`` claim ``person/yury``'s
+    profiles — so it answers ``None`` for the minted form and every profile check would then refuse
+    the person their own profile (the terminal dial and every ``?profile=`` REST route alike).
+
+    The expansion is the ACL's own (``hermes_acl_scope.owner_stamps``): it already derives the
+    login label, the bare platform id and every stamp the SAME person's record holds, and
+    :func:`gateway.owner_identity.is_host_owner` remains the separate owner answer. Only stamps the
+    registry itself names are folded, so an unknown identity still resolves to ``""`` (fail closed)
+    and no second person is ever reached.
+
+    Returns ``""`` when *subject* names nobody in the registry.
+    """
+    text = str(subject or "").strip()
+    if not text:
+        return ""
+    try:
+        registry = _load_registry()
+    except _bindings_errors() as exc:
+        logger.warning("acl profiles: registry unusable — resolving no person (%s)", exc)
+        return ""
+    if registry is None:
+        return ""
+    slug = registry.person_of(text)
+    if slug:
+        return slug
+    # ``person_of`` is exact: ask the ACL's own expansion which stamps this principal also holds.
+    try:
+        from hermes_acl_scope import owner_stamps
+
+        stamps = owner_stamps(text)
+    except Exception:  # health: allow BLE001 -- an unexpanded stamp must not widen access
+        logger.debug("acl profiles: owner-stamp expansion unavailable for %r", text, exc_info=True)
+        return ""
+    for stamp in stamps:
+        slug = registry.person_of(stamp)
+        if slug:
+            return slug
+    return ""
+
+
+def _personal_profiles_for(registry: Any, subject: Any) -> tuple[str, ...]:
+    """The personal profiles *subject*'s OWN record holds (``()`` when it names nobody)."""
+    slug = registry_slug(subject)
+    return tuple(registry.personal_profiles_of(slug)) if slug else ()
+
+
 def visible_profiles(subject: Any, names: Iterable[str]) -> tuple[str, ...]:
     """The profiles *subject* may see, out of *names*, in the order given.
 
@@ -174,7 +226,7 @@ def visible_profiles(subject: Any, names: Iterable[str]) -> tuple[str, ...]:
         return ()
     if registry is None:
         return ()
-    allowed = set(registry.personal_profiles_of(subject)) | set(registry.shared_profiles())
+    allowed = set(_personal_profiles_for(registry, subject)) | set(registry.shared_profiles())
     return tuple(name for name in wanted if name in allowed)
 
 
@@ -204,7 +256,7 @@ def writable_profiles(subject: Any) -> Optional[tuple[str, ...]]:
         return ()
     if registry is None:
         return ()
-    return tuple(registry.personal_profiles_of(subject))
+    return _personal_profiles_for(registry, subject)
 
 
 def request_may_write(request: Any, profile: Any) -> bool:
@@ -354,7 +406,7 @@ def create_allowed(request: Any, name: Any) -> bool:
         return False
     if registry is not None:
         owner_slug = registry.profile_owner(profile)
-        person = registry.person_of(subject)
+        person = registry.person_of(registry_slug(subject))
         if owner_slug is not None and owner_slug != person:
             return False
     return True
@@ -392,6 +444,7 @@ __all__ = [
     "request_is_owner",
     "request_may_write",
     "request_subject",
+    "registry_slug",
     "require_create",
     "require_owner",
     "require_visible",
