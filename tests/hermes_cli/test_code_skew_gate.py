@@ -8,6 +8,7 @@ honest in both directions: it must refuse a PROVEN split, and it must never refu
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -50,6 +51,114 @@ def test_missing_operation_is_refused():
     """A dispatched ``worker.persist`` operation the gateway cannot route is a split too."""
     problems = _skew(OLD_FIELDS, OLD_FIELDS, ops=OPS, required=OPS | {"turn.release"})
     assert problems and "turn.release" in problems[0]
+
+
+# --- extras live in the code, and the gate reads them there --------------------------------------
+
+def _repo_root() -> "Path":
+    return Path(__file__).resolve().parents[2]
+
+
+def _read_repo(rel: str):
+    try:
+        return (_repo_root() / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _edition(drop: str = ""):
+    """The repository's own sources, optionally with one field removed from the extras constant.
+
+    Built from the REAL modules (not from invented names), so this follows the code: whatever the
+    handler accepts is what the gate must compare.
+    """
+    usage = _read_repo("hermes_state_usage.py")
+    assert usage, "hermes_state_usage.py must exist in the checkout"
+    if drop:
+        needle = f'"{drop}"'
+        assert needle in usage, f"{drop} must be accepted by the real handler to test it"
+        usage = usage.replace(needle, '"_replaced_placeholder_"', 1)
+
+    def read(rel: str):
+        if rel == "hermes_state_usage.py":
+            return usage
+        return _read_repo(rel)
+
+    contract = gate.contract_from_sources(read)
+    assert contract is not None, "the real checkout's sources must parse into a contract"
+    return contract
+
+
+def test_extras_are_read_from_the_code_not_a_literal():
+    """``prompt_cache_clock`` is in the real handler's accepted set, and the gate sees it there.
+
+    This is the D1 regression: the earlier revision declared an extras literal in the gate, never
+    read it, and compared only ``_MODEL_USAGE_FIELDS`` — structurally blind to the very field the
+    incident was about. Both halves are pinned: the gate parses the extras out of the source, and
+    removing a field from that ONE constant changes the parsed contract.
+    """
+    assert not hasattr(gate, "_USAGE_MAIN_EXTRA_FIELDS"), \
+        "a literal copy of the extras set in the gate goes stale; it must be parsed from the code"
+    usage = _read_repo("hermes_state_usage.py")
+    assert usage and "USAGE_MAIN_EXTRA_FIELDS" in usage, \
+        "the handler's extras must be a named constant"
+    full = _edition()
+    assert "prompt_cache_clock" in full.usage_main_fields, \
+        "the real handler accepts prompt_cache_clock, so the contract must list it"
+    for field in ("pricing_version", "absolute", "task"):
+        assert field in full.usage_main_fields, f"{field} is accepted by the real handler"
+    assert "prompt_cache_clock" not in _edition(drop="prompt_cache_clock").usage_main_fields
+
+
+def test_two_editions_differing_only_in_extras_are_not_mistaken_for_one_contract():
+    """The field channel decides on the extras too: same model fields, different extras, different verdict.
+
+    ``disk`` sends ``prompt_cache_clock`` and the gateway does not accept it: a refusal that names
+    the field. The opposite order is an ordinary forward commit (gateway ahead) and must stay
+    allowed — the requirement is a subset test, and refusing a gateway that accepts a superset would
+    itself be the false refusal this gate is forbidden from making.
+    """
+    with_clock = _edition()
+    without_clock = _edition(drop="prompt_cache_clock")
+    assert with_clock.usage_main_fields != without_clock.usage_main_fields
+    assert not (with_clock.usage_main_fields - without_clock.usage_main_fields
+                - {"prompt_cache_clock"}), "the two editions differ ONLY in the extras field"
+
+    problems = gate.compare_contracts(with_clock, without_clock, frozenset())
+    assert problems, "a field set differing only in extras must produce a verdict"
+    assert "prompt_cache_clock" in problems[0] and "usage.main" in problems[0]
+    assert gate.compare_contracts(without_clock, with_clock, frozenset()) == ()
+
+
+def test_the_real_incident_pair_is_refused_and_its_reverse_still_passes():
+    """Disk ``34086e258353`` (accepts ``prompt_cache_clock``) vs gateway ``4713ca0ab46`` (does not).
+
+    The pair the previous verdict walked through as PASSING. Skipped only when this checkout does
+    not carry those objects (a shallow clone); never silently green without the objects present.
+    """
+    repo = _repo_root()
+    def present(sha: str) -> bool:
+        return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+                              capture_output=True).returncode == 0
+    if not (present("34086e258353") and present("4713ca0ab46")):
+        pytest.skip("the incident commits are not in this checkout's object database")
+    skew = gate.check_code_skew(disk_sha="34086e258353", gateway_sha="4713ca0ab46", repo=repo)
+    assert skew is not None, "disk accepts a field the gateway rejects: this is the incident"
+    assert "prompt_cache_clock" in skew.problems[0]
+    # Reverse: the gateway accepts MORE than disk sends — a forward commit, not skew.
+    assert gate.check_code_skew(disk_sha="4713ca0ab46", gateway_sha="34086e258353",
+                                repo=repo) is None
+
+
+def test_disk_contract_reads_the_extras_of_this_checkout():
+    """``disk_contract()`` on the real checkout includes the named extras (D4: real modules only)."""
+    disk = gate.disk_contract()
+    assert disk is not None
+    usage = _read_repo("hermes_state_usage.py")
+    assert usage and "_MODEL_USAGE_FIELDS" in usage
+    # every field the module names as an accepted extra is in the parsed contract
+    assert {"pricing_version", "absolute", "task"} <= set(disk.usage_main_fields)
+    assert "prompt_cache_clock" in disk.usage_main_fields
 
 
 # --- the refusal text is actionable ---------------------------------------------------------------
@@ -112,6 +221,45 @@ def test_shared_history_with_unreadable_layouts_is_not_skew(tmp_path):
     second = _git(repo, "rev-parse", "HEAD").strip()
     assert gate._diverged(first, second, repo) is False
     assert gate.check_code_skew(disk_sha=second, gateway_sha=first, repo=repo) is None
+
+
+def test_sibling_branches_with_a_common_fork_are_not_diverged(tmp_path):
+    """Two branches of one repository share history even though neither contains the other.
+
+    The earlier revision answered "share no history" for exactly this pair (it tested ancestry
+    in both directions instead of asking for a merge base) and refused a healthy host whose
+    worker and gateway merely sat on different branches. A merge base exists: not divergence.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "fork point")
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "-q", "-b", "worker-side")
+    (repo / "w.txt").write_text("worker\n")
+    _git(repo, "add", "w.txt")
+    _git(repo, "commit", "-qm", "worker work")
+    worker = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "-q", "master")
+    (repo / "g.txt").write_text("gateway\n")
+    _git(repo, "add", "g.txt")
+    _git(repo, "commit", "-qm", "gateway work")
+    gateway = _git(repo, "rev-parse", "HEAD").strip()
+
+    # Neither tip contains the other, yet both hang off one fork point.
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", worker, gateway],
+                          capture_output=True).returncode == 1
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", gateway, worker],
+                          capture_output=True).returncode == 1
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", worker, gateway],
+                          capture_output=True, text=True).stdout.strip() == base
+    assert gate._diverged(worker, gateway, repo) is False
+    # The whole gate must not refuse: unparsable layouts + shared history == PASS.
+    assert gate.check_code_skew(disk_sha=worker, gateway_sha=gateway, repo=repo) is None
 
 
 def test_disjoint_histories_refuse(tmp_path):

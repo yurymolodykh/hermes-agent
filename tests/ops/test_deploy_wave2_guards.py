@@ -4,9 +4,15 @@
 worker-launched restart would kill the gateway that spawned it. The wave-2 script therefore REFUSES
 before touching systemd unless it can prove: it is not a worker, nothing is running, the window is
 confirmed. These tests pin every refusal, and pin that a refusal never reaches ``systemctl``.
+
+The guards themselves live IN THE REPOSITORY (``ops/deploy-wave2.py``): a file outside version
+control cannot be reviewed by diff or rolled back, which is exactly the state that let the 03:19
+restart ship unchecked. The old path keeps a thin wrapper so existing callers do not break — the
+wrapper is pinned here too, so it can never drift away from the canonical file.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -15,7 +21,10 @@ from unittest.mock import patch
 
 import pytest
 
-SCRIPT = Path("/home/hermes/workspaces/01-orchestrator/ops/bin/deploy-wave2.py")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "ops" / "deploy-wave2.py"
+LEGACY_WRAPPER = Path("/home/hermes/workspaces/01-orchestrator/ops/bin/deploy-wave2.py")
+LEGACY_CANONICAL_COPY = LEGACY_WRAPPER.with_name("deploy-wave2.canonical.py")
 MSK = timezone(timedelta(hours=3))
 
 
@@ -145,7 +154,7 @@ def test_a_garbage_marker_is_not_a_window(wave, tmp_path):
     assert wave.window_ok(str(path)) is not None
 
 
-# --- the guards read the board read-only ----------------------------------------------------------
+# --- the run gate never writes ----------------------------------------------------------
 
 def test_the_run_gate_never_writes(wave, monkeypatch, board_db):
     conn = sqlite3.connect(board_db)
@@ -155,3 +164,36 @@ def test_the_run_gate_never_writes(wave, monkeypatch, board_db):
     before = board_db.read_bytes()
     wave.live_runs()
     assert board_db.read_bytes() == before
+
+
+# --- the guards live under version control, and the old path still reaches them -----------
+
+def test_the_script_is_in_the_repository_not_outside_it():
+    """A file only on disk cannot be reviewed or rolled back: the guards must be a repo file."""
+    assert SCRIPT.is_file(), f"the wave-2 guards must live in the repository at {SCRIPT}"
+    rel = SCRIPT.relative_to(REPO_ROOT)
+    tracked = __import__("subprocess").run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch", str(rel)],
+        capture_output=True, text=True)
+    assert tracked.returncode == 0, f"ops/deploy-wave2.py must be git-tracked, got {tracked.stderr}"
+    assert "def worker_context" in SCRIPT.read_text(encoding="utf-8")
+
+
+def test_the_old_path_is_a_wrapper_that_reaches_the_repository_file():
+    """Existing systemd-run/task callers keep working, and the old path cannot be edited stale."""
+    if not LEGACY_WRAPPER.is_file():
+        pytest.skip("the legacy 01-orchestrator path does not exist on this host")
+    text = LEGACY_WRAPPER.read_text(encoding="utf-8")
+    assert "def worker_context" not in text, \
+        "the legacy path must be a wrapper, not a second copy of the guards"
+    assert "ops" in text and "deploy-wave2.py" in text
+    assert "main(" in text or "execv" in text, "the wrapper must actually hand over to the repo file"
+
+
+def test_the_legacy_copy_matches_the_repository_file_byte_for_byte():
+    """If a canonical copy was installed next to the wrapper, it may never silently diverge."""
+    if not LEGACY_CANONICAL_COPY.is_file():
+        pytest.skip("no canonical copy installed next to the legacy wrapper")
+    digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    assert digest(LEGACY_CANONICAL_COPY) == digest(SCRIPT), \
+        "deploy-wave2.canonical.py drifted from ops/deploy-wave2.py: reinstall the copy"
