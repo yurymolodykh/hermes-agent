@@ -767,7 +767,6 @@ async def execute_managed(authority, ref, row, policy):
                 return accepted['final_response']
             raise RuntimeStoreError('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
-        import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
         logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
         if scope is None:

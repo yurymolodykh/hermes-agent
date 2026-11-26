@@ -33,6 +33,59 @@ time.sleep(60)  # interpreter teardown that outlives the owner's exit wait
 """
 
 
+CHILD_PERSISTENCE_ERROR = CHILD.replace(
+    "        send({'type': 'finished'})",
+    "        send({'type': 'finished', 'persistence_error': 'invalid_params'})")
+
+
+@pytest.mark.platforms("linux")
+def test_finished_frame_carrying_a_persistence_error_still_settles_the_result(tmp_path, monkeypatch):
+    """A worker that delivered its answer but could not write its close-time receipt is not lost.
+
+    Regression for t_7403b0fe: the owner rejected any 'finished' frame that carried an extra
+    key (``invalid_worker_frame``), so a persistence error at close turned the finished card
+    into an unknown/lost execution. The answer is authoritative; the receipt is not.
+    """
+    from gateway import session_managed_worker as managed
+    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_contract import Submission
+    from gateway.session_policy import build_policy
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    db.create_session('s', source='test')
+    db.update_token_counts('s', input_tokens=10, output_tokens=5, api_call_count=1, model='m')
+    runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
+                             _adapter_for_source=lambda source: None)
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id='i'))
+    authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
+    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
+    ref = SessionRef('owned', 's')
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+
+    class Child(subprocess.Popen):
+        def __init__(self, args, **kw):
+            super().__init__([sys.executable, '-c', CHILD_PERSISTENCE_ERROR, 'lingering'], **kw)
+    monkeypatch.setattr(managed.subprocess, 'Popen', Child)
+    policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
+
+    async def scenario():
+        await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
+        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
+        authority._stamp_claim(ref, authority.sessions['s'], row)
+        async with asyncio.timeout(40):
+            return row, await managed.execute_managed(authority, ref, row, policy)
+    with db:
+        row, response = asyncio.run(scenario())
+        status = db._read_one('SELECT status FROM session_admissions WHERE admission_id=?', (row['admission_id'],))[0]
+    assert response == 'FINISHED_ANSWER', 'the answer must survive a failed close-time receipt'
+    assert authority.pending_results[row['admission_id']]['result']['final_response'] == 'FINISHED_ANSWER'
+    assert status == 'started', 'the turn was marked unknown instead of reaching settlement'
+
+
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize(('exit_shape', 'rotate'), [('nonzero', False), ('lingering', False), ('nonzero', True)])
 def test_finished_worker_keeps_its_result_on_slow_or_nonzero_exit(tmp_path, monkeypatch, exit_shape, rotate):
