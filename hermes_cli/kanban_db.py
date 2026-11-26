@@ -330,6 +330,17 @@ KANBAN_OWNER_LOST_EXIT_CODE = 69
 # condition a gateway restart records for a turn it stopped.
 KANBAN_WORKER_LOST_EXIT_CODE = 71
 
+# Worker exit "the code on disk is not the code the running owner serves": the worker refused to
+# start because ``hermes_cli.code_skew_gate`` proved that this checkout's ``worker.persist``
+# contract (the ``usage.main`` field set / the dispatched operations) is not one the running
+# gateway can answer (26.11.2026: a gateway serving ``da0f60614069`` while workers booted off
+# ``8fc03744473`` refused every ``usage.main`` as ``invalid_params`` and each turn died ~60 s in).
+# Nothing of the card's work ran, and no retry can change the tree, so the sweep requeues it to
+# ``ready`` WITHOUT counting a failure and stamps the actionable reason; the respawn guard then
+# spaces the retries until the gateway is restarted onto this checkout. 76 == BSD EX_PROTOCOL:
+# the two sides speak different protocols.
+KANBAN_CODE_SKEW_EXIT_CODE = 76
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""
