@@ -191,6 +191,10 @@ class DispatchResult:
     a failure — a long quota window must never trip the circuit breaker."""
     keypool_reaped: list[dict] = field(default_factory=list)
     """Reservations this tick's sweep dropped: their owner process was gone."""
+    closed_orphaned_runs: list[int] = field(default_factory=list)
+    """``task_runs`` ids closed because the run was still open on a task that is
+    no longer ``running`` and whose worker is gone. These rows were counting
+    against ``kanban.max_in_progress`` without a live worker behind them."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -897,6 +901,60 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None,
 # A running task with no heartbeat for this long is inactive regardless of
 # ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
+
+
+def close_orphaned_runs_of_terminal_tasks(conn: sqlite3.Connection) -> list[int]:
+    """Close ``task_runs`` rows left open on a task that is no longer running.
+
+    Capacity is counted from run rows, not from liveness: an ``ended_at IS NULL``
+    row of an archived/completed card keeps a ``kanban.max_in_progress`` slot busy
+    for as long as the row exists (runs 117/118/119 of 19.11 sat a week on archived
+    probe cards; ``hermes kanban reclaim`` refused them with "not running or
+    unknown id", so only a hand-written UPDATE freed the slots).
+
+    Scope is deliberately narrow: the task must not be ``running`` AND its recorded
+    worker must be provably gone. A live worker is never touched, and neither is a
+    task in ``running`` — that state belongs to :func:`_reclaim_dead_workers`,
+    :func:`detect_stale_running` and the owner-recovery guards, which know how to
+    tell our worker from a stranger's. Returns the closed run ids.
+    """
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.task_id, r.worker_pid, r.worker_started_at, r.claim_lock, t.status "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NULL AND t.status <> 'running'"
+    ).fetchall()
+    if not rows:
+        return []
+    host_prefix = _kb._host_prefix()
+    closed: list[int] = []
+    for row in rows:
+        pid = _kb._opt_int(row["worker_pid"])
+        if pid is not None:
+            if pid == os.getpid():
+                continue
+            if not str(row["claim_lock"] or "").startswith(host_prefix):
+                continue  # another host's worker: its own dispatcher owns the row
+            if _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+                continue  # a live process may still be writing: never close under it
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET status = 'crashed', outcome = 'crashed', "
+                "       summary = COALESCE(summary, 'task is no longer running'), "
+                "       error = COALESCE(error, 'stale run of a task that is no longer running'), "
+                "       ended_at = ?, claim_expires = NULL "
+                " WHERE id = ? AND ended_at IS NULL",
+                (int(time.time()), row["run_id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(
+                conn, row["task_id"], "open_run_closed",
+                {"run_id": int(row["run_id"]), "task_status": row["status"],
+                 "reason": "run still open on a task that is no longer running"},
+                run_id=int(row["run_id"]),
+            )
+            closed.append(int(row["run_id"]))
+    return closed
 
 
 def detect_stale_running(
@@ -2520,6 +2578,10 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
+    # Last: every other sweep above only looks at tasks in ``running``. A run left
+    # open on a card that already left ``running`` is invisible to all of them and
+    # holds a capacity slot forever (dozens of "owner refused" crashes traced to it).
+    result.closed_orphaned_runs = close_orphaned_runs_of_terminal_tasks(conn)
     result.keypool_reaped = _kbkp.keypool_sweep()  # backstop: host-restart orphans
     # Wake parked cards whose deadline passed BEFORE promotion, so a woken card is
     # promoted and spawned in the SAME tick it comes due. Catch-up is free: the
