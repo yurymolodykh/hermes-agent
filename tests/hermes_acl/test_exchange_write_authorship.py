@@ -286,7 +286,71 @@ class TestSiblingWriteRoutes:
         assert response.status_code == 403, response.text
         assert legacy_file.is_file()
 
+    def test_deleting_your_own_root_level_legacy_file_works(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """D1: a file written before the layout sits at the root — its author can still remove it."""
+        legacy_file = _isolated_home / "shared" / "alice-legacy.txt"
+        legacy_file.write_text("alice's old file", encoding="utf-8")
+        results_acl.record_exchange_authorship(_request_as("alice"), legacy_file)
+
+        response = fs_client_factory("alice").request("DELETE", "/api/files", json={"path": str(legacy_file)})
+
+        assert response.status_code == 200, response.text
+        assert not legacy_file.exists()
+
+    def test_deleting_an_unrecorded_root_level_file_keeps_the_old_behaviour(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """D1: no journal row means "cannot tell", i.e. the pre-change policy — deletable."""
+        legacy_file = _isolated_home / "shared" / "unrecorded.txt"
+        legacy_file.write_text("nobody recorded this", encoding="utf-8")
+
+        response = fs_client_factory("alice").request("DELETE", "/api/files", json={"path": str(legacy_file)})
+
+        assert response.status_code == 200, response.text
+        assert not legacy_file.exists()
+
+    def test_recursively_deleting_the_exchange_root_is_refused(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """D1b: one request must not rmtree every colleague's folder."""
+        exchange = _isolated_home / "shared"
+        for slug in ("person_alice", "person_bob"):
+            (exchange / slug).mkdir(parents=True, exist_ok=True)
+            (exchange / slug / "keep.txt").write_text(slug, encoding="utf-8")
+
+        response = fs_client_factory("alice").request(
+            "DELETE", "/api/files", json={"path": str(exchange), "recursive": True})
+
+        assert response.status_code == 403, response.text
+        assert (exchange / "person_alice" / "keep.txt").is_file()
+        assert (exchange / "person_bob" / "keep.txt").is_file()
+
+    def test_deleting_your_own_folder_recursively_still_works(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """D1b: the refusal is scoped to the root, not to a person's own folder."""
+        own = _isolated_home / "shared" / "person_alice" / "drafts"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "a.txt").write_text("a", encoding="utf-8")
+
+        response = fs_client_factory("alice").request(
+            "DELETE", "/api/files", json={"path": str(own), "recursive": True})
+
+        assert response.status_code == 200, response.text
+        assert not own.exists()
+
+    def test_deleting_a_neighbours_folder_recursively_is_refused(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        foreign = _isolated_home / "shared" / "person_bob" / "drafts"
+        foreign.mkdir(parents=True, exist_ok=True)
+        (foreign / "b.txt").write_text("b", encoding="utf-8")
+
+        response = fs_client_factory("alice").request(
+            "DELETE", "/api/files", json={"path": str(foreign), "recursive": True})
+
+        assert response.status_code == 403, response.text
+        assert (foreign / "b.txt").is_file()
+
     def test_with_scoping_off_delete_and_mkdir_are_unchanged(
+            self, legacy, fs_client_factory, _isolated_home):
         exchange = _isolated_home / "shared"
         assert fs_client_factory("alice").post(
             "/api/files/mkdir", json={"path": str(exchange / "plain")}).status_code == 200
@@ -342,6 +406,64 @@ class TestSiblingWriteRoutes:
 
         assert response.status_code == 409, response.text
         assert own.read_text(encoding="utf-8") == "bob's migrated deliverable"
+
+
+# ---------------------------------------------------------------------------
+# 2b. a path that is already a directory is a clash, not a filename (D2)
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryClashBeforeRedirect:
+    """D2: the redirect must not run before the "that path is a directory" guard.
+
+    ``upload(path=<exchange root>)`` used to answer 200 and create a FILE named ``shared`` inside
+    the caller's folder; ``upload(path=shared/person_bob)`` created a file named ``person_bob``.
+    A neighbour's folder is 403; any other existing folder is 409 — and nothing is created.
+    """
+
+    def test_uploading_to_the_exchange_root_is_a_name_clash(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        exchange = _isolated_home / "shared"
+
+        response = _upload(fs_client_factory("alice"), exchange, "bytes")
+
+        assert response.status_code == 409, response.text
+        assert not (exchange / "person_alice").exists(), "nothing may be created under the slug"
+
+    def test_uploading_onto_a_neighbours_folder_is_refused(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        exchange = _isolated_home / "shared"
+        neighbour = exchange / "person_bob"
+        neighbour.mkdir(parents=True, exist_ok=True)
+
+        response = _upload(fs_client_factory("alice"), neighbour, "bytes")
+
+        assert response.status_code == 403, response.text
+        assert neighbour.is_dir()
+        assert not (exchange / "person_alice").exists()
+
+    def test_uploading_onto_your_own_folder_name_is_a_clash(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        exchange = _isolated_home / "shared"
+        own = exchange / "person_alice"
+        own.mkdir(parents=True, exist_ok=True)
+
+        response = _upload(fs_client_factory("alice"), own, "bytes")
+
+        assert response.status_code == 409, response.text
+        assert own.is_dir()
+        assert not (own / "person_alice").exists()
+
+    def test_a_real_subfolder_upload_still_works_through_the_redirect(
+            self, multi_user, registry, fs_client_factory, profile_homes, _isolated_home):
+        """The guard is about EXISTING directories, not about the redirect itself."""
+        exchange = _isolated_home / "shared"
+        (exchange / "person_alice").mkdir(parents=True, exist_ok=True)
+
+        response = _upload(fs_client_factory("alice"), exchange / "brief.md", "brief")
+
+        assert response.status_code == 200, response.text
+        assert (exchange / "person_alice" / "brief.md").read_text(encoding="utf-8") == "brief"
 
 
 class TestAuthorshipBackstop:
