@@ -119,7 +119,6 @@ def record_persist_failure(scope, *, operation, params, error, trace=None, extra
         logger.debug('persist-failure record not written', exc_info=True)
 
 
-
 def call_off_event_loop(fn, *args, **kwargs):
     """Call ``fn`` here, or on a worker thread when this thread is running an event loop.
 
