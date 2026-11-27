@@ -7,6 +7,7 @@ honest in both directions: it must refuse a PROVEN split, and it must never refu
 """
 from __future__ import annotations
 
+import ast
 import subprocess
 from pathlib import Path
 
@@ -66,28 +67,49 @@ def _read_repo(rel: str):
         return None
 
 
+# A field that exists in no revision: the two editions of the handler differ ONLY in this extra, so
+# the helper stays usable before AND after the contract grew a real ``prompt_cache_clock`` field.
+_PROBE_EXTRA = "probe_extra_field"
+
+
+def _with_probe_extra(runtime: str, extra: str = _PROBE_EXTRA) -> str:
+    """Return ``runtime`` with one field added to the ``usage.main`` accepted set.
+
+    Addressed by CONDITION, never by position: the gate's own parser finds the ``_worker_usage``
+    main branch (``allowed = X if auxiliary else Y``, or ``if auxiliary: X`` / ``else: Y``) and the
+    field goes at the END of exactly that expression. Touching the first ``allowed =`` line in file
+    order breaks as soon as the contract grows: on the t_7403b0fe revision the first such line with
+    ``_MODEL_USAGE_FIELDS`` is the AUXILIARY branch, and an injected real field there is a no-op.
+    """
+    tree = ast.parse(runtime)
+    handler = next((node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "_worker_usage"), None)
+    assert handler is not None, "hermes_state_runtime must declare _worker_usage"
+    expr = gate._main_allowed_expr(handler)
+    assert expr is not None and getattr(expr, "end_col_offset", None) is not None, \
+        "_worker_usage must build its usage.main accepted set as a named expression"
+    # AST offsets are UTF-8 byte offsets, so splice bytes and decode once.
+    lines = runtime.encode("utf-8").splitlines(keepends=True)
+    index = expr.end_lineno - 1
+    column = expr.end_col_offset
+    lines[index] = lines[index][:column] + f" | {{{extra!r}}}".encode() + lines[index][column:]
+    return b"".join(lines).decode("utf-8")
+
+
 def _edition(extra: str = "") -> gate.RpcContract:
     """A contract built from THIS checkout's real modules, with one field added to the handler's set.
 
     Nothing is hand-written: the field set comes from ``hermes_state_usage._MODEL_USAGE_FIELDS`` and
     from the accepted-set expression inside the real ``_worker_usage``. ``extra`` injects one more
-    field into that expression — the shape of the commit that added ``prompt_cache_clock`` — so the
-    two editions differ ONLY in the extras, exactly as the incident pair did.
+    field into the ``usage.main`` branch of that expression — the shape of the commit that added
+    ``prompt_cache_clock`` — so the two editions differ ONLY in the extras, exactly as the incident
+    pair did.
     """
     usage = _read_repo("hermes_state_usage.py")
     runtime = _read_repo("hermes_state_runtime.py")
     assert usage and runtime, "the real modules must exist in this checkout"
     if extra:
-        # the first ``allowed =`` line that names the model-field constant IS the handler's set
-        # (the turn-lease handler above it names only its two payload keys).
-        lines = runtime.splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            if line.lstrip().startswith("allowed = ") and "_MODEL_USAGE_FIELDS" in line:
-                lines[index] = line.rstrip("\n") + f" | {{{extra!r}}}\n"
-                break
-        else:
-            raise AssertionError("the handler's accepted-set expression must name the field constant")
-        runtime = "".join(lines)
+        runtime = _with_probe_extra(runtime, extra)
 
     def read(rel):
         if rel == "hermes_state_usage.py":
@@ -108,44 +130,96 @@ def test_extras_are_read_from_the_code_not_a_literal():
     read it, and parsed only ``_MODEL_USAGE_FIELDS`` — structurally blind to the field that caused
     the incident. Extras must come from the code, so adding one field to the handler's expression
     changes the parsed contract without touching the gate.
+
+    The probe field is a name no revision accepts, so this holds before AND after the contract grew
+    a real ``prompt_cache_clock``: the helper's job is "one extra reaches usage.main", not "this
+    particular field is new".
     """
     assert not hasattr(gate, "_USAGE_MAIN_EXTRA_FIELDS"), \
         "a literal copy of the extras set in the gate goes stale; it must be parsed from the code"
     plain = _edition()
-    with_clock = _edition("prompt_cache_clock")
-    assert "prompt_cache_clock" not in plain.usage_main_fields
-    assert "prompt_cache_clock" in with_clock.usage_main_fields, \
+    with_probe = _edition(_PROBE_EXTRA)
+    assert _PROBE_EXTRA not in plain.usage_main_fields
+    assert _PROBE_EXTRA in with_probe.usage_main_fields, \
         "a field added to the handler's accepted set must appear in the parsed contract"
     # the extras that already exist in this checkout came out of the same expression
-    assert with_clock.usage_main_fields - plain.usage_main_fields == {"prompt_cache_clock"}
+    assert with_probe.usage_main_fields - plain.usage_main_fields == {_PROBE_EXTRA}
+
+
+def test_the_probe_field_lands_in_the_usage_main_branch_not_the_auxiliary_one():
+    """The helper addresses the ``usage.main`` branch by condition, never by file order.
+
+    t_7403b0fe split the handler into ``if auxiliary: ... else: ...``; the first ``allowed =``
+    line that names ``_MODEL_USAGE_FIELDS`` in that shape is the AUXILIARY branch. Injecting there
+    changed nothing the gate parses, so the "extras are read from the code" claim stopped being
+    exercised — a silent loss of the test, not a code regression.
+    """
+    runtime_source = _read_repo("hermes_state_runtime.py")
+    assert runtime_source, "hermes_state_runtime.py must exist in this checkout"
+    runtime = _with_probe_extra(runtime_source, _PROBE_EXTRA)
+    handler = next(node for node in ast.walk(ast.parse(runtime))
+                   if isinstance(node, ast.FunctionDef) and node.name == "_worker_usage")
+    assignment = next(
+        node for node in ast.walk(handler)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "allowed" for t in node.targets)
+        and isinstance(node.value, ast.IfExp))
+    # ``allowed = X if auxiliary else Y``: the auxiliary branch is the ``if`` value, main the else.
+    assert _PROBE_EXTRA not in ast.unparse(assignment.value.body), \
+        "the probe must not land in the auxiliary branch: the gate does not read it there"
+    assert _PROBE_EXTRA in ast.unparse(assignment.value.orelse)
+    parsed = gate.contract_from_sources(
+        lambda rel: runtime if rel == "hermes_state_runtime.py" else _read_repo(rel))
+    assert parsed is not None and _PROBE_EXTRA in parsed.usage_main_fields
+
+
+def test_check_code_skew_still_refuses_a_probe_field_the_gateway_lacks(monkeypatch):
+    """Anti-weakening: a real extra on disk against a gateway without it is a REFUSAL, not a pass.
+
+    Both sides come from this checkout's real modules; only the two readers are pinned. If the
+    helper ever put the field where the gate does not look, this assertion would go green on a
+    broken gate — which is exactly what the card requires to be impossible.
+    """
+    with_probe = _edition(_PROBE_EXTRA)
+    without_probe = _edition()
+    assert _PROBE_EXTRA not in without_probe.usage_main_fields
+    monkeypatch.setattr(gate, "disk_contract", lambda *_a, **_kw: with_probe)
+    monkeypatch.setattr(gate, "commit_contract", lambda *_a, **_kw: without_probe)
+    skew = gate.check_code_skew(disk_sha="1" * 40, gateway_sha="2" * 40)
+    assert skew is not None, "an extra field the gateway rejects must refuse the worker start"
+    assert _PROBE_EXTRA in skew.problems[0] and "usage.main" in skew.problems[0]
+    # and the safe direction (gateway ahead of disk) still runs
+    monkeypatch.setattr(gate, "disk_contract", lambda *_a, **_kw: without_probe)
+    monkeypatch.setattr(gate, "commit_contract", lambda *_a, **_kw: with_probe)
+    assert gate.check_code_skew(disk_sha="1" * 40, gateway_sha="2" * 40) is None
 
 
 def test_two_editions_differing_only_in_extras_are_not_mistaken_for_one_contract():
     """Same model fields, different extras: the field channel must see a difference, both ways.
 
-    The unsafe direction (disk accepts ``prompt_cache_clock``, gateway does not) is a refusal that
-    names the field. The safe direction (the gateway accepts a superset) is a forward commit, so it
-    is NOT a refusal — but it is never reported as "identical contracts" either: the difference is
+    The unsafe direction (disk accepts an extra field, gateway does not) is a refusal that names
+    the field. The safe direction (the gateway accepts a superset) is a forward commit, so it is
+    NOT a refusal — but it is never reported as "identical contracts" either: the difference is
     visible in the parsed sets, which is what the blind revision lost.
     """
-    without_clock = _edition()
-    with_clock = _edition("prompt_cache_clock")
-    assert with_clock.usage_main_fields - without_clock.usage_main_fields == {"prompt_cache_clock"}
-    assert without_clock.usage_main_fields - with_clock.usage_main_fields == set()
+    without_probe = _edition()
+    with_probe = _edition(_PROBE_EXTRA)
+    assert with_probe.usage_main_fields - without_probe.usage_main_fields == {_PROBE_EXTRA}
+    assert without_probe.usage_main_fields - with_probe.usage_main_fields == set()
 
-    problems = gate.compare_contracts(with_clock, without_clock, frozenset())
+    problems = gate.compare_contracts(with_probe, without_probe, frozenset())
     assert problems, "a field the gateway does not accept must be reported"
-    assert "prompt_cache_clock" in problems[0] and "usage.main" in problems[0]
+    assert _PROBE_EXTRA in problems[0] and "usage.main" in problems[0]
     # reverse order: parsed on both sides (so the difference is visible), yet allowed by the
     # subset rule — a gateway ahead of disk is an ordinary forward commit.
-    assert gate.compare_contracts(without_clock, with_clock, frozenset()) == ()
+    assert gate.compare_contracts(without_probe, with_probe, frozenset()) == ()
     # ...but the difference is never invisible: the symmetric view names the field from BOTH sides,
     # which is precisely what the blind revision could not do.
-    forward = gate.field_set_differences(without_clock, with_clock)
-    assert forward and "prompt_cache_clock" in forward[0]
-    backward = gate.field_set_differences(with_clock, without_clock)
-    assert backward and "prompt_cache_clock" in backward[0]
-    assert gate.field_set_differences(with_clock, with_clock) == ()
+    forward = gate.field_set_differences(without_probe, with_probe)
+    assert forward and _PROBE_EXTRA in forward[0]
+    backward = gate.field_set_differences(with_probe, without_probe)
+    assert backward and _PROBE_EXTRA in backward[0]
+    assert gate.field_set_differences(with_probe, with_probe) == ()
 
 
 def test_the_real_incident_pair_is_refused_by_contract():
