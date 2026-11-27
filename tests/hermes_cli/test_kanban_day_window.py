@@ -186,6 +186,117 @@ def test_broken_config_warns_once_not_per_tick(monkeypatch, caplog):
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
 
 
+# ── weekday restriction (kanban.day_window_days) ───────────────────────────
+#
+# 2026-03-16 is a Monday; 2026-03-21 Saturday; 2026-03-22 Sunday.
+
+WEEKDAYS_ONLY = (4, (daywin.dt_time(8, 0), daywin.dt_time(18, 0)), Moscow,
+                 frozenset({0, 1, 2, 3, 4}))
+
+
+def test_weekday_inside_window_applies_the_day_cap():
+    """Tuesday 12:00 inside the window and a listed weekday → the day cap."""
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=17),
+                                         settings=WEEKDAYS_ONLY) == 4
+
+
+def test_saturday_inside_window_keeps_the_base_cap():
+    """Saturday 12:00 is inside the hours but not a listed weekday → 7."""
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=21),
+                                         settings=WEEKDAYS_ONLY) == 7
+
+
+def test_sunday_inside_window_keeps_the_base_cap():
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=22),
+                                         settings=WEEKDAYS_ONLY) == 7
+
+
+def test_weekday_outside_window_keeps_the_base_cap():
+    """Wednesday 22:00 — neither the hours nor the weekday give the day cap."""
+    assert daywin.resolve_day_window_cap(7, now=at(22, 0, day=18),
+                                         settings=WEEKDAYS_ONLY) == 7
+
+
+def test_uppercase_day_names_are_accepted(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"day_max_in_progress": 4,
+                            "day_window": ["08:00", "18:00"],
+                            "day_window_tz": "Europe/Moscow",
+                            "day_window_days": ["MON", "Tue", "WED", " thu", "Fri"]}},
+    )
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=17)) == 4  # Tuesday
+    daywin.reset_state()
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=21)) == 7  # Saturday
+
+
+def test_numeric_day_values_are_accepted(monkeypatch):
+    """0..6 with Monday = 0, mirroring ``datetime.weekday()``."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"day_max_in_progress": 4,
+                            "day_window": ["08:00", "18:00"],
+                            "day_window_tz": "Europe/Moscow",
+                            "day_window_days": [0, 1, 2, 3, 4]}},
+    )
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=16)) == 4  # Monday
+    daywin.reset_state()
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=22)) == 7  # Sunday
+
+
+@pytest.mark.parametrize(
+    "bad_days",
+    [
+        ["mon", "funday"],
+        "mon-fri",
+        [],
+        [7],
+        [-1],
+        [True],
+        {"mon": 1},
+    ],
+)
+def test_bad_day_list_warns_once_and_keeps_every_day(bad_days, monkeypatch, caplog):
+    """An unusable list must not widen the business-hours cap: window every day."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"day_max_in_progress": 4,
+                            "day_window": ["08:00", "18:00"],
+                            "day_window_tz": "Europe/Moscow",
+                            "day_window_days": bad_days}},
+    )
+    with caplog.at_level(logging.WARNING):
+        for minute in range(10):
+            assert daywin.resolve_day_window_cap(7, now=at(12, minute)) == 4
+        # Saturday too: the window stays a seven-day window.
+        assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=21)) == 4
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+
+def test_load_settings_returns_four_elements(monkeypatch):
+    """The tuple grew a 4th slot; the first three keep their exact meaning."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"day_max_in_progress": 4,
+                            "day_window": ["08:00", "18:00"],
+                            "day_window_tz": "Europe/Moscow",
+                            "day_window_days": ["mon", "tue", "wed", "thu", "fri"]}},
+    )
+    settings = daywin._load_settings()
+    assert len(settings) == 4
+    cap, window, tz, days = settings[0], settings[1], settings[2], settings[3]
+    assert (cap, window) == (4, (daywin.dt_time(8, 0), daywin.dt_time(18, 0)))
+    assert getattr(tz, "key", None) == "Europe/Moscow"
+    assert days == frozenset({0, 1, 2, 3, 4})
+
+
+def test_three_element_settings_still_accepted():
+    """Backward compatibility: the pre-key tuple has no weekday list."""
+    assert daywin.resolve_day_window_cap(7, now=at(12, 0, day=21), settings=SETTINGS) == 4
+    assert daywin.resolve_day_window_cap(7, now=at(23, 0, day=21), settings=SETTINGS) == 7
+
+
 # ── wiring into the dispatcher tick ────────────────────────────────────────
 
 
