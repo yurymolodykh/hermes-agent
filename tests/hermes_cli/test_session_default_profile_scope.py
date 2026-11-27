@@ -234,10 +234,15 @@ def test_acl_off_keeps_the_launch_store(homes, monkeypatch, registry):
 
 
 def test_owner_keeps_the_launch_store(homes, multi_user, registry):
-    """The host owner's dashboard is unchanged — including its own rows in the root store."""
+    """The host owner's dashboard is unchanged — the launch store, and only its own rows.
+
+    ``root-alice-1`` is stamped ``person/alice``, which is NOT an owner stamp even in the root
+    store: the owner's row scope excluded it before this change too (verified against the
+    pre-fix default), so the invariant is "same answer as before", not "every root row".
+    """
     with _client(as_login=OWNER_LOGIN) as cli:
         ids, _ = _ids(cli, "/api/sessions?limit=50")
-    assert ids == {"root-owner-1", "root-alice-1"}
+    assert ids == {"root-owner-1"}
 
 
 def test_person_without_a_registry_profile_keeps_the_fail_closed_answer(homes, multi_user,
