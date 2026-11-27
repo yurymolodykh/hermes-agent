@@ -114,6 +114,20 @@ def main() -> int:
             response = cli.get(path)
             print(f"    GET {path} -> {response.status_code}")
 
+    # A foreign session id must answer 404, exactly like an absent one (criterion 3).
+    import sqlite3
+    conn = sqlite3.connect(f"file:{HOME}/profiles/01-orchestrator/state.db?mode=ro", uri=True)
+    foreign_id = conn.execute("SELECT id FROM sessions LIMIT 1").fetchone()[0]
+    conn.close()
+    with client_for("maria.safronova") as cli:
+        r = cli.get(f"/api/sessions/{foreign_id}")
+        r_unprofiled = cli.get(f"/api/sessions/{foreign_id}?profile=01-orchestrator")
+        print(f"    foreign id {foreign_id[:24]}… -> {r.status_code} (no profile), "
+              f"{r_unprofiled.status_code} (named foreign profile)")
+        if r.status_code != 404 or r_unprofiled.status_code != 404:
+            print("    !! foreign session id did not answer 404")
+            ok = False
+
     ids, _ = report("maria.safronova", "/api/sessions?limit=50&profile=01-maria-safronova")
     print("\nRESULT:", "OK" if ok else "PROBLEMS")
     return 0 if ok else 1
