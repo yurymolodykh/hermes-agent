@@ -78,6 +78,8 @@ def main() -> int:
     for login, profile, label in (
         ("maria.safronova", "01-maria-safronova", "Maria"),
         ("kurilenko", "01-kurilenko", "Kurilenko"),
+        ("ksenia.kozlovskaya", "01-ksenia-kozlovskaya", "Ksenia"),
+        ("maksim.matrosov", "01-maksim-matrosov", "Maksim"),
     ):
         ids, _ = report(login, "/api/sessions?limit=50")
         prof_db = HOME / "profiles" / profile / "state.db"
