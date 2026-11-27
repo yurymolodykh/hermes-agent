@@ -4,13 +4,16 @@ generation provider ABCs.
 Several backends return *ephemeral* delivery URLs that expire before a downstream
 consumer (Telegram ``send_photo``, browser fetch) can resolve them, so providers
 materialise the bytes locally at tool-completion time. Filenames are
-``<prefix>_<YYYYMMDD_HHMMSS>_<uuid8>.<ext>``.
+``<prefix>_<YYYYMMDD_HHMMSS>_<uuid8>.<ext>``, where ``prefix`` is sanitised to
+``[A-Za-z0-9._-]`` (a provider model id such as ``vendor/model`` would otherwise
+nest the path into a subdirectory that does not exist).
 """
 
 from __future__ import annotations
 
 import base64
 import datetime
+import re
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -27,6 +30,26 @@ MEDIA_CACHE_MAX_AGE_HOURS = 24
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SAVE_URL_REDIRECTS = 5
 
+# ``prefix`` is caller-supplied (image-gen plugins build it from a provider model id,
+# e.g. ``openai_<model_id>`` where the id itself may be ``vendor/model``). Only these
+# characters may reach the filename: everything else becomes ``_``, so a ``/`` cannot
+# nest the path into a non-existent subdirectory and ``..`` cannot escape the cache.
+_UNSAFE_PREFIX_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_prefix(prefix: str) -> str:
+    """Map *prefix* onto ``[A-Za-z0-9._-]`` for use in a cache filename.
+
+    Safe values pass through unchanged (the sanitiser is idempotent), so existing
+    filenames keep their shape. Every unsafe character (``/``, space, ``\\``, quotes,
+    ...) becomes a single ``_``. A prefix that sanitises to nothing or to a bare
+    dot-run (``.``/``..``/``...``) becomes ``_`` — never a traversal token.
+    """
+    safe = _UNSAFE_PREFIX_CHARS.sub("_", str(prefix))
+    if not safe.strip("."):
+        return "_"
+    return safe
+
 
 def cache_dir(kind: str) -> Path:
     """Return ``$HERMES_HOME/cache/<kind>/``, creating parents as needed."""
@@ -39,7 +62,7 @@ def cache_dir(kind: str) -> Path:
 def cache_path(kind: str, prefix: str, extension: str) -> Path:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
-    return cache_dir(kind) / f"{prefix}_{ts}_{short}.{extension}"
+    return cache_dir(kind) / f"{_safe_prefix(prefix)}_{ts}_{short}.{extension}"
 
 
 def save_bytes(kind: str, raw: bytes, *, prefix: str, extension: str) -> Path:
