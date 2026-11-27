@@ -300,8 +300,7 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = "No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one."
     if locked:
         out["locked"] = locked
     if errors:
