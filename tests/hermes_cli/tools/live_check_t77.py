@@ -4,7 +4,7 @@ Card t_77e5de22. Mounts the card's routers in a TestClient, stamps a verified da
 login (as the auth gate does), and counts rows per caller. Opens every store READ-ONLY;
 nothing is written (no DELETE route is touched).
 
-    .venv/bin/python /path/to/live_check_t77.py
+    .venv/bin/python tests/hermes_cli/tools/live_check_t77.py
 """
 from __future__ import annotations
 
@@ -15,10 +15,11 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("REAL_HERMES_HOME", "/home/hermes/.hermes")).resolve()
 os.environ["HERMES_HOME"] = str(HOME)          # the real home, as the gateway sees it
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# repo root = three levels up from tests/hermes_cli/tools/
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 
-from fastapi import FastAPI                            # noqa: E402
-from fastapi.testclient import TestClient              # noqa: E402
+from fastapi import FastAPI                          
+from fastapi.testclient import TestClient            
 
 
 class Session:
