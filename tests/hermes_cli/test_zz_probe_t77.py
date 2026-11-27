@@ -5,7 +5,7 @@ Not a permanent test — deleted after the RED/GREEN receipt is captured.
 from __future__ import annotations
 
 from tests.hermes_cli.test_session_default_profile_scope import (  # noqa: F401 — fixtures
-    OWNER_LOGIN, _client, _ids, homes, multi_user, registry)
+    OWNER_LOGIN, _client, _ids, _isolated_home, homes, multi_user, registry)
 
 
 def test_probe_owner_baseline(homes, multi_user, registry, monkeypatch):
