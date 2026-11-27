@@ -608,18 +608,20 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
     profile = session_profile(request, profile)
 
     def _stats(db):
+        # Same row scope as the list: a shared profile's counters describe the team's store.
+        stats_scope = row_scope(scope, _serving_profile(profile))
         out = {
             # exclude_children=True: the dashboard Sessions page pairs these counts with
             # list_sessions_rich rows, which collapse compression chains to one row carrying
             # the tip's id — the raw row count is inflated by the hidden chain links (#54298).
-            "total": db.session_count(include_archived=True, exclude_children=True, user_id=scope),
-            "active_store": db.session_count(include_archived=False, exclude_children=True, user_id=scope),
-            "archived": db.session_count(archived_only=True, exclude_children=True, user_id=scope),
-            "messages": db.message_count(user_id=scope),
+            "total": db.session_count(include_archived=True, exclude_children=True, user_id=stats_scope),
+            "active_store": db.session_count(include_archived=False, exclude_children=True, user_id=stats_scope),
+            "archived": db.session_count(archived_only=True, exclude_children=True, user_id=stats_scope),
+            "messages": db.message_count(user_id=stats_scope),
             "by_source": {}}
         try:
             out["by_source"] = db.session_count_by_source(
-                include_archived=True, exclude_children=True, user_id=scope)
+                include_archived=True, exclude_children=True, user_id=stats_scope)
         except Exception:
             pass
         return out
@@ -633,8 +635,9 @@ async def get_session_detail(session_id: str, request: Request, profile: Optiona
     profile = session_profile(request, profile)
     def _detail(db):
         sid = _resolve_session_id(db, session_id)
-        # A foreign row answers exactly what a missing id answers (404), never 403.
-        session = require_row(db.get_session(sid) if sid else None, scope)
+        # A foreign row answers exactly what a missing id answers (404), never 403. A shared
+        # profile's rows are team material, so they open for any verified person.
+        session = require_row(db.get_session(sid) if sid else None, scope, _serving_profile(profile))
         # Always stamp the owner: unowned default-profile rows made multi-profile
         # clients resolve them to whichever gateway happened to be active.
         session["profile"] = _serving_profile(profile)
@@ -665,7 +668,7 @@ async def get_session_mutation_snapshot(session_id: str, request: Request, profi
     else:
         row = authority.db.get_session(session_id)
     # The counters of a foreign row are never disclosed, not even as zeroes.
-    require_row(row, scope)
+    require_row(row, scope, _serving_profile(profile))
     # An absent import anchor has revision zero by the owner's storage contract,
     # not by a client guessing after a failed or stale detail request.
     return {'session_id': session_id, 'exists': row is not None,
@@ -680,11 +683,12 @@ async def get_session_latest_descendant(session_id: str, request: Request, profi
     def _read(db):
         # The walk starts at the requested row and follows children, so the SCOPE is checked on
         # the start and on every hop: a foreign parent must not disclose its children either.
+        row_profile = _serving_profile(profile)
         first = db.get_session(session_id) or db.get_session(_resolve_session_id(db, session_id) or "")
-        require_row(first, scope)
+        require_row(first, scope, row_profile)
         latest, path = _session_latest_descendant(session_id, db)
         if latest:
-            require_row(db.get_session(latest), scope)
+            require_row(db.get_session(latest), scope, row_profile)
         return latest, path
     latest, path = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if not latest:
@@ -845,7 +849,7 @@ async def get_session_messages(
         sid = db.resolve_resume_session_id(sid)
         # The READ is refused before a single message is loaded: a foreign id must not answer
         # an empty transcript (that would still be a difference from "no such id").
-        require_row(db.get_session(sid), scope)
+        require_row(db.get_session(sid), scope, _serving_profile(profile))
         # Always page (an omitted limit used to load whole transcripts). Explicit
         # pagination anchors at the start; the default view is the latest page.
         default_page = limit is None
@@ -880,7 +884,7 @@ async def get_session_messages(
             "returned": len(projected_messages)}}
 
 
-def _timeline_session_id(db, session_id: str, owner: str, scope=None) -> str:
+def _timeline_session_id(db, session_id: str, owner: str, scope=None, profile=None) -> str:
     # Durable jump addresses are exact ids, never title/prefix guesses. A NULL
     # legacy owner belongs to this profile's store, just like /messages pages.
     # ``scope`` adds the CALLER's owner scope on both the requested id and the resume tip, so a
@@ -890,7 +894,7 @@ def _timeline_session_id(db, session_id: str, owner: str, scope=None) -> str:
         if sid is None:
             return False
         row = db.get_session(sid)
-        if row is None or row_outside(row, scope):
+        if row is None or row_outside(row, scope, profile):
             return False
         return row.get("profile_name") in (None, owner)
 
@@ -919,7 +923,7 @@ async def get_session_timeline(
     scope = session_scope(request)
 
     def _read(db):
-        sid = _timeline_session_id(db, session_id, owner, scope)
+        sid = _timeline_session_id(db, session_id, owner, scope, owner)
         return {"session_id": sid, "profile": owner,
                 **read_timeline(db, sid, limit=limit, after_row_id=after_row_id)}
 
@@ -939,7 +943,7 @@ async def get_session_messages_around(
     scope = session_scope(request)
 
     def _read(db):
-        sid = _timeline_session_id(db, session_id, owner, scope)
+        sid = _timeline_session_id(db, session_id, owner, scope, owner)
         page = read_around(db, sid, row_id, limit=limit)
         if page is None:
             raise HTTPException(status_code=404, detail="Prompt not found")
@@ -1077,7 +1081,8 @@ async def export_session_endpoint(session_id: str, request: Request, profile: Op
 
     def _prepare_export(db):
         sid = _resolve_session_id(db, session_id)
-        return (sid, require_row(db.get_session(sid) if sid else None, scope)) if sid else None
+        row_profile = _serving_profile(profile)
+        return (sid, require_row(db.get_session(sid) if sid else None, scope, row_profile)) if sid else None
 
     prepared = await asyncio.to_thread(_with_db, profile, _prepare_export, read_only=True)
     if prepared is None or prepared[1] is None:

@@ -38,6 +38,7 @@ from hermes_cli.web_server_config import (
 )
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, config_scoped_to_thread
+from hermes_cli.web_routers._session_acl import row_scope
 from hermes_cli.web_routers.handler_offload import off_loop
 from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
@@ -542,7 +543,9 @@ def get_profiles_sessions(
                 home, source=filters["source"], sources=filters["sources"],
                 exclude_sources=filters["exclude_sources"])
             scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents,
-                      "user_id": owner_scope}
+                      # A registry-shared profile holds team material, so its rows are all in
+                      # scope; a personal one keeps the caller's stamps (``()`` = fail closed).
+                      "user_id": row_scope(owner_scope, name)}
             rows = db.list_sessions_rich(
                 limit=per_profile, offset=0, order_by_last_active=order == "recent",
                 # Same SQL-level blob skip as /api/sessions.
@@ -631,7 +634,7 @@ def _sidebar_payload(
     errors: list[dict[str, str]] = []
     now = time.time()
 
-    def _slice(db, key, recents_subagents=(False, None)):
+    def _slice(db, key, recents_subagents=(False, None), owner_scope=None):
         source, exclude = slice_scope[key]
         # Only recents takes subagent runs (sessions.show_subagents); cron/messaging keep shape.
         include_subagents, exclude = recents_subagents if key == "recents" else (False, exclude)
@@ -642,17 +645,19 @@ def _sidebar_payload(
             min_message_count=1, include_archived=False, archived_only=False,
             order_by_last_active=True, compact_rows=True, include_pinned=True,
             include_subagents=include_subagents,
-            # МПД Т2/Т4: a SHARED profile is a runtime several people use, so its rows are still
-            # scoped to their own owner stamp — "may use profile 03" never means "may read
-            # somebody else's conversation in it". ``None`` (acl off) keeps the old query.
-            user_id=owner_scope)
+            # Already resolved PER PROFILE by the caller (``row_scope``): a personal profile
+            # keeps the caller's stamps, a registry-shared one is team material and reads whole,
+            # and ``None`` (acl off) keeps the old query. A missing value is the fail-closed
+            # empty scope, never "everything".
+            user_id=() if owner_scope is None else owner_scope)
 
-    def _build_slices(db, cache_key, recents_subagents):
+    def _build_slices(db, cache_key, recents_subagents, slice_owner_scope):
         # ``usage`` is aggregated in SQL rather than over the recents window: the window is a
         # page, and a total that shrank when you scrolled would be worse than no total at all.
-        slices = {"recents": _slice(db, "recents", recents_subagents),
-                  "usage": db.usage_totals(user_id=owner_scope),
-                  "cron": _slice(db, "cron"), "messaging": _slice(db, "messaging")}
+        slices = {"recents": _slice(db, "recents", recents_subagents, slice_owner_scope),
+                  "usage": db.usage_totals(user_id=slice_owner_scope),
+                  "cron": _slice(db, "cron", owner_scope=slice_owner_scope),
+                  "messaging": _slice(db, "messaging", owner_scope=slice_owner_scope)}
         _sidebar_profile_cache_put(cache_key, slices)
         return slices
 
@@ -666,17 +671,20 @@ def _sidebar_payload(
         if not db_path.exists():
             continue
         recents_subagents = subagent_listing_scope(home, exclude_sources=recents_exclude_list or None)
+        # Ровно то же правило, что у списка: общий профиль читается целиком, личный — по штампам.
+        slice_owner_scope = row_scope(owner_scope, name)
         profile_cache_key = (str(db_path), _sidebar_db_fingerprint(db_path), cap["recents"],
                              tuple(recents_exclude_list), cap["cron"], cap["messaging"],
                              tuple(messaging_exclude_list), recents_subagents[0],
                              # The cache is per store, so the caller's row scope is part of its
                              # identity: two people must not read each other's cached slices.
-                             owner_scope)
+                             slice_owner_scope)
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
             slices = _read_profile_db(
                 name, home, errors,
-                lambda db: _build_slices(db, profile_cache_key, recents_subagents))
+                lambda db: _build_slices(db, profile_cache_key, recents_subagents,
+                                         slice_owner_scope))
             if slices is None:
                 continue
         if _slice_has_rows(slices):
