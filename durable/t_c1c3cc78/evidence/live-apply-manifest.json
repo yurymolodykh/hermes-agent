@@ -1,0 +1,227 @@
+{
+ "tool": "disk_reclaim_cron.py",
+ "generated_at": "2026-11-27T08:48:55+0300",
+ "generated_at_epoch": 1795758535.429,
+ "mode_source": "apply",
+ "host_free_bytes": 56339267584,
+ "items": [
+  {
+   "path": "/home/hermes/.hermes/logs/disk-reclaim.log",
+   "bytes": 1412679,
+   "mtime": 1795758506.654,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 7160,
+   "lines_after": 2000,
+   "why": "7160 строк > 2000"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/09-independent-reviewer/cache/scratch/t9be97024",
+   "bytes": 675066,
+   "mtime": 1795459074.012,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 09-independent-reviewer",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/t_e0809b88",
+   "bytes": 50955,
+   "mtime": 1795498065.288,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (t_e0809b88)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082802",
+   "bytes": 4446,
+   "mtime": 1795498082.105,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082802)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082841",
+   "bytes": 4446,
+   "mtime": 1795498121.038,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082841)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082936",
+   "bytes": 4446,
+   "mtime": 1795498176.233,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082936)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082401",
+   "bytes": 385,
+   "mtime": 1795497841.983,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082401)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T081816",
+   "bytes": 368,
+   "mtime": 1795497496.259,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T081816)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T083819",
+   "bytes": 342,
+   "mtime": 1795498699.795,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T083819)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082520",
+   "bytes": 338,
+   "mtime": 1795497920.517,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082520)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T083957",
+   "bytes": 338,
+   "mtime": 1795498797.795,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T083957)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082526",
+   "bytes": 327,
+   "mtime": 1795497926.8,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082526)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T084411",
+   "bytes": 326,
+   "mtime": 1795499051.193,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T084411)",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/tmpi_f19jp8",
+   "bytes": 0,
+   "mtime": 1795381732.87,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 02-hermes-platform",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10mb-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795539649.741,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-claimed-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.208,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-claimed-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.21,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795554039.657,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10mb-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795539649.742,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-live-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.215,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795554039.66,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10-live5",
+   "bytes": 0,
+   "mtime": 1795539649.729,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/var/tmp/cgr10m-live-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.216,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "action": "delete"
+  },
+  {
+   "path": "/home/hermes/.hermes/cache/uv",
+   "bytes": 64,
+   "mtime": 1795756342.225,
+   "class": "cache-prune",
+   "action": "uv-cache-prune",
+   "why": "uv cache prune для /home/hermes/.hermes/cache/uv"
+  },
+  {
+   "path": "/home/hermes/.cache/uv",
+   "bytes": 0,
+   "mtime": 1795756300.971,
+   "class": "cache-prune",
+   "action": "uv-cache-prune",
+   "why": "uv cache prune для /home/hermes/.cache/uv"
+  },
+  {
+   "path": "/home/hermes/.cache/pnpm",
+   "bytes": 0,
+   "mtime": 1795308134.953,
+   "class": "cache-prune",
+   "action": "pnpm-store-prune",
+   "why": "pnpm store prune для ~/.cache/pnpm"
+  }
+ ],
+ "totals": {
+  "items": 26,
+  "bytes": 2154526
+ }
+}

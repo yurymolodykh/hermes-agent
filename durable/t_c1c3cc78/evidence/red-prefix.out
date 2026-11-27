@@ -1,0 +1,132 @@
+$ cd /home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/red-proof/scripts && /home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest -q tests/test_disk_reclaim_readonly_removal.py
+exit=1
+FFF.F                                                                    [100%]
+=================================== FAILURES ===================================
+_____________________ test_readonly_000_subdir_is_removed ______________________
+
+tmp_path = PosixPath('/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_000_subdir_is_re0')
+
+    def test_readonly_000_subdir_is_removed(tmp_path):
+        """Подкаталог режима 000 (как arc2-1795381736/workspaces) не запирает объект."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        _make_board(home)
+        mod = _load_module(home)
+        obj = _readonly_tree(tmp_path / "obj000", 0o000)
+        try:
+            rc, out = _run(mod, home, [_candidate(obj)])
+            assert rc == 0
+>           assert out["refused"] == [], f"отказ не должен остаться: {out['refused']}"
+E           AssertionError: отказ не должен остаться: [{'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_000_subdir_is_re0/obj000', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, 'why': 'тест', 'refused': "ошибка удаления: [Errno 13] Permission denied: '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_000_subdir_is_re0/obj000/kh/boards/_archived/arc2'"}]
+E           assert [{'path': '/h...438.238, ...}] == []
+E             
+E             Left contains one more item: {'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_000_subdir_is_re0/obj000', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, ...}
+E             Use -v to get more diff
+
+tests/test_disk_reclaim_readonly_removal.py:122: AssertionError
+_____________________ test_readonly_300_subdir_is_removed ______________________
+
+tmp_path = PosixPath('/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_300_subdir_is_re0')
+
+    def test_readonly_300_subdir_is_removed(tmp_path):
+        """Режим 0300 (как t9be97024/tmp/edge-unreadable_indexes/store/indexes)."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        _make_board(home)
+        mod = _load_module(home)
+        obj = _readonly_tree(tmp_path / "obj300", 0o300)
+        rc, out = _run(mod, home, [_candidate(obj)])
+        assert rc == 0
+>       assert out["refused"] == [], out["refused"]
+E       AssertionError: [{'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_300_subdir_is_re0/obj300', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, ...}]
+E       assert [{'path': '/h...438.238, ...}] == []
+E         
+E         Left contains one more item: {'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_300_subdir_is_re0/obj300', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, ...}
+E         Use -v to get more diff
+
+tests/test_disk_reclaim_readonly_removal.py:143: AssertionError
+______________ test_readonly_file_inside_readonly_dir_is_removed _______________
+
+tmp_path = PosixPath('/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_file_inside_read0')
+
+    def test_readonly_file_inside_readonly_dir_is_removed(tmp_path):
+        """Файл без права записи внутри каталога 0555: chmod нужен и файлу, и родителю."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        _make_board(home)
+        mod = _load_module(home)
+        obj = tmp_path / "objfile"
+        (obj / "d").mkdir(parents=True)
+        (obj / "d" / "f.bin").write_bytes(b"y" * 128)
+        os.chmod(obj / "d" / "f.bin", 0o400)
+        os.chmod(obj / "d", 0o555)
+        _age(obj)
+        rc, out = _run(mod, home, [_candidate(obj)])
+        assert rc == 0
+>       assert out["refused"] == [], out["refused"]
+E       AssertionError: [{'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_file_inside_read0/objfile', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, ...}]
+E       assert [{'path': '/h...438.238, ...}] == []
+E         
+E         Left contains one more item: {'path': '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_readonly_file_inside_read0/objfile', 'class': 'var-tmp', 'bytes': 1, 'mtime': 1795650438.238, ...}
+E         Use -v to get more diff
+
+tests/test_disk_reclaim_readonly_removal.py:161: AssertionError
+_____________ test_second_refusal_is_reported_not_retried_forever ______________
+
+tmp_path = PosixPath('/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_second_refusal_is_reporte0')
+
+    def test_second_refusal_is_reported_not_retried_forever(tmp_path):
+        """Второй отказ (живая блокировка) пишется в манифест с явной причиной."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        _make_board(home)
+        mod = _load_module(home)
+        obj = tmp_path / "objstuck"
+        obj.mkdir()
+        (obj / "f").write_bytes(b"z")
+        _age(obj)
+    
+        calls = []
+        real = mod.shutil.rmtree
+    
+        def fake_rmtree(path, **kw):
+            """Имитация живой блокировки: тот же узел отказывает и на повторе."""
+            calls.append(path)
+            kw["onexc"](os.rmdir, str(obj / "f"), OSError(13, "Permission denied"))
+    
+        mod.shutil.rmtree = fake_rmtree
+        try:
+>           rc, out = _run(mod, home, [_candidate(obj)])
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_disk_reclaim_readonly_removal.py:208: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_disk_reclaim_readonly_removal.py:95: in _run
+    rc = mod.main()
+         ^^^^^^^^^^
+disk_reclaim_cron.py:1020: in main
+    shutil.rmtree(c["path"])
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path = '/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/pytest-of-hermes/pytest-7/test_second_refusal_is_reporte0/objstuck'
+kw = {}
+
+    def fake_rmtree(path, **kw):
+        """Имитация живой блокировки: тот же узел отказывает и на повторе."""
+        calls.append(path)
+>       kw["onexc"](os.rmdir, str(obj / "f"), OSError(13, "Permission denied"))
+        ^^^^^^^^^^^
+E       KeyError: 'onexc'
+
+tests/test_disk_reclaim_readonly_removal.py:204: KeyError
+=========================== short test summary info ============================
+FAILED tests/test_disk_reclaim_readonly_removal.py::test_readonly_000_subdir_is_removed
+FAILED tests/test_disk_reclaim_readonly_removal.py::test_readonly_300_subdir_is_removed
+FAILED tests/test_disk_reclaim_readonly_removal.py::test_readonly_file_inside_readonly_dir_is_removed
+FAILED tests/test_disk_reclaim_readonly_removal.py::test_second_refusal_is_reported_not_retried_forever
+4 failed, 1 passed in 0.59s
+
+/home/hermes/.hermes/hermes-agent/.venv/lib/python3.14/site-packages/pytest_asyncio/plugin.py:306: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session". Set it to "fixture-scope" to keep the current behavior.
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
