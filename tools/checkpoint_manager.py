@@ -987,6 +987,10 @@ class CheckpointManager(LockHygiene):
             digest = _hash_file(path)
             if digest is None:
                 return
+            # A bounded 2 s queue, not ``timeout=0``: a lost ledger mark makes safe restore treat
+            # a Hermes-written file as hand-edited, so one short wait is worth the correctness.
+            # The 116 s stall that motivated the non-blocking alternative came from an *unbounded*
+            # wait behind maintenance's gc; 2 s cannot reproduce it.
             with store_lock(_resolve_checkpoint_base(),
                             timeout=LEDGER_LOCK_TIMEOUT_SECONDS,
                             purpose=f"agent-write ledger for {path}"):

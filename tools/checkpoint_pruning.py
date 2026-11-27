@@ -24,7 +24,14 @@ GC_PENDING_NAME = ".gc-pending"
 # taker must therefore be able to WAIT through a sibling snapshot instead of being refused at
 # t=0 (t_312ea8d7/t_977db51b/t_33063b55 lost every checkpoint of a run to that refusal). The
 # bound stays finite so a wedged holder still surfaces as a visible failure, never a hang.
+#
+# ``STORE_LOCK_TIMEOUT_SECONDS`` is the same defect measured from the other side (independent
+# fix, branch wt/t_9f42e621): the queue a caller gets when it does not name its own bound. It is
+# kept as the named constant the acceptance of that branch reads, while every production caller
+# below still passes its own bound (snapshot 120 s, ledger 2 s, destructive 0) — a single
+# "default" for all of them would either stall a turn behind maintenance or refuse a snapshot.
 SNAPSHOT_LOCK_TIMEOUT_SECONDS = 120.0
+STORE_LOCK_TIMEOUT_SECONDS = 5.0
 
 # Destructive maintenance (clear, clear_legacy) and the periodic prune must NOT queue behind a
 # live writer: they are grab-or-skip operations whose refusal is the documented contract.
@@ -42,6 +49,33 @@ def store_lock_path(base: Path) -> Path:
     return base.with_name(f".{base.name}.lock")
 
 
+def lock_holder_hint(lock: Path) -> str:
+    """Who to blame when ``lock`` could not be taken: the live holder, or that none is visible.
+
+    ``hermes_cli._early_recovery._held_open`` is the one authority on "does a running process
+    still own this path" (on Linux it reads every process's fds through /proc, on macOS/BSD it
+    asks ``lsof``); a third probe must not grow here. Every answer is honest: a visible holder is
+    named with its pid and command line, an unknown one is reported as unknown, and neither is
+    invented. The label is folded to one line and clipped — a worker's argv can be a whole script,
+    and the failure line ends up in a card comment.
+    """
+    try:
+        from hermes_cli._early_recovery import _held_open
+
+        verdict = _held_open(Path(lock))
+    except (ImportError, OSError) as exc:
+        # A diagnostic must never replace the failure it explains; log it so a broken probe is
+        # visible rather than silently reported as "unknown".
+        logging.getLogger(__name__).debug("checkpoint lock holder probe failed: %s", exc, exc_info=True)
+        return "holder unknown (probe unavailable)"
+    if verdict is True or verdict is None:
+        return "holder unknown (the platform could not inspect open files)"
+    if verdict is False:
+        return "no live process holds a descriptor on the lock file"
+    label = " ".join(str(verdict).split())
+    return f"held by {label[:120]}{'…' if len(label) > 120 else ''}"
+
+
 @contextmanager
 def store_lock(base: Path, *, timeout: float | None = NONBLOCKING, purpose: str = "operation"):
     """Serialize whole operations, including GC and clear, across processes.
@@ -49,31 +83,33 @@ def store_lock(base: Path, *, timeout: float | None = NONBLOCKING, purpose: str 
     ``timeout`` is how long to wait for a holder before failing. ``NONBLOCKING`` (0) keeps the
     original grab-or-refuse behaviour for destructive callers; a positive value lets an
     interactive snapshot ride out a sibling snapshot. ``None`` waits forever and is reserved for
-    callers that must eventually run.
+    callers that must eventually run. Callers that name no bound keep the fail-fast default on
+    purpose: ``checkpoint_maintenance.clear_all`` and ``data_cleanup_holders`` must not queue
+    behind a live writer (measured contract, ``test_destructive_maintenance_does_not_queue``).
+
+    ``pm.filesystem.lock_path`` does the waiting: besides the bounded retry it re-checks that the
+    held descriptor is still the file at the path, so a lock file unlinked while held cannot hand
+    two processes "the" lock.
     """
-    from hermes_cli.runtime_state import _lock
+    from pm.filesystem import lock_path
 
     base.parent.mkdir(parents=True, exist_ok=True)
     # Outside base so clear_all and legacy migration cannot replace its inode.
-    fd = os.open(store_lock_path(base), os.O_CREAT | os.O_RDWR, 0o600)
+    lock = store_lock_path(base)
+    started = time.monotonic()
+    fd = lock_path(lock, timeout=timeout, create_dir=True)
+    waited = time.monotonic() - started
+    if fd is None:
+        # Named, not anonymous: a bare "store is busy" cost a whole card's rollback points and
+        # left the operator with no way to tell a wedged holder from a dead-lock file.
+        gave_up = (
+            f"; gave up after {waited:.1f}s of waiting" if timeout is not None else ""
+        )
+        raise PruneError(
+            f"checkpoint store is busy: {base} — waited {waited:.1f}s for {purpose}"
+            f"{gave_up}; {lock_holder_hint(lock)} ({lock})"
+        )
     try:
-        started = time.monotonic()
-        if timeout is None:
-            # Explicitly unbounded: a caller that is obliged to run sooner or later waits without a
-            # limit. Re-entrant use is NOT supported — flock lives on the open file description, so
-            # a second os.open() in the same process contends with the first exactly like another
-            # process would, and the inner call waits on a lock only it could release.
-            held = _lock(fd, wait=True)
-        elif timeout > 0:
-            held = _lock(fd, wait=True, timeout=timeout)
-        else:
-            held = _lock(fd, wait=False)
-        waited = time.monotonic() - started
-        if not held:
-            raise PruneError(
-                f"checkpoint store is busy: {base} "
-                f"(waited {waited:.1f}s for {purpose}; another process holds {store_lock_path(base)})"
-            )
         if waited >= 0.5:
             # Honest record: a snapshot that took 12 s of someone else's ``git add`` is a fact the
             # operator needs, not a silent success.
