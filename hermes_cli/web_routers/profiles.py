@@ -634,7 +634,7 @@ def _sidebar_payload(
     errors: list[dict[str, str]] = []
     now = time.time()
 
-    def _slice(db, key, recents_subagents=(False, None), owner_scope=None):
+    def _slice(db, key, recents_subagents, owner_scope):
         source, exclude = slice_scope[key]
         # Only recents takes subagent runs (sessions.show_subagents); cron/messaging keep shape.
         include_subagents, exclude = recents_subagents if key == "recents" else (False, exclude)
@@ -647,9 +647,8 @@ def _sidebar_payload(
             include_subagents=include_subagents,
             # Already resolved PER PROFILE by the caller (``row_scope``): a personal profile
             # keeps the caller's stamps, a registry-shared one is team material and reads whole,
-            # and ``None`` (acl off) keeps the old query. A missing value is the fail-closed
-            # empty scope, never "everything".
-            user_id=() if owner_scope is None else owner_scope)
+            # ``None`` (acl off) keeps the old unscoped query, and ``()`` stays fail-closed.
+            user_id=owner_scope)
 
     def _build_slices(db, cache_key, recents_subagents, slice_owner_scope):
         # ``usage`` is aggregated in SQL rather than over the recents window: the window is a
