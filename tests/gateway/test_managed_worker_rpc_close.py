@@ -67,6 +67,66 @@ def test_execute_closes_the_rpc_after_the_store_on_a_start_failure(tmp_path, mon
     assert events == ['store.close', 'rpc.close']
 
 
+def test_a_refused_close_time_flush_still_delivers_the_turn_result(tmp_path, monkeypatch):
+    """The store refusing its close-time write must not turn a finished turn into a crash.
+
+    Regression for t_7403b0fe: ``flush_token_counts()`` raised ``WorkerPersistenceError``
+    before the result frame was sent, so the card's answer was dropped and the run was
+    replayed. The result now goes out first, and the owner is told about the receipt.
+    """
+    from agent import managed_worker as worker
+
+    events, payloads = [], []
+
+    class RefusingStore:
+        scope = None
+        def __init__(self, *args): pass
+        def get_messages_as_conversation(self, sid): return []
+        def flush_token_counts(self): raise ValueError('invalid_params')
+        def finish(self): events.append('store.finish')
+        def close(self): raise ValueError('invalid_params')
+
+    class RPC:
+        def __init__(self, home): pass
+        def __call__(self, method, **params): return {'owner_epoch': 1}
+        def close(self): events.append('rpc.close')
+
+    class Agent:
+        def __init__(self, **kwargs): self.session_prompt_tokens = self.session_completion_tokens = 0
+        def run_conversation(self, text, **kwargs):
+            return {'final_response': 'the answer', 'completed': True}
+
+    class Controls:
+        def __init__(self, *args):
+            self.stopped, self.finish = threading.Event(), threading.Event()
+            self.finish.set()
+        def approval(self, data): pass
+        def clarify(self, questions): pass
+
+    def send(kind, **payload):
+        events.append(kind)
+        payloads.append((kind, payload))
+
+    frame, _ = assignment(tmp_path, monkeypatch)
+    monkeypatch.setattr(worker, 'bind_worker_policy', lambda frame: None)
+    monkeypatch.setattr(worker, 'discover_profile_mcp', lambda policy: None)
+    monkeypatch.setattr(worker, 'retire_agent', lambda agent: None)
+    monkeypatch.setattr(worker, 'WorkerControls', Controls)
+    monkeypatch.setattr('agent.runtime_session_store.WorkerRPC', RPC)
+    monkeypatch.setattr('agent.runtime_session_store.RuntimeSessionStore', RefusingStore)
+    monkeypatch.setattr('tools.process_registry.process_registry.recover_from_checkpoint', lambda: None)
+    monkeypatch.setattr('run_agent.AIAgent', Agent)
+    monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
+
+    worker.execute(frame, SimpleNamespace(send=send))  # no raise
+
+    result = next(payload for kind, payload in payloads if kind == 'result')
+    assert 'the answer' in str(result)
+    finished = next(payload for kind, payload in payloads if kind == 'finished')
+    assert finished['persistence_error'] == 'invalid_params'
+    assert events[-1] == 'rpc.close'
+
+
 @pytest.mark.parametrize('start_error', [None, RuntimeError('construct_failed')])
 def test_a_failing_rpc_close_never_masks_the_turns_outcome(tmp_path, monkeypatch, start_error):
     events = []
