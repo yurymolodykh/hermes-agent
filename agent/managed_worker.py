@@ -416,20 +416,29 @@ def execute(frame, channel):
             # after execution.finish is a stale_generation write that fails the close-time flush.
             from agent.title_generator import wait_for_title_upgrades
             wait_for_title_upgrades()
-            store.flush_token_counts()
+            # A turn that produced its answer must not lose it to a close-time persistence
+            # failure: the outbox and the usage flush are the durability channel, not the turn's
+            # verdict (t_7403b0fe). Record what failed, carry it to the owner on the finishing
+            # frame, and still hand the result over — never swallow it and never resend.
+            persistence_error = _record_close_failure(store, 'flush_token_counts')
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
             channel.send('result', result=result_frame(result))
             if not controls.finish.wait(30):
                 raise ValueError('managed_finish_timeout')
-            store.finish()
-            channel.send('finished')
+            if persistence_error is None:
+                # ``self.failure`` is sticky, so after a refused flush ``finish`` would raise the
+                # same error again; the owner's settlement closes an execution that never wrote
+                # ``execution.finish`` itself (hermes_state_runtime settlement path).
+                persistence_error = _record_close_failure(store, 'execution.finish', operation='finish')
+            channel.send('finished', **({'persistence_error': persistence_error}
+                                        if persistence_error is not None else {}))
     finally:
         unregister_gateway_notify(frame['route'])
         if agent is not None:
             retire_agent(agent)
         try:
-            store.close()
+            _record_close_failure(store, 'store.close', operation='close')
         finally:
             with contextlib.suppress(Exception):  # a failing socket close never replaces the turn's outcome
                 rpc.close()
@@ -455,6 +464,33 @@ def hello():
     from hermes_cli.process_identity import worker_birth
     me = psutil.Process()
     return {'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]}
+
+
+def _record_close_failure(store, surface, operation=None):
+    """Run one close-time durability call; return its error string instead of raising it.
+
+    "The turn persisted its answer" and "the turn produced its answer" are different facts.
+    A refused outbox write makes ``self.failure`` sticky, so every later persistence call raises
+    the same string — and the worker used to surface that at ``flush_token_counts()``, before the
+    result frame, turning a finished card into a crash and replay (t_7403b0fe). Recording the
+    failure and continuing keeps the result; the owner is told, and the card is not replayed.
+    """
+    try:
+        if operation == 'finish':
+            store.finish()
+        elif operation == 'close':
+            store.close()
+        else:
+            store.flush_token_counts()
+    except Exception as exc:
+        logger.warning('%s failed at close; the turn result is still delivered: %s', surface, exc)
+        # The store logged the operation that was refused; this line names the close-time surface.
+        from agent.runtime_session_store import record_persist_failure
+        record_persist_failure(getattr(store, 'scope', None), operation=surface or 'close',
+                               params={}, error=exc,
+                               extra={'surface': surface, 'close_time': True})
+        return str(exc)
+    return None
 
 
 def main():

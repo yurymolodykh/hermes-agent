@@ -16,6 +16,8 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
+import traceback
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,64 @@ def _caller_summary(limit=8):
             frames.append(f'{module}:{frame.f_code.co_name}:{frame.f_lineno}')
         frame = frame.f_back
     return ' <- '.join(frames)
+
+
+def _entry_operation(entry):
+    """The journal entry's RPC operation name, or '?' for a malformed entry (diagnostics only)."""
+    return entry.get('operation', '?') if isinstance(entry, dict) else '?'
+
+
+def _failure_log_path(scope):
+    """``<profile>/logs/persist-failures.log`` for this worker's profile, or None if unknown.
+
+    The outbox journal records the absolute profile home (``profile_id``); a store built by a
+    test or a non-profile caller may not, and there is no safe fallback: never write a
+    persistence record somewhere the operator would not look.
+    """
+    home = scope.get('profile_id') if isinstance(scope, dict) else None
+    if not isinstance(home, str) or not os.path.isabs(home):
+        return None
+    return Path(home) / 'logs' / 'persist-failures.log'
+
+
+def record_persist_failure(scope, *, operation, params, error, trace=None, extra=None):
+    """Append one provenance record for a refused/failed worker persistence call.
+
+    ``self.failure`` keeps only the error string, which for an owner-side refusal is the bare
+    ``invalid_params``: it names neither the RPC method nor the payload that was rejected, and
+    the owner raises that same string from many handlers (t_7403b0fe). This record carries the
+    operation, the PARAMETER NAMES (never values: ``scope`` holds the worker secret), the error
+    and the traceback, appended as one JSON line so a crash is diagnosable after the fact.
+
+    Never raises: a diagnostic that dies must not replace the failure it describes.
+    """
+    try:
+        path = _failure_log_path(scope)
+        if path is None:
+            return
+        record = {
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            'operation': operation,
+            'param_keys': sorted(params) if isinstance(params, dict) else None,
+            'error': str(error),
+            'error_type': type(error).__name__,
+            'traceback': trace,
+            'pid': os.getpid(),
+            'execution_id': (scope or {}).get('execution_id'),
+            'session_id': (scope or {}).get('session_id'),
+        }
+        if extra:
+            record.update(extra)
+        line = json.dumps(record, ensure_ascii=True, default=str)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Append-only, owner-only. O_APPEND keeps concurrent append lines whole.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (line + '\n').encode('utf-8'))
+        finally:
+            os.close(fd)
+    except Exception:  # health: allow BLE001 -- a diagnostic failure never masks the real one
+        logger.debug('persist-failure record not written', exc_info=True)
 
 
 def call_off_event_loop(fn, *args, **kwargs):
@@ -363,6 +423,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self._save(candidate)
             except Exception as exc:
                 self.failure = str(exc)
+                record_persist_failure(self.scope, operation=operation, params=payload, error=exc,
+                                       trace=traceback.format_exc())
                 raise
             self.journal = candidate
             return self.retry_pending()[0]
@@ -382,6 +444,18 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)
+                # The refused entry stays at the head of the journal: its operation and payload
+                # are what the owner rejected, so they name the culprit of a bare error string.
+                pending = self.journal.get('pending') or []
+                stuck = pending[0] if pending and isinstance(pending[0], dict) else {}
+                payload = stuck.get('payload')
+                record_persist_failure(
+                    self.scope, operation=stuck.get('operation') or 'worker.persist',
+                    params={'sequence': stuck.get('sequence'),
+                            **(payload if isinstance(payload, dict) else {})},
+                    error=exc, trace=traceback.format_exc(),
+                    extra={'stuck_entry': True,
+                           'pending_operations': [_entry_operation(e) for e in pending]})
                 raise
             self.failure = None
             return results
@@ -444,6 +518,13 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def flush_token_counts(self, timeout=5.0):
         with self.lock:
             if self.failure:
+                # Close-time surface of a failure recorded earlier; log where it broke out so the
+                # journal shows the sequence (the first record carries the refused operation).
+                record_persist_failure(self.scope, operation='flush_token_counts', params={},
+                                       error=WorkerPersistenceError(self.failure),
+                                       extra={'surface': 'flush_token_counts',
+                                              'pending_operations': [_entry_operation(e) for e in
+                                                                     self.journal.get('pending') or []]})
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
