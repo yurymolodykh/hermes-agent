@@ -655,8 +655,8 @@ def _sidebar_payload(
         # page, and a total that shrank when you scrolled would be worse than no total at all.
         slices = {"recents": _slice(db, "recents", recents_subagents, slice_owner_scope),
                   "usage": db.usage_totals(user_id=slice_owner_scope),
-                  "cron": _slice(db, "cron", owner_scope=slice_owner_scope),
-                  "messaging": _slice(db, "messaging", owner_scope=slice_owner_scope)}
+                  "cron": _slice(db, "cron", (False, None), slice_owner_scope),
+                  "messaging": _slice(db, "messaging", (False, None), slice_owner_scope)}
         _sidebar_profile_cache_put(cache_key, slices)
         return slices
 
