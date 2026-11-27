@@ -35,6 +35,8 @@ OWNER_LOGIN = "owner"
 ALICE_ROOT = "01-alice"
 BOB_ROOT = "01-bob"
 SHARED_ROOT = "02-hermes-platform"
+#: The stamp the host owner's agent writes into a shared profile's store (live: ``uid:1001``).
+SHARED_OWNER_STAMP = "uid:1001"
 
 ALICE_DOC = {
     "slug": ALICE, "display_name": "Alice", "shared": False,
@@ -133,7 +135,7 @@ def homes(_isolated_home, registry):
     root_db = _isolated_home / "state.db"
     alice_home = _profile_home(_isolated_home, ALICE_ROOT)
     bob_home = _profile_home(_isolated_home, BOB_ROOT)
-    _profile_home(_isolated_home, SHARED_ROOT)
+    shared_home = _profile_home(_isolated_home, SHARED_ROOT)
     _seed(root_db, [
         ("root-owner-1", host_owner_subject(), "owner chat"),
         ("root-alice-1", ALICE, "alice chat left in the root store"),
@@ -141,7 +143,13 @@ def homes(_isolated_home, registry):
     _seed(alice_home / "state.db", [("alice-1", ALICE, "alice own chat"),
                                     ("alice-2", ALICE, "alice second chat")])
     _seed(bob_home / "state.db", [("bob-1", BOB, "bob own chat")])
-    return {"root": root_db, "alice": alice_home / "state.db", "bob": bob_home / "state.db"}
+    # A SHARED profile's rows are stamped with whoever happened to work in it — on the live
+    # host that is the host owner's ``uid:1001``, never the employee reading the team's work.
+    # That is exactly why a stamp-only filter hides a shared profile from every employee.
+    _seed(shared_home / "state.db", [("shared-1", SHARED_OWNER_STAMP, "team chat"),
+                                     ("shared-2", SHARED_OWNER_STAMP, "team chat two")])
+    return {"root": root_db, "alice": alice_home / "state.db", "bob": bob_home / "state.db",
+            "shared": shared_home / "state.db"}
 
 
 def _app():
@@ -267,4 +275,59 @@ def test_person_without_a_registry_profile_keeps_the_fail_closed_answer(homes, m
 def test_unverified_caller_is_unchanged_and_closed(homes, multi_user, registry):
     with _client() as cli:
         body = cli.get("/api/sessions?limit=50").json()
+    assert body["sessions"] == []
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# A SHARED profile's work is the team's: every verified person reads it
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The policy is "personal correspondence and personal profiles are isolated; everything the team
+# produced is common". The registry already says which profiles are shared (``shared/service``),
+# so row filtering must consult that fact: a shared profile's rows are stamped with whoever ran
+# the turn there (the host owner's ``uid:1001`` on the live host), and a stamp-only filter
+# therefore hid the whole team's work behind the owner's identity.
+
+
+def test_shared_profile_list_is_readable_by_any_verified_person(homes, multi_user, registry):
+    """RED before the fix: a shared profile answered 200 with 0 rows (store had 307)."""
+    with _client(as_login="alice") as cli:
+        ids, body = _ids(cli, f"/api/sessions?limit=50&profile={SHARED_ROOT}")
+    assert ids == {"shared-1", "shared-2"}
+    # Each row stays in its own profile — the listing never re-labels them into Alice's.
+    assert {row["profile"] for row in body["sessions"]} == {SHARED_ROOT}
+    assert body["total"] == 2
+
+
+def test_shared_profile_rows_are_the_same_for_every_person(homes, multi_user, registry):
+    """Team material is one answer, not one answer per viewer."""
+    with _client(as_login="bob") as cli:
+        bob_ids, _ = _ids(cli, f"/api/sessions?limit=50&profile={SHARED_ROOT}")
+    assert bob_ids == {"shared-1", "shared-2"}
+
+
+def test_shared_profile_row_opens_by_id(homes, multi_user, registry):
+    with _client(as_login="alice") as cli:
+        assert cli.get(f"/api/sessions/shared-1?profile={SHARED_ROOT}").status_code == 200
+        assert cli.get(f"/api/sessions/shared-1/messages?profile={SHARED_ROOT}").status_code == 200
+
+
+def test_shared_profile_list_does_not_leak_personal_rows(homes, multi_user, registry):
+    """Opening the shared store must not become a way into anybody's personal profile."""
+    with _client(as_login="alice") as cli:
+        ids, _ = _ids(cli, f"/api/sessions?limit=50&profile={SHARED_ROOT}")
+        # Negative controls: a personal store of another person stays closed, by list and by id.
+        foreign_ids, foreign_body = _ids(cli, f"/api/sessions?limit=50&profile={BOB_ROOT}")
+        assert cli.get(f"/api/sessions/bob-1?profile={BOB_ROOT}").status_code == 404
+        assert cli.get(f"/api/sessions/bob-1?profile={SHARED_ROOT}").status_code == 404
+    assert ids == {"shared-1", "shared-2"}
+    assert foreign_ids == set()
+    assert foreign_body["total"] == 0
+
+
+def test_shared_profile_is_closed_to_an_unverified_caller(homes, multi_user, registry):
+    """Fail closed: no verified identity means no owner scope, and shared rows are not public."""
+    with _client() as cli:
+        body = cli.get(f"/api/sessions?limit=50&profile={SHARED_ROOT}").json()
+        assert cli.get(f"/api/sessions/shared-1?profile={SHARED_ROOT}").status_code == 404
     assert body["sessions"] == []
