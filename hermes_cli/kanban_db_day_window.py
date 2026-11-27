@@ -12,7 +12,14 @@ kanban:
   day_max_in_progress: 4
   day_window: ["08:00", "18:00"]   # 08:00 inclusive, 18:00 exclusive
   day_window_tz: "Europe/Moscow"
+  day_window_days: ["mon", "tue", "wed", "thu", "fri"]  # optional; unset = every day
 ```
+
+``day_window_days`` narrows the layer to the listed weekdays (``mon``…``sun``, or
+``0``…``6`` with Monday as 0); on any other weekday the base cap applies for the
+whole day, so a weekend keeps the full width while business days get the narrow
+lane. A malformed list warns once and keeps the pre-key behaviour (window every
+day) — a typo must not silently widen the weekday cap.
 
 It is a *layer*, never a replacement: with the day keys unset (their shipped
 default) :func:`resolve_day_window_cap` returns the base cap untouched, so
@@ -90,24 +97,79 @@ def _parse_time(raw: Any) -> Optional[dt_time]:
         return None
 
 
-def _load_settings() -> tuple[Optional[int], Optional[tuple[dt_time, dt_time]], Any]:
+_DAY_NAMES = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+
+
+def _parse_day_of_week(raw: Any) -> Optional[int]:
+    """``"mon"``/``"Mon"``/``0`` -> ``0`` (Monday); anything else -> ``None``."""
+    if isinstance(raw, bool):  # bool is an int subclass; not a weekday
+        return None
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= 6 else None
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in _DAY_NAMES:
+            return _DAY_NAMES[text]
+        if text.isdigit():
+            value = int(text)
+            return value if 0 <= value <= 6 else None
+    return None
+
+
+def _parse_days(raw: Any) -> Optional[frozenset[int]]:
+    """``kanban.day_window_days`` -> the weekdays the window applies to.
+
+    ``None`` means "every day" — both when the key is unset (the shipped
+    default) and when it is unusable. A broken list deliberately keeps the
+    window running every day: falling back to "no day limit at all" would
+    silently hand the owner the wide cap on business days, the exact opposite
+    of the misconfiguration's likely intent.
+    """
+    if raw is None:
+        return None
+    days: set[int] = set()
+    if isinstance(raw, (list, tuple)) and raw:
+        for item in raw:
+            day = _parse_day_of_week(item)
+            if day is None:
+                days = set()
+                break
+            days.add(day)
+    if not days:
+        _warn_once(
+            f"days:{raw!r}",
+            "kanban dispatch: invalid kanban.day_window_days=%r (expected a non-empty "
+            "list of mon..sun or 0..6, Monday = 0); the daytime window applies to every "
+            "day of the week",
+            raw,
+        )
+        return None
+    return frozenset(days)
+
+
+def _load_settings(
+) -> tuple[Optional[int], Optional[tuple[dt_time, dt_time]], Any, Optional[frozenset[int]]]:
     """Read and validate ``kanban.day_*``.
 
-    Returns ``(day_cap, (start, end), tzinfo)``. ``day_cap is None`` means "the
-    window is not configured, or is unusable — apply the base cap".
+    Returns ``(day_cap, (start, end), tzinfo, days)``. ``day_cap is None`` means
+    "the window is not configured, or is unusable — apply the base cap";
+    ``days is None`` means "the window applies to every day of the week".
     """
     try:
         from hermes_cli.config import load_config_readonly
 
         kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
     except Exception:  # a broken config must not take dispatch down
-        return None, None, None
+        return None, None, None, None
     if not isinstance(kanban_cfg, dict):
-        return None, None, None
+        return None, None, None, None
 
     raw_cap = kanban_cfg.get("day_max_in_progress")
     raw_window = kanban_cfg.get("day_window")
     raw_tz = kanban_cfg.get("day_window_tz")
+    raw_days = kanban_cfg.get("day_window_days")
 
     day_cap: Optional[int] = None
     if raw_cap is not None:
@@ -160,7 +222,7 @@ def _load_settings() -> tuple[Optional[int], Optional[tuple[dt_time, dt_time]], 
             window = (start, end)
 
     if day_cap is None or window is None:
-        return None, None, None
+        return None, None, None, None
 
     tz: Any = FALLBACK_TZ
     if raw_tz is not None and not isinstance(raw_tz, str):
@@ -184,35 +246,44 @@ def _load_settings() -> tuple[Optional[int], Optional[tuple[dt_time, dt_time]], 
                 name,
             )
             tz = FALLBACK_TZ
-    return day_cap, window, tz
+    days = _parse_days(raw_days)
+    return day_cap, window, tz, days
 
 
 def resolve_day_window_cap(
     base_cap: Optional[int],
     *,
     now: Optional[float] = None,
-    settings: Optional[tuple[Optional[int], Optional[tuple[dt_time, dt_time]], Any]] = None,
+    settings: Optional[tuple] = None,
 ) -> Optional[int]:
     """The concurrency cap for ``now`` with the daytime window applied.
 
-    Inside ``[day_window[0], day_window[1])`` of ``day_window_tz`` the result is
-    ``min(base_cap, day_max_in_progress)`` — or ``day_max_in_progress`` alone
-    when ``base_cap is None``. Outside the window, and whenever the day config
-    is unset or unusable, it is ``base_cap`` unchanged.
+    Inside ``[day_window[0], day_window[1])`` of ``day_window_tz`` **and** on a
+    weekday listed in ``day_window_days`` (every day when that key is unset) the
+    result is ``min(base_cap, day_max_in_progress)`` — or ``day_max_in_progress``
+    alone when ``base_cap is None``. Outside the window, on an unlisted weekday,
+    and whenever the day config is unset or unusable, it is ``base_cap``
+    unchanged.
 
     ``settings`` is a test seam: pass the tuple :func:`_load_settings` would
-    return to avoid touching the real config.
+    return to avoid touching the real config. The historical 3-element tuple
+    (no weekday list) is still accepted.
     """
     if settings is None:
         settings = _load_settings()
-    day_cap, window, tz = settings
+    day_cap, window, tz = settings[0], settings[1], settings[2]
+    days = settings[3] if len(settings) > 3 else None
     if day_cap is None or window is None:
         return base_cap
 
     stamp = time.time() if now is None else float(now)
-    local_time = datetime.fromtimestamp(stamp, tz).timetz().replace(tzinfo=None)
+    local = datetime.fromtimestamp(stamp, tz)
+    local_time = local.timetz().replace(tzinfo=None)
+    weekday = local.weekday()  # Monday == 0, as datetime documents
     start, end = window
-    if not (start <= local_time < end):
+    in_window = start <= local_time < end
+    on_day = days is None or weekday in days
+    if not (in_window and on_day):
         effective = base_cap
     elif base_cap is None:
         effective = day_cap
@@ -225,12 +296,22 @@ def resolve_day_window_cap(
         if changed:
             _logged_level = effective
     if changed:
+        if in_window and on_day:
+            state = "window applies"
+        elif not in_window:
+            state = "window does not apply (outside the window)"
+        else:
+            state = (
+                "window does not apply (day_window_days excludes "
+                f"{local.strftime('%a').lower()})"
+            )
         _log().info(
-            "kanban dispatch: daytime window %s-%s %s — concurrency cap is now %s "
+            "kanban dispatch: daytime window %s-%s %s (%s) — concurrency cap is now %s "
             "(day_max_in_progress=%d, base=%s)",
             start.strftime("%H:%M"),
             end.strftime("%H:%M"),
             getattr(tz, "key", tz),
+            state,
             effective,
             day_cap,
             base_cap,

@@ -1934,6 +1934,13 @@ DEFAULT_CONFIG = {
         # IANA zone the window is expressed in. Unknown zone → UTC+3 with one WARN, because a
         # silently disabled window would hand the owner the wide cap all day.
         "day_window_tz": "Europe/Moscow",
+        # Weekdays the daytime window applies to: names "mon".."sun" and/or numbers 0..6
+        # (Monday = 0, as datetime.weekday()). On any other weekday the base max_in_progress
+        # applies for the whole day, so a weekend can run at full width while business days
+        # stay narrow. None = the window applies to every day (the pre-key behaviour). An
+        # unusable list (unknown name, out-of-range number, empty) warns once and keeps the
+        # every-day behaviour — a typo must never widen the business-hours cap.
+        "day_window_days": None,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
