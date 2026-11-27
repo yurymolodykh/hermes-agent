@@ -91,6 +91,18 @@ _MODEL_USAGE_FIELDS = frozenset((
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
     "actual_cost_usd", "cost_status", "cost_source", "api_call_count"))
 
+# The keys a ``usage.main`` receipt may carry ON TOP of ``_MODEL_USAGE_FIELDS``: what
+# ``hermes_state_runtime._worker_usage`` accepts for a worker's normal usage batch. One named
+# module-level literal, deliberately, because it IS the worker/owner RPC contract: a skew gate
+# has to compare the sender's set against the receiver's set, and a list written inline inside
+# a function body cannot be read out of either side (t_7403b0fe, t_7b2f251e). Add a field here
+# and every reader — the handler, the tests, a contract gate — sees the same set.
+USAGE_MAIN_EXTRA_FIELDS = frozenset((
+    "pricing_version", "absolute", "task", "prompt_cache_clock"))
+
+# ``usage.auxiliary`` (a compression child) instead accepts these on top of the model fields.
+USAGE_AUXILIARY_EXTRA_FIELDS = frozenset(("task",))
+
 
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
