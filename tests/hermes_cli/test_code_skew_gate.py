@@ -165,8 +165,8 @@ def test_the_probe_field_lands_in_the_usage_main_branch_not_the_auxiliary_one():
                    if isinstance(node, ast.FunctionDef) and node.name == "_worker_usage")
     main_expr = gate._main_allowed_expr(handler)
     assert main_expr is not None
-    start = (main_expr.lineno, main_expr.col_offset)
-    end = (main_expr.end_lineno, main_expr.end_col_offset)
+    start = (getattr(main_expr, "lineno"), getattr(main_expr, "col_offset"))
+    end = (getattr(main_expr, "end_lineno"), getattr(main_expr, "end_col_offset"))
     probe_nodes = [node for node in ast.walk(handler)
                    if isinstance(node, ast.Constant) and node.value == _PROBE_EXTRA]
     assert len(probe_nodes) == 1, "the probe must be injected exactly once"
