@@ -149,25 +149,30 @@ def test_extras_are_read_from_the_code_not_a_literal():
 def test_the_probe_field_lands_in_the_usage_main_branch_not_the_auxiliary_one():
     """The helper addresses the ``usage.main`` branch by condition, never by file order.
 
-    t_7403b0fe split the handler into ``if auxiliary: ... else: ...``; the first ``allowed =``
-    line that names ``_MODEL_USAGE_FIELDS`` in that shape is the AUXILIARY branch. Injecting there
-    changed nothing the gate parses, so the "extras are read from the code" claim stopped being
-    exercised — a silent loss of the test, not a code regression.
+    t_7403b0fe split the handler into an auxiliary/main pair; the first ``allowed =`` line that
+    names ``_MODEL_USAGE_FIELDS`` in that shape is the AUXILIARY branch. Injecting there changed
+    nothing the gate parses, so the "extras are read from the code" claim stopped being exercised —
+    a silent loss of the test, not a code regression.
+
+    Shape-agnostic on purpose (``X if auxiliary else Y`` and ``if auxiliary: X / else: Y`` are both
+    real revisions of this handler): the probe must appear exactly ONCE, inside the span the gate's
+    own parser reports as the ``usage.main`` expression.
     """
     runtime_source = _read_repo("hermes_state_runtime.py")
     assert runtime_source, "hermes_state_runtime.py must exist in this checkout"
     runtime = _with_probe_extra(runtime_source, _PROBE_EXTRA)
     handler = next(node for node in ast.walk(ast.parse(runtime))
                    if isinstance(node, ast.FunctionDef) and node.name == "_worker_usage")
-    assignment = next(
-        node for node in ast.walk(handler)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "allowed" for t in node.targets)
-        and isinstance(node.value, ast.IfExp))
-    # ``allowed = X if auxiliary else Y``: the auxiliary branch is the ``if`` value, main the else.
-    assert _PROBE_EXTRA not in ast.unparse(assignment.value.body), \
-        "the probe must not land in the auxiliary branch: the gate does not read it there"
-    assert _PROBE_EXTRA in ast.unparse(assignment.value.orelse)
+    main_expr = gate._main_allowed_expr(handler)
+    assert main_expr is not None
+    start = (main_expr.lineno, main_expr.col_offset)
+    end = (main_expr.end_lineno, main_expr.end_col_offset)
+    probe_nodes = [node for node in ast.walk(handler)
+                   if isinstance(node, ast.Constant) and node.value == _PROBE_EXTRA]
+    assert len(probe_nodes) == 1, "the probe must be injected exactly once"
+    probe = probe_nodes[0]
+    assert start <= (probe.lineno, probe.col_offset) < end, \
+        "the probe must land inside the usage.main expression; elsewhere the gate never sees it"
     parsed = gate.contract_from_sources(
         lambda rel: runtime if rel == "hermes_state_runtime.py" else _read_repo(rel))
     assert parsed is not None and _PROBE_EXTRA in parsed.usage_main_fields
