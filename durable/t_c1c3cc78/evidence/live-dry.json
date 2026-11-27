@@ -1,0 +1,501 @@
+{
+ "checked_at": "2026-11-27T08:48:24+0300",
+ "mode": "dry-run",
+ "source": "scan",
+ "candidates": [
+  {
+   "path": "/home/hermes/.hermes/logs/disk-reclaim.log",
+   "bytes": 1404077,
+   "mtime": 1795757258.358,
+   "age_h": 0.3,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 7118,
+   "lines_after": 2000,
+   "why": "7118 строк > 2000",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/09-independent-reviewer/cache/scratch/t9be97024",
+   "bytes": 675066,
+   "mtime": 1795459074.012,
+   "age_h": 83.2,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 09-independent-reviewer",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/t_e0809b88",
+   "bytes": 50955,
+   "mtime": 1795498065.288,
+   "age_h": 72.3,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (t_e0809b88)",
+   "registry_id": "t_e0809b88",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082802",
+   "bytes": 4446,
+   "mtime": 1795498082.105,
+   "age_h": 72.3,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082802)",
+   "registry_id": "copy-guard-quarantine-20261124T082802",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082841",
+   "bytes": 4446,
+   "mtime": 1795498121.038,
+   "age_h": 72.3,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082841)",
+   "registry_id": "copy-guard-quarantine-20261124T082841",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082936",
+   "bytes": 4446,
+   "mtime": 1795498176.233,
+   "age_h": 72.3,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082936)",
+   "registry_id": "copy-guard-quarantine-20261124T082936",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082401",
+   "bytes": 385,
+   "mtime": 1795497841.983,
+   "age_h": 72.4,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082401)",
+   "registry_id": "copy-guard-quarantine-20261124T082401",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T081816",
+   "bytes": 368,
+   "mtime": 1795497496.259,
+   "age_h": 72.5,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T081816)",
+   "registry_id": "copy-guard-quarantine-20261124T081816",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T083819",
+   "bytes": 342,
+   "mtime": 1795498699.795,
+   "age_h": 72.2,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T083819)",
+   "registry_id": "copy-guard-quarantine-20261124T083819",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082520",
+   "bytes": 338,
+   "mtime": 1795497920.517,
+   "age_h": 72.4,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082520)",
+   "registry_id": "copy-guard-quarantine-20261124T082520",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T083957",
+   "bytes": 338,
+   "mtime": 1795498797.795,
+   "age_h": 72.1,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T083957)",
+   "registry_id": "copy-guard-quarantine-20261124T083957",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T082526",
+   "bytes": 327,
+   "mtime": 1795497926.8,
+   "age_h": 72.4,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T082526)",
+   "registry_id": "copy-guard-quarantine-20261124T082526",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/backups-managed/copy-guard-quarantine-20261124T084411",
+   "bytes": 326,
+   "mtime": 1795499051.193,
+   "age_h": 72.1,
+   "class": "backup-ttl",
+   "why": "TTL 3д истёк (copy-guard-quarantine-20261124T084411)",
+   "registry_id": "copy-guard-quarantine-20261124T084411",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/02-hermes-platform/cache/scratch/tmpi_f19jp8",
+   "bytes": 0,
+   "mtime": 1795381732.87,
+   "age_h": 104.7,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 02-hermes-platform",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10mb-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795539649.741,
+   "age_h": 60.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-claimed-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.208,
+   "age_h": 52.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-claimed-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.21,
+   "age_h": 52.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795554039.657,
+   "age_h": 56.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10mb-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795539649.742,
+   "age_h": 60.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-live-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.215,
+   "age_h": 52.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-listing-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795554039.66,
+   "age_h": 56.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10-live5",
+   "bytes": 0,
+   "mtime": 1795539649.729,
+   "age_h": 60.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/var/tmp/cgr10m-live-inotify-A-touch-after-incomplete",
+   "bytes": 0,
+   "mtime": 1795568478.216,
+   "age_h": 52.8,
+   "class": "var-tmp",
+   "why": "/var/tmp старше 6 ч",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.hermes/cache/uv",
+   "bytes": 0,
+   "mtime": 1795756342.225,
+   "age_h": 0.6,
+   "class": "cache-prune",
+   "action": "uv-cache-prune",
+   "cmd": [
+    "/home/hermes/.hermes/tools/uv-0.13.5-linux-x64/uv",
+    "cache",
+    "prune"
+   ],
+   "env": {
+    "UV_CACHE_DIR": "/home/hermes/.hermes/cache/uv"
+   },
+   "why": "uv cache prune для /home/hermes/.hermes/cache/uv",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.cache/uv",
+   "bytes": 0,
+   "mtime": 1795756300.971,
+   "age_h": 0.6,
+   "class": "cache-prune",
+   "action": "uv-cache-prune",
+   "cmd": [
+    "/home/hermes/.hermes/tools/uv-0.13.5-linux-x64/uv",
+    "cache",
+    "prune"
+   ],
+   "env": {},
+   "why": "uv cache prune для /home/hermes/.cache/uv",
+   "would": true
+  },
+  {
+   "path": "/home/hermes/.cache/pnpm",
+   "bytes": 0,
+   "mtime": 1795308134.953,
+   "age_h": 125.1,
+   "class": "cache-prune",
+   "action": "pnpm-store-prune",
+   "cmd": [
+    "/home/hermes/.hermes/tools/pnpm-12.15.0-linux-x64/pnpm",
+    "store",
+    "prune"
+   ],
+   "env": {},
+   "why": "pnpm store prune для ~/.cache/pnpm",
+   "would": true
+  }
+ ],
+ "refused": [
+  {
+   "path": "/home/hermes/.hermes/profiles/03-software-engineer/cache/scratch/pytest-of-hermes",
+   "bytes": 881549357,
+   "mtime": 1795693525.96,
+   "age_h": 18.0,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 03-software-engineer",
+   "refused": "стоп-имя"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/09-independent-reviewer/cache/scratch/pytest-of-hermes",
+   "bytes": 881202595,
+   "mtime": 1795697318.518,
+   "age_h": 17.0,
+   "min_age_hours": 6,
+   "class": "scratch",
+   "scratch_kind": "run",
+   "why": "прогонная копия 09-independent-reviewer",
+   "refused": "стоп-имя"
+  },
+  {
+   "path": "/tmp/pavlova.pdf",
+   "bytes": 6778809,
+   "mtime": 1795686423.096,
+   "age_h": 20.0,
+   "class": "tmp",
+   "why": "/tmp старше 6 ч",
+   "refused": "ссылка из незакрытой карточки t_9f57d0cb: /tmp/pavlova.pdf"
+  },
+  {
+   "path": "/tmp/zondaero500ng_datasheet.pdf",
+   "bytes": 5343947,
+   "mtime": 1795687231.905,
+   "age_h": 19.8,
+   "class": "tmp",
+   "why": "/tmp старше 6 ч",
+   "refused": "ссылка из незакрытой карточки t_9f57d0cb: /tmp/zondaero500ng_datasheet.pdf"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/15-sre-qa/logs/agent.log",
+   "bytes": 2294651,
+   "mtime": 1795758477.804,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 27724,
+   "lines_after": 2000,
+   "why": "27724 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/15-sre-qa/logs/agent.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/03-software-engineer/logs/agent.log",
+   "bytes": 2290937,
+   "mtime": 1795758484.356,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 27608,
+   "lines_after": 2000,
+   "why": "27608 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/03-software-engineer/logs/agent.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/01-orchestrator/logs/agent.log",
+   "bytes": 2095015,
+   "mtime": 1795758432.518,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 17910,
+   "lines_after": 2000,
+   "why": "17910 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/01-orchestrator/logs/agent.log"
+  },
+  {
+   "path": "/tmp/zondaero500ng_manual.pdf",
+   "bytes": 1665872,
+   "mtime": 1795687232.843,
+   "age_h": 19.8,
+   "class": "tmp",
+   "why": "/tmp старше 6 ч",
+   "refused": "ссылка из незакрытой карточки t_9f57d0cb: /tmp/zondaero500ng_manual.pdf"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/05-rag-knowledge-engineer/logs/agent.log",
+   "bytes": 796893,
+   "mtime": 1795758486.56,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 10946,
+   "lines_after": 2000,
+   "why": "10946 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/05-rag-knowledge-engineer/logs/agent.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/05-rag-knowledge-engineer/logs/errors.log",
+   "bytes": 696734,
+   "mtime": 1795758237.964,
+   "age_h": 0.1,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 10243,
+   "lines_after": 2000,
+   "why": "10243 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/05-rag-knowledge-engineer/logs/errors.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/02-hermes-platform/logs/errors.log",
+   "bytes": 588273,
+   "mtime": 1795758314.692,
+   "age_h": 0.1,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 8975,
+   "lines_after": 2000,
+   "why": "8975 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/02-hermes-platform/logs/errors.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/08-visual-media-designer/logs/agent.log",
+   "bytes": 284477,
+   "mtime": 1795758497.681,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 5145,
+   "lines_after": 2000,
+   "why": "5145 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/08-visual-media-designer/logs/agent.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/08-visual-media-designer/logs/errors.log",
+   "bytes": 221433,
+   "mtime": 1795758016.521,
+   "age_h": 0.1,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 4605,
+   "lines_after": 2000,
+   "why": "4605 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/08-visual-media-designer/logs/errors.log"
+  },
+  {
+   "path": "/home/hermes/.hermes/profiles/01-orchestrator/logs/errors.log",
+   "bytes": 207363,
+   "mtime": 1795758413.335,
+   "age_h": 0.0,
+   "class": "logs",
+   "action": "rotate:2000",
+   "lines_before": 4150,
+   "lines_after": 2000,
+   "why": "4150 строк > 2000",
+   "refused": "живой процесс держит /home/hermes/.hermes/profiles/01-orchestrator/logs/errors.log"
+  },
+  {
+   "path": "/tmp/probe24.jsonl",
+   "bytes": 20706,
+   "mtime": 1795540788.988,
+   "age_h": 60.5,
+   "class": "tmp",
+   "why": "/tmp старше 6 ч",
+   "refused": "ссылка из незакрытой карточки t_f4f15fa9: /tmp/probe24.jsonl"
+  },
+  {
+   "path": "/tmp/interleave.jsonl",
+   "bytes": 19057,
+   "mtime": 1795541406.835,
+   "age_h": 60.3,
+   "class": "tmp",
+   "why": "/tmp старше 6 ч",
+   "refused": "ссылка из незакрытой карточки t_f4f15fa9: /tmp/interleave.jsonl"
+  }
+ ],
+ "freed_bytes": 2145860,
+ "free_before_bytes": 56336240640,
+ "free_after_bytes": 56336224256,
+ "free_gib": 52.5,
+ "classes": [
+  {
+   "class": "logs",
+   "objects": 1,
+   "bytes": 1404077,
+   "refused": 9
+  },
+  {
+   "class": "scratch",
+   "objects": 2,
+   "bytes": 675066,
+   "refused": 2
+  },
+  {
+   "class": "backup-ttl",
+   "objects": 11,
+   "bytes": 66717,
+   "refused": 0
+  },
+  {
+   "class": "var-tmp",
+   "objects": 9,
+   "bytes": 0,
+   "refused": 0
+  },
+  {
+   "class": "cache-prune",
+   "objects": 3,
+   "bytes": 0,
+   "refused": 0
+  },
+  {
+   "class": "tmp",
+   "objects": 0,
+   "bytes": 0,
+   "refused": 5
+  }
+ ]
+}
