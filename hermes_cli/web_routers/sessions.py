@@ -28,8 +28,8 @@ from hermes_cli.web_routers._common import (
     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
 )
 from hermes_cli.web_routers._session_acl import (
-    NOT_FOUND as _ACL_NOT_FOUND, refuse_writes, require_row, row_outside, scoped_ids, session_profile,
-    session_scope, visible_row,
+    NOT_FOUND as _ACL_NOT_FOUND, refuse_writes, require_row, row_outside, row_scope, scoped_ids,
+    session_profile, session_scope, visible_row,
 )
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
@@ -223,7 +223,9 @@ def get_sessions(
                 exclude_sources=exclude_list or None, cwd_prefix=(cwd_prefix or None),
                 min_message_count=min_message_count, include_archived=include_archived,
                 archived_only=archived_only, include_subagents=include_subagents,
-                user_id=scope)
+                # A registry-shared profile's rows are team material, so its store is listed
+                # whole; a personal one keeps the caller's stamp scope (``1 = 0`` when empty).
+                user_id=row_scope(scope, profile_name or _cron_default_profile()))
             sessions = db.list_sessions_rich(
                 limit=limit,
                 offset=offset,
@@ -375,14 +377,14 @@ async def search_sessions(
                     return
                 # The owner scope is checked on BOTH ends of the compression walk: a foreign
                 # lineage's root must not become a result key, and its tip must not be served.
-                if not visible_row(get_session(raw_sid), scope):
+                if not visible_row(get_session(raw_sid), scope, profile):
                     return
                 root = compression_root(raw_sid)
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
                 sid = lineage_tip(raw_sid)
-                if not visible_row(get_session(sid), scope):
+                if not visible_row(get_session(sid), scope, profile):
                     return
                 payload["session_id"] = sid
                 payload["lineage_root"] = root
@@ -445,7 +447,9 @@ async def search_sessions(
             matches = db.search_messages(
                 query=prefix_query, source_filter=include_sources,
                 exclude_sources=exclude_list or None, limit=max(safe_limit * 5, 50),
-                user_id=scope,
+                # A shared profile's transcripts are team material, so its store is searched
+                # whole; a personal one keeps the stamp scope exactly as before.
+                user_id=row_scope(scope, row_profile),
                 fields=("session_id", "role", "snippet", "source", "model", "session_started"))
             for m in matches:
                 if len(seen) >= safe_limit:
@@ -467,7 +471,8 @@ async def search_sessions(
                     title_rows = db.list_sessions_rich(
                         search_query=q.strip(), include_archived=True, order_by_last_active=True,
                         source=source_filter, sources=source_list or None,
-                        exclude_sources=exclude_list or None, limit=safe_limit, user_id=scope)
+                        exclude_sources=exclude_list or None, limit=safe_limit,
+                        user_id=row_scope(scope, row_profile))
                 except Exception:  # health: allow BLE001 -- best-effort supplement lane: an old/odd store that rejects the search_query read must not fail the id+content results already collected
                     _log.debug("Title-match supplement skipped for %r", q[: 200])
                     title_rows = []

@@ -80,34 +80,90 @@ def session_profile(request: Optional[Request], profile: Optional[str]) -> Optio
     return owns[0]
 
 
-def row_outside(row: Any, scope: Optional[Sequence[str]]) -> bool:
-    """Whether a stored session row is OUTSIDE *scope* (``False`` for an unscoped caller)."""
+def profile_is_shared(profile: Optional[str]) -> bool:
+    """Whether the ACL registry declares *profile* a SHARED one (``shared/service``).
+
+    A shared profile is a runtime the whole team uses, so what was produced in it is team
+    material: the owner's policy is "personal correspondence and personal profiles are isolated;
+    everything the team produced is common". Its rows therefore are not one person's, even though
+    each row carries the ``user_id`` stamp of whoever happened to run the turn.
+
+    Fail-closed on every uncertain answer: no registry, ACL inactive, a broken registry
+    (:class:`BindingsError`) or an unnamed profile all say "not shared", so the stamp filter stays
+    exactly as strict as before instead of widening on a read failure.
+    """
+    text = str(profile or "").strip()
+    if not text:
+        return False
+    try:
+        from hermes_acl_bindings import BindingsError, load_cached
+    except ImportError:  # registry module absent: nothing is declared shared
+        return False
+    try:
+        registry = load_cached()
+    except BindingsError as exc:
+        logger.warning("acl sessions: bindings registry unusable — %r stays personal (%s)", text, exc)
+        return False
+    return bool(registry is not None and registry.is_shared(text))
+
+
+def shared_access(scope: Optional[Sequence[str]], profile: Optional[str]) -> bool:
+    """Whether *profile*'s rows are readable by this caller AS TEAM MATERIAL.
+
+    Both halves are required, deliberately: the profile must be registry-shared AND the caller
+    must be a VERIFIED person (a non-empty scope). An empty scope is "identity not established";
+    treating it as team access would publish every shared profile anonymously.
+    """
+    return bool(scope) and profile_is_shared(profile)
+
+
+def row_scope(scope: Optional[Sequence[str]], profile: Optional[str]) -> Optional[Sequence[str]]:
+    """The ``user_id`` scope for a LISTING of *profile*'s store.
+
+    ``None`` (= no SQL owner predicate) when the caller may read the profile as team material:
+    every row of a shared store is in scope. Otherwise *scope* verbatim, so a personal profile
+    keeps its exact per-stamp filter — including the empty scope's ``1 = 0``.
+    """
+    if scope is None or not scope:
+        return scope
+    return None if profile_is_shared(profile) else scope
+
+
+def row_outside(row: Any, scope: Optional[Sequence[str]], profile: Optional[str] = None) -> bool:
+    """Whether a stored session row is OUTSIDE *scope* (``False`` for an unscoped caller).
+
+    *profile* is the store the row came from; when it is registry-shared and the caller is
+    verified, its rows are team material and every one of them is in scope.
+    """
     if scope is None:
+        return False
+    if shared_access(scope, profile):
         return False
     from hermes_acl_scope import row_outside_scope
     return row_outside_scope(row, scope)
 
 
-def require_row(row: Any, scope: Optional[Sequence[str]]) -> Any:
+def require_row(row: Any, scope: Optional[Sequence[str]], profile: Optional[str] = None) -> Any:
     """Return *row* when the caller may see it, else raise the same 404 a missing id gives."""
-    if row is None or row_outside(row, scope):
+    if row is None or row_outside(row, scope, profile):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     return row
 
 
-def visible_row(row: Any, scope: Optional[Sequence[str]]) -> bool:
+def visible_row(row: Any, scope: Optional[Sequence[str]], profile: Optional[str] = None) -> bool:
     """``True`` when *row* exists and is inside *scope*."""
-    return row is not None and not row_outside(row, scope)
+    return row is not None and not row_outside(row, scope, profile)
 
 
-def scoped_ids(ids: Iterable[str], db, scope: Optional[Sequence[str]]) -> list[str]:
+def scoped_ids(ids: Iterable[str], db, scope: Optional[Sequence[str]],
+               profile: Optional[str] = None) -> list[str]:
     """Keep only the *ids* whose stored row is inside *scope* (unscoped callers keep all)."""
     wanted = [str(value) for value in ids if value]
     if scope is None:
         return wanted
     kept: list[str] = []
     for session_id in wanted:
-        if visible_row(db.get_session(session_id), scope):
+        if visible_row(db.get_session(session_id), scope, profile):
             kept.append(session_id)
     return kept
 
