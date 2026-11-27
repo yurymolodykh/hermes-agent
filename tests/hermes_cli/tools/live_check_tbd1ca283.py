@@ -18,8 +18,8 @@ os.environ["HERMES_HOME"] = str(HOME)          # the real home, as the gateway s
 # repo root = three levels up from tests/hermes_cli/tools/
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 
-from fastapi import FastAPI                            # noqa: E402
-from fastapi.testclient import TestClient              # noqa: E402
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 class Session:
@@ -28,10 +28,11 @@ class Session:
 
 
 def client_for(login: str | None):
+    from hermes_cli.web_routers.profiles import sessions_router
     from hermes_cli.web_routers.sessions import list_router, manage_router, search_router
 
     app = FastAPI()
-    for router in (list_router, search_router, manage_router):
+    for router in (list_router, search_router, manage_router, sessions_router):
         app.include_router(router)
     client = TestClient(app)
     if login:
@@ -79,7 +80,7 @@ def main() -> int:
             ok = False
             print(f"    [FAIL] {shared}: no rows for a verified person")
         else:
-            detail, _, dstatus = report("maria.safronova",
+            _detail, _, dstatus = report("maria.safronova",
                                         f"/api/sessions/{ids[0]}?profile={shared}")
             expect(f"{shared} row opens by id", dstatus, 200)
 
@@ -88,6 +89,19 @@ def main() -> int:
     for personal in ("01-kurilenko", "01-orchestrator"):
         ids, _, status = report("maria.safronova", f"/api/sessions?limit=50&profile={personal}")
         expect(f"{personal} rows", ids, [])
+
+    # 2b. The per-profile fan-out route the dashboard sidebar uses must agree with the list.
+    print("\n--- /api/profiles/sessions fan-out")
+    for shared in ("03-software-engineer", "06-contest-methodologist"):
+        _ids, body, status = report("maria.safronova", f"/api/profiles/sessions?profile={shared}&limit=50")
+        expect(f"fan-out {shared} status", status, 200)
+        rows = body.get("sessions") or []
+        if rows:
+            expect(f"fan-out {shared} rows stay in profile",
+                   sorted({row.get("profile") for row in rows}), [shared])
+        else:
+            ok = False
+            print(f"    [FAIL] fan-out {shared}: no rows for a verified person")
 
     # 3. Identity not established: shared rows are NOT published anonymously.
     print("\n--- no identity => nothing")

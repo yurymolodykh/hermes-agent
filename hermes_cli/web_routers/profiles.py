@@ -533,9 +533,10 @@ def get_profiles_sessions(
     totals: dict[str, int] = {}
     errors: list[dict[str, str]] = []
     now = time.time()
-    # МПД Т2/Т4: a profile in the visible set is a runtime, not a container of one person's rows.
-    # "May use profile 03" therefore never means "may read somebody else's conversation in it" —
-    # rows keep their own owner scope from step 4. ``None`` (acl off) keeps the old query.
+    # A profile in the visible set is a runtime, not a container of one person's rows: a PERSONAL
+    # one keeps each row's own owner stamp (step 4), so "may use 01-x" never means "may read what
+    # somebody else wrote there". A registry-SHARED one is the opposite case — its work belongs to
+    # the team, and ``row_scope`` below says so per profile. ``None`` (acl off) keeps the old query.
     owner_scope = _request_scope(request)
     for name, home in targets:
         def _read(db, name=name, home=home):
