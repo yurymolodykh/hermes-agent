@@ -28,8 +28,8 @@ from hermes_cli.web_routers._common import (
     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
 )
 from hermes_cli.web_routers._session_acl import (
-    NOT_FOUND as _ACL_NOT_FOUND, refuse_writes, require_row, row_outside, scoped_ids, session_scope,
-    visible_row,
+    NOT_FOUND as _ACL_NOT_FOUND, refuse_writes, require_row, row_outside, scoped_ids, session_profile,
+    session_scope, visible_row,
 )
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
@@ -204,6 +204,7 @@ def get_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     profile_name = _cron_profile_home(profile)[0] if profile else None
     try:
         db = _open_session_db_for_profile(profile, read_only=True)
@@ -310,6 +311,7 @@ async def search_sessions(
     if not q or not q.strip():
         return {"results": []}
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     with http_failure("GET /api/sessions/search failed", 500, detail="Search failed"):
         row_profile = _serving_profile(profile)
 
@@ -508,7 +510,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions, request: Reque
     if len(body.ids) > 500:
         raise HTTPException(status_code=400, detail="ids must contain at most 500 entries")
     scope = session_scope(request)
-    profile = destructive_profile(body.profile, "POST /api/sessions/bulk-delete")
+    profile = destructive_profile(session_profile(request, body.profile), "POST /api/sessions/bulk-delete")
     skipped: list[str] = []  # rows a live turn/compression still owns; the UI must keep them listed
     def _delete(db):
         ids = scoped_ids(body.ids, db, scope) if scope is not None else body.ids
@@ -538,6 +540,7 @@ async def import_sessions_endpoint(request: Request):
     # that belongs to someone else, so a foreign id refuses the whole request (400 — nothing
     # is written, and the refusal names no session).
     scope = session_scope(request)
+    body = body.model_copy(update={"profile": session_profile(request, body.profile)})
     if scope is not None:
         ids = [str(item.get('id') or '') for item in body.sessions if isinstance(item, dict)]
         foreign = await asyncio.to_thread(
@@ -558,6 +561,7 @@ async def count_empty_sessions_endpoint(request: Request, profile: Optional[str]
     Counted inside the caller's owner scope, so the badge never reflects another person's rows.
     """
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     count = await asyncio.to_thread(
         _with_db, profile, lambda db: db.count_empty_sessions(user_id=scope), read_only=True)
     return {"count": count}
@@ -579,7 +583,7 @@ async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str
     conversations are not theirs to retire.
     """
     scope = session_scope(request)
-    profile = destructive_profile(profile, "DELETE /api/sessions/empty")
+    profile = destructive_profile(session_profile(request, profile), "DELETE /api/sessions/empty")
     deleted = await asyncio.to_thread(
         _with_db, profile,
         lambda db: db.delete_empty_sessions(sessions_dir=_session_files_dir(profile), user_id=scope),
@@ -596,6 +600,8 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
     stores even without naming a session.
     """
     scope = session_scope(request)
+    profile = session_profile(request, profile)
+
     def _stats(db):
         out = {
             # exclude_children=True: the dashboard Sessions page pairs these counts with
@@ -619,6 +625,7 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
 @manage_router.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, request: Request, profile: Optional[str] = None):
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     def _detail(db):
         sid = _resolve_session_id(db, session_id)
         # A foreign row answers exactly what a missing id answers (404), never 403.
@@ -646,6 +653,7 @@ async def get_session_detail(session_id: str, request: Request, profile: Optiona
 async def get_session_mutation_snapshot(session_id: str, request: Request, profile: Optional[str] = None):
     from hermes_cli.web_server_sessions import _session_mutation_context
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     authority, _actor = _session_mutation_context(request, profile)
     if authority is None:  # standalone serve: the counters the offline receipt checks
         row = await asyncio.to_thread(_with_db, profile, lambda db: db.get_session(session_id), read_only=True)
@@ -663,6 +671,7 @@ async def get_session_mutation_snapshot(session_id: str, request: Request, profi
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
 async def get_session_latest_descendant(session_id: str, request: Request, profile: Optional[str] = None):
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     def _read(db):
         # The walk starts at the requested row and follows children, so the SCOPE is checked on
         # the start and on every hop: a foreign parent must not disclose its children either.
@@ -822,6 +831,7 @@ async def get_session_messages(
     if order not in (None, "oldest", "latest"):
         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
     scope = session_scope(request)
+    profile = session_profile(request, profile)
 
     def _read(db):
         sid = _resolve_session_id(db, session_id)
@@ -899,6 +909,7 @@ async def get_session_timeline(
     """
     from hermes_state_timeline import get_session_timeline as read_timeline
 
+    profile = session_profile(request, profile)
     owner = _serving_profile(profile)
     scope = session_scope(request)
 
@@ -918,6 +929,7 @@ async def get_session_messages_around(
     """Bounded display page starting at a timeline prompt; no intervening payloads."""
     from hermes_state_timeline import get_session_messages_around as read_around
 
+    profile = session_profile(request, profile)
     owner = _serving_profile(profile)
     scope = session_scope(request)
 
@@ -941,6 +953,7 @@ async def delete_session_endpoint(session_id: str, request: Request, profile: Op
     from hermes_cli.web_server_sessions import _mutate_session_request
     from hermes_state import SessionDB
     scope = session_scope(request)
+    profile = session_profile(request, profile)
     if scope is not None:
         # An EXISTING row of another person answers 404, indistinguishable from an absent id;
         # an absent id keeps the idempotent "already_absent" success below.
@@ -1030,6 +1043,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
     payload = {key: getattr(body, key) for key in ('title', 'archived', 'hidden', 'pinned', 'unread')
                if getattr(body, key) is not None}
     scope = session_scope(request)
+    body = body.model_copy(update={"profile": session_profile(request, body.profile)})
     if scope is not None:
         # A foreign EXISTING row answers 404 exactly like an absent id; an absent id keeps the
         # create-then-rename import path working (the mutation's own authorize decides that one).
@@ -1054,6 +1068,7 @@ async def export_session_endpoint(session_id: str, request: Request, profile: Op
     a missing one does and no byte of its transcript is ever written to the response.
     """
     scope = session_scope(request)
+    profile = session_profile(request, profile)
 
     def _prepare_export(db):
         sid = _resolve_session_id(db, session_id)
